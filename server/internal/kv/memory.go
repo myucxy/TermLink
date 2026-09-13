@@ -388,6 +388,31 @@ func (m *MemoryCoordinator) GetLease(ctx context.Context, sessionID uuid.UUID) (
 	return current.lease, nil
 }
 
+// IsLeaseParticipantActive checks one exact shared-lease fence without
+// renewing the lease or participant. Expired participants are pruned while
+// the coordinator lock is held so release, renewal, and authorization observe
+// one consistent state.
+func (m *MemoryCoordinator) IsLeaseParticipantActive(ctx context.Context, lease Lease, deviceID uuid.UUID) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if lease.SessionID == uuid.Nil || lease.HolderDeviceID == uuid.Nil || lease.ID == uuid.Nil || lease.Version < 1 || deviceID == uuid.Nil {
+		return false, errors.New("invalid lease participant query")
+	}
+	now := m.now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.prepareLocked(now); err != nil {
+		return false, err
+	}
+	current := m.liveLeaseLocked(lease.SessionID, now)
+	if current == nil || !sameLease(current.lease, lease) {
+		return false, nil
+	}
+	expiresAt, exists := current.participants[deviceID]
+	return exists && now.Before(expiresAt), nil
+}
+
 func (m *MemoryCoordinator) Renew(ctx context.Context, lease Lease, duration time.Duration) (Lease, error) {
 	return m.RenewForDevice(ctx, lease, lease.HolderDeviceID, duration)
 }

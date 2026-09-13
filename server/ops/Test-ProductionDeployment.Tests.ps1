@@ -174,7 +174,7 @@ function New-EnvironmentOverrideFile {
         } else { $line }
     }
     foreach ($name in @($Overrides.Keys | Sort-Object)) {
-        if (-not $seen.Contains([string]$name)) { "$name=$($Overrides[$name])" }
+        if (-not $seen.Contains([string]$name)) { $lines += "$name=$($Overrides[$name])" }
     }
     [IO.File]::WriteAllLines($Destination, @($lines), [Text.UTF8Encoding]::new($false))
     return $Destination
@@ -221,6 +221,97 @@ function Test-ProductionDockerfileContract {
     }
 }
 
+function Test-AcceptanceSourcePrebuildContract {
+    param(
+        [Parameter(Mandatory)][string]$ServerRoot,
+        [Parameter(Mandatory)][string]$TestRoot
+    )
+
+    $startScriptPath = Join-Path $ServerRoot 'ops\Start-ProductionAcceptance.ps1'
+    $startScript = [IO.File]::ReadAllText($startScriptPath)
+    $pathsIndex = $startScript.IndexOf('$paths = Get-TermLinkAcceptancePaths', [StringComparison]::Ordinal)
+    $earlyPathExportIndex = $startScript.IndexOf(
+        'Set-TermLinkAcceptanceComposeEnvironment -Paths $paths',
+        $pathsIndex,
+        [StringComparison]::Ordinal)
+    $prebuildIndex = $startScript.IndexOf(
+        '& docker compose @prebuildComposeArguments build server',
+        $earlyPathExportIndex,
+        [StringComparison]::Ordinal)
+    $resetIndex = $startScript.IndexOf(
+        'if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container))',
+        $prebuildIndex,
+        [StringComparison]::Ordinal)
+    $firstSecretWriteIndex = $startScript.IndexOf(
+        'Write-SecretFile $paths.InitialAdminPassword',
+        $resetIndex,
+        [StringComparison]::Ordinal)
+    $finalPathExportIndex = $startScript.IndexOf(
+        'Set-TermLinkAcceptanceComposeEnvironment -Paths $paths',
+        $firstSecretWriteIndex,
+        [StringComparison]::Ordinal)
+    if ($pathsIndex -lt 0 -or $earlyPathExportIndex -le $pathsIndex -or
+        $prebuildIndex -le $earlyPathExportIndex -or $resetIndex -le $prebuildIndex -or
+        $firstSecretWriteIndex -le $resetIndex -or $finalPathExportIndex -le $firstSecretWriteIndex) {
+        throw 'Acceptance source prebuild no longer exports paths before Compose while preserving Reset and secret creation order.'
+    }
+
+    $environmentNames = @(
+        'TERMLINK_ACCEPTANCE_KEYCLOAK_ADMIN_PASSWORD_FILE',
+        'TERMLINK_ACCEPTANCE_ADMIN_INITIAL_PASSWORD_FILE',
+        'TERMLINK_ACCEPTANCE_USER_PASSWORD_FILE',
+        'TERMLINK_ACCEPTANCE_POSTGRES_PASSWORD_FILE',
+        'TERMLINK_ACCEPTANCE_VALKEY_PASSWORD_FILE',
+        'TERMLINK_ACCEPTANCE_OIDC_CLIENT_SECRET_FILE',
+        'TERMLINK_ACCEPTANCE_DATABASE_URL_FILE',
+        'TERMLINK_ACCEPTANCE_REDIS_URL_FILE',
+        'TERMLINK_ACCEPTANCE_TOKEN_SIGNING_KEY_FILE'
+    )
+    $savedEnvironment = @{}
+    foreach ($name in $environmentNames) {
+        $savedEnvironment[$name] = [pscustomobject]@{
+            Exists = Test-Path -LiteralPath "Env:$name"
+            Value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        }
+    }
+
+    $missingRoot = Join-Path $TestRoot 'source-prebuild-paths-not-created'
+    $paths = [pscustomobject]@{
+        AdminPassword = Join-Path $missingRoot 'keycloak-admin-password'
+        InitialAdminPassword = Join-Path $missingRoot 'admin-initial-password'
+        UserPassword = Join-Path $missingRoot 'acceptance-user-password'
+        PostgresPassword = Join-Path $missingRoot 'postgres-password'
+        ValkeyPassword = Join-Path $missingRoot 'valkey-password'
+        OidcClientSecret = Join-Path $missingRoot 'oidc-client-secret'
+        DatabaseUrl = Join-Path $missingRoot 'database-url'
+        RedisUrl = Join-Path $missingRoot 'redis-url'
+        TokenSigningKey = Join-Path $missingRoot 'token-signing-key'
+    }
+    try {
+        Import-Module (Join-Path $ServerRoot 'ops\ProductionAcceptance.Common.psm1') -Force
+        Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
+        $embeddedCompose = Join-Path $ServerRoot 'compose\acceptance.embedded-identity.compose.yml'
+        $output = @(& docker compose --project-name termlink-source-prebuild-contract `
+            -f $embeddedCompose build server 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Embedded source prebuild failed before secret creation: $($output -join ' ')"
+        }
+        if (Test-Path -LiteralPath $missingRoot) {
+            throw 'Source prebuild unexpectedly created or read the acceptance secret tree.'
+        }
+    }
+    finally {
+        foreach ($name in $environmentNames) {
+            if ($savedEnvironment[$name].Exists) {
+                Set-Item -LiteralPath "Env:$name" -Value $savedEnvironment[$name].Value
+            }
+            else {
+                Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw 'Docker CLI is required for production deployment policy tests.'
 }
@@ -243,6 +334,7 @@ $thirdIdentityKey = $null
 try {
     Set-TestSecretPermissions -Path $testRoot -Directory $true
     Set-TestSecretPermissions -Path $secretRoot -Directory $true
+    Test-AcceptanceSourcePrebuildContract -ServerRoot $serverRoot -TestRoot $testRoot
 
     $valkeyPassword = 'Valkey_Test_7Pz4mN8vQ2xK6cR9'
     $directValkeyPassword = 'DirectValkey_Test_8Qm4xN7pR2vK6sL9'
@@ -330,6 +422,9 @@ receivers:
     $directTransport = Join-Path $composeRoot 'direct-transport.compose.yml'
     $acceptance = Join-Path $composeRoot 'acceptance.compose.yml'
     $acceptanceLocalEdge = Join-Path $composeRoot 'acceptance.local-edge.compose.yml'
+    $acceptanceSingleNode = Join-Path $composeRoot 'acceptance.single-node.compose.yml'
+    $acceptanceEmbeddedIdentity = Join-Path $composeRoot 'acceptance.embedded-identity.compose.yml'
+    $acceptanceDirectProductMetadata = Join-Path $composeRoot 'acceptance.direct-product-e2e-metadata.compose.yml'
 
     $publicAcceptance = Get-ComposeConfig -EnvironmentFile $envFile -Files @($acceptance)
     $publicAcceptanceServices = @($publicAcceptance.services.PSObject.Properties.Name)
@@ -353,6 +448,40 @@ receivers:
     if ($localTLSListeners.Count -ne 1) {
         throw 'Private-LAN acceptance did not expose Lucky internal TLS on port 9443.'
     }
+
+    foreach ($acceptanceConfig in @(
+        (Get-ComposeConfig -EnvironmentFile $envFile -Files @($acceptance, $acceptanceSingleNode)),
+        (Get-ComposeConfig -EnvironmentFile $envFile -Files @($acceptanceEmbeddedIdentity))
+    )) {
+        $acceptanceServerEnvironment = $acceptanceConfig.services.server.environment
+        if ([string]$acceptanceServerEnvironment.TERMLINK_DIRECT_TRANSPORT_ENABLED -cne 'true' -or
+            [string]$acceptanceServerEnvironment.TERMLINK_DIRECT_ROUTING_PERMITTED -cne 'false') {
+            throw 'Acceptance must exercise Direct signalling without implicitly permitting production Direct routing.'
+        }
+        $acceptanceEnvironmentNames = @($acceptanceServerEnvironment.PSObject.Properties.Name)
+        if ($acceptanceEnvironmentNames -ccontains 'TERMLINK_DIRECT_PRODUCT_E2E_METADATA_ENABLED' -or
+            $acceptanceEnvironmentNames -ccontains 'TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256') {
+            throw 'Ordinary acceptance unexpectedly exposes Direct product E2E metadata.'
+        }
+    }
+
+    $metadataDigest = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+    $metadataEnv = New-EnvironmentOverrideFile -Source $envFile `
+        -Destination (Join-Path $testRoot 'direct-product-metadata.env') `
+        -Overrides @{ TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256 = $metadataDigest }
+    $metadataConfig = Get-ComposeConfig -EnvironmentFile $metadataEnv `
+        -Files @($acceptance, $acceptanceSingleNode, $acceptanceDirectProductMetadata)
+    $metadataServerEnvironment = $metadataConfig.services.server.environment
+    if ([string]$metadataServerEnvironment.TERMLINK_DIRECT_PRODUCT_E2E_METADATA_ENABLED -cne 'true' -or
+        [string]$metadataServerEnvironment.TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256 -cne $metadataDigest) {
+        throw 'Explicit Direct product acceptance metadata was not injected exactly.'
+    }
+    $missingMetadataDigestEnv = New-FilteredEnvironmentFile -Source $envFile `
+        -Destination (Join-Path $testRoot 'missing-direct-product-metadata.env') `
+        -RemovePrefixes @('TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256=')
+    Assert-ComposeConfigRejected -EnvironmentFile $missingMetadataDigestEnv `
+        -Files @($acceptance, $acceptanceSingleNode, $acceptanceDirectProductMetadata) `
+        -ExpectedPattern 'exact acceptance server image content digest is required'
 
     # Render every valid feature selection with and without edge. Account
     # deletion is independent from the retired object-storage subsystem.
@@ -401,13 +530,19 @@ receivers:
     $serverEnvironmentNames = @($directServer.environment.PSObject.Properties.Name)
     $migrationEnvironmentNames = @($directMigration.environment.PSObject.Properties.Name)
     foreach ($name in @(
-        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS'
+        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_DIRECT_ROUTING_PERMITTED',
+        'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS'
     )) {
         if ($serverEnvironmentNames -cnotcontains $name) {
             throw "Direct server topology omitted $name."
         }
         if ($migrationEnvironmentNames -ccontains $name) {
             throw "Migration unexpectedly received Direct authority $name."
+        }
+    }
+    foreach ($name in @('TERMLINK_DIRECT_PRODUCT_E2E_METADATA_ENABLED', 'TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256')) {
+        if ($serverEnvironmentNames -ccontains $name) {
+            throw "Production Direct topology unexpectedly exposes acceptance-only metadata setting $name."
         }
     }
     $serverSecretSources = @($directServer.secrets | ForEach-Object { [string]$_.source })
@@ -428,9 +563,25 @@ receivers:
     if ($directServer.depends_on.PSObject.Properties.Name -ccontains 'direct-valkey') {
         throw 'Direct state health unexpectedly gates Relay server startup.'
     }
+    if ([string]$directServer.environment.TERMLINK_DIRECT_TRANSPORT_ENABLED -cne 'true' -or
+        [string]$directServer.environment.TERMLINK_DIRECT_ROUTING_PERMITTED -cne 'false') {
+        throw 'Direct capability must not implicitly enable production Direct routing.'
+    }
+
+    $enabledDirectRoutingEnv = New-EnvironmentOverrideFile -Source $envFile `
+        -Destination (Join-Path $testRoot 'enabled-direct-routing.env') `
+        -Overrides @{ TERMLINK_DIRECT_ROUTING_PERMITTED = 'true' }
+    & $policy -EnvFile $enabledDirectRoutingEnv -ComposeFile @($core, $directTransport) -IncludeEdge:$false | Out-Null
+    $enabledDirectRoutingConfig = Get-ComposeConfig -EnvironmentFile $enabledDirectRoutingEnv -Files @($core, $directTransport)
+    if ([string]$enabledDirectRoutingConfig.services.server.environment.TERMLINK_DIRECT_ROUTING_PERMITTED -cne 'true') {
+        throw 'An explicit production Direct routing permission was not preserved by Compose.'
+    }
 
     Assert-PolicyRejected -Policy $policy -EnvironmentFile $envFile `
         -Files @($core, $acceptance) -ExpectedPattern 'not part of the reviewed production matrix'
+    Assert-PolicyRejected -Policy $policy -EnvironmentFile $metadataEnv `
+        -Files @($core, $acceptanceDirectProductMetadata) `
+        -ExpectedPattern 'not part of the reviewed production matrix'
 
     $noAcmeEnv = New-FilteredEnvironmentFile -Source $envFile -Destination (Join-Path $testRoot 'no-acme.env') `
         -RemovePrefixes @('TERMLINK_ACME_EMAIL=')

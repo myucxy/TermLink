@@ -275,7 +275,12 @@
                       </Grid>
                       <StackPanel Grid.Column="1">
                         <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                        <TextBlock Text="{Binding DetailText}" Classes="muted" FontSize="12" />
+                        <TextBlock Text="{Binding DetailText}"
+                                    ToolTip.Tip="{Binding DetailText}"
+                                    Classes="muted"
+                                    FontSize="12"
+                                    TextWrapping="NoWrap"
+                                    TextTrimming="CharacterEllipsis" />
                       </StackPanel>
                       <StackPanel Grid.Column="2" VerticalAlignment="Center">
                         <TextBlock Text="{Binding StateText}" FontWeight="SemiBold" />
@@ -334,6 +339,16 @@
               </StackPanel>
 
               <StackPanel x:Name="AccountPageRoot" IsVisible="{Binding IsAccountSettingsSelected}" Spacing="14">
+                <Border x:Name="ServerConfigurationCard" Classes="card">
+                  <StackPanel Spacing="10" MaxWidth="560" HorizontalAlignment="Left">
+                    <StackPanel>
+                      <TextBlock Classes="section-title" Text="{x:Static text:PresentationText.ServerUrl}" />
+                      <TextBlock Classes="muted" Text="{x:Static text:PresentationText.ServerUrlDetail}" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <TextBox Text="{Binding Account.ServerUrl}" PlaceholderText="{x:Static text:PresentationText.ServerUrlHint}" />
+                    <Button Classes="primary" Content="{x:Static text:PresentationText.Configure}" Command="{Binding ConfigureServerCommand}" HorizontalAlignment="Left" />
+                  </StackPanel>
+                </Border>
                 <Border x:Name="LinkedAccountCard" Classes="card" IsVisible="{Binding IsAccountLinked}">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel Spacing="5">

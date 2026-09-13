@@ -328,7 +328,7 @@ $allowedEnvironment = @{
         'TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION', 'TERMLINK_ANDROID_OIDC_CLIENT_ID', 'TERMLINK_ANDROID_OIDC_REDIRECT_URI',
         'TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS', 'TERMLINK_APPSHIP_BASE_URL',
         'TERMLINK_DATABASE_URL_FILE', 'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS',
-        'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_LISTEN_ADDR',
+        'TERMLINK_DIRECT_ROUTING_PERMITTED', 'TERMLINK_DIRECT_TRANSPORT_ENABLED', 'TERMLINK_LISTEN_ADDR',
         'TERMLINK_HUMAN_VERIFICATION_PROVIDER', 'TERMLINK_HUMAN_VERIFICATION_SECRET_FILE', 'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
         'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
         'TERMLINK_LOG_LEVEL', 'TERMLINK_METRICS_LISTEN_ADDR', 'TERMLINK_OIDC_ALLOWED_PARTIES', 'TERMLINK_OIDC_CLIENT_ID',
@@ -759,7 +759,8 @@ foreach ($name in @(
     'TERMLINK_HUMAN_VERIFICATION_SITE_KEY',
     'TERMLINK_KEYCLOAK_ADMIN_BASE_URL', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID',
     'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',
-    'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS', 'TERMLINK_DIRECT_TRANSPORT_ENABLED'
+    'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_ROUTING_PERMITTED',
+    'TERMLINK_DIRECT_STUN_SERVERS', 'TERMLINK_DIRECT_TRANSPORT_ENABLED'
 )) {
     Assert-Production ($null -eq (Get-PropertyValue $migrationEnvironment $name)) `
         "The migration job must not receive recovery authority '$name'."
@@ -768,13 +769,17 @@ $directTransportEnabled = [string](Get-PropertyValue $serverEnvironment 'TERMLIN
 Assert-Production ($directTransportEnabled -eq $directTransportOverlayRequested) `
     'TERMLINK_DIRECT_TRANSPORT_ENABLED must exactly match direct-transport.compose.yml.'
 if ($directTransportEnabled) {
+    $directRoutingPermission = [string](Get-PropertyValue $serverEnvironment 'TERMLINK_DIRECT_ROUTING_PERMITTED')
+    Assert-Production ($directRoutingPermission -cin @('true', 'false')) `
+        'TERMLINK_DIRECT_ROUTING_PERMITTED must be an explicit boolean when Direct transport is enabled.'
     Assert-Production ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_DIRECT_REDIS_URL_FILE') -ceq
         '/run/secrets/direct_redis_url') `
         'Direct transport must use only its reviewed file-backed independent Valkey URL.'
     Assert-ProductionStunServers -Value ([string](Get-PropertyValue $serverEnvironment 'TERMLINK_DIRECT_STUN_SERVERS'))
 } else {
     foreach ($name in @(
-        'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_STUN_SERVERS', 'TERMLINK_DIRECT_TRANSPORT_ENABLED'
+        'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_DIRECT_ROUTING_PERMITTED',
+        'TERMLINK_DIRECT_STUN_SERVERS', 'TERMLINK_DIRECT_TRANSPORT_ENABLED'
     )) {
         Assert-Production ($null -eq (Get-PropertyValue $serverEnvironment $name)) `
             "Core deployment unexpectedly includes Direct transport setting '$name'."

@@ -56,6 +56,41 @@ namespace TermLink.Agent
         bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result);
     }
 
+    internal enum RemoteInputDispatchOutcome
+    {
+        Unavailable = 0,
+        Enqueued = 1,
+        Duplicate = 2
+    }
+
+    /// <summary>
+    /// Optional richer remote-input boundary for make-before-break transports.
+    /// A duplicate is not a rejection: the result from the first carrier copy
+    /// remains authoritative.
+    /// </summary>
+    internal interface IIdempotentRemoteControllableSession : IRemoteControllableSession
+    {
+        RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes);
+    }
+
+    internal interface IRemoteInputReplayDispatchSession : IIdempotentRemoteControllableSession
+    {
+        RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes,
+            Guid senderDeviceId,
+            byte[] envelopeSha256);
+        bool TrySendRemoteInputRejection(
+            Guid inputId,
+            LocalRemoteInputResult result,
+            Guid senderDeviceId,
+            byte[] envelopeSha256);
+    }
+
     // Kept separate from IRegistryManagedSession so existing registry test
     // doubles do not need to implement the production replay surface.
     internal interface IBufferedRegistryManagedSession
@@ -73,6 +108,18 @@ namespace TermLink.Agent
             out ulong latestSequence,
             out bool hasMore);
         void DeleteBufferedEvents();
+    }
+
+    // The production Relay uses this optional surface to recover an input
+    // replay fence after the Agent process is rebuilt. It is deliberately
+    // separate from the existing registry doubles and control interfaces.
+    internal interface IRemoteInputReplaySession
+    {
+        bool TryGetRemoteInputIdentity(
+            Guid inputId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256);
+        bool TryFindRemoteInputResult(Guid inputId, out LocalFrame resultFrame);
     }
 
     internal sealed class SessionRegistry : IDisposable
@@ -486,6 +533,67 @@ namespace TermLink.Agent
 
         public bool TrySendRemoteInput(Guid sessionId, Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
+            return DispatchRemoteInput(sessionId, inputId, expectedLocalInputEpoch, bytes) ==
+                RemoteInputDispatchOutcome.Enqueued;
+        }
+
+        public RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid sessionId,
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes)
+        {
+            return DispatchRemoteInput(
+                sessionId,
+                inputId,
+                expectedLocalInputEpoch,
+                bytes,
+                Guid.Empty,
+                null);
+        }
+
+        public RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid sessionId,
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes,
+            Guid senderDeviceId,
+            byte[] envelopeSha256)
+        {
+            IRemoteControllableSession controllable;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!remoteAccessEnabled || !sessions.TryGetValue(sessionId, out managed))
+                    return RemoteInputDispatchOutcome.Unavailable;
+                controllable = managed as IRemoteControllableSession;
+            }
+            var replayAware = controllable as IRemoteInputReplayDispatchSession;
+            if (replayAware != null)
+            {
+                return replayAware.DispatchRemoteInput(
+                    inputId,
+                    expectedLocalInputEpoch,
+                    bytes,
+                    senderDeviceId,
+                    envelopeSha256);
+            }
+            var idempotent = controllable as IIdempotentRemoteControllableSession;
+            if (idempotent != null)
+                return idempotent.DispatchRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+            return controllable != null &&
+                controllable.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes)
+                    ? RemoteInputDispatchOutcome.Enqueued
+                    : RemoteInputDispatchOutcome.Unavailable;
+        }
+
+        internal bool TrySendRemoteInputRejection(
+            Guid sessionId,
+            Guid inputId,
+            LocalRemoteInputResult result,
+            Guid senderDeviceId,
+            byte[] envelopeSha256)
+        {
             IRemoteControllableSession controllable;
             lock (sync)
             {
@@ -493,7 +601,12 @@ namespace TermLink.Agent
                 if (!remoteAccessEnabled || !sessions.TryGetValue(sessionId, out managed)) return false;
                 controllable = managed as IRemoteControllableSession;
             }
-            return controllable != null && controllable.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+            var replayAware = controllable as IRemoteInputReplayDispatchSession;
+            return replayAware != null && replayAware.TrySendRemoteInputRejection(
+                inputId,
+                result,
+                senderDeviceId,
+                envelopeSha256);
         }
 
         public bool TrySendRemoteInputRejection(Guid sessionId, Guid inputId, LocalRemoteInputResult result)
@@ -506,6 +619,119 @@ namespace TermLink.Agent
                 controllable = managed as IRemoteControllableSession;
             }
             return controllable != null && controllable.TrySendRemoteInputRejection(inputId, result);
+        }
+
+        internal bool TryReadRemoteInputIdentity(
+            Guid sessionId,
+            Guid inputId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256)
+        {
+            senderDeviceId = Guid.Empty;
+            envelopeSha256 = null;
+            IRemoteInputReplaySession replay;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!sessions.TryGetValue(sessionId, out managed) &&
+                    !completedSessions.TryGetValue(sessionId, out managed))
+                {
+                    managed = null;
+                    foreach (var candidate in retiring)
+                    {
+                        if (candidate.SessionId == sessionId)
+                        {
+                            managed = candidate;
+                            break;
+                        }
+                    }
+                }
+                replay = managed as IRemoteInputReplaySession;
+            }
+            return replay != null && replay.TryGetRemoteInputIdentity(
+                inputId,
+                out senderDeviceId,
+                out envelopeSha256);
+        }
+
+        internal bool TryFindRemoteInputIdentity(
+            Guid inputId,
+            out Guid sessionId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256)
+        {
+            sessionId = Guid.Empty;
+            senderDeviceId = Guid.Empty;
+            envelopeSha256 = null;
+            foreach (var candidate in SnapshotAllSessionIds())
+            {
+                if (!TryReadRemoteInputIdentity(
+                    candidate,
+                    inputId,
+                    out senderDeviceId,
+                    out envelopeSha256))
+                {
+                    continue;
+                }
+                sessionId = candidate;
+                return true;
+            }
+            return false;
+        }
+
+        internal bool TryReadRemoteInputResult(
+            Guid sessionId,
+            Guid inputId,
+            out LocalFrame resultFrame)
+        {
+            resultFrame = null;
+            IRemoteInputReplaySession replay;
+            lock (sync)
+            {
+                IRegistryManagedSession managed;
+                if (!sessions.TryGetValue(sessionId, out managed) &&
+                    !completedSessions.TryGetValue(sessionId, out managed))
+                {
+                    managed = null;
+                    foreach (var candidate in retiring)
+                    {
+                        if (candidate.SessionId == sessionId)
+                        {
+                            managed = candidate;
+                            break;
+                        }
+                    }
+                }
+                replay = managed as IRemoteInputReplaySession;
+            }
+            return replay != null && replay.TryFindRemoteInputResult(inputId, out resultFrame);
+        }
+
+        internal bool TryFindRemoteInputResult(
+            Guid inputId,
+            out Guid sessionId,
+            out LocalFrame resultFrame)
+        {
+            sessionId = Guid.Empty;
+            resultFrame = null;
+            foreach (var candidate in SnapshotAllSessionIds())
+            {
+                if (!TryReadRemoteInputResult(candidate, inputId, out resultFrame)) continue;
+                sessionId = candidate;
+                return true;
+            }
+            return false;
+        }
+
+        private IList<Guid> SnapshotAllSessionIds()
+        {
+            lock (sync)
+            {
+                var result = new HashSet<Guid>(sessions.Keys);
+                foreach (var sessionId in completedSessions.Keys) result.Add(sessionId);
+                foreach (var session in retiring) result.Add(session.SessionId);
+                return result.ToList();
+            }
         }
 
         internal bool TryReadBufferedEvents(
@@ -958,9 +1184,10 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class RecoveredBufferedSession : IRegistryManagedSession, IRecoveryRegistrationSession, IBufferedRegistryManagedSession
+    internal sealed class RecoveredBufferedSession : IRegistryManagedSession, IRecoveryRegistrationSession, IBufferedRegistryManagedSession, IRemoteInputReplaySession
     {
         private readonly EncryptedEventBuffer buffer;
+        private readonly string bufferDirectory;
         private readonly SessionRegistration registration;
         private readonly ManagedShellType shellType;
         private readonly DateTime registeredAtUtc;
@@ -977,6 +1204,7 @@ namespace TermLink.Agent
             SessionId = registration.SessionId;
             shellType = registration.ShellType;
             registeredAtUtc = registration.RegisteredAtUtc;
+            this.bufferDirectory = bufferDirectory;
             buffer = new EncryptedEventBuffer(bufferDirectory, SessionId, maximumBufferBytes);
         }
 
@@ -1095,6 +1323,37 @@ namespace TermLink.Agent
         public void DeleteBufferedEvents()
         {
             buffer.DeleteAll();
+            TryDeletePersistentState(bufferDirectory, "input-dedupe.dat");
+            TryDeletePersistentState(bufferDirectory, "command-sequence.dat");
+        }
+
+        private static void TryDeletePersistentState(string directory, string name)
+        {
+            try
+            {
+                var path = Path.Combine(directory, name);
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        public bool TryGetRemoteInputIdentity(
+            Guid inputId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256)
+        {
+            // A completed recovery buffer has no live SessionAgent command
+            // fence. Its result stream remains searchable below, but there is
+            // no authenticated request identity to claim for a new retry.
+            senderDeviceId = Guid.Empty;
+            envelopeSha256 = null;
+            return false;
+        }
+
+        public bool TryFindRemoteInputResult(Guid inputId, out LocalFrame resultFrame)
+        {
+            return buffer.TryFindRemoteInputResult(inputId, out resultFrame);
         }
 
         public void Dispose()
@@ -1103,7 +1362,7 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class ManagedSession : IRegistryManagedSession, IInterruptibleRegistryManagedSession, IRecoveryRegistrationSession, IRemoteControllableSession, IBufferedRegistryManagedSession
+    internal sealed class ManagedSession : IRegistryManagedSession, IInterruptibleRegistryManagedSession, IRecoveryRegistrationSession, IRemoteInputReplayDispatchSession, IBufferedRegistryManagedSession, IRemoteInputReplaySession
     {
         private readonly SessionAgent agent;
         private readonly SessionRegistration registration;
@@ -1213,9 +1472,45 @@ namespace TermLink.Agent
             return agent.TrySendRemoteInput(inputId, expectedLocalInputEpoch, bytes);
         }
 
+        public RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes)
+        {
+            return agent.DispatchRemoteInput(inputId, expectedLocalInputEpoch, bytes);
+        }
+
+        public RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes,
+            Guid senderDeviceId,
+            byte[] envelopeSha256)
+        {
+            return agent.DispatchRemoteInput(
+                inputId,
+                expectedLocalInputEpoch,
+                bytes,
+                senderDeviceId,
+                envelopeSha256);
+        }
+
         public bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result)
         {
             return agent.TrySendRemoteInputRejection(inputId, result);
+        }
+
+        public bool TrySendRemoteInputRejection(
+            Guid inputId,
+            LocalRemoteInputResult result,
+            Guid senderDeviceId,
+            byte[] envelopeSha256)
+        {
+            return agent.TrySendRemoteInputRejection(
+                inputId,
+                result,
+                senderDeviceId,
+                envelopeSha256);
         }
 
         public IList<LocalFrame> ReadBufferedEvents(
@@ -1249,6 +1544,22 @@ namespace TermLink.Agent
         public void DeleteBufferedEvents()
         {
             agent.DeleteBufferedEvents();
+        }
+
+        public bool TryGetRemoteInputIdentity(
+            Guid inputId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256)
+        {
+            return agent.TryGetRemoteInputIdentity(
+                inputId,
+                out senderDeviceId,
+                out envelopeSha256);
+        }
+
+        public bool TryFindRemoteInputResult(Guid inputId, out LocalFrame resultFrame)
+        {
+            return agent.TryFindRemoteInputResult(inputId, out resultFrame);
         }
 
         public bool WaitForStop()
@@ -1710,6 +2021,21 @@ namespace TermLink.Agent
             }
         }
 
+        private void ConfigureProductionServer(string serverUrl)
+        {
+            var normalized = ProductionEnrollment.NormalizeServerOrigin(serverUrl);
+            lock (productionRuntimeMutationSync)
+            {
+                // Persist only after validation. The old runtime is retired
+                // before its account files are removed; local sessions remain
+                // owned by SessionRegistry throughout the switch.
+                ProductionEnrollment.ConfigureServer(normalized);
+                var previous = Interlocked.Exchange(ref productionRuntime, null);
+                RetireProductionRuntime(previous);
+                ProductionEnrollment.ForgetLocalAccount();
+            }
+        }
+
         private void ReplaceProductionRuntimeLocked(ProductionAgentRuntime next)
         {
             var previous = Interlocked.Exchange(ref productionRuntime, null);
@@ -1865,7 +2191,7 @@ namespace TermLink.Agent
                     ReplaceProductionAccount(delegate
                     {
                         ProductionEnrollment.LoginDirect(
-                            ProductionEnrollment.PublicServerUrl,
+                            ProductionEnrollment.ConfiguredServerUrl(),
                             request.PcName,
                             request.AccountUsername,
                             request.AccountPassword);
@@ -1879,7 +2205,7 @@ namespace TermLink.Agent
                     ReplaceProductionAccount(delegate
                     {
                         ProductionEnrollment.RegisterDirect(
-                            ProductionEnrollment.PublicServerUrl,
+                            ProductionEnrollment.ConfiguredServerUrl(),
                             request.PcName,
                             request.AccountUsername,
                             request.AccountNickname,
@@ -1893,8 +2219,9 @@ namespace TermLink.Agent
 #endif
                 case RegistryCommand.BeginAccountAuthorization:
 #if TERMLINK_PRODUCTION_RUNTIME
+                    var configuredServerUrl = ProductionEnrollment.ConfiguredServerUrl();
                     if (ProductionEnrollment.TryContinueActiveBrowserAuthorization(
-                            ProductionEnrollment.PublicServerUrl))
+                            configuredServerUrl))
                     {
                         // The owning request performs the runtime swap while
                         // holding this lock. Do not acknowledge the joined
@@ -1905,10 +2232,17 @@ namespace TermLink.Agent
                     ReplaceProductionAccount(delegate
                     {
                         ProductionEnrollment.LinkAccount(
-                            ProductionEnrollment.PublicServerUrl,
+                            configuredServerUrl,
                             request.PcName);
                     });
                     return Response(true, "ACCOUNT_AUTHORIZATION_ACCEPTED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.ConfigureServer:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    ConfigureProductionServer(request.ServerUrl);
+                    return Response(true, "PRODUCTION_SERVER_CONFIGURED", 0);
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
@@ -1993,7 +2327,7 @@ namespace TermLink.Agent
             {
                 Configured = false,
                 AccountLinked = false,
-                ServerOrigin = string.Empty,
+                ServerOrigin = ProductionAccountStorage.LoadServerUrl(),
                 TerminalSnapshotEnabled = false,
                 AgentVersion = string.Empty,
                 RelayState = ProductionRelayState.NotConfigured,

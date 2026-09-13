@@ -96,17 +96,55 @@ Transport signalling has its own `connection_id`, monotonic `path_epoch`,
 `DirectTransportReceiptV1` acknowledges only direct `frame_seq` bytes. Receipt
 of bytes must never commit, persist or advertise a terminal cumulative ACK;
 only successful application through the existing renderer/recovery state
-machine may do that.
+machine may do that. Because V1 uses one reliable ordered QUIC stream and the
+receipt has no largest-observed field, `missing` MUST be empty. A receipt never
+causes another receipt; receipt-of-receipt loops are forbidden.
 
 After mutual ticket/device/QUIC proof, each peer independently proposes a
 bounded list of per-session first-direct Envelope sequences for its own
 outbound direction. Below a barrier, Relay remains authoritative. The sender
 continues using Relay and buffers exact bytes from the barrier while proposal,
-accept, commit and commit echo converge. It then replays that bounded buffer
+accept, commit and commit echo converge. The receiver MUST NOT accept the
+proposal until every listed session has continuously applied the common Relay
+prefix through `first_direct_seq - 1`; a bounded prefix-wait timeout rejects the
+whole proposal and leaves Relay authoritative. This prevents a faster Direct
+frame from overtaking an earlier Relay frame and manufacturing a History Gap.
+It then replays that bounded buffer
 and duplicates the exact Envelope bytes over Relay and direct QUIC for the
 agreed short grace window. Receivers deduplicate with the existing
 session/direction sequence rules. A half-completed or over-budget negotiation
 stays Relay-only; the opposite direction may switch independently.
+
+Direct routing is opt-in by message type. The first production allowlist is
+exactly `INPUT_EVENT` for Android-to-PC and `OUTPUT_CHUNK` for PC-to-Android.
+All other types, including Gap, input results, Resize, Lease, History,
+termination, lifecycle, `HEARTBEAT`, `GOODBYE`, `SESSION_UPSERT`,
+`SESSION_REMOVED`, `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`,
+`MESSAGE_TYPE_UNSPECIFIED`, an unknown numeric value, or an invalid
+direction/message combination are Relay-only. This classification is made
+from the already parsed Envelope metadata, but every transmission and fallback
+still uses the original serialized Envelope bytes. Expanding the allowlist
+requires a mutually negotiated endpoint version and per-type authorization,
+ordering, fallback, and interoperability tests.
+
+Before a Direct `INPUT_EVENT` is written to SessionHost, the authoritative PC
+Agent obtains a fresh server decision bound to `(session_id,
+sender_device_id)`. It validates CONTROL/MANAGE permission, lease identity,
+version and expiry, policy version, and the control mode. SINGLE and TAKEOVER
+require the sender to be the current lease holder; only COLLABORATIVE permits
+another authorized subscriber to share that lease. Missing or unavailable
+authority fails that input closed without failing the Relay connection.
+
+Because Relay-only control and Direct-enabled data share one Envelope sequence,
+receivers MUST feed both carriers into one peer-scoped serialized ingress and
+reorder per `(direction, session_id)` before application. During duplicate
+grace, a Direct copy arriving before its Relay copy is held until the matching
+Relay bytes arrive or the bounded grace expires. Equal `(direction,
+session_id, seq)` and equal bytes are delivered exactly once. Different bytes
+for that same key retire the Direct epoch; the Relay copy remains authoritative
+and recovery resumes from the existing durable application ACK. A transport
+receipt may be emitted for an authenticated Direct frame, but it never bypasses
+this ingress, releases an application outbox, or advances a durable ACK.
 
 On timeout, malformed direct data, ticket expiry, address change, QUIC close,
 app background restriction or peer-proof failure, the affected route switches
@@ -176,6 +214,14 @@ TURN carrier and relay candidate values are reserved for a later
 `direct_transport_turn_v1` capability and must otherwise be rejected for the
 path attempt. A rejected or unknown transport capability never changes the
 Realtime V1 capability intersection.
+
+Production data routing additionally requires the independent optional
+capabilities `direct_transport_data_v1` and `direct_session_cutover_v1` to be
+present in the server config and negotiated by both Realtime and transport
+signalling connections. The former permits opaque Envelope carriage over the
+authenticated Direct path; the latter freezes per-session, per-direction
+barrier commit, deregistration, and fallback semantics. Missing either
+capability is fail-closed to Relay and must not invalidate the Relay connection.
 
 An `OUTPUT_CHUNK` from a metadata-capable producer sets `source_event_seq` to
 the authoritative SessionHost journal sequence and a monotonic

@@ -1,7 +1,7 @@
 {
   "schema": "termlink.phase1-session-registry-validation",
   "version": 1,
-  "generated_at_utc": "2026-08-26T04:20:25.6052962Z",
+  "generated_at_utc": "2026-09-08T13:21:30.8102292Z",
   "classification": "local Win-Agent Registry and current-user control IPC; not production Relay or protocol",
   "passed": true,
   "registry_process_model": "one long-lived Registry with one isolated SessionAgent worker per Host",

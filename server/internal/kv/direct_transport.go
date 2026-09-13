@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -241,17 +242,18 @@ local oldInstance=redis.call('HGET',KEYS[1],'instance_id')
 local oldMailbox=redis.call('HGET',KEYS[1],'mailbox_generation')
 local oldPeer=redis.call('HGET',KEYS[1],'peer_generation')
 local oldMultipair=redis.call('HGET',KEYS[1],'multipair_v2')
+local oldDirectData=redis.call('HGET',KEYS[1],'direct_data_v1')
 if oldAccount and oldAccount~=ARGV[1] then return {0,0} end
 local replaced=0
 if oldPeer and (oldAccount~=ARGV[1] or oldInstance~=ARGV[3] or oldMailbox~=ARGV[4] or
-                oldPeer~=ARGV[5] or oldMultipair~=ARGV[6]) then
+                oldPeer~=ARGV[5] or oldMultipair~=ARGV[6] or oldDirectData~=ARGV[7]) then
   replaced=1
 end
 redis.call('HSET',KEYS[1],
-  'schema','2','account_id',ARGV[1],'device_id',ARGV[2],
+  'schema','3','account_id',ARGV[1],'device_id',ARGV[2],
   'instance_id',ARGV[3],'mailbox_generation',ARGV[4],'peer_generation',ARGV[5],
-  'multipair_v2',ARGV[6])
-redis.call('PEXPIRE',KEYS[1],ARGV[7])
+  'multipair_v2',ARGV[6],'direct_data_v1',ARGV[7])
+redis.call('PEXPIRE',KEYS[1],ARGV[8])
 return {1,replaced}`)
 
 func (s *DirectTransportState) RegisterPresence(ctx context.Context, presence transport.DirectPresence) (transport.DirectPresenceRegistration, error) {
@@ -263,6 +265,7 @@ func (s *DirectTransportState) RegisterPresence(ctx context.Context, presence tr
 	}, presence.AccountID.String(), presence.DeviceID.String(), presence.Mailbox.InstanceID.String(),
 		presence.Mailbox.Generation.String(), presence.PeerGeneration.String(),
 		directBoolFlag(presence.SupportsMultipairV2),
+		directBoolFlag(presence.SupportsDirectDataV1),
 		transport.DirectDevicePresenceTTL.Milliseconds()).Slice()
 	if err != nil {
 		return transport.DirectPresenceRegistration{}, directStateUnavailable("register presence", err)
@@ -276,14 +279,15 @@ func (s *DirectTransportState) RegisterPresence(ctx context.Context, presence tr
 
 var refreshDirectPresenceScript = redis.NewScript(`
 if redis.call('GET',KEYS[2])~=ARGV[4] or
-   redis.call('HGET',KEYS[1],'schema')~='2' or
+   redis.call('HGET',KEYS[1],'schema')~='3' or
    redis.call('HGET',KEYS[1],'account_id')~=ARGV[1] or
    redis.call('HGET',KEYS[1],'device_id')~=ARGV[2] or
    redis.call('HGET',KEYS[1],'instance_id')~=ARGV[3] or
    redis.call('HGET',KEYS[1],'mailbox_generation')~=ARGV[4] or
    redis.call('HGET',KEYS[1],'peer_generation')~=ARGV[5] or
-   redis.call('HGET',KEYS[1],'multipair_v2')~=ARGV[6] then return 0 end
-redis.call('PEXPIRE',KEYS[1],ARGV[7])
+   redis.call('HGET',KEYS[1],'multipair_v2')~=ARGV[6] or
+   redis.call('HGET',KEYS[1],'direct_data_v1')~=ARGV[7] then return 0 end
+redis.call('PEXPIRE',KEYS[1],ARGV[8])
 return 1`)
 
 func (s *DirectTransportState) RefreshPresence(ctx context.Context, presence transport.DirectPresence) (bool, error) {
@@ -295,6 +299,7 @@ func (s *DirectTransportState) RefreshPresence(ctx context.Context, presence tra
 	}, presence.AccountID.String(), presence.DeviceID.String(), presence.Mailbox.InstanceID.String(),
 		presence.Mailbox.Generation.String(), presence.PeerGeneration.String(),
 		directBoolFlag(presence.SupportsMultipairV2),
+		directBoolFlag(presence.SupportsDirectDataV1),
 		transport.DirectDevicePresenceTTL.Milliseconds()).Int64()
 	if err != nil {
 		return false, directStateUnavailable("refresh presence", err)
@@ -303,13 +308,14 @@ func (s *DirectTransportState) RefreshPresence(ctx context.Context, presence tra
 }
 
 var removeDirectPresenceScript = redis.NewScript(`
-if redis.call('HGET',KEYS[1],'schema')~='2' or
+if redis.call('HGET',KEYS[1],'schema')~='3' or
    redis.call('HGET',KEYS[1],'account_id')~=ARGV[1] or
    redis.call('HGET',KEYS[1],'device_id')~=ARGV[2] or
    redis.call('HGET',KEYS[1],'instance_id')~=ARGV[3] or
    redis.call('HGET',KEYS[1],'mailbox_generation')~=ARGV[4] or
    redis.call('HGET',KEYS[1],'peer_generation')~=ARGV[5] or
-   redis.call('HGET',KEYS[1],'multipair_v2')~=ARGV[6] then return 0 end
+   redis.call('HGET',KEYS[1],'multipair_v2')~=ARGV[6] or
+   redis.call('HGET',KEYS[1],'direct_data_v1')~=ARGV[7] then return 0 end
 redis.call('DEL',KEYS[1])
 return 1`)
 
@@ -320,7 +326,8 @@ func (s *DirectTransportState) RemovePresence(ctx context.Context, presence tran
 	result, err := removeDirectPresenceScript.Run(ctx, s.client, []string{s.presenceKey(presence.DeviceID)},
 		presence.AccountID.String(), presence.DeviceID.String(), presence.Mailbox.InstanceID.String(),
 		presence.Mailbox.Generation.String(), presence.PeerGeneration.String(),
-		directBoolFlag(presence.SupportsMultipairV2)).Int64()
+		directBoolFlag(presence.SupportsMultipairV2),
+		directBoolFlag(presence.SupportsDirectDataV1)).Int64()
 	if err != nil {
 		return false, directStateUnavailable("remove presence", err)
 	}
@@ -329,13 +336,14 @@ func (s *DirectTransportState) RemovePresence(ctx context.Context, presence tran
 
 var consumeDirectSignalBudgetScript = redis.NewScript(`
 if redis.call('GET',KEYS[4])~=ARGV[4] or
-   redis.call('HGET',KEYS[3],'schema')~='2' or
+   redis.call('HGET',KEYS[3],'schema')~='3' or
    redis.call('HGET',KEYS[3],'account_id')~=ARGV[1] or
    redis.call('HGET',KEYS[3],'device_id')~=ARGV[2] or
    redis.call('HGET',KEYS[3],'instance_id')~=ARGV[3] or
    redis.call('HGET',KEYS[3],'mailbox_generation')~=ARGV[4] or
    redis.call('HGET',KEYS[3],'peer_generation')~=ARGV[5] or
-   redis.call('HGET',KEYS[3],'multipair_v2')~=ARGV[9] then return 3 end
+   redis.call('HGET',KEYS[3],'multipair_v2')~=ARGV[9] or
+   redis.call('HGET',KEYS[3],'direct_data_v1')~=ARGV[10] then return 3 end
 local deviceCount=redis.call('INCR',KEYS[1])
 if deviceCount==1 then redis.call('PEXPIRE',KEYS[1],ARGV[6]) end
 local accountCount=redis.call('INCR',KEYS[2])
@@ -354,7 +362,8 @@ func (s *DirectTransportState) ConsumeSignalBudget(ctx context.Context, request 
 	}, presence.AccountID.String(), presence.DeviceID.String(), presence.Mailbox.InstanceID.String(),
 		presence.Mailbox.Generation.String(), presence.PeerGeneration.String(),
 		transport.DirectSignalRateWindow.Milliseconds(), transport.DirectSignalDeviceLimit,
-		transport.DirectSignalAccountLimit, directBoolFlag(presence.SupportsMultipairV2)).Int64()
+		transport.DirectSignalAccountLimit, directBoolFlag(presence.SupportsMultipairV2),
+		directBoolFlag(presence.SupportsDirectDataV1)).Int64()
 	if err != nil {
 		return 0, directStateUnavailable("consume signal budget", err)
 	}
@@ -362,6 +371,45 @@ func (s *DirectTransportState) ConsumeSignalBudget(ctx context.Context, request 
 		return 0, directStateUnavailable("decode signal budget result", nil)
 	}
 	return transport.DirectSignalBudgetStatus(result), nil
+}
+
+var resolveDirectSignalResponderScript = redis.NewScript(`
+if redis.call('HGET',KEYS[1],'state')~='active' or
+   redis.call('HGET',KEYS[1],'account_id')~=ARGV[1] or
+   redis.call('HGET',KEYS[1],'connection_id')~=ARGV[2] or
+   redis.call('HGET',KEYS[1],'path_epoch')~=ARGV[5] then return '' end
+local initiator=redis.call('HGET',KEYS[1],'initiator_id')
+local responder=redis.call('HGET',KEYS[1],'responder_id')
+if not ((initiator==ARGV[3] and responder==ARGV[4]) or
+        (responder==ARGV[3] and initiator==ARGV[4])) then return '' end
+local clock=redis.call('TIME')
+local now=tonumber(clock[1])*1000+math.floor(tonumber(clock[2])/1000)
+local expires=tonumber(redis.call('HGET',KEYS[1],'expires_at_ms'))
+if not expires or now>=expires then return '' end
+return responder`)
+
+func (s *DirectTransportState) ResolveSignalResponder(ctx context.Context, request transport.DirectSignalRouteRequest) (uuid.UUID, error) {
+	if err := request.Validate(); err != nil {
+		return uuid.Nil, err
+	}
+	value, err := resolveDirectSignalResponderScript.Run(ctx, s.client, []string{
+		s.routeKey(request.AccountID, request.ConnectionID),
+	}, request.AccountID.String(), request.ConnectionID.String(), request.SenderID.String(),
+		request.RecipientID.String(), strconv.FormatUint(request.PathEpoch, 10)).Text()
+	if errors.Is(err, redis.Nil) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, directStateUnavailable("resolve signal responder", err)
+	}
+	if value == "" {
+		return uuid.Nil, nil
+	}
+	responder, err := uuid.Parse(value)
+	if err != nil || responder == uuid.Nil {
+		return uuid.Nil, directStateUnavailable("decode signal responder", err)
+	}
+	return responder, nil
 }
 
 var authorizeAndPublishDirectSignalScript = redis.NewScript(`
@@ -384,13 +432,14 @@ local function decimal_increment(value)
 end
 
 if redis.call('GET',KEYS[3])~=ARGV[6] or
-   redis.call('HGET',KEYS[2],'schema')~='2' or
+   redis.call('HGET',KEYS[2],'schema')~='3' or
    redis.call('HGET',KEYS[2],'account_id')~=ARGV[1] or
    redis.call('HGET',KEYS[2],'device_id')~=ARGV[3] or
    redis.call('HGET',KEYS[2],'instance_id')~=ARGV[5] or
    redis.call('HGET',KEYS[2],'mailbox_generation')~=ARGV[6] or
    redis.call('HGET',KEYS[2],'peer_generation')~=ARGV[7] or
-   redis.call('HGET',KEYS[2],'multipair_v2')~=ARGV[18] then return {5,0,0} end
+   redis.call('HGET',KEYS[2],'multipair_v2')~=ARGV[18] or
+   redis.call('HGET',KEYS[2],'direct_data_v1')~=ARGV[19] then return {5,0,0} end
 
 if redis.call('HGET',KEYS[1],'state')~='active' or
    redis.call('HGET',KEYS[1],'account_id')~=ARGV[1] or
@@ -433,8 +482,11 @@ local recipientInstance=redis.call('HGET',KEYS[4],'instance_id')
 local recipientMailbox=redis.call('HGET',KEYS[4],'mailbox_generation')
 local recipientPeer=redis.call('HGET',KEYS[4],'peer_generation')
 local recipientMultipair=redis.call('HGET',KEYS[4],'multipair_v2')
+local recipientDirectData=redis.call('HGET',KEYS[4],'direct_data_v1')
 if signalType>10 and recipientAccount and
-   (redis.call('HGET',KEYS[4],'schema')~='2' or recipientMultipair~='1') then return {2,0,now} end
+   (redis.call('HGET',KEYS[4],'schema')~='3' or recipientMultipair~='1') then return {2,0,now} end
+if signalType>=6 and signalType<=9 and recipientAccount and
+   (redis.call('HGET',KEYS[4],'schema')~='3' or recipientDirectData~='1') then return {2,0,now} end
 
 local subscribers=0
 if recipientAccount and recipientInstance and recipientMailbox and recipientPeer and
@@ -465,7 +517,8 @@ func (s *DirectTransportState) AuthorizeAndPublish(ctx context.Context, request 
 		strconv.FormatUint(request.SignalSequence, 10), request.SentAt.UTC().UnixMilli(), nonce,
 		uint32(request.SignalType), request.Frame, s.mailboxChannelPrefix(), s.instanceKeyPrefix(),
 		transport.DirectSignalsPerDirection, transport.DirectCandidatesPerDirection,
-		directBoolFlag(sender.SupportsMultipairV2)).Slice()
+		directBoolFlag(sender.SupportsMultipairV2),
+		directBoolFlag(sender.SupportsDirectDataV1)).Slice()
 	if err != nil {
 		return transport.DirectSignalPublishResult{}, directStateUnavailable("authorize and publish signal", err)
 	}

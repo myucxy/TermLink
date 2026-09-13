@@ -158,6 +158,7 @@ data class ProductionDirectShadowDiagnostic internal constructor(
 }
 
 internal const val DIRECT_SHADOW_DIAGNOSTIC_REASON_REDACTED = "DIRECT_REASON_REDACTED"
+private val DIRECT_REMOTE_REASON_CODE = Regex("[A-Z0-9_]{1,64}")
 
 private val SAFE_DIRECT_SHADOW_DIAGNOSTIC_REASONS = setOf(
     "FEATURE_DISABLED",
@@ -195,6 +196,7 @@ private val SAFE_DIRECT_SHADOW_DIAGNOSTIC_REASONS = setOf(
     "DIRECT_OFFER_SEND_FAILED",
     "DIRECT_RANDOM_SOURCE_INVALID",
     "DIRECT_ROUTING_FORBIDDEN",
+    "DIRECT_REMOTE_PATH_CLOSED",
     "DIRECT_SHADOW_FAILED",
     "DIRECT_SHADOW_READY_REJECTED",
     "DIRECT_SIGN_REQUEST_REJECTED",
@@ -430,11 +432,14 @@ internal interface ProductionDirectShadowNativeV4 : Closeable {
         signature: ByteArray,
     ): DirectNativeResultV4<Unit>
     fun poll(): DirectNativeResultV4<DirectNativeEventV4?>
+    /** Transfers the live nominated socket exactly once to ABI v5. */
+    fun takePromotionSource(): ProductionDirectV4ReadySource? = null
 }
 
 private class JniProductionDirectShadowNativeV4(
     private val handle: DirectNativeHandleV4,
 ) : ProductionDirectShadowNativeV4 {
+    private val promotionClaimed = AtomicBoolean(false)
     override fun gather(request: DirectNativeGatherRequestV4) = handle.gather(request)
     override fun beginChecks(request: DirectNativeBeginChecksRequestV4) = handle.beginChecks(request)
     override fun appendCheckPairs(request: DirectNativeAppendCheckPairsRequestV4) =
@@ -451,7 +456,12 @@ private class JniProductionDirectShadowNativeV4(
         signature: ByteArray,
     ) = handle.submitSignature(epoch, attemptId, requestId, signature)
     override fun poll() = handle.poll()
-    override fun close() = handle.close()
+    override fun takePromotionSource(): ProductionDirectV4ReadySource? =
+        if (promotionClaimed.compareAndSet(false, true)) JniProductionDirectV4ReadySource(handle)
+        else null
+    override fun close() {
+        if (!promotionClaimed.get()) handle.close()
+    }
 }
 
 internal data class CapturedDirectNetwork(
@@ -648,6 +658,8 @@ class ProductionDirectShadowRuntime internal constructor(
     private val pollDelay: ProductionDirectShadowDelay,
     private val retryDelay: ProductionDirectShadowDelay,
     private val uuidSource: () -> UUID,
+    private val productionGateProvider: ((serverRoutingPermitted: Boolean, keyEpoch: Long) -> ProductionDirectDataGate?)? = null,
+    private val productionHandoffConsumer: ((ProductionDirectV4ReadyHandoff) -> Boolean)? = null,
 ) : Closeable {
     constructor(
         enabled: Boolean = false,
@@ -704,6 +716,43 @@ class ProductionDirectShadowRuntime internal constructor(
         uuidSource = UUID::randomUUID,
     )
 
+    internal constructor(
+        enabled: Boolean,
+        authenticationGeneration: Long,
+        localDeviceId: UUID,
+        identity: DeviceIdentity,
+        relayEvents: Flow<ProductionRealtimeSessionConnectionEvent>,
+        connectivityManager: ConnectivityManager,
+        parentScope: CoroutineScope,
+        sharedSignalingFactory: () -> ProductionDirectShadowSignaling,
+        productionGateProvider: (Boolean, Long) -> ProductionDirectDataGate?,
+        productionHandoffConsumer: (ProductionDirectV4ReadyHandoff) -> Boolean,
+    ) : this(
+        enabled = enabled,
+        authenticationGeneration = authenticationGeneration,
+        localDeviceId = localDeviceId,
+        identity = identity,
+        relayEvents = relayEvents,
+        signalingFactory = { sharedSignalingFactory() },
+        nativeFactory = {
+            throw IllegalStateException("DIRECT_V5_REQUIRES_MULTIPAIR")
+        },
+        nativeV4Factory = {
+            val created = JniDirectNetworkCoreV4().create(DirectNativeCreateConfigV4(enabled = true))
+            val handle = (created as? DirectNativeResultV4.Success)?.value
+            handle?.let(::JniProductionDirectShadowNativeV4)
+        },
+        platform = AndroidProductionDirectShadowPlatform(connectivityManager),
+        parentScope = parentScope,
+        clockMillis = System::currentTimeMillis,
+        random = SecureRandom(),
+        pollDelay = ProductionDirectShadowDelay(::delay),
+        retryDelay = ProductionDirectShadowDelay(::delay),
+        uuidSource = UUID::randomUUID,
+        productionGateProvider = productionGateProvider,
+        productionHandoffConsumer = productionHandoffConsumer,
+    )
+
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
     private val lock = Any()
@@ -715,6 +764,9 @@ class ProductionDirectShadowRuntime internal constructor(
     private var network: CapturedDirectNetwork? = null
     private var peerGeneration = 0L
     private var peers: List<ProductionDirectAuthorizedPeer> = emptyList()
+    private var peerSelectionCursor = 0
+    /** Peers already handed to v5; retained across Relay reconnect generations. */
+    private val promotedPeerEpochs = LinkedHashMap<UUID, Long>()
     private var active: Attempt? = null
     private var attemptJob: Job? = null
     private var retryJob: Job? = null
@@ -751,6 +803,9 @@ class ProductionDirectShadowRuntime internal constructor(
     init {
         require(authenticationGeneration > 0) { "Direct authentication generation must be positive" }
         require(localDeviceId != NIL_UUID) { "Direct local device ID is required" }
+        require((productionGateProvider == null) == (productionHandoffConsumer == null)) {
+            "Direct production promotion requires both gate and handoff owners"
+        }
     }
 
     fun start(): Boolean = synchronized(lock) {
@@ -781,6 +836,11 @@ class ProductionDirectShadowRuntime internal constructor(
             }
             retired = peers
             peers = owned
+            peerSelectionCursor = 0
+            val currentEpochs = owned.associate { it.deviceId to it.keyEpoch }
+            promotedPeerEpochs.entries.removeIf { (deviceId, keyEpoch) ->
+                currentEpochs[deviceId] != keyEpoch
+            }
             peerGeneration = nextGeneration(peerGeneration)
             retryAttempt = 0
             current = active
@@ -792,6 +852,77 @@ class ProductionDirectShadowRuntime internal constructor(
         current?.retire("DIRECT_AUTHORIZATION_CHANGED", networkChanged = false)
         currentJob?.cancel()
         wake.trySend(Unit)
+        return true
+    }
+
+    /** Re-enables discovery only for the exact peer whose v5 actor retired. */
+    internal fun retryPromotedPeer(
+        expectedAuthenticationGeneration: Long,
+        peerDeviceId: UUID,
+    ): Boolean {
+        if (expectedAuthenticationGeneration != authenticationGeneration || closed.get()) return false
+        val removed = synchronized(lock) {
+            promotedPeerEpochs.remove(peerDeviceId) != null
+        }
+        if (removed) wake.trySend(Unit)
+        return removed
+    }
+
+    /** Retires only the active discovery attempt matching a rejected bounded-lane frame. */
+    internal fun observeSignalLaneOverflow(
+        expectedAuthenticationGeneration: Long,
+        peerDeviceId: UUID,
+        connectionId: UUID,
+        pathEpoch: Long,
+    ): Boolean {
+        if (expectedAuthenticationGeneration != authenticationGeneration || closed.get()) return false
+        val current: Attempt
+        val currentJob: Job?
+        synchronized(lock) {
+            val candidate = active ?: return false
+            if (candidate.peer.deviceId != peerDeviceId || candidate.connectionId != connectionId ||
+                candidate.ticket.pathEpoch != pathEpoch
+            ) return false
+            current = candidate
+            active = null
+            currentJob = attemptJob
+            publishSnapshotLocked(
+                snapshotFor(
+                    if (relayGeneration > 0) ProductionDirectShadowState.RELAY_ONLY
+                    else ProductionDirectShadowState.WAITING_FOR_RELAY,
+                    "DIRECT_SIGNAL_QUEUE_OVERFLOW",
+                    current,
+                ),
+                current,
+            )
+        }
+        current.retire("DIRECT_SIGNAL_QUEUE_OVERFLOW", networkChanged = false)
+        currentJob?.cancel()
+        scheduleRetry()
+        return true
+    }
+
+    /** An explicit server emergency-off retires v5 elsewhere and blocks stale promotion ownership. */
+    internal fun observeProductionRoutingPermitted(
+        expectedAuthenticationGeneration: Long,
+        permitted: Boolean,
+    ): Boolean {
+        if (expectedAuthenticationGeneration != authenticationGeneration || closed.get()) return false
+        val current: Attempt?
+        val currentJob: Job?
+        synchronized(lock) {
+            if (permitted) {
+                wake.trySend(Unit)
+                return true
+            }
+            promotedPeerEpochs.clear()
+            current = active
+            active = null
+            currentJob = attemptJob
+            publishGateStateLocked("DIRECT_ROUTING_FORBIDDEN")
+        }
+        current?.retire("DIRECT_ROUTING_FORBIDDEN", networkChanged = false)
+        currentJob?.cancel()
         return true
     }
 
@@ -816,6 +947,7 @@ class ProductionDirectShadowRuntime internal constructor(
             if (sameNetwork(network, captured)) return true
             network = captured
             networkGeneration = nextGeneration(networkGeneration)
+            promotedPeerEpochs.clear()
             retryAttempt = 0
             current = active
             active = null
@@ -985,6 +1117,9 @@ class ProductionDirectShadowRuntime internal constructor(
                 withTimeout(attemptTimeoutMillis(created)) {
                     driveAttemptV4(created, native)
                 }
+                if (created.shadowReady.get() && productionHandoffConsumer != null) {
+                    promoteReadyV4(created, native)
+                }
             } else {
                 val native = nativeFactory()
                 created.native.set(native)
@@ -1030,6 +1165,69 @@ class ProductionDirectShadowRuntime internal constructor(
                 synchronized(lock) { if (active === attempt) active = null }
             }
         }
+    }
+
+    /** Called only after [driveAttemptV4] has cancelled and joined its discovery pump. */
+    private fun promoteReadyV4(
+        attempt: Attempt,
+        native: ProductionDirectShadowNativeV4,
+    ) {
+        val gateProvider = productionGateProvider
+            ?: throw DirectAttemptFailure("DIRECT_V5_GATE_UNAVAILABLE")
+        val consumer = productionHandoffConsumer
+            ?: throw DirectAttemptFailure("DIRECT_V5_HANDOFF_UNAVAILABLE")
+        val nomination = attempt.nominationRequestV4
+            ?: throw DirectAttemptFailure("DIRECT_V5_NOMINATION_UNAVAILABLE")
+        val source = native.takePromotionSource()
+            ?: throw DirectAttemptFailure("DIRECT_V5_SOURCE_UNAVAILABLE")
+        if (!attempt.nativeV4.compareAndSet(native, null)) {
+            source.close()
+            throw DirectAttemptFailure("DIRECT_V5_SOURCE_STALE")
+        }
+        val gate = gateProvider(attempt.config.directRoutingPermitted, attempt.peer.keyEpoch)
+        if (gate == null || !gate.admission().permitsNewCutover()) {
+            source.close()
+            throw DirectAttemptFailure("DIRECT_V5_GATE_REJECTED")
+        }
+        val registration = try {
+            ProductionDirectCutoverPeerRegistration(
+                peerDeviceId = attempt.peer.deviceId,
+                pathFence = ProductionDirectPathFence(
+                    attempt.ticket.pathEpoch,
+                    attempt.connectionId,
+                    attempt.attemptId,
+                ),
+                keyEpoch = attempt.peer.keyEpoch,
+                keyId = attempt.peer.keyIdBytes,
+                pairwiseKey = attempt.peer.pairwiseKey,
+                directPathBinding = attempt.localPathBindingV4,
+                signalingGeneration = gate.signaling.generation,
+                localSignalSequence = attempt.localSequence,
+                remoteSignalSequence = attempt.lastRemoteSequence,
+                remoteSignalAcknowledgement = attempt.lastRemoteAck,
+            )
+        } catch (failure: Throwable) {
+            source.close()
+            throw failure
+        }
+        attempt.nominationRequestV4 = null
+        val handoff = ProductionDirectV4ReadyHandoff(registration, nomination, gate, source)
+        val installed = runCatching { consumer(handoff) }.getOrDefault(false)
+        if (!installed) {
+            handoff.close()
+            throw DirectAttemptFailure("DIRECT_V5_HANDOFF_REJECTED")
+        }
+        synchronized(lock) {
+            if (active === attempt && gateStillCurrentLocked(attempt.gate)) {
+                promotedPeerEpochs[attempt.peer.deviceId] = attempt.peer.keyEpoch
+                active = null
+                retryAttempt = 0
+                publishGateStateLocked()
+            }
+        }
+        attempt.releaseNegotiationSecrets()
+        runCatching(attempt.signaling::close)
+        wake.trySend(Unit)
     }
 
     private suspend fun driveAttempt(
@@ -1365,6 +1563,12 @@ class ProductionDirectShadowRuntime internal constructor(
                 val result = payload.nominationResultV2
                 acceptNominationResultV4(attempt, result)
             }
+            TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE -> {
+                if (!payload.hasPathClose() ||
+                    !DIRECT_REMOTE_REASON_CODE.matches(payload.pathClose.reasonCode)
+                ) throw DirectAttemptFailure("DIRECT_V4_PATH_CLOSE_REJECTED")
+                throw DirectAttemptFailure("DIRECT_REMOTE_PATH_CLOSED")
+            }
             else -> throw DirectAttemptFailure("DIRECT_V4_SIGNAL_TYPE_REJECTED")
         }
     }
@@ -1405,6 +1609,8 @@ class ProductionDirectShadowRuntime internal constructor(
             signalCase == TransportSignalPayloadV1.SignalCase.NOMINATION_ACK_V2
         TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_NOMINATION_RESULT_V2 ->
             signalCase == TransportSignalPayloadV1.SignalCase.NOMINATION_RESULT_V2
+        TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE ->
+            signalCase == TransportSignalPayloadV1.SignalCase.PATH_CLOSE
         else -> false
     }
 
@@ -1418,6 +1624,7 @@ class ProductionDirectShadowRuntime internal constructor(
                 builder.nominationAckV2 = value.nominationAckV2
             TransportSignalPayloadV1.SignalCase.NOMINATION_RESULT_V2 ->
                 builder.nominationResultV2 = value.nominationResultV2
+            TransportSignalPayloadV1.SignalCase.PATH_CLOSE -> builder.pathClose = value.pathClose
             else -> return TransportSignalPayloadV1.getDefaultInstance()
         }
         return builder.build()
@@ -1659,8 +1866,10 @@ class ProductionDirectShadowRuntime internal constructor(
                 nowMillis = clockMillis(),
             )
             if (native.commitNomination(request) !is DirectNativeResultV4.Success) {
+                request.destroy()
                 throw DirectAttemptFailure("DIRECT_NATIVE_V4_NOMINATION_FAILED")
             }
+            attempt.nominationRequestV4 = request
             attempt.nominationCommitted = true
             attempt.nominated = true
             attempt.ticketWire.fill(0)
@@ -1723,8 +1932,10 @@ class ProductionDirectShadowRuntime internal constructor(
             throw DirectAttemptFailure("DIRECT_V4_SHADOW_READY_DUPLICATE")
         }
         synchronized(lock) { retryAttempt = 0 }
-        attempt.releaseNegotiationSecrets()
-        runCatching(attempt.signaling::close)
+        if (productionHandoffConsumer == null) {
+            attempt.releaseNegotiationSecrets()
+            runCatching(attempt.signaling::close)
+        }
         publishAttempt(attempt, ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED)
     }
 
@@ -2152,6 +2363,16 @@ class ProductionDirectShadowRuntime internal constructor(
         if (envelope.signalSeq != attempt.lastRemoteSequence + 1 ||
             envelope.signalAck < attempt.lastRemoteAck || envelope.signalAck > attempt.localSequence
         ) throw DirectAttemptFailure("DIRECT_SIGNAL_CURSOR_REJECTED")
+        if (envelope.signalType == TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE) {
+            val payload = decryptPayloadV4(attempt, envelope)
+                ?: throw DirectAttemptFailure("DIRECT_PATH_CLOSE_REJECTED")
+            if (!payload.hasPathClose() ||
+                !DIRECT_REMOTE_REASON_CODE.matches(payload.pathClose.reasonCode)
+            ) throw DirectAttemptFailure("DIRECT_PATH_CLOSE_REJECTED")
+            attempt.lastRemoteSequence = envelope.signalSeq
+            attempt.lastRemoteAck = envelope.signalAck
+            throw DirectAttemptFailure("DIRECT_REMOTE_PATH_CLOSED")
+        }
         if (attempt.nominated || !attempt.offerSent ||
             envelope.signalType != TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_ANSWER ||
             envelope.signalSeq != 1L || envelope.signalAck != attempt.offerSequence
@@ -2505,20 +2726,27 @@ class ProductionDirectShadowRuntime internal constructor(
         else -> null
     }
 
-    private fun validShadowConfig(config: DirectTransportServerConfig): Boolean =
-        config.protocolVersion == PROTOCOL_VERSION &&
-            config.capabilities in setOf(
-                setOf(
-                    DirectTransportSignalingClient.DIRECT_SIGNALING_CAPABILITY,
-                    DirectTransportSignalingClient.DIRECT_SHADOW_CAPABILITY,
-                ),
-                setOf(
-                    DirectTransportSignalingClient.DIRECT_SIGNALING_CAPABILITY,
-                    DirectTransportSignalingClient.DIRECT_SHADOW_CAPABILITY,
-                    DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY,
-                ),
-            ) && !config.directRoutingPermitted && config.ticketSigningKeys.isNotEmpty() &&
-            config.stunServers.size <= 2
+    private fun validShadowConfig(config: DirectTransportServerConfig): Boolean {
+        val routingModeValid = if (productionHandoffConsumer == null) {
+            !config.directRoutingPermitted &&
+                config.capabilities in setOf(
+                    setOf(
+                        DirectTransportSignalingClient.DIRECT_SIGNALING_CAPABILITY,
+                        DirectTransportSignalingClient.DIRECT_SHADOW_CAPABILITY,
+                    ),
+                    setOf(
+                        DirectTransportSignalingClient.DIRECT_SIGNALING_CAPABILITY,
+                        DirectTransportSignalingClient.DIRECT_SHADOW_CAPABILITY,
+                        DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY,
+                    ),
+                )
+        } else {
+            DirectTransportSignalingClient.hasDirectDataCapabilities(config) &&
+                DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY in config.capabilities
+        }
+        return config.protocolVersion == PROTOCOL_VERSION && routingModeValid &&
+            config.ticketSigningKeys.isNotEmpty() && config.stunServers.size <= 2
+    }
 
     private fun attemptTimeoutMillis(attempt: Attempt): Long =
         (attempt.ticket.expiresAtMs - clockMillis()).coerceIn(1L, ATTEMPT_TIMEOUT_MILLIS)
@@ -2626,11 +2854,15 @@ class ProductionDirectShadowRuntime internal constructor(
             publishGateStateLocked()
             return null
         }
-        val selectedPeer = peers.firstOrNull()
+        val selection = selectNextProductionDirectPeer(peers, peerSelectionCursor) { peer ->
+            promotedPeerEpochs[peer.deviceId] != peer.keyEpoch
+        }
+        val selectedPeer = selection?.value
         if (selectedPeer == null) {
             publishGateStateLocked()
             return null
         }
+        peerSelectionCursor = selection.nextCursor
         return Gate(
             authenticationGeneration = authenticationGeneration,
             relayGeneration = relayGeneration,
@@ -2654,6 +2886,9 @@ class ProductionDirectShadowRuntime internal constructor(
             relayGeneration <= 0 -> ProductionDirectShadowState.WAITING_FOR_RELAY
             network == null -> ProductionDirectShadowState.WAITING_FOR_NETWORK
             peers.isEmpty() -> ProductionDirectShadowState.WAITING_FOR_PEER
+            productionHandoffConsumer != null && peers.all { peer ->
+                promotedPeerEpochs[peer.deviceId] == peer.keyEpoch
+            } -> ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED
             active == null -> ProductionDirectShadowState.RELAY_ONLY
             else -> mutableSnapshot.value.state
         }
@@ -2850,6 +3085,7 @@ class ProductionDirectShadowRuntime internal constructor(
         var localNominationResultSentV4 = false
         var localPathBindingV4 = ByteArray(0)
         var remotePathBindingV4 = ByteArray(0)
+        var nominationRequestV4: DirectNativeCommitNominationRequestV4? = null
 
         fun retire(reason: String, networkChanged: Boolean) {
             if (!retired.compareAndSet(false, true)) return
@@ -2888,6 +3124,8 @@ class ProductionDirectShadowRuntime internal constructor(
         }
 
         fun releaseNegotiationSecrets() {
+            nominationRequestV4?.destroy()
+            nominationRequestV4 = null
             peer.close()
             ticketWire.fill(0)
             localCertificateSha256.fill(0)
@@ -3032,7 +3270,29 @@ class ProductionDirectShadowRuntime internal constructor(
     }
 }
 
-private fun verifyEd25519(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean =
+internal data class ProductionDirectPeerSelection<T>(
+    val value: T,
+    val nextCursor: Int,
+)
+
+/** Deterministic bounded round-robin selection prevents one failing PC starving the others. */
+internal fun <T> selectNextProductionDirectPeer(
+    values: List<T>,
+    cursor: Int,
+    eligible: (T) -> Boolean,
+): ProductionDirectPeerSelection<T>? {
+    if (values.isEmpty()) return null
+    val start = cursor.coerceAtLeast(0) % values.size
+    repeat(values.size) { offset ->
+        val index = (start + offset) % values.size
+        if (eligible(values[index])) {
+            return ProductionDirectPeerSelection(values[index], (index + 1) % values.size)
+        }
+    }
+    return null
+}
+
+internal fun verifyEd25519(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean =
     runCatching {
         if (publicKey.size != 32 || signature.size != 64) return@runCatching false
         val encoded = ED25519_SPKI_PREFIX + publicKey

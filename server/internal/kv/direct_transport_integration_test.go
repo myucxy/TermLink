@@ -84,6 +84,48 @@ func TestDirectTransportStateIsSharedAndGenerationFenced(t *testing.T) {
 	if removed, err := first.AbortTicket(ctx, reservation); err != nil || removed {
 		t.Fatalf("AbortTicket() removed active route=%t error=%v", removed, err)
 	}
+	routeKey := first.routeKey(accountID, connectionID)
+	routeTTLBefore, err := first.client.PTTL(ctx, routeKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, request := range map[string]transport.DirectSignalRouteRequest{
+		"initiator to responder": {
+			AccountID: accountID, ConnectionID: connectionID, SenderID: pcID,
+			RecipientID: androidID, PathEpoch: finalization.PathEpoch,
+		},
+		"responder to initiator": {
+			AccountID: accountID, ConnectionID: connectionID, SenderID: androidID,
+			RecipientID: pcID, PathEpoch: finalization.PathEpoch,
+		},
+	} {
+		t.Run("resolve responder "+name, func(t *testing.T) {
+			responder, resolveErr := second.ResolveSignalResponder(ctx, request)
+			if resolveErr != nil || responder != androidID {
+				t.Fatalf("ResolveSignalResponder()=%s/%v, want %s/nil", responder, resolveErr, androidID)
+			}
+		})
+	}
+	stale := transport.DirectSignalRouteRequest{
+		AccountID: accountID, ConnectionID: connectionID, SenderID: pcID,
+		RecipientID: androidID, PathEpoch: finalization.PathEpoch + 1,
+	}
+	if responder, err := first.ResolveSignalResponder(ctx, stale); err != nil || responder != uuid.Nil {
+		t.Fatalf("stale route responder/error=%s/%v, want nil/nil", responder, err)
+	}
+	wrongDirection := stale
+	wrongDirection.PathEpoch = finalization.PathEpoch
+	wrongDirection.SenderID = uuid.New()
+	if responder, err := first.ResolveSignalResponder(ctx, wrongDirection); err != nil || responder != uuid.Nil {
+		t.Fatalf("wrong direction responder/error=%s/%v, want nil/nil", responder, err)
+	}
+	routeTTLAfter, err := first.client.PTTL(ctx, routeKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routeTTLAfter > routeTTLBefore {
+		t.Fatalf("responder resolution extended route TTL from %s to %s", routeTTLBefore, routeTTLAfter)
+	}
 
 	instanceID := uuid.New()
 	oldMailbox := transport.DirectMailbox{InstanceID: instanceID, Generation: uuid.New()}
@@ -406,6 +448,76 @@ func TestDirectTransportMultipairPublishRequiresBothSharedPresences(t *testing.T
 	}
 	if delivery.RecipientID != recipientID || delivery.PeerGeneration != recipient.PeerGeneration || string(delivery.Frame) != string(request.Frame) {
 		t.Fatalf("delivery=%+v, want recipient=%s peer=%s frame=%x", delivery, recipientID, recipient.PeerGeneration, request.Frame)
+	}
+
+	request.SignalSequence = 3
+	request.Nonce[0] = 2
+	request.SignalType = transport.SignalCutoverProposal
+	request.Sender.SupportsDirectDataV1 = true
+	if result, err := first.AuthorizeAndPublish(ctx, request); err != nil || result.Status != transport.DirectSignalPublishStalePresence {
+		t.Fatalf("forged sender direct-data capability result=%+v error=%v, want stale presence", result, err)
+	}
+
+	sender.PeerGeneration = uuid.New()
+	sender.SupportsDirectDataV1 = true
+	if result, err := first.RegisterPresence(ctx, sender); err != nil || !result.Registered || !result.Replaced {
+		t.Fatalf("upgrade sender direct-data presence result=%+v error=%v", result, err)
+	}
+	request.Sender = sender
+	recipient.PeerGeneration = uuid.New()
+	recipient.SupportsDirectDataV1 = false
+	if result, err := second.RegisterPresence(ctx, recipient); err != nil || !result.Registered || !result.Replaced {
+		t.Fatalf("retain unsupported recipient direct-data presence result=%+v error=%v", result, err)
+	}
+	if result, err := first.AuthorizeAndPublish(ctx, request); err != nil || result.Status != transport.DirectSignalPublishDenied || result.SubscriberCount != 0 {
+		t.Fatalf("one-sided direct-data capability result=%+v error=%v, want denied", result, err)
+	}
+
+	recipient.PeerGeneration = uuid.New()
+	recipient.SupportsDirectDataV1 = true
+	if result, err := second.RegisterPresence(ctx, recipient); err != nil || !result.Registered || !result.Replaced {
+		t.Fatalf("upgrade recipient direct-data presence result=%+v error=%v", result, err)
+	}
+	result, err = first.AuthorizeAndPublish(ctx, request)
+	if err != nil || result.Status != transport.DirectSignalPublishAccepted || result.SubscriberCount != 1 {
+		t.Fatalf("bilateral direct-data result=%+v error=%v", result, err)
+	}
+	delivery, err = subscription.Receive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.RecipientID != recipientID || delivery.PeerGeneration != recipient.PeerGeneration || string(delivery.Frame) != string(request.Frame) {
+		t.Fatalf("direct-data delivery=%+v, want recipient=%s peer=%s frame=%x", delivery, recipientID, recipient.PeerGeneration, request.Frame)
+	}
+
+	// A rolling-deployment schema-2 writer does not know direct_data_v1 and its
+	// HSET leaves unknown hash fields behind. The schema fence must prevent a
+	// stale value of 1 from granting cutover while preserving V1 shadow delivery.
+	legacyPeerGeneration := uuid.New()
+	if err := second.client.HSet(
+		ctx,
+		second.presenceKey(recipientID),
+		"schema", "2",
+		"peer_generation", legacyPeerGeneration.String(),
+	).Err(); err != nil {
+		t.Fatal(err)
+	}
+	request.SignalSequence = 4
+	request.Nonce[0] = 3
+	if result, err := first.AuthorizeAndPublish(ctx, request); err != nil || result.Status != transport.DirectSignalPublishDenied || result.SubscriberCount != 0 {
+		t.Fatalf("legacy schema-2 recipient direct-data result=%+v error=%v, want denied", result, err)
+	}
+	request.SignalType = transport.SignalPathOffer
+	result, err = first.AuthorizeAndPublish(ctx, request)
+	if err != nil || result.Status != transport.DirectSignalPublishAccepted || result.SubscriberCount != 1 {
+		t.Fatalf("legacy schema-2 recipient V1 shadow result=%+v error=%v", result, err)
+	}
+	delivery, err = subscription.Receive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.RecipientID != recipientID || delivery.PeerGeneration != legacyPeerGeneration || string(delivery.Frame) != string(request.Frame) {
+		t.Fatalf("legacy schema-2 delivery=%+v, want recipient=%s peer=%s frame=%x", delivery, recipientID, legacyPeerGeneration, request.Frame)
 	}
 }
 

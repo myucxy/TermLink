@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
@@ -25,6 +26,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.channels.Channel
 import okhttp3.OkHttpClient
 import okhttp3.Dispatcher
 import okhttp3.WebSocket
@@ -35,18 +37,292 @@ import okio.ByteString as OkioByteString
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductionNetworkTest {
     @Test
+    fun receivedEnvelopeRetainsExactWireBytesAndClearsOnIdempotentClose() {
+        val envelope = testEnvelope(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 1)
+        val raw = byteArrayOf(0x98.toByte(), 0x06, 0x7b) + envelope.toByteArray()
+        val expected = raw.copyOf()
+        val parsed = Envelope.parseFrom(raw)
+        val released = AtomicInteger(0)
+        val received = ProductionReceivedEnvelope(
+            envelope = parsed,
+            wireBytes = raw.size,
+            generation = 7,
+            releaseReservation = { released.incrementAndGet() },
+            rawBytes = raw,
+        )
+        val borrowed = received.rawBytes
+
+        assertArrayEquals(expected, received.exactBytes)
+        assertArrayEquals(expected, received.copyRawBytes())
+        received.close()
+        received.close()
+
+        assertEquals(1, released.get())
+        assertTrue(borrowed.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun closeObservedWrapperRetainsRawBytesUntilBothReservationsClose() {
+        val envelope = testEnvelope(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 2)
+        val raw = byteArrayOf(0x98.toByte(), 0x06, 0x7b) + envelope.toByteArray()
+        val expected = raw.copyOf()
+        val released = AtomicInteger(0)
+        val observed = AtomicInteger(0)
+        val root = ProductionReceivedEnvelope(
+            envelope = Envelope.parseFrom(raw),
+            wireBytes = raw.size,
+            generation = 8,
+            releaseReservation = { released.incrementAndGet() },
+            rawBytes = raw,
+        )
+        val borrowed = root.rawBytes
+        val wrapper = root.withCloseObserver { observed.incrementAndGet() }
+
+        root.close()
+        assertArrayEquals(expected, borrowed)
+        assertEquals(0, observed.get())
+
+        wrapper.close()
+        wrapper.close()
+        assertEquals(1, released.get())
+        assertEquals(1, observed.get())
+        assertTrue(borrowed.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun channelDiscardAndCloseClearRawOwners() = runBlocking {
+        val firstEnvelope = testEnvelope(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 3)
+        val secondEnvelope = testEnvelope(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 4)
+        val firstRaw = firstEnvelope.toByteArray()
+        val secondRaw = secondEnvelope.toByteArray()
+        val firstBorrowed = firstRaw
+        val secondBorrowed = secondRaw
+        val channel = Channel<ProductionReceivedEnvelope>(
+            capacity = 1,
+            onUndeliveredElement = ProductionReceivedEnvelope::close,
+        )
+        assertTrue(
+            channel.trySend(
+                ProductionReceivedEnvelope(
+                    envelope = firstEnvelope,
+                    wireBytes = firstRaw.size,
+                    generation = 1,
+                    releaseReservation = {},
+                    rawBytes = firstRaw,
+                ),
+            ).isSuccess,
+        )
+        val second = ProductionReceivedEnvelope(
+            envelope = secondEnvelope,
+            wireBytes = secondRaw.size,
+            generation = 1,
+            releaseReservation = {},
+            rawBytes = secondRaw,
+        )
+        assertFalse(channel.trySend(second).isSuccess)
+        // trySend reports a rejected element but does not invoke the
+        // undelivered callback on every Channel implementation; the producer
+        // therefore owns this explicit overflow release, as the WebSocket
+        // listener does too.
+        second.close()
+        assertTrue(secondBorrowed.all { it == 0.toByte() })
+
+        channel.cancel()
+        assertTrue(firstBorrowed.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun sendExactSendsCallerBytesWithoutReserializing() = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val androidId = UUID.randomUUID()
+        val pcId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        val sent = CompletableDeferred<ByteArray>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    private var welcomed = false
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        if (!welcomed) {
+                            welcomed = true
+                            check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                        }
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, bytes: OkioByteString) {
+                        sent.complete(bytes.toByteArray())
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = androidId,
+            identity = identity,
+            role = "android",
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            val connected = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it == RealtimeState.Connected }
+            }
+            client.connect()
+            withTimeout(5_000) { connected.await() }
+
+            val canonical = testEnvelope(sessionId, androidId, pcId, 5)
+            val exact = byteArrayOf(0x98.toByte(), 0x06, 0x7b) + canonical.toByteArray()
+            val parsed = Envelope.parseFrom(exact)
+            assertTrue(client.sendExact(parsed, exact))
+            assertArrayEquals(exact, withTimeout(5_000) { sent.await() })
+        } finally {
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun realtimeHelloAddsOnlyExplicitExperimentalCapabilities() {
         val baseline = productionRealtimeCapabilities(emptySet())
-        val enabled = productionRealtimeCapabilities(setOf("terminal_snapshot_v1"))
+        val enabled = productionRealtimeCapabilities(
+            required = setOf("terminal_snapshot_v1"),
+            optionalAdvertised = setOf("terminal_snapshot_v1", "direct_transport_data_v1"),
+        )
 
         assertTrue("terminal_snapshot_v1" !in baseline)
         assertEquals(1, enabled.count { it == "terminal_snapshot_v1" })
+        assertEquals(1, enabled.count { it == "direct_transport_data_v1" })
         assertEquals(enabled.sorted(), enabled)
+    }
+
+    @Test
+    fun optionalCapabilityIsAdvertisedButNotRequiredForRelayConnection(): Unit = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val helloSeen = CompletableDeferred<String>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        helloSeen.complete(text)
+                        check(webSocket.send("{\"type\":\"welcome\",\"protocol_version\":1}"))
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            allowCleartextForLocalTest = true,
+            optionalAdvertisedCapabilities = setOf("direct_transport_data_v1"),
+        )
+        try {
+            val connected = async(start = CoroutineStart.UNDISPATCHED) {
+                client.state.first { it == RealtimeState.Connected }
+            }
+            client.connect()
+            withTimeout(5_000) { connected.await() }
+
+            assertTrue(withTimeout(5_000) { helloSeen.await() }.contains("direct_transport_data_v1"))
+            val negotiation = client.negotiatedCapabilities.value
+            assertEquals(client.diagnostics().connectedGeneration, negotiation.generation)
+            assertTrue("direct_transport_data_v1" !in negotiation.capabilities)
+            assertEquals(RealtimeState.Connected, client.state.replayCache.last())
+        } finally {
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun optionalNegotiationIsScopedToOnePhysicalGeneration(): Unit = runBlocking {
+        val server = MockWebServer()
+        val identity = DeviceIdentity.generate()
+        val hellosSeen = AtomicInteger(0)
+        listOf(true, false).forEach { echoOptional ->
+            server.enqueue(
+                MockResponse().withWebSocketUpgrade(
+                    object : WebSocketListener() {
+                        override fun onMessage(webSocket: WebSocket, text: String) {
+                            assertTrue(text.contains("direct_transport_data_v1"))
+                            hellosSeen.incrementAndGet()
+                            val capabilities = if (echoOptional) {
+                                ",\"capabilities\":[\"direct_transport_data_v1\"]"
+                            } else {
+                                ""
+                            }
+                            check(
+                                webSocket.send(
+                                    "{\"type\":\"welcome\",\"protocol_version\":1$capabilities}",
+                                ),
+                            )
+                        }
+
+                        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                            webSocket.close(code, reason)
+                        }
+                    },
+                ),
+            )
+        }
+        server.start()
+        val client = ProductionRealtimeClient(
+            rootUrl = server.url("/").toString(),
+            tokenProvider = AccessTokenProvider { "oidc-token" },
+            deviceId = UUID.randomUUID(),
+            identity = identity,
+            role = "android",
+            allowCleartextForLocalTest = true,
+            optionalAdvertisedCapabilities = setOf("direct_transport_data_v1"),
+        )
+        try {
+            client.connect()
+            val first = withTimeout(5_000) {
+                client.negotiatedCapabilities.first {
+                    "direct_transport_data_v1" in it.capabilities
+                }
+            }
+            assertEquals(first.generation, client.diagnostics().connectedGeneration)
+
+            client.connect()
+            withTimeout(5_000) {
+                client.state.first { it == RealtimeState.Connected }
+            }
+            val second = client.negotiatedCapabilities.value
+            assertTrue(second.generation > first.generation)
+            assertTrue("direct_transport_data_v1" !in second.capabilities)
+            assertEquals(second.generation, client.diagnostics().connectedGeneration)
+            assertEquals(2, hellosSeen.get())
+            assertEquals(RealtimeState.Connected, client.state.replayCache.last())
+        } finally {
+            client.close()
+            identity.destroy()
+            server.shutdown()
+        }
     }
 
     @Test

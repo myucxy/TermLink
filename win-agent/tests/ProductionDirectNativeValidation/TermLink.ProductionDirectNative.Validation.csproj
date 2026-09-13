@@ -8,4 +8,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />
   </ItemGroup>
+  <ItemGroup Condition="'$(SkipDirectV5Validation)' == 'true'">
+    <Compile Remove="ProductionDirectNativeV5Validation.cs" />
+  </ItemGroup>
+  <PropertyGroup Condition="'$(SkipDirectV5Validation)' == 'true'">
+    <DefineConstants>$(DefineConstants);TERMLINK_SKIP_DIRECT_V5_VALIDATION</DefineConstants>
+  </PropertyGroup>
 </Project>

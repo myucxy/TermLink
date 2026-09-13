@@ -41,6 +41,24 @@ The first stage deliberately runs as **shadow direct**:
   joins the handle's worker before returning, so a platform may unload the
   native library only after all code from that handle has stopped executing.
   Its frozen declaration is `include/termlink_direct_ffi_v4.h`.
+- `termlink-direct-ffi` ABI v5 is the versioned data-plane ownership boundary
+  for the later authenticated QUIC integration.  Each operation carries an
+  exact `(connection_id, path_epoch, attempt_id)` fence; an older epoch or a
+  different attempt fails closed.  Accepted `Envelope` bytes are copied into
+  an owned native queue before `send` returns, and receive uses a peek-before-
+  pop rule so a short caller buffer never loses a frame.  Outbound and inbound
+  transport copies share hard limits of 256 frames and 8 MiB, while one
+  opaque realtime Envelope is strictly below 1 MiB.  Direct transport
+  receipts release only those native retransmission copies; they cannot
+  advance a terminal ACK or reach a Relay, session, renderer, Agent, or
+  SessionHost.  `cancel`, `network_changed`, and `destroy` synchronously
+  retire/join native work.  The legacy `attach_v5` compatibility seam returns
+  explicit `NOT_READY` (`-6`) until a nominated V4 socket is promoted; it
+  never reports a fabricated path-ready event.  Production uses `promote_v5`,
+  which moves the nominated socket exactly once, performs the
+  ticket/device/QUIC proof, retains the authenticated `DirectEndpoint` data
+  connection, and only then emits `PATH_READY`.  Its fixed declaration is
+  `include/termlink_direct_ffi_v5.h`.
 
 All direct dependencies use exact versions and resolve fully offline from the
 pinned `D:\Dev` Cargo cache. Cryptographic primitives and TLS are provided by

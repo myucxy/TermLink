@@ -621,13 +621,17 @@ if ($setupRecords.Count -eq 1) {
             -WorkingDirectory $payloadVerificationRoot
         $payloadRoot = Join-Path $payloadVerificationRoot 'payload'
         Expand-SafePayloadArchive -ArchivePath $payloadArchivePath -Destination $payloadRoot
-        foreach ($requiredTerminalCore in @('TermLink.TerminalCore.dll', 'termlink_terminal_ffi.dll')) {
-            Assert-Release (Test-Path -LiteralPath (Join-Path $payloadRoot $requiredTerminalCore) -PathType Leaf) `
-                "Windows Setup payload is missing terminal-core binary: $requiredTerminalCore"
+        foreach ($requiredWindowsRuntime in @(
+            'TermLink.TerminalCore.dll',
+            'termlink_terminal_ffi.dll',
+            'termlink_direct_ffi.dll')) {
+            Assert-Release (Test-Path -LiteralPath (Join-Path $payloadRoot $requiredWindowsRuntime) -PathType Leaf) `
+                "Windows Setup payload is missing required runtime binary: $requiredWindowsRuntime"
         }
         $ownedPayloadBinaries = @(Get-ChildItem -LiteralPath $payloadRoot -File -Recurse | Where-Object {
             $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
-            $_.Name -ceq 'termlink_terminal_ffi.dll'
+            $_.Name -ceq 'termlink_terminal_ffi.dll' -or
+            $_.Name -ceq 'termlink_direct_ffi.dll'
         } | Sort-Object FullName)
         Assert-Release ($ownedPayloadBinaries.Count -gt 0) `
             'Windows Setup payload contains no TermLink-owned binaries.'

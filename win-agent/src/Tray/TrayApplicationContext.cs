@@ -1716,7 +1716,7 @@ namespace TermLink.Tray
         private readonly string serverUrl;
         private readonly Dictionary<Control, Rectangle> logicalBounds = new Dictionary<Control, Rectangle>();
 
-        public AccountLinkForm() : this(ProductionEnrollment.PublicServerUrl)
+        public AccountLinkForm() : this(ProductionEnrollment.ConfiguredServerUrl())
         {
         }
 
@@ -1869,7 +1869,7 @@ namespace TermLink.Tray
         private readonly string serverUrl;
         private readonly Dictionary<Control, Rectangle> logicalBounds = new Dictionary<Control, Rectangle>();
 
-        public AccountRegisterForm() : this(ProductionEnrollment.PublicServerUrl)
+        public AccountRegisterForm() : this(ProductionEnrollment.ConfiguredServerUrl())
         {
         }
 

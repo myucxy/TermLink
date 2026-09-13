@@ -213,6 +213,8 @@ try {
         'Installed package does not contain the Windows terminal-core managed runtime.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'termlink_terminal_ffi.dll') -PathType Leaf) `
         'Installed package does not contain the Windows terminal-core native runtime.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'termlink_direct_ffi.dll') -PathType Leaf) `
+        'Installed package does not contain the Windows network-core native runtime.'
     Assert-True (Test-Path -LiteralPath (Join-Path $installLocation 'TermLink.Agent.exe') -PathType Leaf) `
         'Installed package does not contain the independent Agent executable.'
     $expectedProductExecutables = @(
@@ -250,7 +252,8 @@ try {
     $signedBinaries = @(Get-ChildItem -LiteralPath $installLocation -File |
         Where-Object {
             $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
-            $_.Name -ceq 'termlink_terminal_ffi.dll'
+            $_.Name -ceq 'termlink_terminal_ffi.dll' -or
+            $_.Name -ceq 'termlink_direct_ffi.dll'
         })
     Assert-True ($signedBinaries.Count -eq $buildResult.SignedTermLinkBinaries) `
         'Installed TermLink binary count differs from the signed build.'

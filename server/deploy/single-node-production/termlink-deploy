@@ -28,6 +28,7 @@ IMAGE=''
 HTTP_PORT=''
 PUBLIC_PORT=''
 BACKUP_RECIPIENT=''
+DIRECT_ROUTING_PERMITTED='false'
 RESTORE_ACTIVE=0
 TEMP_PATHS=()
 COMPOSE=()
@@ -89,6 +90,8 @@ Install/config options:
   --http-port PORT           Loopback origin port (default: 8080).
   --public-port PORT         External HTTPS port (default: 443).
   --backup-recipient VALUE   Native age recipient used by backup and upgrade.
+  --enable-direct-routing    Permit negotiated LAN/NAT Direct data routing.
+  --disable-direct-routing   Keep Direct probing available but route via Relay.
   --restore FILE             Restore this v4 archive during a fresh install.
   --identity FILE            age identity for --restore.
 
@@ -215,6 +218,8 @@ load_config() {
   HTTP_PORT="$(config_get TERMLINK_HTTP_PORT)"
   PUBLIC_PORT="$(config_get TERMLINK_PUBLIC_PORT)"
   BACKUP_RECIPIENT="$(grep -E '^TERMLINK_BACKUP_RECIPIENT=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  DIRECT_ROUTING_PERMITTED="$(grep -E '^TERMLINK_DIRECT_ROUTING_PERMITTED=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  [[ -n "$DIRECT_ROUTING_PERMITTED" ]] || DIRECT_ROUTING_PERMITTED=false
   [[ "$(config_get TERMLINK_RUNTIME_DIR)" == "$RUNTIME_DIR" ]] || die 'runtime directory does not match the managed path'
   [[ "$(config_get TERMLINK_SECRETS_DIR)" == "$SECRETS_DIR" ]] || die 'secret directory does not match the managed path'
   validate_domain "$PUBLIC_HOST"
@@ -222,6 +227,8 @@ load_config() {
   validate_port "$HTTP_PORT" TERMLINK_HTTP_PORT
   validate_port "$PUBLIC_PORT" TERMLINK_PUBLIC_PORT
   [[ -z "$BACKUP_RECIPIENT" ]] || validate_recipient "$BACKUP_RECIPIENT"
+  [[ "$DIRECT_ROUTING_PERMITTED" == true || "$DIRECT_ROUTING_PERMITTED" == false ]] || \
+    die 'TERMLINK_DIRECT_ROUTING_PERMITTED must be true or false'
   local expected_public_url="https://$PUBLIC_HOST"
   [[ "$PUBLIC_PORT" == 443 ]] || expected_public_url="$expected_public_url:$PUBLIC_PORT"
   [[ "$PUBLIC_URL" == "$expected_public_url" ]] || die 'public URL does not match the configured host and HTTPS port'
@@ -246,6 +253,7 @@ TERMLINK_HTTP_BIND_IP=127.0.0.1
 TERMLINK_HTTP_PORT=$HTTP_PORT
 TERMLINK_PUBLIC_PORT=$PUBLIC_PORT
 TERMLINK_BACKUP_RECIPIENT=$BACKUP_RECIPIENT
+TERMLINK_DIRECT_ROUTING_PERMITTED=$DIRECT_ROUTING_PERMITTED
 EOF
   chmod 0600 "$tmp"
   mv -f -- "$tmp" "$CONFIG_FILE"
@@ -355,6 +363,7 @@ services:
       TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE: /run/secrets/account_deletion_identity_key
       TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION: "1"
       TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
+      TERMLINK_DIRECT_ROUTING_PERMITTED: ${TERMLINK_DIRECT_ROUTING_PERMITTED:-false}
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
       TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
@@ -481,7 +490,8 @@ build_compose_commands() {
   local name
   for name in COMPOSE_ENV_FILES COMPOSE_FILE COMPOSE_PROFILES COMPOSE_PROJECT_NAME \
     TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS TERMLINK_APPSHIP_BASE_URL \
-    TERMLINK_CONTAINER_LOG_MAX_FILES TERMLINK_CONTAINER_LOG_MAX_SIZE TERMLINK_DIRECT_STUN_SERVERS \
+    TERMLINK_CONTAINER_LOG_MAX_FILES TERMLINK_CONTAINER_LOG_MAX_SIZE \
+    TERMLINK_DIRECT_ROUTING_PERMITTED TERMLINK_DIRECT_STUN_SERVERS \
     TERMLINK_HTTP_BIND_IP TERMLINK_HTTP_PORT TERMLINK_IMAGE TERMLINK_LOG_LEVEL \
     TERMLINK_POSTGRES_CPU_LIMIT \
     TERMLINK_POSTGRES_MEMORY_LIMIT TERMLINK_POSTGRES_MEMORY_RESERVATION TERMLINK_POSTGRES_PIDS_LIMIT \
@@ -757,6 +767,7 @@ command_install() {
   local recipient=''
   local restore_input=''
   local restore_identity=''
+  local direct_routing=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain) domain="${2:-}"; shift 2 ;;
@@ -767,6 +778,8 @@ command_install() {
       --backup-recipient) recipient="${2:-}"; shift 2 ;;
       --restore) restore_input="${2:-}"; shift 2 ;;
       --identity) restore_identity="${2:-}"; shift 2 ;;
+      --enable-direct-routing) direct_routing=true; shift ;;
+      --disable-direct-routing) direct_routing=false; shift ;;
       -h|--help) show_help; return ;;
       *) die "unknown install option: $1" ;;
     esac
@@ -794,6 +807,7 @@ command_install() {
   HTTP_PORT="$http_port"
   PUBLIC_PORT="$public_port"
   BACKUP_RECIPIENT="$recipient"
+  DIRECT_ROUTING_PERMITTED="$direct_routing"
   install_runtime_assets
   initialize_secrets
   write_config
@@ -952,6 +966,7 @@ command_config() {
   local new_http=''
   local new_public_port=''
   local new_recipient='__unchanged__'
+  local new_direct_routing='__unchanged__'
   local show_only=true
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -962,6 +977,8 @@ command_config() {
       --public-port) new_public_port="${2:-}"; show_only=false; shift 2 ;;
       --backup-recipient) new_recipient="${2:-}"; show_only=false; shift 2 ;;
       --clear-backup-recipient) new_recipient=''; show_only=false; shift ;;
+      --enable-direct-routing) new_direct_routing=true; show_only=false; shift ;;
+      --disable-direct-routing) new_direct_routing=false; show_only=false; shift ;;
       -h|--help) show_help; return ;;
       *) die "unknown config option: $1" ;;
     esac
@@ -980,6 +997,9 @@ command_config() {
   if [[ "$new_recipient" != __unchanged__ ]]; then
     [[ -z "$new_recipient" ]] || validate_recipient "$new_recipient"
     BACKUP_RECIPIENT="$new_recipient"
+  fi
+  if [[ "$new_direct_routing" != __unchanged__ ]]; then
+    DIRECT_ROUTING_PERMITTED="$new_direct_routing"
   fi
   write_config
   build_compose_commands

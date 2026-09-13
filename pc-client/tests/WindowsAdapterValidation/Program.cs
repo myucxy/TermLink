@@ -92,6 +92,12 @@ try
     Require(first.Capabilities.Contains(PcCapabilityIds.RemoteAgentUpdateV1),
         "The Windows adapter did not expose the update capability.");
 
+    await client.ConfigureServerAsync("https://term.example.test:8910", CancellationToken.None);
+    var configuredServer = await client.GetStatusAsync(false, CancellationToken.None);
+    Require(!configuredServer.AccountLinked &&
+            string.Equals(configuredServer.ServerOrigin, "https://term.example.test:8910", StringComparison.OrdinalIgnoreCase),
+        "The Agent did not persist the configured server origin while signed out.");
+
     await client.SetRemoteAccessAsync(false, CancellationToken.None);
     var stopped = await client.GetStatusAsync(false, CancellationToken.None);
     Require(!stopped.RemoteAccessEnabled && stopped.Revision > first.Revision,

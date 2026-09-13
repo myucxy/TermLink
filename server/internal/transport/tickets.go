@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/auth"
@@ -45,17 +47,18 @@ var (
 
 type TransportAuthority interface {
 	AllocateDirectTransportEpoch(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (uint64, error)
-	AuthorizeDirectTransportPair(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
+	AuthorizeDirectTransportSignal(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (string, error)
 }
 
 type RouteTicketService struct {
-	authority TransportAuthority
-	state     DirectStateStore
-	private   ed25519.PrivateKey
-	public    ed25519.PublicKey
-	keyID     []byte
-	clock     func() time.Time
-	random    io.Reader
+	authority              TransportAuthority
+	state                  DirectStateStore
+	directRoutingPermitted bool
+	private                ed25519.PrivateKey
+	public                 ed25519.PublicKey
+	keyID                  []byte
+	clock                  func() time.Time
+	random                 io.Reader
 
 	mu                 sync.Mutex
 	connections        map[connectionKey]*routeState
@@ -108,20 +111,34 @@ type rateState struct {
 }
 
 func NewRouteTicketService(authority TransportAuthority, seed []byte, stunServers ...string) (*RouteTicketService, error) {
-	return newRouteTicketService(authority, nil, seed, stunServers...)
+	return newRouteTicketService(authority, nil, seed, false, stunServers...)
+}
+
+// NewRouteTicketServiceWithRouting constructs the single-node service with an
+// explicit production data-routing gate. Callers must keep this false until
+// both clients negotiate direct_transport_data_v1 and
+// direct_session_cutover_v1.
+func NewRouteTicketServiceWithRouting(authority TransportAuthority, seed []byte, directRoutingPermitted bool, stunServers ...string) (*RouteTicketService, error) {
+	return newRouteTicketService(authority, nil, seed, directRoutingPermitted, stunServers...)
 }
 
 // NewSharedRouteTicketService is the production multi-replica constructor.
 // The shared state dependency is mandatory and no operation falls back to
 // process-local replay, rate, or signalling state.
 func NewSharedRouteTicketService(authority TransportAuthority, state DirectStateStore, seed []byte, stunServers ...string) (*RouteTicketService, error) {
+	return NewSharedRouteTicketServiceWithRouting(authority, state, seed, false, stunServers...)
+}
+
+// NewSharedRouteTicketServiceWithRouting is the multi-replica equivalent of
+// NewRouteTicketServiceWithRouting.
+func NewSharedRouteTicketServiceWithRouting(authority TransportAuthority, state DirectStateStore, seed []byte, directRoutingPermitted bool, stunServers ...string) (*RouteTicketService, error) {
 	if state == nil {
 		return nil, errors.New("direct transport shared state unavailable")
 	}
-	return newRouteTicketService(authority, state, seed, stunServers...)
+	return newRouteTicketService(authority, state, seed, directRoutingPermitted, stunServers...)
 }
 
-func newRouteTicketService(authority TransportAuthority, state DirectStateStore, seed []byte, stunServers ...string) (*RouteTicketService, error) {
+func newRouteTicketService(authority TransportAuthority, state DirectStateStore, seed []byte, directRoutingPermitted bool, stunServers ...string) (*RouteTicketService, error) {
 	if authority == nil || len(seed) < ed25519.SeedSize {
 		return nil, errors.New("transport ticket dependencies unavailable")
 	}
@@ -130,7 +147,8 @@ func newRouteTicketService(authority TransportAuthority, state DirectStateStore,
 	digest := sha256.Sum256(public)
 	keyID := []byte("direct-v1-" + hex.EncodeToString(digest[:8]))
 	return &RouteTicketService{
-		authority: authority, state: state, private: private, public: public, keyID: keyID,
+		authority: authority, state: state, directRoutingPermitted: directRoutingPermitted,
+		private: private, public: public, keyID: keyID,
 		clock: time.Now, random: rand.Reader,
 		connections: map[connectionKey]*routeState{}, pendingConnections: map[connectionKey]struct{}{},
 		deviceTicketRate: map[uuid.UUID]rateState{}, accountTicketRate: map[uuid.UUID]rateState{},
@@ -152,18 +170,31 @@ func (s *RouteTicketService) configHTTP(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *RouteTicketService) EnabledConfig(stunServers []string) EnabledDeviceConfig {
+	capabilities := []string{
+		"direct_signaling_v1",
+		"direct_transport_shadow_v1",
+		"direct_transport_shadow_multipair_v2",
+	}
+	if s.directRoutingPermitted {
+		capabilities = append(
+			capabilities,
+			"direct_transport_data_v1",
+			"direct_session_cutover_v1",
+		)
+	}
 	return EnabledDeviceConfig{
-		ProtocolVersion: 1, Capabilities: []string{
-			"direct_signaling_v1",
-			"direct_transport_shadow_v1",
-			"direct_transport_shadow_multipair_v2",
-		},
-		DirectRoutingPermitted: false,
+		ProtocolVersion:        1,
+		Capabilities:           capabilities,
+		DirectRoutingPermitted: s.directRoutingPermitted,
 		TicketSigningKeys: []TicketSigningKey{{
 			KeyID: string(s.keyID), Algorithm: "Ed25519", PublicKey: base64.RawURLEncoding.EncodeToString(s.public),
 		}},
 		STUNServers: append([]string(nil), stunServers...),
 	}
+}
+
+func (s *RouteTicketService) DirectRoutingPermitted() bool {
+	return s != nil && s.directRoutingPermitted
 }
 
 type ticketRequest struct {
@@ -345,6 +376,9 @@ func (s *RouteTicketService) issueShared(ctx context.Context, principal auth.Pri
 // before the shared store atomically advances replay state and publishes to the
 // recipient mailbox. Failures are confined to the signalling lane.
 func (s *RouteTicketService) AuthorizeAndPublishSignal(ctx context.Context, principal auth.Principal, presence DirectPresence, envelope SignalEnvelope, frame []byte) error {
+	if isDirectDataControlSignal(envelope.SignalType) && !s.DirectRoutingPermitted() {
+		return ErrTransportDenied
+	}
 	if s.state == nil || presence.AccountID != principal.UserID || presence.DeviceID != principal.Device.ID {
 		return ErrTransportDenied
 	}
@@ -366,7 +400,11 @@ func (s *RouteTicketService) AuthorizeAndPublishSignal(ctx context.Context, prin
 	if budget != DirectSignalBudgetAccepted {
 		return ErrTransportDenied
 	}
-	if err := s.authority.AuthorizeDirectTransportPair(ctx, principal.UserID, principal.Device.ID, recipientID); err != nil {
+	responderID, err := s.resolveSignalResponder(ctx, principal.UserID, envelope, principal.Device.ID, recipientID)
+	if err != nil {
+		return err
+	}
+	if responderID == uuid.Nil || !s.authorizeSignalKey(ctx, principal.UserID, principal.Device.ID, recipientID, responderID, envelope.KeyID) {
 		return ErrTransportDenied
 	}
 	var nonce [12]byte
@@ -396,6 +434,9 @@ func (s *RouteTicketService) AuthorizeAndPublishSignal(ctx context.Context, prin
 }
 
 func (s *RouteTicketService) AuthorizeSignal(ctx context.Context, principal auth.Principal, envelope SignalEnvelope) error {
+	if isDirectDataControlSignal(envelope.SignalType) && !s.DirectRoutingPermitted() {
+		return ErrTransportDenied
+	}
 	connectionID, err := uuid.FromBytes(envelope.ConnectionID)
 	if err != nil {
 		return ErrTransportDenied
@@ -405,6 +446,10 @@ func (s *RouteTicketService) AuthorizeSignal(ctx context.Context, principal auth
 		return ErrTransportDenied
 	}
 	now := s.clock().UTC()
+	responderID, err := s.resolveSignalResponder(ctx, principal.UserID, envelope, principal.Device.ID, recipientID)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.cleanupLocked(now)
 	allowed := allowRateLocked(s.deviceSignalRate, principal.Device.ID, now, signalRateWindow, deviceSignalsPerWindow) &&
@@ -413,9 +458,7 @@ func (s *RouteTicketService) AuthorizeSignal(ctx context.Context, principal auth
 	if !allowed {
 		return ErrTransportRateLimited
 	}
-	if err := s.authority.AuthorizeDirectTransportPair(
-		ctx, principal.UserID, principal.Device.ID, recipientID,
-	); err != nil {
+	if responderID == uuid.Nil || !s.authorizeSignalKey(ctx, principal.UserID, principal.Device.ID, recipientID, responderID, envelope.KeyID) {
 		return ErrTransportDenied
 	}
 	s.mu.Lock()
@@ -450,6 +493,47 @@ func (s *RouteTicketService) AuthorizeSignal(ctx context.Context, principal auth
 	state.signals[principal.Device.ID]++
 	state.nonces[principal.Device.ID][nonce] = struct{}{}
 	return nil
+}
+
+func (s *RouteTicketService) resolveSignalResponder(
+	ctx context.Context,
+	accountID uuid.UUID,
+	envelope SignalEnvelope,
+	senderID, recipientID uuid.UUID,
+) (uuid.UUID, error) {
+	connectionID, err := uuid.FromBytes(envelope.ConnectionID)
+	if err != nil {
+		return uuid.Nil, nil
+	}
+	if s.state != nil {
+		return s.state.ResolveSignalResponder(ctx, DirectSignalRouteRequest{
+			AccountID: accountID, ConnectionID: connectionID, SenderID: senderID,
+			RecipientID: recipientID, PathEpoch: envelope.PathEpoch,
+		})
+	}
+	now := s.clock().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	state := s.connections[connectionKey{accountID: accountID, connection: connectionID}]
+	if state == nil || !now.Before(state.expiresAt) || state.pathEpoch != envelope.PathEpoch ||
+		!state.containsDirection(senderID, recipientID) {
+		return uuid.Nil, nil
+	}
+	return state.responder, nil
+}
+
+func (s *RouteTicketService) authorizeSignalKey(
+	ctx context.Context,
+	accountID, senderID, recipientID, responderID uuid.UUID,
+	keyID []byte,
+) bool {
+	expected, err := s.authority.AuthorizeDirectTransportSignal(
+		ctx, accountID, senderID, recipientID, responderID,
+	)
+	expectedBytes := []byte(expected)
+	return err == nil && len(expectedBytes) >= 1 && len(expectedBytes) <= 64 && utf8.ValidString(expected) &&
+		len(keyID) == len(expectedBytes) && subtle.ConstantTimeCompare(keyID, expectedBytes) == 1
 }
 
 // IsNextSignalSequence applies the signalling replay policy without overflowing

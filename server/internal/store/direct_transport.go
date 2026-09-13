@@ -46,9 +46,8 @@ const allocateDirectTransportEpochSQL = `
 	)
 	SELECT last_epoch FROM allocated`
 
-const authorizeDirectTransportPairSQL = `
-	SELECT EXISTS(
-		SELECT 1
+const authorizeDirectTransportSignalSQL = `
+	SELECT CASE WHEN source.id=$4 THEN source.key_id ELSE target.key_id END
 		FROM devices source
 		JOIN users account ON account.id=$1 AND account.status='ACTIVE'
 		JOIN devices target ON target.id=$3 AND target.user_id=$1
@@ -70,8 +69,8 @@ const authorizeDirectTransportPairSQL = `
 		    OR
 		    (target.device_type='ANDROID' AND source.device_type IN ('WINDOWS_PC','PC_AGENT') AND pc.device_id=source.id)
 		  )
-		  AND ($4 OR android_grant.device_id IS NOT NULL)
-	)`
+		  AND ($5 OR android_grant.device_id IS NOT NULL)
+		  AND (source.id=$4 OR target.id=$4)`
 
 // AllocateDirectTransportEpoch authorizes one exact Android/PC pair and
 // atomically advances its path epoch. Persisting the counter prevents a server
@@ -98,24 +97,22 @@ func (s *Postgres) AllocateDirectTransportEpoch(
 	return uint64(epoch), nil
 }
 
-// AuthorizeDirectTransportPair rechecks current device trust, PC ownership,
-// remote-routing policy and grant expiry for every signalling frame. Revoking
-// either device or disabling remote routing therefore fences an in-flight
-// ticket without waiting for its short TTL.
-func (s *Postgres) AuthorizeDirectTransportPair(
+// AuthorizeDirectTransportSignal rechecks current device trust, PC ownership,
+// remote-routing policy and grant expiry for every signalling frame and
+// returns the ticket responder's current device key ID from the same database
+// snapshot. Revocation, routing disablement, or key rotation therefore fences
+// an in-flight ticket without waiting for its short TTL.
+func (s *Postgres) AuthorizeDirectTransportSignal(
 	ctx context.Context,
-	accountID, sourceDeviceID, targetDeviceID uuid.UUID,
-) error {
-	var allowed bool
-	err := s.Pool.QueryRow(ctx, authorizeDirectTransportPairSQL,
-		accountID, sourceDeviceID, targetDeviceID, s.AutoTrustDevices).Scan(&allowed)
-	if err != nil {
-		return err
+	accountID, sourceDeviceID, targetDeviceID, responderDeviceID uuid.UUID,
+) (string, error) {
+	var responderKeyID string
+	err := s.Pool.QueryRow(ctx, authorizeDirectTransportSignalSQL,
+		accountID, sourceDeviceID, targetDeviceID, responderDeviceID, s.AutoTrustDevices).Scan(&responderKeyID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDenied
 	}
-	if !allowed {
-		return ErrDenied
-	}
-	return nil
+	return responderKeyID, err
 }
 
 func canonicalDirectTransportPair(first, second uuid.UUID) (uuid.UUID, uuid.UUID) {

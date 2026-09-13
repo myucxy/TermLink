@@ -47,6 +47,9 @@ fun buildConfigString(value: String): String =
 @CacheableTask
 abstract class GenerateTailFirstE2EContract : DefaultTask() {
     @get:Input
+    abstract val applicationId: Property<String>
+
+    @get:Input
     abstract val serverOrigin: Property<String>
 
     @get:Input
@@ -67,7 +70,7 @@ abstract class GenerateTailFirstE2EContract : DefaultTask() {
             {
               "schema_version": 1,
               "transport": "explicit_broadcast_run_as_file",
-              "package_name": "dev.termlink.harness",
+              "package_name": ${jsonString(applicationId.get())},
               "receiver_class": "dev.termlink.product.debug.TailFirstE2EReceiver",
               "broadcast_action": "dev.termlink.product.debug.TAIL_FIRST_E2E",
               "response_relative_path": "no_backup/tail-first-e2e/response.json",
@@ -89,10 +92,107 @@ abstract class GenerateTailFirstE2EContract : DefaultTask() {
     }
 }
 
-val requestedDebugServerUrl = providers.gradleProperty("termlinkServerUrl")
-    .orElse(providers.environmentVariable("TERMLINK_SERVER_URL"))
+@CacheableTask
+abstract class GenerateDirectProductE2EContract : DefaultTask() {
+    @get:Input
+    abstract val applicationId: Property<String>
+
+    @get:Input
+    abstract val serverOrigin: Property<String>
+
+    @get:Input
+    abstract val directTransportShadow: Property<Boolean>
+
+    @get:Input
+    abstract val directTransportDataPlane: Property<Boolean>
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    private fun jsonString(value: String): String =
+        "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
+    @TaskAction
+    fun generate() {
+        check(directTransportShadow.get() && directTransportDataPlane.get()) {
+            "Direct product E2E contract requires both acceptance gates"
+        }
+        val outputFile = outputDirectory.file("termlink-direct-product-e2e-contract-v1.json").get().asFile
+        outputFile.parentFile.mkdirs()
+        outputFile.writeText(
+            """
+            {
+              "schema_version": 1,
+              "kind": "termlink.android-direct-product-e2e-contract",
+              "transport": "explicit_broadcast_run_as_file",
+              "application_id": ${jsonString(applicationId.get())},
+              "receiver_class": "dev.termlink.product.debug.DirectProductE2EReceiver",
+              "broadcast_action": "dev.termlink.product.debug.DIRECT_PRODUCT_E2E",
+              "response_relative_path": "no_backup/direct-product-e2e/response.json",
+              "server_origin": ${jsonString(serverOrigin.get())},
+              "build_type": "debug",
+              "shadow_acceptance": ${directTransportShadow.get()},
+              "data_plane_acceptance": ${directTransportDataPlane.get()},
+              "required_server_capabilities": [
+                "direct_transport_shadow_v1",
+                "direct_transport_shadow_multipair_v2",
+                "direct_transport_data_v1",
+                "direct_session_cutover_v1"
+              ],
+              "operation_extra": "operation",
+              "request_id_extra": "request_id",
+              "run_id_extra": "run_id",
+              "arguments_json_extra": "arguments_json",
+              "probe_operation": "probe",
+              "operations": [
+                "probe",
+                "inspect_transport",
+                "send_text_marker",
+                "send_key",
+                "request_resize",
+                "background",
+                "foreground",
+                "lock_screen",
+                "wake_screen",
+                "open_late_session",
+                "start_long_output",
+                "stop_long_output",
+                "prepare_session",
+                "close_test_sessions"
+              ],
+              "diagnostics": [
+                "app_process_id",
+                "app_process_start_time",
+                "candidate_kinds",
+                "carrier",
+                "contiguous_applied_sequence",
+                "digest_conflict_count",
+                "duplicate_apply_count",
+                "duplicate_drop_count",
+                "durable_ack",
+                "fallback_reason",
+                "gap_count",
+                "last_received_sequence",
+                "marker_digest",
+                "network_generation",
+                "path_epoch",
+                "relay_generation",
+                "signalling_generation",
+                "transport_receipt_high_watermark",
+                "viewport_digest"
+              ]
+            }
+            """.trimIndent() + "\n",
+            Charsets.UTF_8,
+        )
+    }
+}
+
+val requestedDebugServerUrlProperty = providers.gradleProperty("termlinkServerUrl")
     .orNull
     ?.takeIf { it.isNotBlank() }
+val requestedDebugServerUrl = requestedDebugServerUrlProperty
+    ?: providers.environmentVariable("TERMLINK_SERVER_URL").orNull?.takeIf { it.isNotBlank() }
 val debugServerUrl = normalizeTermLinkServerUrl(requestedDebugServerUrl ?: publicTermLinkServerUrl)
 val debugServerUri = URI(debugServerUrl)
 val debugAllowsCleartextLocalTest = debugServerUri.scheme.equals("http", ignoreCase = true) &&
@@ -112,6 +212,20 @@ val debugDirectTransportShadow = providers.gradleProperty("termlinkEnableDirectT
     .get()
     .toBooleanStrictOrNull()
     ?: throw GradleException("termlinkEnableDirectTransportShadow must be true or false")
+val debugDirectTransportDataPlane = providers.gradleProperty("termlinkEnableDirectTransportDataPlane")
+    // The real Direct data plane is available only to an explicitly isolated
+    // acceptance build. Public-origin use additionally requires an exact,
+    // repeated origin acknowledgement. Omitted always means disabled.
+    .orElse("false")
+    .get()
+    .toBooleanStrictOrNull()
+    ?: throw GradleException("termlinkEnableDirectTransportDataPlane must be true or false")
+val debugPublicDirectAcceptanceOrigin = providers.gradleProperty(
+    "termlinkPublicDirectAcceptanceOrigin",
+).orNull
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?.let(::normalizeTermLinkServerUrl)
 val termLinkVersionCode = providers.gradleProperty("termlinkVersionCode")
     .orElse("32")
     .get()
@@ -129,6 +243,33 @@ val debugApplicationIdSuffix = providers.gradleProperty("termlinkDebugApplicatio
     ?.trim()
     ?.takeIf { it.isNotEmpty() }
     ?.let { if (it.startsWith('.')) it else ".$it" }
+
+if (debugDirectTransportDataPlane) {
+    if (!debugDirectTransportShadow) {
+        throw GradleException(
+            "termlinkEnableDirectTransportDataPlane=true requires " +
+                "-PtermlinkEnableDirectTransportShadow=true",
+        )
+    }
+    val explicitPrivateOrigin = requestedDebugServerUrlProperty != null &&
+        isLocalTestHost(debugServerUri.host)
+    val explicitlyAcknowledgedPublicOrigin = requestedDebugServerUrlProperty != null &&
+        debugServerUrl == publicTermLinkServerUrl &&
+        debugPublicDirectAcceptanceOrigin == publicTermLinkServerUrl
+    if (!explicitPrivateOrigin && !explicitlyAcknowledgedPublicOrigin) {
+        throw GradleException(
+            "Direct data-plane acceptance requires either an explicit private/localhost " +
+                "-PtermlinkServerUrl origin, or an exact public-origin acknowledgement " +
+                "through -PtermlinkPublicDirectAcceptanceOrigin",
+        )
+    }
+    if (debugApplicationIdSuffix == null) {
+        throw GradleException(
+            "Direct data-plane acceptance requires an isolated " +
+                "-PtermlinkDebugApplicationIdSuffix",
+        )
+    }
+}
 
 android {
     namespace = "dev.termlink.harness"
@@ -164,10 +305,12 @@ android {
         // The app-owned embedded flow removes that component at merge time, but
         // the library placeholder must still have a non-routable value.
         manifestPlaceholders["appAuthRedirectScheme"] = "dev.termlink.disabled"
+        manifestPlaceholders["termlinkDirectProductE2EEnabled"] = "false"
         buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
         buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
         buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
         buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "false")
+        buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", "false")
     }
 
     buildFeatures {
@@ -186,7 +329,9 @@ android {
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", debugAllowsCleartextLocalTest.toString())
             buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", debugTerminalSnapshotRuntime.toString())
             buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", debugDirectTransportShadow.toString())
+            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", debugDirectTransportDataPlane.toString())
             manifestPlaceholders["termlinkUsesCleartextTraffic"] = debugAllowsCleartextLocalTest.toString()
+            manifestPlaceholders["termlinkDirectProductE2EEnabled"] = debugDirectTransportDataPlane.toString()
         }
         getByName("release") {
             // Release intentionally ignores all local Debug injection inputs.
@@ -194,6 +339,7 @@ android {
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
             buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
             buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "false")
+            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", "false")
         }
     }
 
@@ -247,6 +393,7 @@ androidComponents {
         val generateContract = tasks.register<GenerateTailFirstE2EContract>(
             "generate${variant.name.replaceFirstChar { it.uppercase() }}TailFirstE2EContract",
         ) {
+            applicationId.set(variant.applicationId)
             serverOrigin.set(debugServerUrl)
             terminalSnapshotRuntime.set(debugTerminalSnapshotRuntime)
         }
@@ -254,6 +401,21 @@ androidComponents {
             generateContract,
             GenerateTailFirstE2EContract::outputDirectory,
         )
+
+        if (debugDirectTransportDataPlane) {
+            val generateDirectProductContract = tasks.register<GenerateDirectProductE2EContract>(
+                "generate${variant.name.replaceFirstChar { it.uppercase() }}DirectProductE2EContract",
+            ) {
+                applicationId.set(variant.applicationId)
+                serverOrigin.set(debugServerUrl)
+                directTransportShadow.set(debugDirectTransportShadow)
+                directTransportDataPlane.set(debugDirectTransportDataPlane)
+            }
+            variant.sources.assets?.addGeneratedSourceDirectory(
+                generateDirectProductContract,
+                GenerateDirectProductE2EContract::outputDirectory,
+            )
+        }
     }
 }
 

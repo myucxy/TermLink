@@ -1203,10 +1203,24 @@ internal static class Program
                 await socketWriteGate.WaitAsync(cancellation.Token).ConfigureAwait(false);
                 try
                 {
+                    var welcome = JsonSerializer.SerializeToUtf8Bytes(new
+                    {
+                        type = "welcome",
+                        protocol_version = 1,
+                        heartbeat_seconds = 15,
+                        connection_id = Guid.NewGuid().ToString("D"),
+                        capabilities = new[]
+                        {
+                            "cumulative_ack",
+                            "e2ee_x25519_chacha20poly1305",
+                            "flow_control_v1",
+                            "lease_v1"
+                        }
+                    });
                     await WriteWebSocketFrameAsync(
                         stream,
                         opcode: 1,
-                        Encoding.UTF8.GetBytes("{}"),
+                        welcome,
                         cancellation.Token).ConfigureAwait(false);
                 }
                 finally { socketWriteGate.Release(); }

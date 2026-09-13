@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -162,7 +163,7 @@ func (e SignalEnvelope) Validate() error {
 	if e.PathEpoch == 0 || e.PathEpoch > math.MaxInt64 || e.SignalSeq == 0 || e.SignalSeq > math.MaxInt64 || e.SignalACK > math.MaxInt64 || e.SentAtMS <= 0 {
 		return fmt.Errorf("%w: invalid sequence metadata", ErrInvalidSignal)
 	}
-	if len(e.KeyID) == 0 || len(e.KeyID) > 64 || len(e.Nonce) != 12 || len(e.Ciphertext) < 16 || len(e.Ciphertext) > maxCipherBytes {
+	if len(e.KeyID) == 0 || len(e.KeyID) > 64 || !utf8.Valid(e.KeyID) || len(e.Nonce) != 12 || len(e.Ciphertext) < 16 || len(e.Ciphertext) > maxCipherBytes {
 		return fmt.Errorf("%w: invalid encrypted payload metadata", ErrInvalidSignal)
 	}
 	return nil

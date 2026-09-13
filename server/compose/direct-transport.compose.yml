@@ -4,6 +4,7 @@ services:
       # Direct signaling remains an optional lane. A Direct state failure must
       # degrade this process to Relay-only; it must never gate Relay startup.
       TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
+      TERMLINK_DIRECT_ROUTING_PERMITTED: ${TERMLINK_DIRECT_ROUTING_PERMITTED:-false}
       TERMLINK_DIRECT_REDIS_URL_FILE: /run/secrets/direct_redis_url
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:?TERMLINK_DIRECT_STUN_SERVERS is required}
     secrets:

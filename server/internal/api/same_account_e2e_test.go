@@ -69,6 +69,10 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-windows",
 			TokenID: "same-account-windows-" + uuid.NewString(),
 		},
+		"same-account-windows-two": {
+			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-windows",
+			TokenID: "same-account-windows-two-" + uuid.NewString(),
+		},
 		"same-account-android": {
 			Issuer: issuer, Subject: sameSubject, AuthorizedParty: "termlink-android",
 			TokenID: "same-account-android-" + uuid.NewString(), MFA: true, AuthenticatedAt: time.Now(),
@@ -103,20 +107,23 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	defer testServer.Close()
 
 	windows := newDevice(t)
+	windowsTwo := newDevice(t)
 	android := newDevice(t)
 	androidTwo := newDevice(t)
 	crossAndroid := newDevice(t)
 	windowsRegistration := sameAccountRegister(t, testServer.URL, windows, "WINDOWS_PC", "Same-account PC", "same-account-windows")
+	windowsTwoRegistration := sameAccountRegister(t, testServer.URL, windowsTwo, "WINDOWS_PC", "Same-account PC two", "same-account-windows-two")
 	androidRegistration := sameAccountRegister(t, testServer.URL, android, "ANDROID", "Same-account Android", "same-account-android")
 	androidTwoRegistration := sameAccountRegister(t, testServer.URL, androidTwo, "ANDROID", "Same-account Android two", "same-account-android-two")
 	crossRegistration := sameAccountRegister(t, testServer.URL, crossAndroid, "ANDROID", "Cross-account Android", "cross-account-android")
 
 	sameUserID := mustResponseUUID(t, windowsRegistration, "user_id")
+	windowsTwoUserID := mustResponseUUID(t, windowsTwoRegistration, "user_id")
 	androidUserID := mustResponseUUID(t, androidRegistration, "user_id")
 	androidTwoUserID := mustResponseUUID(t, androidTwoRegistration, "user_id")
 	crossUserID := mustResponseUUID(t, crossRegistration, "user_id")
-	if androidUserID != sameUserID || androidTwoUserID != sameUserID {
-		t.Fatalf("same OIDC subject produced different accounts: windows=%s androids=%s/%s", sameUserID, androidUserID, androidTwoUserID)
+	if windowsTwoUserID != sameUserID || androidUserID != sameUserID || androidTwoUserID != sameUserID {
+		t.Fatalf("same OIDC subject produced different accounts: windows=%s/%s androids=%s/%s", sameUserID, windowsTwoUserID, androidUserID, androidTwoUserID)
 	}
 	if crossUserID == sameUserID {
 		t.Fatal("different OIDC subjects unexpectedly shared an account")
@@ -124,10 +131,11 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	defer func() {
 		_, _ = repository.Pool.Exec(context.Background(), `DELETE FROM users WHERE id=ANY($1)`, []uuid.UUID{sameUserID, crossUserID})
 	}()
-	if windowsRegistration["bootstrap"] != true || androidRegistration["bootstrap"] != false || androidTwoRegistration["bootstrap"] != false {
-		t.Fatalf("unexpected bootstrap flags: windows=%v androids=%v/%v", windowsRegistration["bootstrap"], androidRegistration["bootstrap"], androidTwoRegistration["bootstrap"])
+	if windowsRegistration["bootstrap"] != true || windowsTwoRegistration["bootstrap"] != false || androidRegistration["bootstrap"] != false || androidTwoRegistration["bootstrap"] != false {
+		t.Fatalf("unexpected bootstrap flags: windows=%v/%v androids=%v/%v", windowsRegistration["bootstrap"], windowsTwoRegistration["bootstrap"], androidRegistration["bootstrap"], androidTwoRegistration["bootstrap"])
 	}
 	assertDeviceTrusted(t, repository, windows.id)
+	assertDeviceTrusted(t, repository, windowsTwo.id)
 	assertDeviceTrusted(t, repository, android.id)
 	assertDeviceTrusted(t, repository, androidTwo.id)
 	assertDeviceTrusted(t, repository, crossAndroid.id)
@@ -138,7 +146,7 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodPut, "/v1/pcs/"+pcID.String(), map[string]any{
 		"name": "Same-account PC", "agent_version": "e2e", "key_epoch": 1,
 	}, "same-account-upsert-pc", http.StatusOK)
-	sameAccountSignedJSONWithHeaders(t, testServer.URL, android, "same-account-android", http.MethodPut, "/v1/account/pcs/"+pcID.String()+"/control-policy", map[string]any{
+	collaborativePolicy := sameAccountSignedJSONWithHeaders(t, testServer.URL, android, "same-account-android", http.MethodPut, "/v1/account/pcs/"+pcID.String()+"/control-policy", map[string]any{
 		"remote_routing_enabled": true, "mode": "COLLABORATIVE", "local_priority": true, "expected_version": 1,
 	}, "same-account-collaborative-policy", map[string]string{
 		"X-TermLink-Operation-Reason": "verify same-account collaborative control",
@@ -173,6 +181,10 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	if sharedLease["lease_id"] != lease["lease_id"] || sharedLease["version"] != lease["version"] || sharedLease["holder_device_id"] != lease["holder_device_id"] {
 		t.Fatalf("second Android received a different shared lease: first=%v second=%v", lease, sharedLease)
 	}
+	assertDirectInputLeaseAuthorizationHTTP(
+		t, testServer.URL, service, authentication, repository, valkey, pcID, sessionID, windows, windowsTwo, android, androidTwo,
+		crossAndroid, mustNestedResponseInt64(t, collaborativePolicy, "policy", "policy_version"),
+	)
 
 	pcSocket := sameAccountDialRealtime(t, testServer.URL, windows, "same-account-windows", "pc")
 	defer pcSocket.Close()
@@ -239,6 +251,12 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	_ = crossSocket.Close()
 
 	sameAccountSignedJSON(t, testServer.URL, androidTwo, "same-account-android-two", http.MethodDelete, "/v1/sessions/"+sessionID.String()+"/lease/"+leaseID.String(), nil, "same-account-release-last-participant", http.StatusNoContent)
+	noLeaseDirectPath := "/v1/sessions/" + sessionID.String() + "/lease?sender_device_id=" + androidTwo.id.String()
+	nonOwningWithoutLease := sameAccountSignedJSON(
+		t, testServer.URL, windowsTwo, "same-account-windows-two", http.MethodGet,
+		noLeaseDirectPath, nil, "", http.StatusForbidden,
+	)
+	assertDirectInputErrorPayload(t, nonOwningWithoutLease, "CONTROL_NOT_GRANTED", "errors.control_not_granted")
 	sameAccountSignedJSON(t, testServer.URL, windows, "same-account-windows", http.MethodGet, "/v1/sessions/"+sessionID.String()+"/lease", nil, "", http.StatusNotFound)
 	var durableLeaseCount int
 	if err := repository.Pool.QueryRow(context.Background(), `SELECT count(*) FROM control_leases WHERE session_id=$1`, sessionID).Scan(&durableLeaseCount); err != nil {
@@ -247,6 +265,7 @@ func TestSameAccountDirectUseE2EGate(t *testing.T) {
 	if durableLeaseCount != 0 {
 		t.Fatalf("last shared-lease participant left %d durable fences, want 0", durableLeaseCount)
 	}
+	assertExpiredDirectInputLeaseDenied(t, testServer.URL, valkey, windows, androidTwo, sessionID)
 	assertNoLegacyAuthorizationRows(t, repository, sameUserID)
 	t.Log("covered: same-subject Windows+two Android registration; shared lease acquisition; simultaneous Relay input; participant release/disconnect and active authority-revocation isolation; last-participant live/durable cleanup; cross-subject isolation")
 	t.Log("boundary: service integration only; real OIDC, packaged clients, TLS, and client cryptography remain outside this gate")

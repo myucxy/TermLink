@@ -11,7 +11,7 @@ quinn = { version = "=0.11.11", default-features = false, features = ["runtime-t
 rcgen = "=0.13.2"
 ring = { version = "=0.17.14", default-features = false, features = ["std"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
-tokio = { version = "=1.53.1", features = ["io-util", "rt", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 termlink-direct-wire = { path = "../termlink-direct-wire" }

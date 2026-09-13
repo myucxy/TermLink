@@ -10,6 +10,7 @@ param(
     [switch]$SingleNode,
     [switch]$EmbeddedIdentity,
     [switch]$EnableDirectTransportShadow,
+    [switch]$EnableDirectDataPlane,
     [ValidateNotNullOrEmpty()]
     [string]$DirectStunServers = 'stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302',
     [ValidatePattern('^docker\.io/myucxy/termlink:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$')]
@@ -255,11 +256,25 @@ if (-not [string]::IsNullOrWhiteSpace($ServerImage) -and
 if ($EmbeddedIdentity -and -not $SingleNode) {
     throw '内置身份验收必须使用单机模式。 / Embedded identity acceptance requires single-node mode.'
 }
+if ($EnableDirectDataPlane -and -not ($EnableDirectTransportShadow -or $SingleNode)) {
+    throw 'Direct 数据面验收需要先启用 Direct transport。 / Direct data-plane acceptance requires Direct transport.'
+}
+$directRoutingPermitted = if ($EnableDirectDataPlane) { 'true' } else { 'false' }
+# Override inherited process values in both acceptance topologies. The data
+# plane can only be enabled by this invocation's explicit switch; a stale
+# shell environment must never turn routing on implicitly.
+$env:TERMLINK_DIRECT_ROUTING_PERMITTED = $directRoutingPermitted
+$env:TERMLINK_SINGLE_NODE_DIRECT_ROUTING_PERMITTED = $directRoutingPermitted
 $endpoints = Set-AcceptanceEndpointEnvironment `
     -Address $LanAddress `
     -PublicUpstreamBindAddress $LuckyBindAddress `
     -PublicUpstreamPort $LuckyPort
 $paths = Get-TermLinkAcceptancePaths
+# Compose resolves every file-backed secret path while it loads the project,
+# including for a build-only command. Export only these non-secret path values
+# before the optional metadata prebuild; the files themselves are still
+# created and permission-hardened later, after the Reset safety checks.
+Set-TermLinkAcceptanceComposeEnvironment -Paths $paths
 $composeFiles = @()
 $singleNodeComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.single-node.compose.yml'
 $embeddedIdentityComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.embedded-identity.compose.yml'
@@ -361,6 +376,43 @@ if (-not [string]::IsNullOrWhiteSpace($selectedServerImage)) {
         }
     }
     $composeFiles += $releaseImageComposeFile
+}
+if ($EnableDirectDataPlane) {
+    $metadataComposeFile = Join-Path $paths.ServerRoot 'compose\acceptance.direct-product-e2e-metadata.compose.yml'
+    if (-not (Test-Path -LiteralPath $metadataComposeFile -PathType Leaf)) {
+        throw "Direct product acceptance metadata Compose overlay not found: $metadataComposeFile"
+    }
+
+    # A source acceptance run first produces the exact image that will be
+    # started, then removes its build declaration through the existing
+    # release-image overlay. This makes the injected identifier the content
+    # address of the running image rather than a hash of a mutable workspace.
+    if ([string]::IsNullOrWhiteSpace($selectedServerImage)) {
+        $prebuildComposeArguments = @($composeFiles | ForEach-Object { '-f'; $_ })
+        & docker compose @prebuildComposeArguments build server
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not build the server image for Direct product acceptance metadata.'
+        }
+        $selectedServerImage = 'termlink-production-acceptance-server:local'
+        $env:TERMLINK_ACCEPTANCE_SERVER_IMAGE = $selectedServerImage
+        $releaseImageComposeFile = if ($EmbeddedIdentity) {
+            Join-Path $paths.ServerRoot 'compose\acceptance.embedded-identity.release-image.compose.yml'
+        }
+        else {
+            Join-Path $paths.ServerRoot 'compose\acceptance.release-image.compose.yml'
+        }
+        if (-not (Test-Path -LiteralPath $releaseImageComposeFile -PathType Leaf)) {
+            throw "Published-image Compose overlay not found: $releaseImageComposeFile"
+        }
+        $composeFiles += $releaseImageComposeFile
+    }
+
+    $imageContentID = (& docker image inspect $selectedServerImage --format '{{.Id}}').Trim()
+    if ($LASTEXITCODE -ne 0 -or $imageContentID -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        throw 'The Direct product acceptance server image lacks an exact content identifier.'
+    }
+    $env:TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256 = $imageContentID.Substring(7)
+    $composeFiles += $metadataComposeFile
 }
 $composeFileArguments = @($composeFiles | ForEach-Object { '-f'; $_ })
 if ($Reset -and (Test-Path -LiteralPath $paths.SecretRoot -PathType Container)) {
@@ -535,6 +587,20 @@ Wait-ProductionAcceptanceStack -ComposeFile $composeFiles `
     -AdditionalHealthyServices $additionalHealthyServices `
     -AdditionalCompletedServices $additionalCompletedServices -TimeoutSeconds 300
 
+if ($EnableDirectDataPlane) {
+    $serverContainerID = (& docker compose @composeFileArguments ps -q server).Trim()
+    $runningImageContentID = if ([string]::IsNullOrWhiteSpace($serverContainerID)) {
+        ''
+    }
+    else {
+        (& docker container inspect $serverContainerID --format '{{.Image}}').Trim()
+    }
+    if ($LASTEXITCODE -ne 0 -or
+        $runningImageContentID -cne "sha256:$($env:TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256)") {
+        throw 'The running server image does not match its Direct product acceptance metadata digest.'
+    }
+}
+
 function Assert-RuntimeSecretMetadata {
     param(
         [Parameter(Mandatory)][string]$Service,
@@ -602,6 +668,7 @@ else {
     $env:TERMLINK_ACCEPTANCE_PC_OIDC_CLIENT_ID = if ($EmbeddedIdentity) { 'termlink-windows' } else { 'termlink-acceptance-cli' }
     $env:TERMLINK_ACCEPTANCE_PROBE_IDENTITY_FILE = $paths.ProbeIdentity
     $env:TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT = if ($EnableDirectTransportShadow -or $SingleNode) { '1' } else { '0' }
+    $env:TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING = if ($EnableDirectDataPlane) { '1' } else { '0' }
     $go = if (Test-Path -LiteralPath 'D:\Dev\Env\Go\bin\go.exe' -PathType Leaf) {
         'D:\Dev\Env\Go\bin\go.exe'
     } else {

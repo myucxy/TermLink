@@ -18,6 +18,13 @@ import org.junit.Test
 
 class AuthenticationLifecycleIsolationTest {
     @Test
+    fun restoredAuthenticationFenceStartsWithPositiveGeneration() {
+        val fence = AuthenticationLifecycleFence(initialGeneration = 1L)
+
+        assertEquals(1L, fence.capture())
+    }
+
+    @Test
     fun staleFailureCannotInvalidateSuccessorAuthentication() {
         val fence = AuthenticationLifecycleFence()
         val retired = fence.capture()

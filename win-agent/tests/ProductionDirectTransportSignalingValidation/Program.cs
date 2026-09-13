@@ -30,9 +30,11 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
             {
                 await ValidateFeatureOffPerformsNoIoAsync().ConfigureAwait(false);
                 await ValidateConfigProofAndCrossLanguageTicketAsync().ConfigureAwait(false);
+                await ValidateForwardCompatibleRoutingConfigAsync().ConfigureAwait(false);
                 await ValidateStrictConfigAndHttpFaultsAsync().ConfigureAwait(false);
                 await ValidateIndependentSignalHandshakeAndFramesAsync().ConfigureAwait(false);
                 await ValidateMultipairNegotiationAndSignalGateAsync().ConfigureAwait(false);
+                await ValidateDirectDataSignalNegotiationAsync().ConfigureAwait(false);
                 await ValidateBoundedSignalQueuesAsync().ConfigureAwait(false);
                 await ValidateIndependentFullJitterRetryAsync().ConfigureAwait(false);
                 ValidateRetryBoundsAndServerOrigin();
@@ -145,6 +147,10 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
             var configResult = await client.FetchConfigAsync().ConfigureAwait(false);
             Require(configResult.Status == ProductionDirectSignalingCallStatus.Success &&
                     !configResult.Value.DirectRoutingPermitted &&
+                    ProductionDirectTransportSignalingClient.HasCurrentShadowCapabilities(
+                        configResult.Value) &&
+                    !ProductionDirectTransportSignalingClient.HasDirectDataCapabilities(
+                        configResult.Value) &&
                     configResult.Value.Capabilities.SequenceEqual(
                         new[] { "direct_signaling_v1", "direct_transport_shadow_v1" }) &&
                     configResult.Value.StunServers.SequenceEqual(
@@ -201,6 +207,137 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
             CryptographicOperations.ZeroMemory(publicKey);
             CryptographicOperations.ZeroMemory(ticketWire);
             CryptographicOperations.ZeroMemory(tampered);
+        }
+
+        private static async Task ValidateForwardCompatibleRoutingConfigAsync()
+        {
+            using var vector = JsonDocument.Parse(await File.ReadAllBytesAsync(
+                Path.Combine(AppContext.BaseDirectory, "direct-transport-ticket-v1.json"))
+                .ConfigureAwait(false));
+            var data = vector.RootElement;
+            var local = Guid.Parse(data.GetProperty("initiator_device_id").GetString());
+            var peer = Guid.Parse(data.GetProperty("responder_device_id").GetString());
+            var connection = Guid.Parse(data.GetProperty("connection_id").GetString());
+            var now = data.GetProperty("issued_at_ms").GetInt64() + 1;
+            var signingKey = data.GetProperty("server_public_key_base64url").GetString();
+            var signingKeyId = data.GetProperty("server_signing_key_id").GetString();
+            var ticketJson = JsonSerializer.Serialize(new
+            {
+                protocol_version = 1,
+                ticket_protobuf = data.GetProperty("ticket_protobuf_base64url").GetString()
+            });
+            var routedConfigJson = ConfigJson(
+                new[]
+                {
+                    "direct_transport_data_v1",
+                    "direct_session_cutover_v1",
+                    "direct_transport_shadow_multipair_v2",
+                    "direct_signaling_v1",
+                    "direct_transport_shadow_v1"
+                },
+                directRoutingPermitted: true,
+                signingKey,
+                signingKeyId: signingKeyId);
+            var shadowConfigJson = ConfigJson(
+                new[]
+                {
+                    "direct_transport_shadow_multipair_v2",
+                    "direct_transport_shadow_v1",
+                    "direct_signaling_v1"
+                },
+                directRoutingPermitted: false,
+                signingKey,
+                signingKeyId: signingKeyId);
+
+            ScriptedHttpHandler Handler(string configJson) => new(request => request.Path switch
+            {
+                ProductionDirectTransportSignalingClient.ConfigPath =>
+                    JsonResponse(HttpStatusCode.OK, configJson),
+                ProductionDirectTransportSignalingClient.TicketPath =>
+                    JsonResponse(HttpStatusCode.Created, ticketJson),
+                _ => throw new InvalidOperationException("Unexpected direct HTTP endpoint.")
+            });
+
+            using var identity = DeviceIdentity.Generate();
+            await using (var routedClient = new ProductionDirectTransportSignalingClient(
+                "https://routed-config.example.test",
+                local,
+                identity,
+                _ => Task.FromResult("token"),
+                enabled: true,
+                httpHandler: Handler(routedConfigJson),
+                clockMilliseconds: () => now,
+                multipairV2Enabled: true,
+                directDataV1Enabled: true))
+            {
+                var config = await routedClient.FetchConfigAsync().ConfigureAwait(false);
+                Require(config.Status == ProductionDirectSignalingCallStatus.Success &&
+                        config.Value.DirectRoutingPermitted &&
+                        ProductionDirectTransportSignalingClient.HasMultipairShadowCapabilities(
+                            config.Value) &&
+                        ProductionDirectTransportSignalingClient.HasDirectDataCapabilities(
+                            config.Value),
+                    "A routed data capability disabled the independent Shadow ticket path.");
+                var ticket = await routedClient.IssueTicketAsync(peer, connection, config.Value)
+                    .ConfigureAwait(false);
+                Require(ticket.Status == ProductionDirectSignalingCallStatus.Success,
+                    "A routed server config prevented the Shadow client from issuing a ticket.");
+            }
+
+            var legacyDataOnlyConfigJson = ConfigJson(
+                new[]
+                {
+                    "direct_transport_data_v1",
+                    "direct_transport_shadow_multipair_v2",
+                    "direct_signaling_v1",
+                    "direct_transport_shadow_v1"
+                },
+                directRoutingPermitted: true,
+                signingKey,
+                signingKeyId: signingKeyId);
+            await using (var legacyDataOnlyClient = new ProductionDirectTransportSignalingClient(
+                "https://legacy-data-config.example.test",
+                local,
+                identity,
+                _ => Task.FromResult("token"),
+                enabled: true,
+                httpHandler: Handler(legacyDataOnlyConfigJson),
+                clockMilliseconds: () => now,
+                multipairV2Enabled: true,
+                directDataV1Enabled: true))
+            {
+                var config = await legacyDataOnlyClient.FetchConfigAsync().ConfigureAwait(false);
+                Require(config.Status == ProductionDirectSignalingCallStatus.Success &&
+                        ProductionDirectTransportSignalingClient.HasMultipairShadowCapabilities(
+                            config.Value) &&
+                        !ProductionDirectTransportSignalingClient.HasDirectDataCapabilities(
+                            config.Value),
+                    "A legacy data-only config was not contained to the Shadow path.");
+            }
+
+            await using (var shadowClient = new ProductionDirectTransportSignalingClient(
+                "https://shadow-config.example.test",
+                local,
+                identity,
+                _ => Task.FromResult("token"),
+                enabled: true,
+                httpHandler: Handler(shadowConfigJson),
+                clockMilliseconds: () => now,
+                multipairV2Enabled: true))
+            {
+                var config = await shadowClient.FetchConfigAsync().ConfigureAwait(false);
+                Require(config.Status == ProductionDirectSignalingCallStatus.Success &&
+                        !config.Value.DirectRoutingPermitted &&
+                        ProductionDirectTransportSignalingClient.HasMultipairShadowCapabilities(
+                            config.Value) &&
+                        !ProductionDirectTransportSignalingClient.HasDirectDataCapabilities(
+                            config.Value),
+                    "Withdrawing direct data also disabled the independent Shadow path.");
+                var ticket = await shadowClient.IssueTicketAsync(peer, connection, config.Value)
+                    .ConfigureAwait(false);
+                Require(ticket.Status == ProductionDirectSignalingCallStatus.Success,
+                    "Withdrawing direct data prevented the Shadow client from issuing a ticket.");
+            }
         }
 
         private static async Task ValidateIndependentSignalHandshakeAndFramesAsync()
@@ -335,6 +472,221 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
                 "An unnegotiated type-12 signal crossed the v1 signalling boundary.");
         }
 
+        private static async Task ValidateDirectDataSignalNegotiationAsync()
+        {
+            var local = Guid.NewGuid();
+            var peer = Guid.NewGuid();
+            var connection = NewVersion4Guid();
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            using var identity = DeviceIdentity.Generate();
+
+            var unadvertisedSocket = new ScriptedSignalSocket();
+            unadvertisedSocket.EnqueueText(
+                "{\"type\":\"SERVER_WELCOME\",\"protocol_version\":1," +
+                "\"capabilities\":[\"direct_transport_shadow_v1\"," +
+                "\"direct_transport_data_v1\",\"direct_session_cutover_v1\"]," +
+                "\"heartbeat_interval_ms\":15000,\"max_signal_frame_bytes\":65536}");
+            await using (var unadvertisedClient = new ProductionDirectTransportSignalingClient(
+                "https://unadvertised-data.example.test", local, identity,
+                _ => Task.FromResult("token"), enabled: true,
+                httpHandler: new ScriptedHttpHandler(_ => throw new InvalidOperationException()),
+                socketFactory: new ScriptedSocketFactory(() => unadvertisedSocket),
+                clockMilliseconds: () => now))
+            {
+                Require(unadvertisedClient.Start(), "The unadvertised-data fixture did not start.");
+                await WaitUntilAsync(
+                    () => unadvertisedClient.Snapshot.State == ProductionDirectSignalingLaneState.Fault,
+                    TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                var hello = Encoding.UTF8.GetString(
+                    unadvertisedSocket.Sent.Single(frame => frame.Type == WebSocketMessageType.Text).Payload);
+                Require(!hello.Contains("direct_transport_data_v1", StringComparison.Ordinal) &&
+                        !hello.Contains("direct_session_cutover_v1", StringComparison.Ordinal) &&
+                        unadvertisedClient.Snapshot.Fault ==
+                            ProductionDirectSignalingFaultCode.SignalProtocolRejected &&
+                        !unadvertisedClient.Snapshot.DirectDataV1Negotiated,
+                    "The signalling lane accepted a data capability it did not advertise.");
+            }
+
+            foreach (var invalidCapabilities in new[]
+            {
+                "\"direct_transport_shadow_v1\",\"direct_transport_data_v1\"," +
+                    "\"direct_session_cutover_v1\",\"direct_transport_data_v1\"",
+                "\"direct_transport_shadow_v1\",\"direct_transport_data_v1\"," +
+                    "\"direct_session_cutover_v1\",\"direct_future_v1\"",
+                "\"direct_transport_shadow_v1\",\"direct_session_cutover_v1\""
+            })
+            {
+                var invalidSocket = new ScriptedSignalSocket();
+                invalidSocket.EnqueueText(
+                    "{\"type\":\"SERVER_WELCOME\",\"protocol_version\":1," +
+                    "\"capabilities\":[" + invalidCapabilities + "]," +
+                    "\"heartbeat_interval_ms\":15000,\"max_signal_frame_bytes\":65536}");
+                await using var invalidClient = new ProductionDirectTransportSignalingClient(
+                    "https://invalid-data-welcome.example.test", local, identity,
+                    _ => Task.FromResult("token"), enabled: true,
+                    httpHandler: new ScriptedHttpHandler(_ => throw new InvalidOperationException()),
+                    socketFactory: new ScriptedSocketFactory(() => invalidSocket),
+                    clockMilliseconds: () => now,
+                    directDataV1Enabled: true);
+                Require(invalidClient.Start(), "The invalid data-Welcome fixture did not start.");
+                await WaitUntilAsync(
+                    () => invalidClient.Snapshot.State == ProductionDirectSignalingLaneState.Fault,
+                    TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                Require(invalidClient.Snapshot.Fault ==
+                        ProductionDirectSignalingFaultCode.SignalProtocolRejected &&
+                        !invalidClient.Snapshot.DirectDataV1Negotiated,
+                    "A duplicate or unknown data-Welcome capability was accepted.");
+            }
+
+            var legacyDataOnlySocket = new ScriptedSignalSocket();
+            legacyDataOnlySocket.EnqueueText(
+                "{\"type\":\"SERVER_WELCOME\",\"protocol_version\":1," +
+                "\"capabilities\":[\"direct_transport_shadow_v1\"," +
+                "\"direct_transport_shadow_multipair_v2\",\"direct_transport_data_v1\"]," +
+                "\"heartbeat_interval_ms\":15000,\"max_signal_frame_bytes\":65536}");
+            var legacyConnected = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            await using (var legacyDataOnlyClient = new ProductionDirectTransportSignalingClient(
+                "https://legacy-data-welcome.example.test", local, identity,
+                _ => Task.FromResult("token"), enabled: true,
+                httpHandler: new ScriptedHttpHandler(_ => throw new InvalidOperationException()),
+                socketFactory: new ScriptedSocketFactory(() => legacyDataOnlySocket),
+                clockMilliseconds: () => now,
+                multipairV2Enabled: true,
+                directDataV1Enabled: true))
+            {
+                legacyDataOnlyClient.StateChanged += state =>
+                {
+                    if (state.State == ProductionDirectSignalingLaneState.Connected)
+                        legacyConnected.TrySetResult(true);
+                };
+                Require(legacyDataOnlyClient.Start(),
+                    "The legacy data-only signalling fixture did not start.");
+                await legacyConnected.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                Require(legacyDataOnlyClient.Snapshot.DirectDataV1Negotiated &&
+                        !legacyDataOnlyClient.Snapshot.DirectSessionCutoverV1Negotiated &&
+                        !legacyDataOnlyClient.Snapshot.DirectDataPlaneV1Negotiated,
+                    "A legacy data-only Welcome was promoted to session-safe Direct.");
+                var rejected = Signal(connection, local, peer, now, sequence: 1);
+                rejected.SignalType = TransportSignalTypeV1.CutoverProposal;
+                Require(!legacyDataOnlyClient.TrySend(rejected) &&
+                        legacyDataOnlyClient.Snapshot.Fault ==
+                            ProductionDirectSignalingFaultCode.SignalFrameRejected,
+                    "A data-only signalling generation emitted a cutover control frame.");
+            }
+
+            var first = new ScriptedSignalSocket();
+            first.EnqueueText(
+                "{\"type\":\"SERVER_WELCOME\",\"protocol_version\":1," +
+                "\"capabilities\":[\"direct_transport_shadow_v1\"," +
+                "\"direct_transport_shadow_multipair_v2\",\"direct_transport_data_v1\"," +
+                "\"direct_session_cutover_v1\"]," +
+                "\"heartbeat_interval_ms\":15000,\"max_signal_frame_bytes\":65536}");
+            var second = new ScriptedSignalSocket();
+            second.EnqueueText(
+                "{\"type\":\"SERVER_WELCOME\",\"protocol_version\":1," +
+                "\"capabilities\":[\"direct_transport_shadow_v1\"," +
+                "\"direct_transport_shadow_multipair_v2\"]," +
+                "\"heartbeat_interval_ms\":15000,\"max_signal_frame_bytes\":65536}");
+            var sockets = new Queue<ScriptedSignalSocket>(new[] { first, second });
+            var factory = new ScriptedSocketFactory(() => sockets.Dequeue());
+            var states = new ConcurrentQueue<ProductionDirectSignalingSnapshot>();
+            var dataConnected = new TaskCompletionSource<long>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var shadowConnected = new TaskCompletionSource<long>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var client = new ProductionDirectTransportSignalingClient(
+                "https://negotiated-data.example.test", local, identity,
+                _ => Task.FromResult("token"), enabled: true,
+                httpHandler: new ScriptedHttpHandler(_ => throw new InvalidOperationException()),
+                socketFactory: factory,
+                clockMilliseconds: () => now,
+                retryJitter: _ => TimeSpan.Zero,
+                retryDelay: (_, _) => Task.CompletedTask,
+                multipairV2Enabled: true,
+                directDataV1Enabled: true);
+            client.StateChanged += state =>
+            {
+                states.Enqueue(state);
+                if (state.State != ProductionDirectSignalingLaneState.Connected) return;
+                if (state.DirectDataPlaneV1Negotiated)
+                    dataConnected.TrySetResult(state.Generation);
+                else
+                    shadowConnected.TrySetResult(state.Generation);
+            };
+            Require(client.Start(), "The direct-data signalling fixture did not start.");
+            var firstGeneration = await dataConnected.Task.WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            var helloText = Encoding.UTF8.GetString(
+                first.Sent.Single(frame => frame.Type == WebSocketMessageType.Text).Payload);
+            using (var hello = JsonDocument.Parse(helloText))
+            {
+                var advertised = hello.RootElement.GetProperty("capabilities")
+                    .EnumerateArray().Select(value => value.GetString()).ToArray();
+                Require(advertised.Count(value => value == "direct_transport_data_v1") == 1 &&
+                        advertised.Count(value => value == "direct_session_cutover_v1") == 1,
+                    "The enabled signalling lane did not advertise the data/session pair exactly once.");
+            }
+            var dataTypes = new[]
+            {
+                TransportSignalTypeV1.CutoverProposal,
+                TransportSignalTypeV1.CutoverAccept,
+                TransportSignalTypeV1.CutoverCommit,
+                TransportSignalTypeV1.Fallback
+            };
+            for (var index = 0; index < dataTypes.Length; index++)
+            {
+                var signal = Signal(connection, local, peer, now, (ulong)index + 1);
+                signal.SignalType = dataTypes[index];
+                Require(client.TrySend(signal),
+                    "A negotiated direct-data control signal was rejected.");
+            }
+            await WaitUntilAsync(
+                () => first.Sent.Count(frame => frame.Type == WebSocketMessageType.Binary) ==
+                    dataTypes.Length,
+                TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+
+            var incoming = Signal(connection, peer, local, now, sequence: 1);
+            incoming.SignalType = TransportSignalTypeV1.CutoverProposal;
+            first.EnqueueBinary(incoming.ToByteArray());
+            using (var readTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+            {
+                TransportSignalEnvelopeV1 received = null;
+                await foreach (var value in client.ReadSignalsAsync(readTimeout.Token).ConfigureAwait(false))
+                {
+                    received = value;
+                    break;
+                }
+                Require(received?.SignalType == TransportSignalTypeV1.CutoverProposal,
+                    "A negotiated inbound direct-data control signal was rejected.");
+            }
+
+            first.EnqueueClose(WebSocketCloseStatus.NormalClosure);
+            var secondGeneration = await shadowConnected.Task.WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Require(secondGeneration > firstGeneration && factory.CreateCount == 2 &&
+                    states.Any(state =>
+                        state.Generation == secondGeneration &&
+                        state.State == ProductionDirectSignalingLaneState.Connecting &&
+                        !state.DirectDataV1Negotiated) &&
+                    client.Snapshot.State == ProductionDirectSignalingLaneState.Connected &&
+                    !client.Snapshot.DirectDataV1Negotiated &&
+                    !client.Snapshot.DirectSessionCutoverV1Negotiated &&
+                    !client.Snapshot.DirectDataPlaneV1Negotiated,
+                "Direct-data negotiation escaped its physical socket generation.");
+
+            var shadowSignal = Signal(connection, local, peer, now, sequence: 5);
+            shadowSignal.SignalType = TransportSignalTypeV1.PathClose;
+            Require(client.TrySend(shadowSignal),
+                "A missing data echo disabled the connected Shadow signalling lane.");
+            var unnegotiatedCutover = Signal(connection, local, peer, now, sequence: 6);
+            unnegotiatedCutover.SignalType = TransportSignalTypeV1.CutoverProposal;
+            Require(!client.TrySend(unnegotiatedCutover) &&
+                    client.Snapshot.Fault == ProductionDirectSignalingFaultCode.SignalFrameRejected &&
+                    !client.Snapshot.DirectDataPlaneV1Negotiated,
+                "An unnegotiated generation emitted a direct-data control signal.");
+        }
+
         private static async Task ValidateStrictConfigAndHttpFaultsAsync()
         {
             using var identity = DeviceIdentity.Generate();
@@ -366,10 +718,43 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
                         directRoutingPermitted: false,
                         signingKey)),
                 (
-                    Name: "direct routing permission",
+                    Name: "routing permission without data capability",
                     Json: ConfigJson(
                         new[] { "direct_signaling_v1", "direct_transport_shadow_v1" },
                         directRoutingPermitted: true,
+                        signingKey)),
+                (
+                    Name: "data capability without routing permission",
+                    Json: ConfigJson(
+                        new[]
+                        {
+                            "direct_signaling_v1",
+                            "direct_transport_shadow_v1",
+                            "direct_transport_data_v1"
+                        },
+                        directRoutingPermitted: false,
+                        signingKey)),
+                (
+                    Name: "session cutover capability without data capability",
+                    Json: ConfigJson(
+                        new[]
+                        {
+                            "direct_signaling_v1",
+                            "direct_transport_shadow_v1",
+                            "direct_session_cutover_v1"
+                        },
+                        directRoutingPermitted: false,
+                        signingKey)),
+                (
+                    Name: "duplicate capability",
+                    Json: ConfigJson(
+                        new[]
+                        {
+                            "direct_signaling_v1",
+                            "direct_transport_shadow_v1",
+                            "direct_signaling_v1"
+                        },
+                        directRoutingPermitted: false,
                         signingKey)),
                 (
                     Name: "unknown JSON field",
@@ -654,7 +1039,8 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
             string[] capabilities,
             bool directRoutingPermitted,
             string signingKey,
-            bool includeUnknownField = false)
+            bool includeUnknownField = false,
+            string signingKeyId = "direct-v1")
         {
             var config = new Dictionary<string, object>
             {
@@ -665,7 +1051,7 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
                 {
                     new
                     {
-                        key_id = "direct-v1",
+                        key_id = signingKeyId,
                         algorithm = "Ed25519",
                         public_key = signingKey
                     }
@@ -851,6 +1237,12 @@ namespace TermLink.ProductionDirectTransportSignaling.Validation
 
             public void EnqueueBinary(byte[] value) => incoming.Writer.TryWrite(
                 new ProductionDirectSignalSocketMessage(WebSocketMessageType.Binary, value));
+
+            public void EnqueueClose(WebSocketCloseStatus status) => incoming.Writer.TryWrite(
+                new ProductionDirectSignalSocketMessage(
+                    WebSocketMessageType.Close,
+                    Array.Empty<byte>(),
+                    status));
 
             public void Abort()
             {

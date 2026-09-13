@@ -69,6 +69,7 @@ add_custom_command(
         "${TERMLINK_DIRECT_CORE_ROOT}/include/termlink_direct_ffi_v2.h"
         "${TERMLINK_DIRECT_CORE_ROOT}/include/termlink_direct_ffi_v3.h"
         "${TERMLINK_DIRECT_CORE_ROOT}/include/termlink_direct_ffi_v4.h"
+        "${TERMLINK_DIRECT_CORE_ROOT}/include/termlink_direct_ffi_v5.h"
     COMMENT "Building TermLink direct Rust static library for ${ANDROID_ABI}"
     VERBATIM)
 
@@ -76,7 +77,10 @@ add_custom_target(termlink_direct_rust DEPENDS "${RUST_LIBRARY}")
 add_library(termlink_direct_ffi STATIC IMPORTED GLOBAL)
 set_target_properties(termlink_direct_ffi PROPERTIES IMPORTED_LOCATION "${RUST_LIBRARY}")
 
-add_library(termlink_direct_jni SHARED termlink_direct_jni.cpp termlink_direct_jni_v4.cpp)
+add_library(termlink_direct_jni SHARED
+    termlink_direct_jni.cpp
+    termlink_direct_jni_v4.cpp
+    termlink_direct_jni_v5.cpp)
 add_dependencies(termlink_direct_jni termlink_direct_rust)
 target_include_directories(termlink_direct_jni PRIVATE "${TERMLINK_DIRECT_CORE_ROOT}/include")
 target_compile_options(termlink_direct_jni PRIVATE

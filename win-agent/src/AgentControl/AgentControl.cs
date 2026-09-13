@@ -333,7 +333,8 @@ namespace TermLink.Agent
         RegisterAccount = 14,
         SignOutAccount = 15,
         SaveTerminalCommands = 16,
-        BeginAccountAuthorization = 17
+        BeginAccountAuthorization = 17,
+        ConfigureServer = 18
     }
 
     public sealed class RegistryRequest
@@ -351,6 +352,7 @@ namespace TermLink.Agent
         public string AccountPassword { get; set; }
         public string AccountPasswordConfirmation { get; set; }
         public string PcName { get; set; }
+        public string ServerUrl { get; set; }
         public IList<ProductionTerminalCommandSummary> TerminalCommands { get; set; }
         public long AuthenticationTimestampUnixSeconds { get; set; }
         public byte[] AuthenticationNonce { get; set; }
@@ -406,12 +408,36 @@ namespace TermLink.Agent
         public string TrustState { get; set; }
     }
 
+    public static class ProductionSessionCarrier
+    {
+        public const string Relay = "RELAY";
+        public const string NegotiatingDirect = "NEGOTIATING_DIRECT";
+        public const string LanDirect = "LAN_DIRECT";
+        public const string NatDirect = "NAT_DIRECT";
+
+        public static string Normalize(string value)
+        {
+            switch ((value ?? string.Empty).Trim().ToUpperInvariant())
+            {
+                case NegotiatingDirect:
+                    return NegotiatingDirect;
+                case LanDirect:
+                    return LanDirect;
+                case NatDirect:
+                    return NatDirect;
+                default:
+                    return Relay;
+            }
+        }
+    }
+
     public sealed class ProductionSessionSummary
     {
         public Guid SessionId { get; set; }
         public int ViewerCount { get; set; }
         public Guid? ControllerDeviceId { get; set; }
         public DateTime? LeaseExpiresAtUtc { get; set; }
+        public string Carrier { get; set; } = ProductionSessionCarrier.Relay;
     }
 
     public sealed class ProductionTerminalCommandSummary
@@ -481,7 +507,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 11;
+        public const byte CurrentVersion = 12;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -499,6 +525,8 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Registry account and command settings require control V8.");
             if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
                 throw new InvalidDataException("Browser account authorization requires control V11.");
+            if (version < 12 && request.Command == RegistryCommand.ConfigureServer)
+                throw new InvalidDataException("Server configuration requires control V12.");
             request.ProtocolVersion = version;
             using (var body = new MemoryStream())
             using (var writer = new BinaryWriter(body, Encoding.UTF8))
@@ -632,6 +660,9 @@ namespace TermLink.Agent
                 case RegistryCommand.BeginAccountAuthorization:
                     WriteString(writer, request.PcName ?? string.Empty);
                     break;
+                case RegistryCommand.ConfigureServer:
+                    WriteString(writer, request.ServerUrl ?? string.Empty);
+                    break;
                 case RegistryCommand.SaveTerminalCommands:
                     var commands = request.TerminalCommands ?? new List<ProductionTerminalCommandSummary>();
                     var maximumCommands = version >= 9 ? 24 : 20;
@@ -664,6 +695,8 @@ namespace TermLink.Agent
             var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
             if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
                 throw new InvalidDataException("Browser account authorization requires control V11.");
+            if (version < 12 && request.Command == RegistryCommand.ConfigureServer)
+                throw new InvalidDataException("Server configuration requires control V12.");
             switch (request.Command)
             {
                 case RegistryCommand.Register:
@@ -706,6 +739,9 @@ namespace TermLink.Agent
                     break;
                 case RegistryCommand.BeginAccountAuthorization:
                     request.PcName = ReadString(reader);
+                    break;
+                case RegistryCommand.ConfigureServer:
+                    request.ServerUrl = ReadString(reader);
                     break;
                 case RegistryCommand.SaveTerminalCommands:
                     var count = reader.ReadInt32();
@@ -919,6 +955,8 @@ namespace TermLink.Agent
                 writer.Write(session.ControllerDeviceId.HasValue);
                 if (session.ControllerDeviceId.HasValue) WriteGuid(writer, session.ControllerDeviceId.Value);
                 WriteOptionalDateTime(writer, session.LeaseExpiresAtUtc);
+                if (version >= 12)
+                    WriteString(writer, ProductionSessionCarrier.Normalize(session.Carrier));
             }
             writer.Write(status.PairingChallenge != null);
             if (status.PairingChallenge != null)
@@ -1007,6 +1045,9 @@ namespace TermLink.Agent
                 if (session.ViewerCount < 0 || session.ViewerCount > 1000) throw new InvalidDataException("Invalid viewer count.");
                 if (reader.ReadBoolean()) session.ControllerDeviceId = ReadGuid(reader);
                 session.LeaseExpiresAtUtc = ReadOptionalDateTime(reader);
+                session.Carrier = version >= 12
+                    ? ProductionSessionCarrier.Normalize(ReadString(reader))
+                    : ProductionSessionCarrier.Relay;
                 sessions.Add(session);
             }
             status.Sessions = sessions;

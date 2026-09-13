@@ -208,6 +208,9 @@ internal static class Program
             var localFrameType = Type(assembly, "TermLink.LocalIpc.LocalFrame");
             var localFrameKindType = Type(assembly, "TermLink.LocalIpc.LocalFrameType");
             var payloadCodecType = Type(assembly, "TermLink.LocalIpc.LocalPayloadCodec");
+            var hostHistoryDataPlaneEnabled = (bool)Field(
+                runtimeType,
+                "HostHistoryDataPlaneEnabled").GetValue(null)!;
 
             var backlogSession = Guid.Parse("00000000-0000-4000-8000-000000000010");
             var terminalSession = Guid.Parse("00000000-0000-4000-8000-000000000020");
@@ -383,6 +386,28 @@ internal static class Program
                     pendingOnlyProduction,
                     CancellationToken.None
                 });
+            if (hostHistoryDataPlaneEnabled)
+            {
+                Require(pendingOnlyDurable &&
+                    !handler.Operations.Skip(operationCountBeforePending).Any(value =>
+                        value == "CHUNK" || value == "SNAPSHOT" || value == "TRANSCRIPT" ||
+                        value == "CURSOR"),
+                    "The PC-owned history path attempted a server archival operation: " +
+                    string.Join(", ", handler.Operations));
+                var localOutputDurable = await InvokeBooleanTask(
+                    uploadHistory,
+                    runtime,
+                    new object[] { sessionId, events, production, CancellationToken.None });
+                Require(localOutputDurable &&
+                    !handler.Operations.Any(value =>
+                        value == "CHUNK" || value == "SNAPSHOT" || value == "TRANSCRIPT" ||
+                        value == "CURSOR"),
+                    "PC-owned history was not retained locally without server object storage: " +
+                    string.Join(", ", handler.Operations));
+                Console.WriteLine(
+                    "Production PC-owned history ordering and server-archive exclusion validation passed.");
+                return 0;
+            }
             Require(!pendingOnlyDurable &&
                 !handler.Operations.Skip(operationCountBeforePending).Any(value =>
                     value == "CHUNK" || value == "SNAPSHOT" || value == "TRANSCRIPT"),
@@ -516,7 +541,7 @@ internal static class Program
         assembly.GetType(name, throwOnError: true);
 
     private static FieldInfo Field(Type type, string name) =>
-        type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
+        type.GetField(name, BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic)
         ?? throw new InvalidOperationException("Missing field: " + name);
 
     private static MethodInfo Method(

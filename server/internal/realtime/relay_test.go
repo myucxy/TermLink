@@ -95,6 +95,79 @@ func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 	}
 }
 
+func TestDirectTransportCapabilitiesRequireGateAndCompleteOffer(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		gate           bool
+		offerData      bool
+		offerCutover   bool
+		wantNegotiated bool
+	}{
+		{name: "gate off capabilities absent"},
+		{name: "gate off capabilities offered", offerData: true, offerCutover: true},
+		{name: "gate on capabilities absent", gate: true},
+		{name: "gate on data only", gate: true, offerData: true},
+		{name: "gate on cutover only", gate: true, offerCutover: true},
+		{name: "gate on complete offer", gate: true, offerData: true, offerCutover: true, wantNegotiated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hub := NewHubWithObserverAndOptions(nil, nil, nil, nil, HubOptions{DirectTransportDataV1: test.gate})
+			offered := append([]string(nil), requiredCapabilities...)
+			if test.offerData {
+				offered = append(offered, directTransportDataV1Capability)
+			}
+			if test.offerCutover {
+				offered = append(offered, directSessionCutoverV1Capability)
+			}
+			hello := clientHello{Role: "android", ProtocolVersions: []uint32{realtimewire.ProtocolVersion}, Capabilities: offered}
+			if !validHello(hello) {
+				t.Fatal("optional Direct data capability changed Relay hello validity")
+			}
+			negotiated := hub.negotiatedCapabilities(hello.Capabilities)
+			if got := containsRelayCapability(negotiated, directTransportDataV1Capability); got != test.wantNegotiated {
+				t.Fatalf("Direct data negotiated=%t, want %t; capabilities=%v", got, test.wantNegotiated, negotiated)
+			}
+			if got := containsRelayCapability(negotiated, directSessionCutoverV1Capability); got != test.wantNegotiated {
+				t.Fatalf("Session cutover negotiated=%t, want %t; capabilities=%v", got, test.wantNegotiated, negotiated)
+			}
+			for _, required := range requiredCapabilities {
+				if !containsRelayCapability(negotiated, required) {
+					t.Fatalf("Relay capability %q was withdrawn: %v", required, negotiated)
+				}
+			}
+		})
+	}
+}
+
+func TestDirectTransportDataNegotiationIsConnectionLocalAndIgnoresUnknownCapabilities(t *testing.T) {
+	hub := NewHubWithObserverAndOptions(nil, nil, nil, nil, HubOptions{DirectTransportDataV1: true})
+	withDirect := append(
+		append([]string(nil), requiredCapabilities...),
+		directTransportDataV1Capability,
+		directSessionCutoverV1Capability,
+		"unknown_future_transport",
+	)
+	first := hub.negotiatedCapabilities(withDirect)
+	if !containsRelayCapability(first, directTransportDataV1Capability) {
+		t.Fatalf("offered Direct data capability was not negotiated: %v", first)
+	}
+	if !containsRelayCapability(first, directSessionCutoverV1Capability) {
+		t.Fatalf("offered session cutover capability was not negotiated: %v", first)
+	}
+	if containsRelayCapability(first, "unknown_future_transport") {
+		t.Fatalf("unknown capability was echoed in Welcome negotiation: %v", first)
+	}
+
+	second := hub.negotiatedCapabilities(append([]string(nil), requiredCapabilities...))
+	if containsRelayCapability(second, directTransportDataV1Capability) ||
+		containsRelayCapability(second, directSessionCutoverV1Capability) {
+		t.Fatalf("one connection's offer leaked into another negotiation: %v", second)
+	}
+	if !validHello(clientHello{Role: "pc", ProtocolVersions: []uint32{realtimewire.ProtocolVersion}, Capabilities: append([]string(nil), requiredCapabilities...)}) {
+		t.Fatal("a client without the optional capability could not connect to Relay")
+	}
+}
+
 func TestNegotiatedLivenessProbeRoundTripsThroughSingleWriter(t *testing.T) {
 	serverSocket, clientSocket := newRelayWebSocketPair(t)
 	hub := NewHubWithObserver(nil, nil, nil, nil)

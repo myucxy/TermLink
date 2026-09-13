@@ -473,9 +473,29 @@ namespace TermLink.Agent
                 out hasMore);
         }
 
+        internal bool TryGetRemoteInputIdentity(
+            Guid inputId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256)
+        {
+            return inputDeduplicator.TryGetIdentity(
+                inputId,
+                out senderDeviceId,
+                out envelopeSha256);
+        }
+
+        internal bool TryFindRemoteInputResult(
+            Guid inputId,
+            out LocalFrame resultFrame)
+        {
+            return eventBuffer.TryFindRemoteInputResult(inputId, out resultFrame);
+        }
+
         internal void DeleteBufferedEvents()
         {
             eventBuffer.DeleteAll();
+            inputDeduplicator.DeletePersistentState();
+            commandSequenceStore.DeletePersistentState();
         }
 
         public void RequestRemoteStop()
@@ -652,6 +672,14 @@ namespace TermLink.Agent
                 {
                     eventBuffer.Append(frame);
                     persistedFrames++;
+                    if (frame.Type == LocalFrameType.RemoteInputResult)
+                    {
+                        LocalRemoteInputResult ignoredResult;
+                        var completedInputId = LocalPayloadCodec.ParseRemoteInputResult(
+                            frame.Payload,
+                            out ignoredResult);
+                        inputDeduplicator.MarkCompleted(completedInputId);
+                    }
                     if (committedFrame != null)
                     {
                         try { committedFrame(frame); }
@@ -772,12 +800,49 @@ namespace TermLink.Agent
 
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
-            if (inputId == Guid.Empty || bytes == null || bytes.Length == 0) return false;
+            return DispatchRemoteInput(inputId, expectedLocalInputEpoch, bytes) ==
+                RemoteInputDispatchOutcome.Enqueued;
+        }
+
+        public RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes)
+        {
+            return DispatchRemoteInput(
+                inputId,
+                expectedLocalInputEpoch,
+                bytes,
+                Guid.Empty,
+                null);
+        }
+
+        internal RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes,
+            Guid senderDeviceId,
+            byte[] envelopeSha256)
+        {
+            if (inputId == Guid.Empty || bytes == null || bytes.Length == 0)
+                return RemoteInputDispatchOutcome.Unavailable;
             lock (commandSync)
             {
+                // The same authenticated input may arrive through Relay and
+                // Direct during the cutover grace period. Keep the first copy
+                // authoritative and let its durable result satisfy the retry.
+                if (inputDeduplicator.Contains(inputId))
+                    return RemoteInputDispatchOutcome.Duplicate;
                 NamedPipeServerStream pipe;
                 lock (statusSync) pipe = connectedPipe;
-                if (pipe == null || !pipe.IsConnected || !inputDeduplicator.TryAccept(inputId)) return false;
+                if (pipe == null || !pipe.IsConnected)
+                    return RemoteInputDispatchOutcome.Unavailable;
+                if (!inputDeduplicator.TryAccept(inputId, senderDeviceId, envelopeSha256))
+                {
+                    return inputDeduplicator.Contains(inputId)
+                        ? RemoteInputDispatchOutcome.Duplicate
+                        : RemoteInputDispatchOutcome.Unavailable;
+                }
                 nextCommandSequence = checked(nextCommandSequence + 1);
                 commandSequenceStore.Save(nextCommandSequence);
                 try
@@ -788,22 +853,47 @@ namespace TermLink.Agent
                         nextCommandSequence,
                         LocalPayloadCodec.RemoteInput(inputId, expectedLocalInputEpoch, bytes)));
                     acceptedInputs++;
-                    return true;
+                    return RemoteInputDispatchOutcome.Enqueued;
                 }
-                catch (IOException) { return false; }
-                catch (ObjectDisposedException) { return false; }
+                catch (IOException)
+                {
+                    // A named-pipe failure can occur after a partial write. Do
+                    // not roll back the persistent at-most-once fence and risk
+                    // writing the command twice on a later carrier retry.
+                    return RemoteInputDispatchOutcome.Duplicate;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return RemoteInputDispatchOutcome.Duplicate;
+                }
             }
         }
 
         public bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result)
         {
+            return TrySendRemoteInputRejection(inputId, result, Guid.Empty, null);
+        }
+
+        internal bool TrySendRemoteInputRejection(
+            Guid inputId,
+            LocalRemoteInputResult result,
+            Guid senderDeviceId,
+            byte[] envelopeSha256)
+        {
             if (inputId == Guid.Empty || result == LocalRemoteInputResult.Accepted ||
                 !Enum.IsDefined(typeof(LocalRemoteInputResult), result) || !remoteInputRejectSupported) return false;
+            if (senderDeviceId == Guid.Empty && envelopeSha256 != null)
+                return false;
+            if (senderDeviceId != Guid.Empty &&
+                (envelopeSha256 == null || envelopeSha256.Length != 32))
+                return false;
             lock (commandSync)
             {
                 NamedPipeServerStream pipe;
                 lock (statusSync) pipe = connectedPipe;
                 if (pipe == null || !pipe.IsConnected) return false;
+                if (!inputDeduplicator.TryAccept(inputId, senderDeviceId, envelopeSha256))
+                    return false;
                 nextCommandSequence = checked(nextCommandSequence + 1);
                 commandSequenceStore.Save(nextCommandSequence);
                 try
@@ -962,10 +1052,26 @@ namespace TermLink.Agent
     internal sealed class InputDeduplicator : IDisposable
     {
         private const int MaximumEntries = 4096;
+        // TLD2 keeps the original input fence together with the authenticated
+        // sender and exact Relay Envelope digest. The old four-byte count-only
+        // format remains readable, but entries loaded from it deliberately
+        // have no replay identity and therefore cannot cross an auth boundary.
+        private const uint CurrentFormatMarker = 0x32444c54; // "TLD2" in LE.
+        private const int EntryBytes = 16 + 16 + 32 + 1;
+        private readonly object sync = new object();
         private readonly string path;
         private readonly byte[] entropy;
         private readonly List<Guid> ordered = new List<Guid>();
         private readonly HashSet<Guid> known = new HashSet<Guid>();
+        private readonly Dictionary<Guid, InputReplayIdentity> identities =
+            new Dictionary<Guid, InputReplayIdentity>();
+
+        private sealed class InputReplayIdentity
+        {
+            public Guid SenderDeviceId;
+            public byte[] EnvelopeSha256;
+            public bool Completed;
+        }
 
         public InputDeduplicator(string bufferDirectory, Guid sessionId)
         {
@@ -977,57 +1083,252 @@ namespace TermLink.Agent
 
         public bool TryAccept(Guid inputId)
         {
+            return TryAccept(inputId, Guid.Empty, null);
+        }
+
+        internal bool TryAccept(Guid inputId, Guid senderDeviceId, byte[] envelopeSha256)
+        {
             if (inputId == Guid.Empty) throw new ArgumentException("input ID is required", "inputId");
-            if (known.Contains(inputId)) return false;
-            known.Add(inputId);
-            ordered.Add(inputId);
-            while (ordered.Count > MaximumEntries)
+            if (senderDeviceId == Guid.Empty && envelopeSha256 != null)
+                throw new ArgumentException("sender device is required for an Envelope digest", "senderDeviceId");
+            if (senderDeviceId != Guid.Empty &&
+                (envelopeSha256 == null || envelopeSha256.Length != 32))
             {
-                known.Remove(ordered[0]);
-                ordered.RemoveAt(0);
+                throw new ArgumentException("Envelope digest must be SHA-256", "envelopeSha256");
             }
-            Save();
-            return true;
+            lock (sync)
+            {
+                if (known.Contains(inputId)) return false;
+                if (known.Count >= MaximumEntries && !EvictCompletedLocked()) return false;
+                known.Add(inputId);
+                ordered.Add(inputId);
+                if (senderDeviceId != Guid.Empty)
+                {
+                    identities[inputId] = new InputReplayIdentity
+                    {
+                        SenderDeviceId = senderDeviceId,
+                        EnvelopeSha256 = (byte[])envelopeSha256.Clone()
+                    };
+                }
+                while (ordered.Count > MaximumEntries)
+                {
+                    var evicted = ordered[0];
+                    known.Remove(evicted);
+                    InputReplayIdentity identity;
+                    if (identities.TryGetValue(evicted, out identity))
+                    {
+                        if (identity.EnvelopeSha256 != null)
+                            Array.Clear(identity.EnvelopeSha256, 0, identity.EnvelopeSha256.Length);
+                        identities.Remove(evicted);
+                    }
+                    ordered.RemoveAt(0);
+                }
+                Save();
+                return true;
+            }
+        }
+
+        public bool Contains(Guid inputId)
+        {
+            if (inputId == Guid.Empty) throw new ArgumentException("input ID is required", "inputId");
+            lock (sync) return known.Contains(inputId);
+        }
+
+        internal void MarkCompleted(Guid inputId)
+        {
+            if (inputId == Guid.Empty) return;
+            lock (sync)
+            {
+                if (!known.Contains(inputId)) return;
+                InputReplayIdentity identity;
+                if (!identities.TryGetValue(inputId, out identity))
+                {
+                    identity = new InputReplayIdentity();
+                    identities[inputId] = identity;
+                }
+                if (identity.Completed) return;
+                identity.Completed = true;
+                Save();
+            }
+        }
+
+        private bool EvictCompletedLocked()
+        {
+            for (var index = 0; index < ordered.Count; index++)
+            {
+                var candidate = ordered[index];
+                InputReplayIdentity identity;
+                if (!identities.TryGetValue(candidate, out identity) || !identity.Completed)
+                    continue;
+                known.Remove(candidate);
+                ordered.RemoveAt(index);
+                identities.Remove(candidate);
+                if (identity.EnvelopeSha256 != null)
+                    Array.Clear(identity.EnvelopeSha256, 0, identity.EnvelopeSha256.Length);
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Returns whether the input fence exists. A true result with an empty
+        /// sender/digest is a legacy or local entry and must be treated as an
+        /// unknown authenticated identity by the production Relay boundary.
+        /// </summary>
+        internal bool TryGetIdentity(
+            Guid inputId,
+            out Guid senderDeviceId,
+            out byte[] envelopeSha256)
+        {
+            if (inputId == Guid.Empty) throw new ArgumentException("input ID is required", "inputId");
+            senderDeviceId = Guid.Empty;
+            envelopeSha256 = null;
+            lock (sync)
+            {
+                if (!known.Contains(inputId)) return false;
+                InputReplayIdentity identity;
+                if (!identities.TryGetValue(inputId, out identity)) return true;
+                senderDeviceId = identity.SenderDeviceId;
+                envelopeSha256 = identity.EnvelopeSha256 == null
+                    ? null
+                    : (byte[])identity.EnvelopeSha256.Clone();
+                return true;
+            }
         }
 
         private void Load()
         {
             if (!File.Exists(path)) return;
-            var protectedBytes = File.ReadAllBytes(path);
-            var bytes = ProtectedData.Unprotect(protectedBytes, entropy, DataProtectionScope.CurrentUser);
-            if (bytes.Length < 4) throw new InvalidDataException("Invalid input dedupe file.");
-            var count = checked((int)LocalFrameCodec.ReadUInt32(bytes, 0));
-            if (count < 0 || count > MaximumEntries || bytes.Length != 4 + count * 16)
+            byte[] protectedBytes = null;
+            byte[] bytes = null;
+            try
             {
-                throw new InvalidDataException("Invalid input dedupe entry count.");
-            }
-            for (var index = 0; index < count; index++)
-            {
-                var guid = new byte[16];
-                Buffer.BlockCopy(bytes, 4 + index * 16, guid, 0, 16);
-                var value = new Guid(guid);
-                if (value == Guid.Empty || !known.Add(value))
+                protectedBytes = File.ReadAllBytes(path);
+                bytes = ProtectedData.Unprotect(protectedBytes, entropy, DataProtectionScope.CurrentUser);
+                if (bytes.Length < 4) throw new InvalidDataException("Invalid input dedupe file.");
+                var marker = LocalFrameCodec.ReadUInt32(bytes, 0);
+                var current = marker == CurrentFormatMarker;
+                var countOffset = current ? 4 : 0;
+                var dataOffset = current ? 8 : 4;
+                if (current && bytes.Length < 8)
+                    throw new InvalidDataException("Invalid input dedupe format marker.");
+                var count = checked((int)LocalFrameCodec.ReadUInt32(bytes, countOffset));
+                var expectedLength = current
+                    ? checked(8 + count * EntryBytes)
+                    : checked(4 + count * 16);
+                if (count < 0 || count > MaximumEntries || bytes.Length != expectedLength)
+                    throw new InvalidDataException("Invalid input dedupe entry count.");
+                for (var index = 0; index < count; index++)
                 {
-                    throw new InvalidDataException("Invalid input dedupe entry.");
+                    var offset = current
+                        ? checked(dataOffset + index * EntryBytes)
+                        : checked(dataOffset + index * 16);
+                    var guid = new byte[16];
+                    Buffer.BlockCopy(bytes, offset, guid, 0, 16);
+                    var value = new Guid(guid);
+                    Array.Clear(guid, 0, guid.Length);
+                    if (value == Guid.Empty || !known.Add(value))
+                        throw new InvalidDataException("Invalid input dedupe entry.");
+                    ordered.Add(value);
+                    if (!current) continue;
+                    var senderBytes = new byte[16];
+                    Buffer.BlockCopy(bytes, offset + 16, senderBytes, 0, 16);
+                    var sender = new Guid(senderBytes);
+                    Array.Clear(senderBytes, 0, senderBytes.Length);
+                    var digest = new byte[32];
+                    Buffer.BlockCopy(bytes, offset + 32, digest, 0, digest.Length);
+                    var completed = current && bytes[offset + 64] == 1;
+                    if (current && bytes[offset + 64] > 1)
+                    {
+                        Array.Clear(digest, 0, digest.Length);
+                        throw new InvalidDataException("Invalid input dedupe completion marker.");
+                    }
+                    if (sender == Guid.Empty)
+                    {
+                        Array.Clear(digest, 0, digest.Length);
+                        continue;
+                    }
+                    identities[value] = new InputReplayIdentity
+                    {
+                        SenderDeviceId = sender,
+                        EnvelopeSha256 = digest,
+                        Completed = completed
+                    };
                 }
-                ordered.Add(value);
+            }
+            finally
+            {
+                if (bytes != null) Array.Clear(bytes, 0, bytes.Length);
+                if (protectedBytes != null) Array.Clear(protectedBytes, 0, protectedBytes.Length);
             }
         }
 
         private void Save()
         {
-            var bytes = new byte[4 + ordered.Count * 16];
-            LocalFrameCodec.WriteUInt32(bytes, 0, checked((uint)ordered.Count));
-            for (var index = 0; index < ordered.Count; index++)
+            byte[] bytes = null;
+            byte[] protectedBytes = null;
+            try
             {
-                Buffer.BlockCopy(ordered[index].ToByteArray(), 0, bytes, 4 + index * 16, 16);
+                bytes = new byte[8 + ordered.Count * EntryBytes];
+                LocalFrameCodec.WriteUInt32(bytes, 0, CurrentFormatMarker);
+                LocalFrameCodec.WriteUInt32(bytes, 4, checked((uint)ordered.Count));
+                for (var index = 0; index < ordered.Count; index++)
+                {
+                    var offset = checked(8 + index * EntryBytes);
+                    var inputBytes = ordered[index].ToByteArray();
+                    Buffer.BlockCopy(inputBytes, 0, bytes, offset, 16);
+                    Array.Clear(inputBytes, 0, inputBytes.Length);
+                    InputReplayIdentity identity;
+                    if (!identities.TryGetValue(ordered[index], out identity)) continue;
+                    var senderBytes = identity.SenderDeviceId.ToByteArray();
+                    Buffer.BlockCopy(senderBytes, 0, bytes, offset + 16, 16);
+                    Array.Clear(senderBytes, 0, senderBytes.Length);
+                    if (identity.EnvelopeSha256 != null)
+                    {
+                        Buffer.BlockCopy(identity.EnvelopeSha256, 0, bytes, offset + 32, 32);
+                    }
+                    bytes[offset + 64] = identity.Completed ? (byte)1 : (byte)0;
+                }
+                protectedBytes = ProtectedData.Protect(bytes, entropy, DataProtectionScope.CurrentUser);
+                AtomicWrite(path, protectedBytes);
             }
-            var protectedBytes = ProtectedData.Protect(bytes, entropy, DataProtectionScope.CurrentUser);
-            AtomicWrite(path, protectedBytes);
+            finally
+            {
+                if (bytes != null) Array.Clear(bytes, 0, bytes.Length);
+                if (protectedBytes != null) Array.Clear(protectedBytes, 0, protectedBytes.Length);
+            }
         }
 
         public void Dispose()
         {
+            lock (sync)
+            {
+                foreach (var identity in identities.Values)
+                {
+                    if (identity.EnvelopeSha256 != null)
+                        Array.Clear(identity.EnvelopeSha256, 0, identity.EnvelopeSha256.Length);
+                }
+                identities.Clear();
+                Array.Clear(entropy, 0, entropy.Length);
+            }
+        }
+
+        internal void DeletePersistentState()
+        {
+            lock (sync)
+            {
+                known.Clear();
+                ordered.Clear();
+                foreach (var identity in identities.Values)
+                {
+                    if (identity.EnvelopeSha256 != null)
+                        Array.Clear(identity.EnvelopeSha256, 0, identity.EnvelopeSha256.Length);
+                }
+                identities.Clear();
+            }
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
 
         internal static void AtomicWrite(string path, byte[] bytes)
@@ -1086,6 +1387,14 @@ namespace TermLink.Agent
             LocalFrameCodec.WriteUInt64(bytes, 0, value);
             InputDeduplicator.AtomicWrite(path, ProtectedData.Protect(bytes, entropy, DataProtectionScope.CurrentUser));
             Value = value;
+        }
+
+        internal void DeletePersistentState()
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            Value = 0;
         }
 
         public void Dispose() { }
@@ -1260,6 +1569,49 @@ namespace TermLink.Agent
                 finally { Array.Clear(stored, 0, stored.Length); }
             }
             return frames;
+        }
+
+        internal bool TryFindRemoteInputResult(
+            Guid inputId,
+            out LocalFrame resultFrame)
+        {
+            resultFrame = null;
+            if (inputId == Guid.Empty) return false;
+            lock (sync)
+            {
+                for (var chunk = chunks.Last; chunk != null; chunk = chunk.Previous)
+                {
+                    byte[] stored = null;
+                    LocalFrame frame = null;
+                    try
+                    {
+                        stored = File.ReadAllBytes(chunk.Value.FullName);
+                        frame = DecodeStored(stored);
+                        if (frame.Type != LocalFrameType.RemoteInputResult)
+                            continue;
+                        LocalRemoteInputResult ignored;
+                        if (LocalPayloadCodec.ParseRemoteInputResult(frame.Payload, out ignored) == inputId)
+                        {
+                            resultFrame = frame;
+                            frame = null;
+                            return true;
+                        }
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // A concurrent external cleanup can retire a chunk
+                        // between enumeration and read. Continue the bounded
+                        // reverse scan; the caller will treat a miss as pending.
+                    }
+                    finally
+                    {
+                        if (frame != null && frame.Payload != null)
+                            Array.Clear(frame.Payload, 0, frame.Payload.Length);
+                        if (stored != null) Array.Clear(stored, 0, stored.Length);
+                    }
+                }
+            }
+            return false;
         }
 
         private LocalFrame DecodeStored(byte[] stored)

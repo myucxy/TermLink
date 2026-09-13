@@ -61,6 +61,70 @@ func TestMemoryCoordinatorSharedLeaseLifecycleAndExpiry(t *testing.T) {
 	}
 }
 
+func TestMemoryCoordinatorLeaseParticipantAuthorizationIsFencedAndDoesNotRenew(t *testing.T) {
+	coordinator, _, now := newMemoryCoordinatorForTest(t)
+	ctx := context.Background()
+	sessionID, holderID, participantID, unknownID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	lease, err := coordinator.Acquire(ctx, sessionID, holderID, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined, err := coordinator.Acquire(ctx, sessionID, participantID, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHolderExpiry := coordinator.leases[sessionID].participants[holderID]
+	originalParticipantExpiry := coordinator.leases[sessionID].participants[participantID]
+
+	for _, test := range []struct {
+		name   string
+		lease  Lease
+		device uuid.UUID
+		want   bool
+	}{
+		{name: "holder", lease: joined, device: holderID, want: true},
+		{name: "joined participant", lease: joined, device: participantID, want: true},
+		{name: "unknown participant", lease: joined, device: unknownID},
+		{name: "stale lease ID", lease: func() Lease { stale := joined; stale.ID = uuid.New(); return stale }(), device: holderID},
+		{name: "stale lease version", lease: func() Lease { stale := joined; stale.Version++; return stale }(), device: holderID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			active, queryErr := coordinator.IsLeaseParticipantActive(ctx, test.lease, test.device)
+			if queryErr != nil || active != test.want {
+				t.Fatalf("IsLeaseParticipantActive()=%t/%v, want %t/nil", active, queryErr, test.want)
+			}
+		})
+	}
+	if got := coordinator.leases[sessionID].participants[holderID]; !got.Equal(originalHolderExpiry) {
+		t.Fatalf("holder expiry changed from %s to %s", originalHolderExpiry, got)
+	}
+	if got := coordinator.leases[sessionID].participants[participantID]; !got.Equal(originalParticipantExpiry) {
+		t.Fatalf("participant expiry changed from %s to %s", originalParticipantExpiry, got)
+	}
+
+	accepted, released, err := coordinator.ReleaseForDevice(ctx, lease, participantID)
+	if err != nil || !accepted || released {
+		t.Fatalf("release participant accepted/released/error=%t/%t/%v", accepted, released, err)
+	}
+	if active, err := coordinator.IsLeaseParticipantActive(ctx, lease, participantID); err != nil || active {
+		t.Fatalf("released participant active/error=%t/%v, want false/nil", active, err)
+	}
+
+	if _, err := coordinator.Acquire(ctx, sessionID, participantID, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(time.Second)
+	if active, err := coordinator.IsLeaseParticipantActive(ctx, lease, participantID); err != nil || active {
+		t.Fatalf("expired participant active/error=%t/%v, want false/nil", active, err)
+	}
+	if _, exists := coordinator.leases[sessionID].participants[participantID]; exists {
+		t.Fatal("expired participant was not pruned")
+	}
+	if got := coordinator.leases[sessionID].participants[holderID]; !got.Equal(originalHolderExpiry) {
+		t.Fatalf("authorization renewed holder expiry from %s to %s", originalHolderExpiry, got)
+	}
+}
+
 func TestMemoryCoordinatorLeaseFencesSurviveCoordinatorRestart(t *testing.T) {
 	versions := &memoryVersionSource{}
 	versions.next.Store(281474976710656)

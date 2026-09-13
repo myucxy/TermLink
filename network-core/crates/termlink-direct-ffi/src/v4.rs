@@ -4,6 +4,7 @@ use std::{
     ffi::c_void,
     mem::size_of,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::Deref,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
@@ -361,6 +362,97 @@ impl_zero_default!(
     TermLinkDirectEventV4,
 );
 
+/// Volatile clearing for key material. A normal slice fill may be optimized
+/// away when the value is about to be dropped, while volatile writes remain an
+/// observable side effect to the compiler.
+#[inline(never)]
+fn secure_zero_v4(bytes: &mut [u8]) {
+    for byte in bytes {
+        // SAFETY: `byte` points to a live byte in the owned sensitive value.
+        unsafe { std::ptr::write_volatile(byte as *mut u8, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+struct SensitiveProbeKeysV4 {
+    local_send_probe_hmac_key: [u8; 32],
+    peer_receive_probe_hmac_key: [u8; 32],
+    #[cfg(test)]
+    drop_observer: Option<Arc<AtomicBool>>,
+}
+
+impl SensitiveProbeKeysV4 {
+    fn take_from(value: &mut TermLinkDirectBeginChecksV4) -> Self {
+        let keys = Self {
+            local_send_probe_hmac_key: value.local_send_probe_hmac_key,
+            peer_receive_probe_hmac_key: value.peer_receive_probe_hmac_key,
+            #[cfg(test)]
+            drop_observer: None,
+        };
+        secure_zero_v4(&mut value.local_send_probe_hmac_key);
+        secure_zero_v4(&mut value.peer_receive_probe_hmac_key);
+        keys
+    }
+
+    fn clear(&mut self) {
+        secure_zero_v4(&mut self.local_send_probe_hmac_key);
+        secure_zero_v4(&mut self.peer_receive_probe_hmac_key);
+    }
+
+    #[cfg(test)]
+    fn observe_drop(&mut self, observer: Arc<AtomicBool>) {
+        self.drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    fn is_zeroed(&self) -> bool {
+        self.local_send_probe_hmac_key == [0; 32] && self.peer_receive_probe_hmac_key == [0; 32]
+    }
+}
+
+impl Drop for SensitiveProbeKeysV4 {
+    fn drop(&mut self) {
+        self.clear();
+        #[cfg(test)]
+        if let Some(observer) = self.drop_observer.take() {
+            observer.store(self.is_zeroed(), Ordering::Release);
+        }
+    }
+}
+
+/// Internal BeginChecks owner. The FFI record remains frozen and Copy, but its
+/// key fields are zeroed before this owner stores the non-sensitive record.
+/// This type is deliberately not Copy or Clone.
+struct OwnedBeginChecksV4 {
+    record: TermLinkDirectBeginChecksV4,
+    probe_keys: SensitiveProbeKeysV4,
+}
+
+impl OwnedBeginChecksV4 {
+    fn from_ffi(value: &mut TermLinkDirectBeginChecksV4) -> Self {
+        let probe_keys = SensitiveProbeKeysV4::take_from(value);
+        // Copy only after `take_from` has cleared the read-local key fields.
+        let record = *value;
+        Self { record, probe_keys }
+    }
+
+    fn local_send_probe_hmac_key(&self) -> &[u8; 32] {
+        &self.probe_keys.local_send_probe_hmac_key
+    }
+
+    fn peer_receive_probe_hmac_key(&self) -> &[u8; 32] {
+        &self.probe_keys.peer_receive_probe_hmac_key
+    }
+}
+
+impl Deref for OwnedBeginChecksV4 {
+    type Target = TermLinkDirectBeginChecksV4;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct OwnerV4 {
     epoch: u64,
@@ -490,14 +582,18 @@ impl EventQueueV4 {
 
 enum CommandV4 {
     Gather(Box<TermLinkDirectGatherV4>),
-    Begin(Box<TermLinkDirectBeginChecksV4>),
+    Begin(Box<OwnedBeginChecksV4>),
     Append(Box<TermLinkDirectAppendCheckPairsV4>),
     Commit(Box<TermLinkDirectCommitNominationV4>),
+    ProductionCommit {
+        value: Box<TermLinkDirectCommitNominationV4>,
+        completion: SyncSender<Result<ProductionHandoffV4, u32>>,
+    },
     Cancel(TermLinkDirectControlV4),
     NetworkChanged(TermLinkDirectControlV4),
     #[cfg(test)]
     AuthenticateForTest {
-        begin: Box<TermLinkDirectBeginChecksV4>,
+        begin: Box<OwnedBeginChecksV4>,
         identity: TemporaryIdentity,
         commit: Box<TermLinkDirectCommitNominationV4>,
         handoff: QuicSocketHandoff,
@@ -531,7 +627,7 @@ struct RetainedV4 {
 
 struct CheckV4 {
     owner: OwnerV4,
-    begin: TermLinkDirectBeginChecksV4,
+    begin: OwnedBeginChecksV4,
     identity: TemporaryIdentity,
     local_candidates: Vec<TermLinkDirectCandidateV4>,
     next_candidate_batch_seq: u32,
@@ -548,6 +644,18 @@ struct CheckV4 {
     total_pair_count: u32,
     plan_complete: bool,
     nomination_committed: bool,
+}
+
+/// One-shot transfer from the frozen V4 gather/check implementation into the
+/// independently versioned V5 production data plane.  This type never crosses
+/// FFI and moving `handoff` guarantees there cannot be two UDP socket owners.
+pub(crate) struct ProductionHandoffV4 {
+    pub(crate) begin: TermLinkDirectBeginChecksV4,
+    #[allow(dead_code)]
+    probe_keys: SensitiveProbeKeysV4,
+    pub(crate) identity: TemporaryIdentity,
+    pub(crate) commit: TermLinkDirectCommitNominationV4,
+    pub(crate) handoff: QuicSocketHandoff,
 }
 
 pub struct NativeBridgeV4 {
@@ -572,7 +680,7 @@ impl Drop for WorkerExitV4 {
 }
 
 impl NativeBridgeV4 {
-    fn create(config: TermLinkDirectCreateV4) -> Result<Self, ()> {
+    pub(crate) fn create(config: TermLinkDirectCreateV4) -> Result<Self, ()> {
         if config.abi_version != ABI_VERSION_V4
             || config.struct_size as usize != size_of::<TermLinkDirectCreateV4>()
             || config.enabled > 1
@@ -709,6 +817,33 @@ impl NativeBridgeV4 {
             false
         }
     }
+
+    pub(crate) fn accept_production_commit_for_v5(
+        &self,
+        value: TermLinkDirectCommitNominationV4,
+    ) -> Result<Receiver<Result<ProductionHandoffV4, u32>>, i32> {
+        if !valid_header(&value, value.abi_version, value.struct_size) {
+            return Err(-2);
+        }
+        if !self.accept_current(value.epoch, value.attempt_id) {
+            return Err(-3);
+        }
+        let (completion, receiver) = mpsc::sync_channel(1);
+        let status = self.submit(
+            CommandV4::ProductionCommit {
+                value: Box::new(value),
+                completion,
+            },
+            value.epoch,
+            value.attempt_id,
+        );
+        if status == 0 {
+            Ok(receiver)
+        } else {
+            Err(status)
+        }
+    }
+
     fn accept_control(&self, value: TermLinkDirectControlV4, network: bool) -> i32 {
         if !valid_header(&value, value.abi_version, value.struct_size)
             || value.reserved != [0; 2]
@@ -997,6 +1132,63 @@ fn worker_loop_v4(
                         );
                     }
                 }
+                CommandV4::ProductionCommit { value, completion } => {
+                    let command_owner = OwnerV4 {
+                        epoch: value.epoch,
+                        attempt_id: value.attempt_id,
+                    };
+                    // This owner lock is the V4 -> V5 socket-transfer
+                    // linearization point. Both cancel/network-change and a
+                    // successor gather take the same lock before changing the
+                    // owner or its cancellation fence. A successful handoff
+                    // marks the V4 attempt consumed while still holding it, so
+                    // no retired/stale socket can subsequently reach V5 and no
+                    // V4 control can claim ownership after the transfer.
+                    let mut current = owner.lock().unwrap_or_else(|entry| entry.into_inner());
+                    let result = if *current != command_owner
+                        || cancel.load(Ordering::Acquire) >= command_owner.epoch
+                        || network.load(Ordering::Acquire) >= command_owner.epoch
+                    {
+                        Err(REASON_CANCELLED_V4)
+                    } else if let Some(check) = checks.take() {
+                        let expected = check.owner;
+                        match prepare_commit_handoff_v4(*value, check) {
+                            Ok(handoff) => {
+                                // Preserve the epoch for monotonic successor
+                                // checks, but make every later operation for
+                                // this exact attempt stale in V4.
+                                current.attempt_id = [0; 16];
+                                Ok(handoff)
+                            }
+                            Err((reason, _returned)) => {
+                                if *current == expected {
+                                    events.force_failure(
+                                        expected.epoch,
+                                        expected.attempt_id,
+                                        reason,
+                                    );
+                                }
+                                Err(reason)
+                            }
+                        }
+                    } else {
+                        if *current == command_owner {
+                            events.force_failure(
+                                command_owner.epoch,
+                                command_owner.attempt_id,
+                                REASON_NOMINATION_REJECTED_V4,
+                            );
+                        }
+                        Err(REASON_NOMINATION_REJECTED_V4)
+                    };
+                    // A successful result moves the sole socket handoff out of
+                    // this worker. Publish completion before releasing the
+                    // owner lock so cancellation cannot observe a consumed V4
+                    // attempt before the V5 caller can observe the transfer.
+                    // The socket cannot subsequently be reused by V4.
+                    let _ = completion.send(result);
+                    drop(current);
+                }
                 #[cfg(test)]
                 CommandV4::AuthenticateForTest {
                     begin,
@@ -1174,13 +1366,13 @@ fn worker_loop_v4(
                 checks.take();
                 continue;
             }
-            let now_ms = check.begin.now_ms;
-            let begin = check.begin;
+            let begin = &check.begin;
+            let now_ms = begin.now_ms;
             let pairs = check.pairs.clone();
             let events_from_pump = check
                 .pump
                 .step(Duration::from_millis(10), |source, packet| {
-                    authenticate_packet(&begin, &pairs, source, packet, now_ms)
+                    authenticate_packet(begin, &pairs, source, packet, now_ms)
                 });
             match events_from_pump {
                 Ok(pump_events) => {
@@ -1564,7 +1756,7 @@ fn publish_candidate_batch(
 
 fn begin_checks_v4(
     config: TermLinkDirectCreateV4,
-    begin: TermLinkDirectBeginChecksV4,
+    begin: OwnedBeginChecksV4,
     retained: RetainedV4,
 ) -> Result<CheckV4, (u32, Option<Box<RetainedV4>>)> {
     let ticket_expires_at_ms = match validate_begin(config, &begin, &retained) {
@@ -1606,10 +1798,10 @@ fn begin_checks_v4(
 
 fn validate_begin(
     config: TermLinkDirectCreateV4,
-    value: &TermLinkDirectBeginChecksV4,
+    value: &OwnedBeginChecksV4,
     retained: &RetainedV4,
 ) -> Result<i64, u32> {
-    if !valid_header(value, value.abi_version, value.struct_size)
+    if !valid_header(&value.record, value.abi_version, value.struct_size)
         || value.reserved0 != 0
         || value.reserved != [0; 4]
         || !retained.owner.matches(value.epoch, value.attempt_id)
@@ -1619,9 +1811,9 @@ fn validate_begin(
         || value.local_device_id == value.peer_device_id
         || value.check_round_id == [0; 16]
         || value.connectivity_nonce == [0; 16]
-        || value.local_send_probe_hmac_key == [0; 32]
-        || value.peer_receive_probe_hmac_key == [0; 32]
-        || value.local_send_probe_hmac_key == value.peer_receive_probe_hmac_key
+        || value.local_send_probe_hmac_key() == &[0; 32]
+        || value.peer_receive_probe_hmac_key() == &[0; 32]
+        || value.local_send_probe_hmac_key() == value.peer_receive_probe_hmac_key()
         || !matches!(value.role, ROLE_INITIATOR_V4 | ROLE_RESPONDER_V4)
         || !(500..=10_000).contains(&value.timeout_ms)
         || value.now_ms < 0
@@ -1673,14 +1865,19 @@ fn validate_begin(
 }
 
 fn append_initial_pairs_v4(check: &mut CheckV4) -> Result<(), u32> {
-    let begin = check.begin;
+    let begin = &check.begin;
+    let pair_batch_seq = begin.pair_batch_seq;
+    let pair_count = begin.pair_count;
+    let total_pair_count = begin.total_pair_count;
+    let plan_complete = begin.plan_complete;
+    let pairs = begin.pairs;
     append_pair_slice(
         check,
-        begin.pair_batch_seq,
-        begin.pair_count,
-        begin.total_pair_count,
-        begin.plan_complete,
-        &begin.pairs,
+        pair_batch_seq,
+        pair_count,
+        total_pair_count,
+        plan_complete,
+        &pairs,
     )
 }
 fn append_pairs_v4(
@@ -1770,7 +1967,7 @@ fn append_pair_slice(
         let peer = remote_candidate(*pair, check.begin.role).endpoint;
         let peer = decode_socket(peer, false)?;
         let nonce = derive_pair_probe_nonce_v2(
-            &check.begin.local_send_probe_hmac_key,
+            check.begin.local_send_probe_hmac_key(),
             &check.begin.connectivity_nonce,
             &wire_pair,
         );
@@ -1785,7 +1982,7 @@ fn append_pair_slice(
             sent_at_ms: check.begin.now_ms,
             anti_amplification_padding: check.begin.attempt_id,
         })
-        .and_then(|v| v.encode_authenticated_v2(&check.begin.local_send_probe_hmac_key))
+        .and_then(|v| v.encode_authenticated_v2(check.begin.local_send_probe_hmac_key()))
         .map_err(|_| REASON_INVALID_PLAN_V4)?;
         native.push(MultipairCheckPair {
             token,
@@ -1873,7 +2070,10 @@ fn local_candidate(pair: TermLinkDirectCandidatePairV4, role: u32) -> TermLinkDi
         pair.responder_candidate
     }
 }
-fn remote_candidate(pair: TermLinkDirectCandidatePairV4, role: u32) -> TermLinkDirectCandidateV4 {
+pub(crate) fn remote_candidate(
+    pair: TermLinkDirectCandidatePairV4,
+    role: u32,
+) -> TermLinkDirectCandidateV4 {
     if role == ROLE_INITIATOR_V4 {
         pair.responder_candidate
     } else {
@@ -1888,7 +2088,7 @@ fn pair_token(pair: &CandidatePair) -> PairToken {
 }
 
 fn authenticate_packet(
-    begin: &TermLinkDirectBeginChecksV4,
+    begin: &OwnedBeginChecksV4,
     pairs: &HashMap<PairToken, TermLinkDirectCandidatePairV4>,
     source: SocketAddr,
     packet: &[u8],
@@ -1903,7 +2103,7 @@ fn authenticate_packet(
             responder_candidate_id: record.responder_candidate.candidate_id,
         };
         let peer_nonce = derive_pair_probe_nonce_v2(
-            &begin.peer_receive_probe_hmac_key,
+            begin.peer_receive_probe_hmac_key(),
             &begin.connectivity_nonce,
             &pair,
         );
@@ -1921,7 +2121,7 @@ fn authenticate_packet(
         };
         if let Ok(probe) = ConnectivityDatagram::decode_authenticated_v2(
             packet,
-            &begin.peer_receive_probe_hmac_key,
+            begin.peer_receive_probe_hmac_key(),
             &expected_probe,
         ) {
             let mut response = [0; 16];
@@ -1935,7 +2135,7 @@ fn authenticate_packet(
                 now_ms,
             )
             .ok()?
-            .encode_ack_without_amplification_v2(packet.len(), &begin.local_send_probe_hmac_key)
+            .encode_ack_without_amplification_v2(packet.len(), begin.local_send_probe_hmac_key())
             .ok()?;
             return Some(AuthenticatedMultipairPacket::Probe {
                 token: *token,
@@ -1943,7 +2143,7 @@ fn authenticate_packet(
             });
         }
         let local_nonce = derive_pair_probe_nonce_v2(
-            &begin.local_send_probe_hmac_key,
+            begin.local_send_probe_hmac_key(),
             &begin.connectivity_nonce,
             &pair,
         );
@@ -1961,7 +2161,7 @@ fn authenticate_packet(
         };
         if ConnectivityDatagram::decode_authenticated_v2(
             packet,
-            &begin.peer_receive_probe_hmac_key,
+            begin.peer_receive_probe_hmac_key(),
             &expected_ack,
         )
         .is_ok()
@@ -1976,7 +2176,7 @@ fn authenticate_packet(
 fn commit_v4(
     config: TermLinkDirectCreateV4,
     commit: TermLinkDirectCommitNominationV4,
-    mut check: CheckV4,
+    check: CheckV4,
     signatures: &Receiver<Box<TermLinkDirectSignatureV4>>,
     events: &EventQueueV4,
     cancel: &AtomicU64,
@@ -1984,6 +2184,30 @@ fn commit_v4(
     owner: &Mutex<OwnerV4>,
     relay_only: &AtomicBool,
 ) -> Result<(), (u32, Option<Box<CheckV4>>)> {
+    let handoff = prepare_commit_handoff_v4(commit, check)?;
+    let ProductionHandoffV4 {
+        mut begin,
+        mut probe_keys,
+        identity,
+        commit,
+        handoff,
+    } = handoff;
+    probe_keys.clear();
+    let begin = OwnedBeginChecksV4::from_ffi(&mut begin);
+    let result = authenticate_quic_v4(
+        config, begin, identity, &commit, handoff, signatures, events, cancel, network, owner,
+        relay_only,
+    );
+    result.map_err(|reason| (reason, None))
+}
+
+fn prepare_commit_handoff_v4(
+    commit: TermLinkDirectCommitNominationV4,
+    mut check: CheckV4,
+) -> Result<ProductionHandoffV4, (u32, Option<Box<CheckV4>>)> {
+    if commit.now_ms > check.ticket_expires_at_ms {
+        return Err((REASON_INVALID_TICKET_V4, Some(Box::new(check))));
+    }
     if !check.plan_complete
         || check.nomination_committed
         || !valid_header(&commit, commit.abi_version, commit.struct_size)
@@ -1998,7 +2222,6 @@ fn commit_v4(
         || commit.peer_certificate_sha256 == [0; 32]
         || commit.peer_device_signing_public_key == [0; 32]
         || commit.now_ms < check.begin.now_ms
-        || commit.now_ms > check.ticket_expires_at_ms
         || commit.reserved != [0; 4]
         || commit.local_proof_nonce[commit.local_proof_nonce_length as usize..]
             .iter()
@@ -2033,17 +2256,26 @@ fn commit_v4(
         Ok(v) => v,
         Err(_) => return Err((REASON_NOMINATION_REJECTED_V4, None)),
     };
-    let result = authenticate_quic_v4(
-        config, begin, identity, &commit, handoff, signatures, events, cancel, network, owner,
-        relay_only,
-    );
-    result.map_err(|reason| (reason, None))
+    let OwnedBeginChecksV4 {
+        record: begin,
+        mut probe_keys,
+    } = begin;
+    // V5 never uses the V4 connectivity HMAC keys. Clear them before the
+    // socket and non-sensitive BeginChecks record leave the V4 worker.
+    probe_keys.clear();
+    Ok(ProductionHandoffV4 {
+        begin,
+        probe_keys,
+        identity,
+        commit,
+        handoff,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn authenticate_quic_v4(
     _config: TermLinkDirectCreateV4,
-    begin: TermLinkDirectBeginChecksV4,
+    begin: OwnedBeginChecksV4,
     identity: TemporaryIdentity,
     commit: &TermLinkDirectCommitNominationV4,
     handoff: QuicSocketHandoff,
@@ -2054,6 +2286,13 @@ fn authenticate_quic_v4(
     owner: &Mutex<OwnerV4>,
     relay_only: &AtomicBool,
 ) -> Result<(), u32> {
+    let OwnedBeginChecksV4 {
+        record: begin,
+        mut probe_keys,
+    } = begin;
+    // QUIC authentication is downstream of V4 connectivity checks and does
+    // not consume these probe keys.
+    probe_keys.clear();
     let expected = OwnerV4 {
         epoch: begin.epoch,
         attempt_id: begin.attempt_id,
@@ -2409,7 +2648,10 @@ fn decode_ip(bytes: [u8; 16], length: u32) -> Result<IpAddr, u32> {
     }
     Ok(ip)
 }
-fn decode_socket(value: TermLinkSocketAddrV4, allow_zero_port: bool) -> Result<SocketAddr, u32> {
+pub(crate) fn decode_socket(
+    value: TermLinkSocketAddrV4,
+    allow_zero_port: bool,
+) -> Result<SocketAddr, u32> {
     if !valid_header(&value, value.abi_version, value.struct_size) || value.reserved != [0; 2] {
         return Err(REASON_INVALID_CANDIDATE_V4);
     }
@@ -2486,8 +2728,8 @@ macro_rules! submit_ffi {
                 if input.is_null() {
                     return -2;
                 }
-                let value = unsafe { input.read_unaligned() };
-                ($body)(bridge, value)
+                let mut value = unsafe { input.read_unaligned() };
+                ($body)(bridge, &mut value)
             }))
             .unwrap_or(-3)
         }
@@ -2496,29 +2738,29 @@ macro_rules! submit_ffi {
 submit_ffi!(
     termlink_direct_gather_v4,
     TermLinkDirectGatherV4,
-    |bridge: &NativeBridgeV4, value| bridge.accept_gather(value)
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectGatherV4| bridge.accept_gather(*value)
 );
 submit_ffi!(
     termlink_direct_begin_checks_v4,
     TermLinkDirectBeginChecksV4,
-    |bridge: &NativeBridgeV4, value: TermLinkDirectBeginChecksV4| {
-        if !valid_header(&value, value.abi_version, value.struct_size) {
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectBeginChecksV4| {
+        let owned = OwnedBeginChecksV4::from_ffi(value);
+        if !valid_header(&*owned, owned.abi_version, owned.struct_size) {
             return -2;
         }
-        if !bridge.accept_current(value.epoch, value.attempt_id) {
+        let epoch = owned.epoch;
+        let attempt_id = owned.attempt_id;
+        if !bridge.accept_current(epoch, attempt_id) {
             return 0;
         }
-        bridge.submit(
-            CommandV4::Begin(Box::new(value)),
-            value.epoch,
-            value.attempt_id,
-        )
+        bridge.submit(CommandV4::Begin(Box::new(owned)), epoch, attempt_id)
     }
 );
 submit_ffi!(
     termlink_direct_append_check_pairs_v4,
     TermLinkDirectAppendCheckPairsV4,
-    |bridge: &NativeBridgeV4, value: TermLinkDirectAppendCheckPairsV4| {
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectAppendCheckPairsV4| {
+        let value = *value;
         if !valid_header(&value, value.abi_version, value.struct_size) {
             return -2;
         }
@@ -2535,7 +2777,8 @@ submit_ffi!(
 submit_ffi!(
     termlink_direct_commit_nomination_v4,
     TermLinkDirectCommitNominationV4,
-    |bridge: &NativeBridgeV4, value: TermLinkDirectCommitNominationV4| {
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectCommitNominationV4| {
+        let value = *value;
         if !valid_header(&value, value.abi_version, value.struct_size) {
             return -2;
         }
@@ -2552,17 +2795,20 @@ submit_ffi!(
 submit_ffi!(
     termlink_direct_cancel_v4,
     TermLinkDirectControlV4,
-    |bridge: &NativeBridgeV4, value| bridge.accept_control(value, false)
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectControlV4| bridge
+        .accept_control(*value, false)
 );
 submit_ffi!(
     termlink_direct_network_changed_v4,
     TermLinkDirectControlV4,
-    |bridge: &NativeBridgeV4, value| bridge.accept_control(value, true)
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectControlV4| bridge
+        .accept_control(*value, true)
 );
 submit_ffi!(
     termlink_direct_submit_signature_v4,
     TermLinkDirectSignatureV4,
-    |bridge: &NativeBridgeV4, value: TermLinkDirectSignatureV4| {
+    |bridge: &NativeBridgeV4, value: &mut TermLinkDirectSignatureV4| {
+        let value = *value;
         if !valid_header(&value, value.abi_version, value.struct_size)
             || value.reserved0 != 0
             || value.reserved != [0; 2]
@@ -2627,7 +2873,7 @@ pub unsafe extern "C" fn termlink_direct_destroy_v4(handle: *mut c_void) {
         }
     }));
 }
-unsafe fn bridge_ref_v4<'a>(handle: *mut c_void) -> Option<&'a NativeBridgeV4> {
+pub(crate) unsafe fn bridge_ref_v4<'a>(handle: *mut c_void) -> Option<&'a NativeBridgeV4> {
     if handle.is_null() {
         None
     } else {
@@ -2768,7 +3014,7 @@ mod tests {
 
     fn test_check(
         socket: DirectUdpSocket,
-        begin: TermLinkDirectBeginChecksV4,
+        mut begin: TermLinkDirectBeginChecksV4,
         local: TermLinkDirectCandidateV4,
     ) -> CheckV4 {
         let mut check = CheckV4 {
@@ -2776,7 +3022,7 @@ mod tests {
                 epoch: begin.epoch,
                 attempt_id: begin.attempt_id,
             },
-            begin,
+            begin: OwnedBeginChecksV4::from_ffi(&mut begin),
             identity: TemporaryIdentity::generate().unwrap(),
             local_candidates: vec![local],
             next_candidate_batch_seq: 2,
@@ -2798,6 +3044,32 @@ mod tests {
         };
         append_initial_pairs_v4(&mut check).unwrap();
         check
+    }
+
+    #[test]
+    fn sensitive_begin_owner_takes_and_clears_ffi_key_material() {
+        let local = test_candidate("192.0.2.10:49152".parse().unwrap(), 1);
+        let remote = test_candidate("192.0.2.11:49153".parse().unwrap(), 2);
+        let pair = test_pair(local, remote, 1);
+        let mut raw = test_begin(ROLE_INITIATOR_V4, [1; 16], [2; 16], [3; 32], [4; 32], pair);
+        let mut owned = OwnedBeginChecksV4::from_ffi(&mut raw);
+        assert_eq!(raw.local_send_probe_hmac_key, [0; 32]);
+        assert_eq!(raw.peer_receive_probe_hmac_key, [0; 32]);
+        assert_eq!(owned.local_send_probe_hmac_key(), &[3; 32]);
+        assert_eq!(owned.peer_receive_probe_hmac_key(), &[4; 32]);
+        assert!(!owned.probe_keys.is_zeroed());
+
+        owned.probe_keys.clear();
+        assert!(owned.probe_keys.is_zeroed());
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut discarded_raw =
+            test_begin(ROLE_INITIATOR_V4, [1; 16], [2; 16], [5; 32], [6; 32], pair);
+        let mut discarded = OwnedBeginChecksV4::from_ffi(&mut discarded_raw);
+        assert!(!discarded.probe_keys.is_zeroed());
+        discarded.probe_keys.observe_drop(Arc::clone(&dropped));
+        drop(CommandV4::Begin(Box::new(discarded)));
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     fn ticket_vector_begin(
@@ -3186,7 +3458,7 @@ mod tests {
         local_candidate.expires_at_ms = 1_900_000_110_000;
         peer_candidate.expires_at_ms = 1_900_000_110_000;
         let pair = test_pair(local_candidate, peer_candidate, 1);
-        let begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
+        let mut begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
         let expected = OwnerV4 {
             epoch: begin.epoch,
             attempt_id: begin.attempt_id,
@@ -3247,7 +3519,7 @@ mod tests {
                         platform: PLATFORM_WINDOWS_V4,
                         reserved: [0; 3],
                     },
-                    begin,
+                    OwnedBeginChecksV4::from_ffi(&mut begin),
                     local_identity,
                     &commit,
                     local_socket.into_quic_handoff(),
@@ -3346,7 +3618,7 @@ mod tests {
         local_candidate.expires_at_ms = 1_900_000_110_000;
         peer_candidate.expires_at_ms = 1_900_000_110_000;
         let pair = test_pair(local_candidate, peer_candidate, 1);
-        let begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
+        let mut begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
         let predecessor = OwnerV4 {
             epoch: begin.epoch,
             attempt_id: begin.attempt_id,
@@ -3371,7 +3643,7 @@ mod tests {
         assert_eq!(
             bridge.submit(
                 CommandV4::AuthenticateForTest {
-                    begin: Box::new(begin),
+                    begin: Box::new(OwnedBeginChecksV4::from_ffi(&mut begin)),
                     identity,
                     commit: Box::new(commit),
                     handoff: auth_socket.into_quic_handoff(),
@@ -3635,12 +3907,15 @@ mod tests {
         let mut remote_candidate = test_candidate(blackhole.local_addr().unwrap(), 0x77);
         remote_candidate.expires_at_ms = 1_900_000_110_000;
         let pair = test_pair(local_candidate, remote_candidate, 1);
-        let begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
+        let mut begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
+        let begin_epoch = begin.epoch;
+        let begin_attempt_id = begin.attempt_id;
+        let owned_begin = OwnedBeginChecksV4::from_ffi(&mut begin);
         assert_eq!(
             bridge.submit(
-                CommandV4::Begin(Box::new(begin)),
-                expected.epoch,
-                expected.attempt_id,
+                CommandV4::Begin(Box::new(owned_begin)),
+                begin_epoch,
+                begin_attempt_id,
             ),
             0
         );
@@ -3686,7 +3961,7 @@ mod tests {
         local.expires_at_ms = 1_900_000_110_000;
         remote.expires_at_ms = 1_900_000_110_000;
         let pair = test_pair(local, remote, 1);
-        let begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
+        let mut begin = ticket_vector_begin(ROLE_INITIATOR_V4, pair);
         let expected = OwnerV4 {
             epoch: begin.epoch,
             attempt_id: begin.attempt_id,
@@ -3712,7 +3987,7 @@ mod tests {
         assert_eq!(
             bridge.submit(
                 CommandV4::AuthenticateForTest {
-                    begin: Box::new(begin),
+                    begin: Box::new(OwnedBeginChecksV4::from_ffi(&mut begin)),
                     identity: TemporaryIdentity::generate().unwrap(),
                     commit: Box::new(commit),
                     handoff: auth_socket.into_quic_handoff(),
@@ -4050,22 +4325,24 @@ mod tests {
         let mut a_valid = false;
         let mut b_valid = false;
         while !(a_valid && b_valid) {
-            let begin = a.begin;
+            let begin = &a.begin;
+            let now_ms = begin.now_ms;
             let pairs = a.pairs.clone();
             a_valid |= a
                 .pump
                 .step(Duration::from_millis(20), |source, packet| {
-                    authenticate_packet(&begin, &pairs, source, packet, begin.now_ms)
+                    authenticate_packet(begin, &pairs, source, packet, now_ms)
                 })
                 .unwrap()
                 .iter()
                 .any(|event| matches!(event, MultipairPumpEvent::PairValidated { .. }));
-            let begin = b.begin;
+            let begin = &b.begin;
+            let now_ms = begin.now_ms;
             let pairs = b.pairs.clone();
             b_valid |= b
                 .pump
                 .step(Duration::from_millis(20), |source, packet| {
-                    authenticate_packet(&begin, &pairs, source, packet, begin.now_ms)
+                    authenticate_packet(begin, &pairs, source, packet, now_ms)
                 })
                 .unwrap()
                 .iter()
@@ -4375,6 +4652,95 @@ mod tests {
     }
 
     #[test]
+    fn production_handoff_reports_expired_ticket_without_consuming_the_socket() {
+        let ip = active_ip();
+        let local_socket = DirectUdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let remote_socket = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let local = test_candidate(local_socket.bound_addr(), 1);
+        let remote = test_candidate(remote_socket.local_addr().unwrap(), 2);
+        let begin = test_begin(
+            ROLE_INITIATOR_V4,
+            [1; 16],
+            [2; 16],
+            [3; 32],
+            [4; 32],
+            test_pair(local, remote, 1),
+        );
+        let check = test_check(local_socket, begin, local);
+        let commit = TermLinkDirectCommitNominationV4 {
+            abi_version: ABI_VERSION_V4,
+            struct_size: size_of::<TermLinkDirectCommitNominationV4>() as u32,
+            epoch: begin.epoch,
+            attempt_id: begin.attempt_id,
+            now_ms: check.ticket_expires_at_ms + 1,
+            ..TermLinkDirectCommitNominationV4::default()
+        };
+        let (reason, retained) = match prepare_commit_handoff_v4(commit, check) {
+            Ok(_) => panic!("expired ticket must not transfer the socket"),
+            Err(error) => error,
+        };
+        assert_eq!(reason, REASON_INVALID_TICKET_V4);
+        assert!(retained.is_some());
+    }
+
+    #[test]
+    fn production_handoff_clears_probe_keys_before_v5_transfer() {
+        let ip = active_ip();
+        let local_socket = DirectUdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let remote_socket = DirectUdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let local = test_candidate(local_socket.bound_addr(), 1);
+        let remote = test_candidate(remote_socket.bound_addr(), 2);
+        let pair = test_pair(local, remote, 1);
+        let begin = test_begin(ROLE_INITIATOR_V4, [1; 16], [2; 16], [3; 32], [4; 32], pair);
+        let mut check = test_check(local_socket, begin, local);
+        let mut peer = test_check(
+            remote_socket,
+            test_begin(ROLE_RESPONDER_V4, [2; 16], [1; 16], [4; 32], [3; 32], pair),
+            remote,
+        );
+        let token = pair_token(&CandidatePair {
+            initiator_candidate_id: pair.initiator_candidate.candidate_id,
+            responder_candidate_id: pair.responder_candidate.candidate_id,
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut local_valid = false;
+        let mut peer_valid = false;
+        while !(local_valid && peer_valid) {
+            let begin = &check.begin;
+            let pairs = check.pairs.clone();
+            local_valid |= check
+                .pump
+                .step(Duration::from_millis(20), |source, packet| {
+                    authenticate_packet(begin, &pairs, source, packet, begin.now_ms)
+                })
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, MultipairPumpEvent::PairValidated { .. }));
+            let begin = &peer.begin;
+            let pairs = peer.pairs.clone();
+            peer_valid |= peer
+                .pump
+                .step(Duration::from_millis(20), |source, packet| {
+                    authenticate_packet(begin, &pairs, source, packet, begin.now_ms)
+                })
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, MultipairPumpEvent::PairValidated { .. }));
+            assert!(Instant::now() < deadline);
+        }
+        assert!(check.validated.insert(token));
+        let commit = ticket_vector_commit(begin, pair, [15; 32]);
+        let handoff = match prepare_commit_handoff_v4(commit, check) {
+            Ok(value) => value,
+            Err((reason, _)) => panic!("expected successful handoff, got {reason}"),
+        };
+
+        assert_eq!(handoff.begin.local_send_probe_hmac_key, [0; 32]);
+        assert_eq!(handoff.begin.peer_receive_probe_hmac_key, [0; 32]);
+        assert!(handoff.probe_keys.is_zeroed());
+    }
+
+    #[test]
     fn host_checks_can_start_before_delayed_stun_trickles_a_candidate() {
         let ip = active_ip();
         assert!(ip.is_ipv4());
@@ -4616,8 +4982,15 @@ mod tests {
         };
         begin.ticket[..ticket.len()].copy_from_slice(&ticket);
         begin.pairs[0] = pair;
+        let begin_epoch = begin.epoch;
+        let begin_attempt_id = begin.attempt_id;
+        let owned_begin = OwnedBeginChecksV4::from_ffi(&mut begin);
         assert_eq!(
-            bridge.submit(CommandV4::Begin(Box::new(begin)), 7, [7; 16]),
+            bridge.submit(
+                CommandV4::Begin(Box::new(owned_begin)),
+                begin_epoch,
+                begin_attempt_id,
+            ),
             0
         );
         let deadline = Instant::now() + Duration::from_secs(1);

@@ -158,6 +158,7 @@ try {
         'TermLink.Agent.dll',
         'TermLink.TerminalCore.dll',
         'termlink_terminal_ffi.dll',
+        'termlink_direct_ffi.dll',
         'TermLink.UpdatePublisher.cer',
         'TermLink.Uninstall.exe',
         'coreclr.dll',
@@ -182,7 +183,8 @@ try {
     $signedPayloadBinaries = @(Get-ChildItem -LiteralPath $installRoot -File |
         Where-Object {
             ($_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
-                $_.Name -ceq 'termlink_terminal_ffi.dll') -and
+                $_.Name -ceq 'termlink_terminal_ffi.dll' -or
+                $_.Name -ceq 'termlink_direct_ffi.dll') -and
             $_.Name -cne 'TermLink.Uninstall.exe'
         } |
         Sort-Object Name)
@@ -348,9 +350,13 @@ try {
         'The upgrade merged with the stale Fragment instead of replacing it completely.'
     $upgradedFragment = $upgradedFragmentText | ConvertFrom-Json
     $upgradedTopLevelProperties = @($upgradedFragment.PSObject.Properties.Name)
-    Assert-True ($upgradedTopLevelProperties.Count -eq 1 -and
-        $upgradedTopLevelProperties[0] -ceq 'profiles') `
+    $expectedTopLevelProperties = @('termlinkAddNoLogo', 'termlinkAddNoProfile', 'profiles')
+    Assert-True ($upgradedTopLevelProperties.Count -eq $expectedTopLevelProperties.Count -and
+        @($upgradedTopLevelProperties | Where-Object { $_ -cnotin $expectedTopLevelProperties }).Count -eq 0) `
         "The upgraded Fragment contains unexpected top-level fields: $($upgradedTopLevelProperties -join ', ')"
+    Assert-True ($upgradedFragment.termlinkAddNoLogo -eq $true -and
+        $upgradedFragment.termlinkAddNoProfile -eq $false) `
+        'The upgraded Fragment changed the default PowerShell logo/profile policy.'
     $upgradedProfiles = @($upgradedFragment.profiles)
     Assert-True ($upgradedProfiles.Count -eq $profiles.Count) `
         'The upgrade retained an extra stale Terminal profile or removed a generated profile.'

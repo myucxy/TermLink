@@ -9,6 +9,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -88,10 +89,28 @@ interface ProductionRealtimeSessionTransport : Closeable {
 
     fun connect()
     fun send(envelope: Envelope): Boolean
+    fun sendExact(envelope: Envelope, exactBytes: ByteArray): Boolean = send(envelope)
     fun sendForConnectedGeneration(envelope: Envelope, expectedGeneration: Int): Boolean {
         if (expectedGeneration <= 0 || currentConnectedGeneration() != expectedGeneration) return false
         return send(envelope)
     }
+    fun sendExactForConnectedGeneration(
+        envelope: Envelope,
+        exactBytes: ByteArray,
+        expectedGeneration: Int,
+    ): Boolean = sendForConnectedGeneration(envelope, expectedGeneration)
+    /**
+     * Sends exact bytes over Relay without offering them to an installed Direct gateway.
+     * Implementations whose [sendExact] can enter Direct routing must override this method.
+     */
+    fun sendRelayExact(envelope: Envelope, exactBytes: ByteArray): Boolean =
+        sendExact(envelope, exactBytes)
+    /** Generation-fenced variant of [sendRelayExact]. */
+    fun sendRelayExactForConnectedGeneration(
+        envelope: Envelope,
+        exactBytes: ByteArray,
+        expectedGeneration: Int,
+    ): Boolean = sendExactForConnectedGeneration(envelope, exactBytes, expectedGeneration)
     /** Reports a session-local transport failure without owning the device socket. */
     fun disconnect(reason: String)
     fun currentConnectedGeneration(): Int
@@ -116,11 +135,32 @@ data class ProductionRealtimeSessionConnectionEvent(
 }
 
 /**
+ * Optional per-PC Direct data-plane seam. Returning true from [offerRelay]
+ * transfers ownership of [received] to the gateway. Any exception or false
+ * result is an immediate Relay pass-through and never changes socket state.
+ */
+internal interface ProductionRealtimeDirectDataGateway {
+    fun offerRelay(
+        peerDeviceId: UUID,
+        received: ProductionReceivedEnvelope,
+    ): Boolean
+
+    /** Must invoke [relayFallback] for every fail-closed/non-Direct outcome. */
+    fun routeEligibleOutbound(
+        peerDeviceId: UUID,
+        envelope: Envelope,
+        exactEnvelopeBytes: ByteArray,
+        relayFallback: () -> Boolean,
+    ): Boolean
+}
+
+/**
  * Owns the single production WebSocket for one Android device and routes opaque
  * envelopes to the live client registered for the exact session UUID.
  */
 class ProductionRealtimeMultiplexer private constructor(
     private val socket: ProductionRealtimeSocket,
+    private val localDeviceId: UUID?,
     parentScope: CoroutineScope,
     authenticationRefresher: RealtimeAuthenticationRefresher,
     authenticationFailureObserver: (Throwable) -> Unit,
@@ -135,6 +175,7 @@ class ProductionRealtimeMultiplexer private constructor(
         identity: DeviceIdentity,
         parentScope: CoroutineScope,
         additionalCapabilities: Set<String> = emptySet(),
+        optionalAdvertisedCapabilities: Set<String> = emptySet(),
         httpClient: OkHttpClient = ProductionRealtimeClient.defaultHttpClient,
         allowCleartextForLocalTest: Boolean = false,
         authenticationRefresher: RealtimeAuthenticationRefresher = RealtimeAuthenticationRefresher { },
@@ -147,9 +188,11 @@ class ProductionRealtimeMultiplexer private constructor(
             identity = identity,
             role = "android",
             additionalCapabilities = additionalCapabilities,
+            optionalAdvertisedCapabilities = optionalAdvertisedCapabilities,
             httpClient = httpClient,
             allowCleartextForLocalTest = allowCleartextForLocalTest,
         ),
+        localDeviceId = deviceId,
         parentScope = parentScope,
         authenticationRefresher = authenticationRefresher,
         authenticationFailureObserver = authenticationFailureObserver,
@@ -165,6 +208,7 @@ class ProductionRealtimeMultiplexer private constructor(
     private val closed = AtomicBoolean(false)
     private val endpointLock = Any()
     private val endpoints = mutableMapOf<UUID, Endpoint>()
+    private val directDataGateway = AtomicReference<ProductionRealtimeDirectDataGateway?>(null)
     private val closedEndpointIncarnations = LinkedHashMap<UUID, ClosedEndpoint>()
     /** Socket-global fence; it intentionally survives endpoint replacement. */
     private val rejectedThroughGeneration = AtomicInteger(0)
@@ -204,8 +248,19 @@ class ProductionRealtimeMultiplexer private constructor(
     val directRelayConnectionEvents: Flow<ProductionRealtimeSessionConnectionEvent>
         get() = supervisor.connectionEvents
 
+    /** Read-only generation-fenced capability echo used to admit new Direct cutovers. */
+    internal val directRealtimeNegotiatedCapabilities:
+        StateFlow<ProductionRealtimeNegotiatedCapabilities>
+        get() = socket.negotiatedCapabilities
+
     /** Registers exactly one consumer for [sessionId]. */
-    fun register(sessionId: UUID): ProductionRealtimeSessionTransport {
+    fun register(
+        sessionId: UUID,
+        peerDeviceId: UUID? = null,
+    ): ProductionRealtimeSessionTransport {
+        require(peerDeviceId == null || peerDeviceId != UUID(0, 0)) {
+            "production session peer device ID is invalid"
+        }
         return synchronized(endpointLock) {
             // close() publishes the owner fence before it takes endpointLock.
             // Rechecking under the map lock prevents a register/close race from
@@ -213,15 +268,117 @@ class ProductionRealtimeMultiplexer private constructor(
             check(!closed.get()) { "production realtime multiplexer is closed" }
             check(sessionId !in endpoints) { "production session is already registered" }
             closedEndpointIncarnations.remove(sessionId)
-            Endpoint(sessionId, nextEndpointIncarnation()).also { endpoint ->
+            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation()).also { endpoint ->
                 endpoints[sessionId] = endpoint
                 logEndpointLifecycle("endpoint_register", endpoint)
             }
         }
     }
 
+    /** Installs one non-owning Direct gateway for this device runtime. */
+    internal fun installDirectDataGateway(gateway: ProductionRealtimeDirectDataGateway): AutoCloseable {
+        check(!closed.get()) { "production realtime multiplexer is closed" }
+        check(directDataGateway.compareAndSet(null, gateway)) {
+            "production Direct data gateway is already installed"
+        }
+        return AutoCloseable { directDataGateway.compareAndSet(gateway, null) }
+    }
+
+    /**
+     * Exact Relay-only fallback used by the device-scoped Direct runtime.
+     * The envelope must still belong to a currently registered peer/session;
+     * this method never re-enters the installed Direct gateway.
+     */
+    internal fun sendRelayExactForPeer(
+        peerDeviceId: UUID,
+        exactEnvelopeBytes: ByteArray,
+    ): Boolean {
+        if (closed.get() || peerDeviceId == UUID(0, 0) || exactEnvelopeBytes.isEmpty()) return false
+        val envelope = runCatching { Envelope.parseFrom(exactEnvelopeBytes) }.getOrNull()
+            ?: return false
+        val sessionId = ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray())
+            ?: return false
+        val endpoint = synchronized(endpointLock) { endpoints[sessionId] } ?: return false
+        if (endpoint.peerDeviceId != peerDeviceId) return false
+        return endpoint.sendRelayExact(envelope, exactEnvelopeBytes)
+    }
+
+    /**
+     * Final common ingress used only after a per-PC Direct actor has obtained an
+     * `INGRESS_DELIVER` action from native. Exact bytes are parsed for routing
+     * metadata but never reserialized. Direct overflow retires that peer in the
+     * caller; it must not replace the healthy Relay socket generation.
+     */
+    internal fun deliverArbitratedExact(
+        peerDeviceId: UUID,
+        carrierOwner: ProductionEnvelopeCarrierOwner,
+        exactEnvelopeBytes: ByteArray,
+    ): Boolean {
+        if (closed.get() || peerDeviceId == UUID(0, 0) ||
+            exactEnvelopeBytes.isEmpty() ||
+            exactEnvelopeBytes.size > ProductionRealtimeClient.MAX_FRAME_BYTES
+        ) return false
+        val envelope = runCatching { Envelope.parseFrom(exactEnvelopeBytes) }.getOrNull()
+            ?: return false
+        val sessionId = ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray())
+            ?: return false
+        val endpoint = synchronized(endpointLock) { endpoints[sessionId] } ?: return false
+        if (endpoint.peerDeviceId != peerDeviceId) return false
+
+        val generation = when (carrierOwner) {
+            is ProductionRelayCarrierOwner -> {
+                val active = endpoint.activeSubscribedGeneration()
+                if (carrierOwner.generation <= 0 || active <= 0 || carrierOwner.generation > active) {
+                    return false
+                }
+                // Relay bytes were already admitted by the device router before
+                // Direct arbitration retained them. A later socket generation
+                // boundary must not discard that authoritative accepted frame.
+                active
+            }
+            is ProductionDirectCarrierOwner -> {
+                if (carrierOwner.peerDeviceId != peerDeviceId ||
+                    envelope.messageType != dev.termlink.protocol.realtime.v1.MessageType.OUTPUT_CHUNK ||
+                    envelope.direction != dev.termlink.protocol.realtime.v1.Direction.PC_TO_ANDROID ||
+                    !envelope.senderDeviceId.toByteArray().contentEquals(
+                        ProductionRealtimeClient.uuidBytes(peerDeviceId),
+                    ) ||
+                    localDeviceId != null && !envelope.recipientDeviceId.toByteArray().contentEquals(
+                        ProductionRealtimeClient.uuidBytes(localDeviceId),
+                    )
+                ) return false
+                endpoint.activeSubscribedGeneration().takeIf { it > 0 } ?: return false
+            }
+        }
+        val ownedBytes = exactEnvelopeBytes.copyOf()
+        val received = ProductionReceivedEnvelope(
+            envelope = envelope,
+            wireBytes = ownedBytes.size,
+            generation = generation,
+            releaseReservation = { },
+            rawBytes = ownedBytes,
+            carrierOwner = when (carrierOwner) {
+                is ProductionRelayCarrierOwner -> carrierOwner.copy()
+                is ProductionDirectCarrierOwner -> carrierOwner.ownedCopy()
+            },
+        )
+        val decision = try {
+            endpoint.deliver(received, alreadyGenerationFenced = true)
+        } finally {
+            received.close()
+        }
+        if (decision != ProductionRealtimeRouteDecision.DELIVERED) {
+            rejectRoute(received, decision, endpoint.incarnation)
+            // This entry point receives frames already owned and arbitrated by
+            // a per-PC Direct actor. Endpoint pressure retires/retries only
+            // that peer; it must never replace the shared Relay generation.
+        }
+        return decision == ProductionRealtimeRouteDecision.DELIVERED
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        directDataGateway.set(null)
         val removed = synchronized(endpointLock) {
             endpoints.values.toList().also { endpoints.clear() }
         }
@@ -267,6 +424,7 @@ class ProductionRealtimeMultiplexer private constructor(
         // Every route outcome, including successful hand-off to a slow endpoint,
         // returns that reservation before this collector accepts the next frame.
         var integrityFailureGeneration = 0
+        var releaseReceived = true
         try {
             val generation = received.generation
             val highestGeneration = highestObservedGeneration.accumulateAndGet(generation, ::maxOf)
@@ -287,6 +445,16 @@ class ProductionRealtimeMultiplexer private constructor(
                 )
             }
             val endpoint = target.endpoint
+            if (endpoint?.peerDeviceId != null) {
+                val gateway = directDataGateway.get()
+                val intercepted = gateway != null && runCatching {
+                    gateway.offerRelay(endpoint.peerDeviceId, received)
+                }.getOrDefault(false)
+                if (intercepted) {
+                    releaseReceived = false
+                    return
+                }
+            }
             val decision = when {
                 endpoint != null -> endpoint.deliver(received)
                 target.closedEndpoint != null -> classifyProductionRealtimeRoute(
@@ -311,7 +479,7 @@ class ProductionRealtimeMultiplexer private constructor(
                 gracefulRetirement = gracefulRetiredGeneration,
             )
         } finally {
-            received.close()
+            if (releaseReceived) received.close()
         }
         if (integrityFailureGeneration > 0) {
             supervisor.replaceCurrentGenerationOnReceiveIntegrityFailure(
@@ -363,6 +531,7 @@ class ProductionRealtimeMultiplexer private constructor(
 
     private inner class Endpoint(
         val sessionId: UUID,
+        val peerDeviceId: UUID?,
         val incarnation: Int,
     ) : ProductionRealtimeSessionTransport {
         private val endpointClosed = AtomicBoolean(false)
@@ -399,14 +568,68 @@ class ProductionRealtimeMultiplexer private constructor(
             subscribedGeneration.set(0)
         }
 
+        fun activeSubscribedGeneration(): Int = subscribedGeneration.get()
+
         override fun send(envelope: Envelope): Boolean = sendInternal(envelope, expectedGeneration = null)
+
+        override fun sendExact(envelope: Envelope, exactBytes: ByteArray): Boolean =
+            sendInternal(envelope, exactBytes, expectedGeneration = null)
 
         override fun sendForConnectedGeneration(
             envelope: Envelope,
             expectedGeneration: Int,
         ): Boolean = sendInternal(envelope, expectedGeneration)
 
-        private fun sendInternal(envelope: Envelope, expectedGeneration: Int?): Boolean {
+        override fun sendExactForConnectedGeneration(
+            envelope: Envelope,
+            exactBytes: ByteArray,
+            expectedGeneration: Int,
+        ): Boolean = sendInternal(envelope, exactBytes, expectedGeneration)
+
+        override fun sendRelayExact(envelope: Envelope, exactBytes: ByteArray): Boolean =
+            sendRelayExactInternal(envelope, exactBytes, expectedGeneration = null)
+
+        override fun sendRelayExactForConnectedGeneration(
+            envelope: Envelope,
+            exactBytes: ByteArray,
+            expectedGeneration: Int,
+        ): Boolean = sendRelayExactInternal(envelope, exactBytes, expectedGeneration)
+
+        private fun sendRelayExactInternal(
+            envelope: Envelope,
+            exactBytes: ByteArray,
+            expectedGeneration: Int?,
+        ): Boolean {
+            require(
+                ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray()) == sessionId,
+            ) { "Envelope session does not match the registered endpoint" }
+            if (expectedGeneration != null) {
+                require(expectedGeneration > 0) { "expectedGeneration must be positive" }
+            }
+            return synchronized(admissionLock) {
+                check(!closed.get() && !endpointClosed.get()) { "production session transport is closed" }
+                if (expectedGeneration == null) {
+                    supervisor.sendExact(envelope, exactBytes)
+                } else {
+                    supervisor.sendExactForConnectedGeneration(
+                        envelope,
+                        exactBytes,
+                        expectedGeneration,
+                    )
+                }
+            }
+        }
+
+        private fun sendInternal(
+            envelope: Envelope,
+            expectedGeneration: Int?,
+        ): Boolean = sendInternal(envelope, exactBytes = null, expectedGeneration)
+
+        private fun sendInternal(
+            envelope: Envelope,
+            exactBytes: ByteArray?,
+            expectedGeneration: Int?,
+        ): Boolean {
             require(
                 ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray()) == sessionId,
             ) { "Envelope session does not match the registered endpoint" }
@@ -422,18 +645,57 @@ class ProductionRealtimeMultiplexer private constructor(
                             check(generation > 0) { "SUBSCRIBE requires a connected socket generation" }
                         }
                         subscribedGeneration.set(0)
-                        supervisor.sendForConnectedGeneration(envelope, generation) { sentGeneration ->
-                            subscribedGeneration.set(sentGeneration)
+                        if (exactBytes == null) {
+                            supervisor.sendForConnectedGeneration(envelope, generation) { sentGeneration ->
+                                subscribedGeneration.set(sentGeneration)
+                            }
+                        } else {
+                            supervisor.sendExactForConnectedGeneration(
+                                envelope,
+                                exactBytes,
+                                generation,
+                            ) { sentGeneration -> subscribedGeneration.set(sentGeneration) }
                         }
                     }
                     dev.termlink.protocol.realtime.v1.MessageType.UNSUBSCRIBE -> {
                         subscribedGeneration.set(0)
-                        supervisor.send(envelope)
+                        if (exactBytes == null) supervisor.send(envelope)
+                        else supervisor.sendExact(envelope, exactBytes)
                     }
-                    else -> if (expectedGeneration != null) {
-                        supervisor.sendForConnectedGeneration(envelope, expectedGeneration)
-                    } else {
-                        supervisor.send(envelope)
+                    else -> {
+                        val relayFallback = {
+                            if (expectedGeneration != null) {
+                                if (exactBytes == null) {
+                                    supervisor.sendForConnectedGeneration(envelope, expectedGeneration)
+                                } else {
+                                    supervisor.sendExactForConnectedGeneration(
+                                        envelope,
+                                        exactBytes,
+                                        expectedGeneration,
+                                    )
+                                }
+                            } else {
+                                if (exactBytes == null) supervisor.send(envelope)
+                                else supervisor.sendExact(envelope, exactBytes)
+                            }
+                        }
+                        val gateway = directDataGateway.get()
+                        val directPeerDeviceId = peerDeviceId
+                        if (gateway != null && directPeerDeviceId != null && exactBytes != null &&
+                            envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.INPUT_EVENT &&
+                            envelope.direction == dev.termlink.protocol.realtime.v1.Direction.ANDROID_TO_PC
+                        ) {
+                            runCatching {
+                                gateway.routeEligibleOutbound(
+                                    directPeerDeviceId,
+                                    envelope,
+                                    exactBytes,
+                                    relayFallback,
+                                )
+                            }.getOrElse { relayFallback() }
+                        } else {
+                            relayFallback()
+                        }
                     }
                 }
             }
@@ -470,7 +732,10 @@ class ProductionRealtimeMultiplexer private constructor(
             closeEndpoint(ownerClosing = true, graceful = false)
         }
 
-        fun deliver(received: ProductionReceivedEnvelope): ProductionRealtimeRouteDecision {
+        fun deliver(
+            received: ProductionReceivedEnvelope,
+            alreadyGenerationFenced: Boolean = false,
+        ): ProductionRealtimeRouteDecision {
             synchronized(admissionLock) {
                 if (endpointClosed.get()) {
                     return classifyProductionRealtimeRoute(endpointPresent = true, endpointClosed = true)
@@ -486,8 +751,9 @@ class ProductionRealtimeMultiplexer private constructor(
                             endpointClosed = true,
                         )
                     }
-                    if (received.generation < highestObservedGeneration.get() ||
-                        received.generation <= rejectedThroughGeneration.get()
+                    if (!alreadyGenerationFenced &&
+                        (received.generation < highestObservedGeneration.get() ||
+                            received.generation <= rejectedThroughGeneration.get())
                     ) {
                         return@synchronized classifyProductionRealtimeRoute(
                             endpointPresent = true,
@@ -571,14 +837,9 @@ class ProductionRealtimeMultiplexer private constructor(
                 (outstandingGenerations[generation] ?: 0) + 1
 
             lateinit var endpointEnvelope: ProductionReceivedEnvelope
-            endpointEnvelope = ProductionReceivedEnvelope(
-                envelope = received.envelope,
-                wireBytes = received.wireBytes,
-                generation = generation,
-                releaseReservation = { wireBytes ->
-                    releaseEndpointReservation(endpointEnvelope, generation, wireBytes)
-                },
-            )
+            endpointEnvelope = received.withCloseObserver {
+                releaseEndpointReservation(endpointEnvelope, generation, received.wireBytes)
+            }
             check(outstandingEnvelopes.add(endpointEnvelope)) {
                 "endpoint reservation identity was duplicated"
             }
@@ -692,13 +953,14 @@ class ProductionRealtimeMultiplexer private constructor(
             stableConnectionMillis: Long =
                 ProductionDeviceConnectionSupervisor.DEFAULT_STABLE_CONNECTION_MILLIS,
         ): ProductionRealtimeMultiplexer = ProductionRealtimeMultiplexer(
-            socket,
-            parentScope,
-            authenticationRefresher,
-            authenticationFailureObserver,
-            retryDelay,
-            retryJitter,
-            stableConnectionMillis,
+            socket = socket,
+            localDeviceId = null,
+            parentScope = parentScope,
+            authenticationRefresher = authenticationRefresher,
+            authenticationFailureObserver = authenticationFailureObserver,
+            retryDelay = retryDelay,
+            retryJitter = retryJitter,
+            stableConnectionMillis = stableConnectionMillis,
         )
     }
 }

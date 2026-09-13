@@ -132,6 +132,26 @@ namespace TermLink.Agent
             public string TokenEndpoint { get; set; }
         }
 
+        internal static string NormalizeServerOrigin(string value)
+        {
+            if (!Uri.TryCreate(value, UriKind.Absolute, out var server) ||
+                server.Scheme != Uri.UriSchemeHttps ||
+                string.IsNullOrEmpty(server.Query) == false ||
+                string.IsNullOrEmpty(server.Fragment) == false ||
+                !string.IsNullOrEmpty(server.UserInfo) ||
+                (!string.IsNullOrEmpty(server.AbsolutePath) && server.AbsolutePath != "/"))
+            {
+                throw new ArgumentException("The TermLink server origin must be an HTTPS origin.");
+            }
+            return new UriBuilder(Uri.UriSchemeHttps, server.IdnHost, server.IsDefaultPort ? -1 : server.Port)
+                .Uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped).TrimEnd('/');
+        }
+
+        internal static string ConfiguredServerUrl() => ProductionAccountStorage.LoadServerUrl();
+
+        public static void ConfigureServer(string serverUrl) =>
+            ProductionAccountStorage.SaveServerUrl(NormalizeServerOrigin(serverUrl));
+
         private sealed class TokenResponse
         {
             [JsonPropertyName("access_token")]
@@ -321,9 +341,7 @@ namespace TermLink.Agent
             bool register,
             string confirm = null)
         {
-            if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps ||
-                !string.IsNullOrEmpty(server.Query) || !string.IsNullOrEmpty(server.Fragment))
-                throw new ArgumentException("The TermLink server origin is invalid.");
+            serverUrl = NormalizeServerOrigin(serverUrl);
             if (string.IsNullOrWhiteSpace(username) || username.Length > 128 || string.IsNullOrWhiteSpace(password))
                 throw new ArgumentException("Account credentials are invalid.");
             using var http = ProductionTls.CreateHttpClient(serverUrl.TrimEnd('/'));
@@ -474,6 +492,7 @@ namespace TermLink.Agent
                     MachineId = machineId
                 };
                 ProductionAgentConfig.Save(config);
+                ProductionAccountStorage.SaveServerUrl(serverUrl);
                 ProductionIdentityStore.TrySave(config, deviceId, identity, accountKey);
             }
             finally

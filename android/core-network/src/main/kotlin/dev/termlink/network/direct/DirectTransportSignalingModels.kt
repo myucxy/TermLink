@@ -61,7 +61,7 @@ internal data class DirectTicketSigningKey(
 internal data class DirectTransportServerConfig(
     val protocolVersion: Int,
     val capabilities: Set<String>,
-    /** This foundation is shadow-only; a true value is always rejected. */
+    /** Server routing gate; true is valid only with `direct_transport_data_v1`. */
     val directRoutingPermitted: Boolean,
     val ticketSigningKeys: Map<String, DirectTicketSigningKey>,
     val stunServers: List<String>,

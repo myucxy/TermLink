@@ -1,5 +1,6 @@
 using System;
 using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -14,6 +15,7 @@ using System.Threading.Tasks;
 using Google.Protobuf;
 using TermLink.Agent;
 using TermLink.Protocol;
+using TermLink.Protocol.Realtime.V1;
 using TermLink.Protocol.Transport.V1;
 
 namespace TermLink.ProductionDirectTransport.Validation
@@ -21,13 +23,44 @@ namespace TermLink.ProductionDirectTransport.Validation
     internal static class Program
     {
         private const uint StunMagicCookie = 0x2112A442;
+        private static bool expectDirectDataPlaneAcceptance;
 
-        private static async Task<int> Main()
+        private static async Task<int> Main(string[] args)
         {
             try
             {
+                var unsupportedArguments = args.Where(value =>
+                        !string.Equals(
+                            value,
+                            "--expect-direct-data-plane-acceptance",
+                            StringComparison.Ordinal) &&
+                        !string.Equals(value, "--nologo", StringComparison.Ordinal))
+                    .ToArray();
+                if (unsupportedArguments.Length != 0)
+                {
+                    throw new ArgumentException(
+                        "Unsupported validation argument: " + unsupportedArguments[0]);
+                }
+                expectDirectDataPlaneAcceptance = args.Any(value => string.Equals(
+                    value,
+                    "--expect-direct-data-plane-acceptance",
+                    StringComparison.Ordinal));
                 ValidateRelayFallbackAndFoundationBoundary();
                 ValidateFeatureAdvertisementDefaultsOff();
+                ValidateRealtimeCapabilityNegotiation();
+                ValidateDirectDataPlaneAdmission();
+                ValidateExactRelayEnvelopeIngress();
+                ValidateDirectRouteEligibilityPolicy();
+                ValidateDirectCutoverCodec();
+                ProductionDirectCutoverSignalCodecValidation.Validate();
+                await ValidatePerAndroidDeviceRouteActorsAsync().ConfigureAwait(false);
+                await ProductionDirectDataRuntimeValidation.ValidateAsync().ConfigureAwait(false);
+                await ProductionRelayExactOutboxValidation.ValidateAsync().ConfigureAwait(false);
+                await ProductionAgentRuntimeDirectWiringValidation.ValidateAsync().ConfigureAwait(false);
+#if TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE
+                await ProductionDirectAcceptanceDiagnosticsValidation.ValidateAsync()
+                    .ConfigureAwait(false);
+#endif
                 DirectTransportDiagnosticsValidation.Validate();
                 ValidateEpochRateAndFailureCooldown();
                 ValidatePeerIsolationAndStaleGenerationCallbacks();
@@ -102,6 +135,19 @@ namespace TermLink.ProductionDirectTransport.Validation
 
         private static void ValidateFeatureAdvertisementDefaultsOff()
         {
+            const string runtimeDataPlaneFlag = "TERMLINK_ENABLE_DIRECT_DATA_PLANE";
+            var previousRuntimeFlag = Environment.GetEnvironmentVariable(runtimeDataPlaneFlag);
+            try
+            {
+                Environment.SetEnvironmentVariable(runtimeDataPlaneFlag, "true");
+                Require(ProductionAgentRuntime.DirectTransportDataPlaneBuildEnabled ==
+                        expectDirectDataPlaneAcceptance,
+                    "A runtime environment variable changed the compile-time Direct data-plane gate.");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(runtimeDataPlaneFlag, previousRuntimeFlag);
+            }
             Require(!ProductionAgentRuntime.IsDirectTransportShadowRuntimeEnabled(null) &&
                     !ProductionAgentRuntime.IsDirectTransportShadowRuntimeEnabled(string.Empty) &&
                     !ProductionAgentRuntime.IsDirectTransportShadowRuntimeEnabled("0") &&
@@ -121,7 +167,831 @@ namespace TermLink.ProductionDirectTransport.Validation
             Require(!capabilities.Any(value =>
                     value?.Contains("direct", StringComparison.OrdinalIgnoreCase) == true),
                 "A Direct transport capability leaked into the Relay HELLO.");
+            Require(ProductionAgentRuntime.DirectTransportDataPlaneBuildEnabled ==
+                    expectDirectDataPlaneAcceptance,
+                "The compiled Direct data-plane acceptance gate did not match the explicit test expectation.");
+
+            using var directHello = JsonDocument.Parse(
+                ProductionAgentRuntime.BuildHelloPayloadWithFeatures(
+                    terminalSnapshotEnabled: true,
+                    typedInputEnabled: true,
+                    directTransportDataEnabled: true));
+            var directCapabilities = directHello.RootElement.GetProperty("capabilities")
+                .EnumerateArray()
+                .Select(value => value.GetString())
+                .ToArray();
+            Require(directCapabilities.Count(value => string.Equals(
+                        value,
+                        ProductionRealtimeCapabilities.DirectTransportDataV1,
+                        StringComparison.Ordinal)) == 1,
+                "The explicit Direct data capability flag was not advertised exactly once.");
+            Require(directCapabilities.Count(value => string.Equals(
+                        value,
+                        ProductionRealtimeCapabilities.DirectSessionCutoverV1,
+                        StringComparison.Ordinal)) == 1,
+                "The explicit Direct session-cutover capability was not advertised exactly once.");
         }
+
+        private static void ValidateRealtimeCapabilityNegotiation()
+        {
+            var advertised = ProductionRealtimeCapabilities.BuildAdvertisedCapabilities(
+                terminalSnapshotEnabled: true,
+                typedInputEnabled: true,
+                directTransportDataEnabled: true);
+            var required = new[]
+            {
+                "cumulative_ack",
+                "e2ee_x25519_chacha20poly1305",
+                "flow_control_v1",
+                "lease_v1"
+            };
+
+            var withoutDirect = ProductionRealtimeCapabilities.ParseWelcome(
+                Welcome(required),
+                advertised);
+            Require(!withoutDirect.DirectTransportDataV1,
+                "A missing optional Welcome echo was synthesized as Direct support.");
+
+            var dataOnlyCapabilities = required
+                .Concat(new[] { ProductionRealtimeCapabilities.DirectTransportDataV1 })
+                .ToArray();
+            var dataOnly = ProductionRealtimeCapabilities.ParseWelcome(
+                Welcome(dataOnlyCapabilities),
+                advertised);
+            Require(dataOnly.DirectTransportDataV1 &&
+                    !dataOnly.DirectSessionCutoverV1 &&
+                    !dataOnly.DirectDataPlaneV1,
+                "A legacy data-only Relay Welcome was promoted to session-safe Direct.");
+
+            var sessionOnlyCapabilities = required
+                .Concat(new[] { ProductionRealtimeCapabilities.DirectSessionCutoverV1 })
+                .ToArray();
+            var sessionOnly = ProductionRealtimeCapabilities.ParseWelcome(
+                Welcome(sessionOnlyCapabilities),
+                advertised);
+            Require(!sessionOnly.DirectTransportDataV1 &&
+                    sessionOnly.DirectSessionCutoverV1 &&
+                    !sessionOnly.DirectDataPlaneV1,
+                "A cutover-only Relay Welcome was promoted to Direct data.");
+
+            var withDirectCapabilities = required.Concat(new[]
+            {
+                ProductionRealtimeCapabilities.DirectTransportDataV1,
+                ProductionRealtimeCapabilities.DirectSessionCutoverV1
+            }).ToArray();
+            var withDirect = ProductionRealtimeCapabilities.ParseWelcome(
+                Welcome(withDirectCapabilities), advertised);
+            Require(withDirect.DirectTransportDataV1 &&
+                    withDirect.DirectSessionCutoverV1 &&
+                    withDirect.DirectDataPlaneV1,
+                "The complete Direct data/session capability pair was not negotiated.");
+
+            var state = new ProductionRealtimeCapabilityState();
+            Require(state.TryMarkConnected(1, withDirect),
+                "The first negotiated Relay generation was rejected.");
+            var first = state.Snapshot();
+            Require(first.Connected && first.PhysicalGeneration == 1 &&
+                    first.DirectTransportDataV1 && first.DirectSessionCutoverV1 &&
+                    first.DirectDataPlaneV1,
+                "The negotiated optional capability was not generation-bound.");
+            state.Clear();
+            var disconnected = state.Snapshot();
+            Require(!disconnected.Connected && disconnected.PhysicalGeneration == 0 &&
+                    disconnected.Capabilities.Count == 0 &&
+                    !disconnected.DirectTransportDataV1 &&
+                    !disconnected.DirectSessionCutoverV1 &&
+                    !disconnected.DirectDataPlaneV1,
+                "Disconnect retained a negotiated optional capability.");
+            Require(state.TryMarkConnected(2, withoutDirect),
+                "The next Relay generation was rejected.");
+            var withdrawn = state.Snapshot();
+            Require(withdrawn.Connected && withdrawn.PhysicalGeneration == 2 &&
+                    !withdrawn.DirectTransportDataV1,
+                "The next Welcome did not withdraw the old generation's optional capability.");
+            Require(!state.TryMarkConnected(1, withDirect) &&
+                    state.Snapshot().PhysicalGeneration == 2 &&
+                    !state.Snapshot().DirectTransportDataV1,
+                "A stale generation restored an obsolete optional capability.");
+
+            RequireThrows<InvalidDataException>(
+                () => ProductionRealtimeCapabilities.ParseWelcome(
+                    Welcome(required.Where(value => value != "lease_v1").ToArray()),
+                    advertised),
+                "A Welcome missing a required Relay capability was accepted.");
+            RequireThrows<InvalidDataException>(
+                () => ProductionRealtimeCapabilities.ParseWelcome(
+                    Welcome(required.Concat(new[] { "cumulative_ack" }).ToArray()),
+                    advertised),
+                "A duplicate Welcome capability was accepted.");
+
+            var malformed = new[]
+            {
+                "{}",
+                "[]",
+                "{\"type\":\"SERVER_WELCOME\",\"protocol_version\":1,\"capabilities\":[]}",
+                "{\"type\":\"welcome\",\"protocol_version\":2,\"capabilities\":[]}",
+                "{\"type\":\"welcome\",\"type\":\"welcome\",\"protocol_version\":1,\"capabilities\":[]}",
+                "{\"type\":\"welcome\",\"protocol_version\":1,\"protocol_version\":1,\"capabilities\":[]}",
+                "{\"type\":\"welcome\",\"protocol_version\":1,\"capabilities\":[],\"capabilities\":[]}",
+                "{\"type\":\"welcome\",\"protocol_version\":1,\"capabilities\":\"cumulative_ack\"}",
+                "{\"type\":\"welcome\",\"protocol_version\":1,\"capabilities\":[\"CUMULATIVE_ACK\"]}",
+                "{\"type\":\"welcome\",\"protocol_version\":1,\"capabilities\":[\"unoffered_v1\"]}",
+                "{\"type\":\"welcome\",\"protocol_version\":1,\"capabilities\":[]} trailing"
+            };
+            foreach (var value in malformed)
+            {
+                RequireThrows<InvalidDataException>(
+                    () => ProductionRealtimeCapabilities.ParseWelcome(
+                        Encoding.UTF8.GetBytes(value),
+                        advertised),
+                    "A malformed or non-negotiated Welcome was accepted: " + value);
+            }
+
+            var tooMany = Enumerable.Range(0, ProductionRealtimeCapabilities.MaximumCapabilities + 1)
+                .Select(index => "capability_" + index)
+                .ToArray();
+            RequireThrows<InvalidDataException>(
+                () => ProductionRealtimeCapabilities.ParseWelcome(
+                    Welcome(tooMany),
+                    tooMany.Concat(required).ToArray()),
+                "An over-count Welcome capability list was accepted.");
+            var overlong = new string('a',
+                ProductionRealtimeCapabilities.MaximumCapabilityBytes + 1);
+            RequireThrows<InvalidDataException>(
+                () => ProductionRealtimeCapabilities.ParseWelcome(
+                    Welcome(required.Concat(new[] { overlong }).ToArray()),
+                    required.Concat(new[] { overlong }).ToArray()),
+                "An over-length Welcome capability was accepted.");
+            RequireThrows<InvalidDataException>(
+                () => ProductionRealtimeCapabilities.ParseWelcome(
+                    new byte[ProductionRealtimeCapabilities.MaximumWelcomeBytes + 1],
+                    advertised),
+                "An oversized Welcome payload was accepted.");
+        }
+
+        private static void ValidateDirectDataPlaneAdmission()
+        {
+            var config = new ProductionDirectTransportServerConfig(
+                1,
+                new[]
+                {
+                    ProductionDirectTransportSignalingClient.DirectSignalingCapability,
+                    ProductionDirectTransportSignalingClient.DirectShadowCapability,
+                    ProductionDirectTransportSignalingClient.DirectDataCapability,
+                    ProductionDirectTransportSignalingClient.DirectSessionCutoverCapability
+                },
+                new Dictionary<string, ProductionDirectTicketSigningKey>(),
+                Array.Empty<string>(),
+                directRoutingPermitted: true);
+            var realtime = new ProductionRealtimeCapabilityState();
+            var welcome = new ProductionRealtimeWelcome(new[]
+            {
+                "cumulative_ack",
+                "e2ee_x25519_chacha20poly1305",
+                "flow_control_v1",
+                "lease_v1",
+                ProductionRealtimeCapabilities.DirectTransportDataV1,
+                ProductionRealtimeCapabilities.DirectSessionCutoverV1
+            });
+            Require(realtime.TryMarkConnected(7, welcome),
+                "Direct admission fixture could not establish Relay generation 7.");
+
+            var disabled = new ProductionDirectDataPlaneAdmission(buildEnabled: false);
+            disabled.ObserveServerConfig(config);
+            disabled.ObserveRelay(realtime.Snapshot());
+            disabled.ObserveSignalling(ConnectedDirectSignalling(3), 7);
+            Require(!disabled.TryCapture(out _),
+                "The production compile-time Direct gate was bypassed.");
+
+            var gate = new ProductionDirectDataPlaneAdmission(buildEnabled: true);
+            gate.ObserveServerConfig(config);
+            gate.ObserveRelay(realtime.Snapshot());
+            gate.ObserveSignalling(ConnectedDirectSignalling(3), 7);
+            Require(gate.TryCapture(out var first) && gate.IsCurrent(first),
+                "Two currently negotiated lanes and the server gate did not authorize cutover.");
+
+            gate.ObserveSignalling(new ProductionDirectSignalingSnapshot
+            {
+                State = ProductionDirectSignalingLaneState.Fault,
+                Generation = 3,
+                DirectDataV1Negotiated = false
+            }, 7);
+            Require(!gate.TryCapture(out _) && !gate.IsCurrent(first),
+                "A signalling fault retained a Direct cutover authorization.");
+
+            gate.ObserveSignalling(ConnectedDirectSignalling(4), 7);
+            Require(gate.TryCapture(out var second) && gate.IsCurrent(second) &&
+                    !gate.IsCurrent(first),
+                "A new signalling generation revived an obsolete cutover token.");
+
+            realtime.Clear();
+            gate.ObserveRelay(realtime.Snapshot());
+            Require(!gate.TryCapture(out _) && !gate.IsCurrent(second),
+                "A Relay disconnect retained Direct authorization.");
+
+            Require(realtime.TryMarkConnected(8, welcome),
+                "Direct admission fixture could not establish Relay generation 8.");
+            gate.ObserveRelay(realtime.Snapshot());
+            gate.ObserveSignalling(ConnectedDirectSignalling(5), 7);
+            Require(!gate.TryCapture(out _),
+                "A signalling callback was rebound to a stale Relay generation.");
+            gate.ObserveSignalling(ConnectedDirectSignalling(5), 8);
+            Require(gate.TryCapture(out var third) && gate.IsCurrent(third),
+                "The signalling lane could not bind to the current Relay generation.");
+
+            gate.ObserveServerConfig(new ProductionDirectTransportServerConfig(
+                1,
+                config.Capabilities,
+                config.TicketSigningKeys,
+                config.StunServers,
+                directRoutingPermitted: false));
+            Require(!gate.TryCapture(out _) && !gate.IsCurrent(third),
+                "Withdrawing the server routing gate retained Direct authorization.");
+
+            var dataOnlyConfig = new ProductionDirectTransportServerConfig(
+                1,
+                config.Capabilities.Where(value => value !=
+                    ProductionDirectTransportSignalingClient.DirectSessionCutoverCapability)
+                    .ToArray(),
+                config.TicketSigningKeys,
+                config.StunServers,
+                directRoutingPermitted: true);
+            gate.ObserveServerConfig(dataOnlyConfig);
+            Require(!gate.TryCapture(out _),
+                "A legacy data-only server config authorized session cutover.");
+
+            gate.ObserveServerConfig(config);
+            var dataOnlyRelay = new ProductionRealtimeWelcome(new[]
+            {
+                "cumulative_ack",
+                "e2ee_x25519_chacha20poly1305",
+                "flow_control_v1",
+                "lease_v1",
+                ProductionRealtimeCapabilities.DirectTransportDataV1
+            });
+            Require(realtime.TryMarkConnected(9, dataOnlyRelay),
+                "The data-only Relay fixture could not advance its generation.");
+            gate.ObserveRelay(realtime.Snapshot());
+            gate.ObserveSignalling(ConnectedDirectSignalling(6), 9);
+            Require(!gate.TryCapture(out _) &&
+                    gate.Snapshot.RelayDirectDataNegotiated &&
+                    !gate.Snapshot.RelaySessionCutoverNegotiated,
+                "A data-only Relay Welcome authorized Direct cutover.");
+
+            Require(realtime.TryMarkConnected(10, welcome),
+                "The complete Relay fixture could not restore both capabilities.");
+            gate.ObserveRelay(realtime.Snapshot());
+            gate.ObserveSignalling(ConnectedDirectSignalling(
+                7,
+                directData: true,
+                sessionCutover: false), 10);
+            Require(!gate.TryCapture(out _) &&
+                    gate.Snapshot.SignallingDirectDataNegotiated &&
+                    !gate.Snapshot.SignallingSessionCutoverNegotiated,
+                "A data-only signalling Welcome authorized Direct cutover.");
+
+            gate.ObserveSignalling(ConnectedDirectSignalling(
+                8,
+                directData: false,
+                sessionCutover: true), 10);
+            Require(!gate.TryCapture(out _),
+                "A cutover-only signalling Welcome authorized Direct data.");
+        }
+
+        private static ProductionDirectSignalingSnapshot ConnectedDirectSignalling(
+            long generation,
+            bool directData = true,
+            bool sessionCutover = true) => new()
+        {
+            State = ProductionDirectSignalingLaneState.Connected,
+            Generation = generation,
+            DirectDataV1Negotiated = directData,
+            DirectSessionCutoverV1Negotiated = sessionCutover
+        };
+
+        private static byte[] Welcome(string[] capabilities)
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                type = "welcome",
+                protocol_version = 1,
+                heartbeat_seconds = 15,
+                connection_id = Guid.NewGuid().ToString("D"),
+                capabilities
+            });
+        }
+
+        private static void ValidateExactRelayEnvelopeIngress()
+        {
+            var sessionId = Guid.NewGuid();
+            var senderDeviceId = Guid.NewGuid();
+            var recipientDeviceId = Guid.NewGuid();
+            var firstRaw = BuildNonCanonicalEnvelope(
+                sessionId,
+                senderDeviceId,
+                recipientDeviceId);
+            var secondRaw = (byte[])firstRaw.Clone();
+            var expectedDigest = SHA256.HashData(firstRaw);
+            byte[] firstDigest;
+            byte[] canonical;
+
+            using (var first = ProductionInboundEnvelope.Parse(firstRaw))
+            {
+                Require(first.RawBytes.Span.SequenceEqual(firstRaw),
+                    "Relay ingress did not retain the exact assembled frame bytes.");
+                firstDigest = ProductionAgentRuntime.ComputeExactEnvelopeSha256(
+                    first.RawBytes.Span);
+                canonical = first.Envelope.ToByteArray();
+                Require(!first.RawBytes.Span.SequenceEqual(canonical),
+                    "The non-canonical wire fixture unexpectedly matched protobuf reserialization.");
+            }
+            Require(firstRaw.All(value => value == 0),
+                "Relay ingress did not clear the owned raw bytes on disposal.");
+
+            byte[] secondDigest;
+            using (var second = ProductionInboundEnvelope.Parse(secondRaw))
+            {
+                secondDigest = ProductionAgentRuntime.ComputeExactEnvelopeSha256(
+                    second.RawBytes.Span);
+            }
+            Require(expectedDigest.SequenceEqual(firstDigest) &&
+                    expectedDigest.SequenceEqual(secondDigest),
+                "An exact Relay retransmission did not retain a stable raw-envelope digest.");
+            Require(!expectedDigest.SequenceEqual(SHA256.HashData(canonical)),
+                "Input replay identity still matched a reserialized protobuf instead of the exact wire bytes.");
+            Require(secondRaw.All(value => value == 0),
+                "The duplicate Relay ingress did not clear its owned raw bytes on disposal.");
+
+            var replayKeys = new HashSet<string>(StringComparer.Ordinal);
+            var deliveries = 0;
+            foreach (var digest in new[] { firstDigest, secondDigest })
+            {
+                if (replayKeys.Add(Convert.ToHexString(digest))) deliveries++;
+                CryptographicOperations.ZeroMemory(digest);
+            }
+            Require(deliveries == 1,
+                "Two exact Relay copies were not collapsed to one input delivery key.");
+            CryptographicOperations.ZeroMemory(expectedDigest);
+            CryptographicOperations.ZeroMemory(canonical);
+        }
+
+        private static byte[] BuildNonCanonicalEnvelope(
+            Guid sessionId,
+            Guid senderDeviceId,
+            Guid recipientDeviceId)
+        {
+            using var stream = new MemoryStream();
+            var output = new CodedOutputStream(stream);
+            output.WriteTag(12, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFrom(recipientDeviceId.ToByteArray()));
+            output.WriteTag(99, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFromUtf8("unknown-wire-field"));
+            output.WriteTag(4, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFrom(senderDeviceId.ToByteArray()));
+            output.WriteTag(11, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFrom(new byte[32]));
+            output.WriteTag(3, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFrom(sessionId.ToByteArray()));
+            output.WriteTag(10, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFrom(new byte[12]));
+            output.WriteTag(1, WireFormat.WireType.Varint);
+            output.WriteUInt32(1);
+            output.WriteTag(2, WireFormat.WireType.Varint);
+            output.WriteEnum((int)MessageType.InputEvent);
+            output.WriteTag(5, WireFormat.WireType.Varint);
+            output.WriteEnum((int)Direction.AndroidToPc);
+            output.WriteTag(6, WireFormat.WireType.Varint);
+            output.WriteUInt64(7);
+            output.WriteTag(8, WireFormat.WireType.Varint);
+            output.WriteInt64(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            output.WriteTag(9, WireFormat.WireType.LengthDelimited);
+            output.WriteBytes(ByteString.CopyFromUtf8("key-epoch-1"));
+            output.Flush();
+            return stream.ToArray();
+        }
+
+        private static void ValidateDirectRouteEligibilityPolicy()
+        {
+            foreach (var messageType in Enum.GetValues<MessageType>())
+            {
+                var pcToAndroid = ProductionDirectRoutePolicy.Evaluate(
+                    messageType,
+                    Direction.PcToAndroid);
+                var androidToPc = ProductionDirectRoutePolicy.Evaluate(
+                    messageType,
+                    Direction.AndroidToPc);
+                Require(pcToAndroid == (messageType == MessageType.OutputChunk
+                            ? ProductionDirectRouteEligibility.DirectEligible
+                            : ProductionDirectRouteEligibility.RelayOnly) &&
+                        androidToPc == (messageType == MessageType.InputEvent
+                            ? ProductionDirectRouteEligibility.DirectEligible
+                            : ProductionDirectRouteEligibility.RelayOnly),
+                    "The Direct route policy admitted a non-terminal-data Envelope: " +
+                    messageType + ".");
+            }
+
+            Require(ProductionDirectRoutePolicy.Evaluate(
+                        (MessageType)999,
+                        Direction.PcToAndroid) == ProductionDirectRouteEligibility.RelayOnly &&
+                    ProductionDirectRoutePolicy.Evaluate(
+                        MessageType.OutputChunk,
+                        (Direction)999) == ProductionDirectRouteEligibility.RelayOnly &&
+                    ProductionDirectRoutePolicy.Evaluate(
+                        MessageType.OutputChunk,
+                        Direction.AndroidToPc) == ProductionDirectRouteEligibility.RelayOnly &&
+                    ProductionDirectRoutePolicy.Evaluate(
+                        MessageType.InputEvent,
+                        Direction.PcToAndroid) == ProductionDirectRouteEligibility.RelayOnly,
+                "An unknown or reversed route value escaped the Relay-only default.");
+
+            var pc = Guid.NewGuid();
+            var android = Guid.NewGuid();
+            var outbound = new Envelope
+            {
+                MessageType = MessageType.OutputChunk,
+                Direction = Direction.PcToAndroid,
+                SenderDeviceId = ByteString.CopyFrom(GuidBytes(pc)),
+                RecipientDeviceId = ByteString.CopyFrom(GuidBytes(android))
+            };
+            Require(ProductionDirectRoutePolicy.Evaluate(outbound, out var outboundAndroid) ==
+                    ProductionDirectRouteEligibility.DirectEligible &&
+                    outboundAndroid == android,
+                "PC-to-Android routing did not key the peer by recipient Android device ID.");
+
+            var inbound = new Envelope
+            {
+                MessageType = MessageType.InputEvent,
+                Direction = Direction.AndroidToPc,
+                SenderDeviceId = ByteString.CopyFrom(GuidBytes(android)),
+                RecipientDeviceId = ByteString.CopyFrom(GuidBytes(pc))
+            };
+            Require(ProductionDirectRoutePolicy.Evaluate(inbound, out var inboundAndroid) ==
+                    ProductionDirectRouteEligibility.DirectEligible &&
+                    inboundAndroid == android,
+                "Android-to-PC routing did not key the peer by sender Android device ID.");
+
+            outbound.RecipientDeviceId = ByteString.CopyFrom(new byte[16]);
+            Require(ProductionDirectRoutePolicy.Evaluate(outbound, out var invalidAndroid) ==
+                    ProductionDirectRouteEligibility.RelayOnly && invalidAndroid == Guid.Empty,
+                "An empty Android device ID was admitted to Direct routing.");
+        }
+
+        private static void ValidateDirectCutoverCodec()
+        {
+            ValidateCrossPlatformDirectCutoverVector();
+
+            var connectionId = Guid.Parse("20000000-0000-0000-0000-000000000001");
+            var barrierId = Guid.Parse("10000000-0000-0000-0000-000000000001");
+            var sessionOne = Guid.Parse("00000000-0000-0000-0000-000000000001");
+            var sessionTwo = Guid.Parse("00000000-0000-0000-0000-000000000002");
+            var binding = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
+            var proposal = ProductionDirectCutoverCodec.CreateProposal(
+                connectionId,
+                5,
+                Direction.PcToAndroid,
+                barrierId,
+                binding,
+                new[]
+                {
+                    new ProductionDirectSessionCutoverBarrier
+                    {
+                        SessionId = sessionTwo,
+                        FirstDirectSequence = 9
+                    },
+                    new ProductionDirectSessionCutoverBarrier
+                    {
+                        SessionId = sessionOne,
+                        FirstDirectSequence = 7
+                    }
+                },
+                250);
+            const string expectedWire =
+                "0A101000000000000000000000000000000112200102030405060708090A0B0C0D0E0F" +
+                "101112131415161718191A1B1C1D1E1F201A140A100000000000000000000000000000" +
+                "000110071A140A1000000000000000000000000000000002100920FA01";
+            const string expectedDigest =
+                "901CB6CE674E3FFA476EA30398DAD8CA321505DC994001D308775E41B1FABBEE";
+            Require(Convert.ToHexString(proposal.WireBytes) == expectedWire &&
+                    Convert.ToHexString(proposal.BarrierSha256) == expectedDigest &&
+                    proposal.SessionBarriers.Select(value => value.SessionId)
+                        .SequenceEqual(new[] { sessionOne, sessionTwo }),
+                "The canonical Direct cutover vector changed or retained caller ordering.");
+            Require(ProductionDirectCutoverCodec.TryParseProposal(
+                        proposal.WireBytes,
+                        connectionId,
+                        5,
+                        Direction.PcToAndroid,
+                        out var parsed) &&
+                    parsed.BarrierId == barrierId &&
+                    parsed.Direction == Direction.PcToAndroid &&
+                    parsed.DirectPathBinding.SequenceEqual(binding) &&
+                    parsed.BarrierSha256.SequenceEqual(proposal.BarrierSha256) &&
+                    parsed.WireBytes.SequenceEqual(proposal.WireBytes),
+                "A canonical Direct cutover proposal did not round-trip byte-identically.");
+
+            var unknownField = proposal.WireBytes.Concat(new byte[] { 0xf8, 0x06, 0x01 }).ToArray();
+            Require(!ProductionDirectCutoverCodec.TryParseProposal(
+                    unknownField,
+                    connectionId,
+                    5,
+                    Direction.PcToAndroid,
+                    out _),
+                "A Direct cutover proposal with an unknown field was accepted.");
+
+            var reversed = DirectCutoverProposalV1.Parser.ParseFrom(proposal.WireBytes);
+            var first = reversed.SessionBarriers[0];
+            reversed.SessionBarriers[0] = reversed.SessionBarriers[1];
+            reversed.SessionBarriers[1] = first;
+            Require(!ProductionDirectCutoverCodec.TryParseProposal(
+                    reversed.ToByteArray(),
+                    connectionId,
+                    5,
+                    Direction.PcToAndroid,
+                    out _),
+                "A non-canonical Direct cutover session order was accepted.");
+
+            var conflictingDirection = DirectCutoverProposalV1.Parser.ParseFrom(
+                proposal.WireBytes);
+            conflictingDirection.SessionBarriers[0].AndroidToPcFirstDirectSeq = 7;
+            Require(!ProductionDirectCutoverCodec.TryParseProposal(
+                        conflictingDirection.ToByteArray(),
+                        connectionId,
+                        5,
+                        Direction.PcToAndroid,
+                        out _) &&
+                    !ProductionDirectCutoverCodec.TryParseProposal(
+                        proposal.WireBytes,
+                        connectionId,
+                        5,
+                        Direction.AndroidToPc,
+                        out _),
+                "A cutover proposal crossed or mixed its authenticated direction.");
+
+            var duplicateSession = DirectCutoverProposalV1.Parser.ParseFrom(
+                proposal.WireBytes);
+            duplicateSession.SessionBarriers[1].SessionId =
+                duplicateSession.SessionBarriers[0].SessionId;
+            var zeroSequence = DirectCutoverProposalV1.Parser.ParseFrom(proposal.WireBytes);
+            zeroSequence.SessionBarriers[0].PcToAndroidFirstDirectSeq = 0;
+            var excessiveGrace = DirectCutoverProposalV1.Parser.ParseFrom(proposal.WireBytes);
+            excessiveGrace.DuplicateGraceMs = 5_001;
+            Require(!ProductionDirectCutoverCodec.TryParseProposal(
+                        duplicateSession.ToByteArray(), connectionId, 5,
+                        Direction.PcToAndroid, out _) &&
+                    !ProductionDirectCutoverCodec.TryParseProposal(
+                        zeroSequence.ToByteArray(), connectionId, 5,
+                        Direction.PcToAndroid, out _) &&
+                    !ProductionDirectCutoverCodec.TryParseProposal(
+                        excessiveGrace.ToByteArray(), connectionId, 5,
+                        Direction.PcToAndroid, out _) &&
+                    !ProductionDirectCutoverCodec.TryParseProposal(
+                        new byte[ProductionDirectCutoverCodec.MaximumProposalBytes + 1],
+                        connectionId, 5, Direction.PcToAndroid, out _),
+                "A bounded Direct cutover field limit was not enforced.");
+
+            RequireThrows<ArgumentException>(
+                () => ProductionDirectCutoverCodec.CreateProposal(
+                    connectionId,
+                    5,
+                    Direction.PcToAndroid,
+                    barrierId,
+                    binding,
+                    new[]
+                    {
+                        new ProductionDirectSessionCutoverBarrier
+                        {
+                            SessionId = sessionOne,
+                            FirstDirectSequence = 7
+                        },
+                        new ProductionDirectSessionCutoverBarrier
+                        {
+                            SessionId = sessionOne,
+                            FirstDirectSequence = 8
+                        }
+                    },
+                    250),
+                "The cutover builder admitted a duplicate session barrier.");
+
+            var proposalSignal = ProductionDirectCutoverSignalCodec.CreateProposal(proposal);
+            Require(ProductionDirectCutoverSignalCodec.TryParseProposal(
+                        proposalSignal, connectionId, 5, Direction.PcToAndroid,
+                        out var signalProposal) &&
+                    signalProposal.WireBytes.SequenceEqual(proposal.WireBytes) &&
+                    !ProductionDirectCutoverSignalCodec.TryParseProposal(
+                        proposalSignal.Concat(new byte[] { 0xf8, 0x06, 0x01 }).ToArray(),
+                        connectionId, 5, Direction.PcToAndroid, out _),
+                "The encrypted cutover proposal wrapper was not canonical and exact.");
+
+            var acceptedSignal = ProductionDirectCutoverSignalCodec.CreateAccept(
+                barrierId, proposal.BarrierSha256, accepted: true, string.Empty);
+            Require(ProductionDirectCutoverSignalCodec.TryParseAccept(
+                        acceptedSignal, out var accepted) && accepted.Accepted &&
+                    accepted.BarrierId == barrierId &&
+                    accepted.BarrierSha256.SequenceEqual(proposal.BarrierSha256),
+                "A canonical Direct cutover accept did not round-trip.");
+            var rejectedSignal = ProductionDirectCutoverSignalCodec.CreateAccept(
+                barrierId, proposal.BarrierSha256, accepted: false,
+                "DIRECT_PREFIX_TIMEOUT");
+            Require(ProductionDirectCutoverSignalCodec.TryParseAccept(
+                        rejectedSignal, out var rejected) && !rejected.Accepted &&
+                    rejected.ReasonCode == "DIRECT_PREFIX_TIMEOUT" &&
+                    !ProductionDirectCutoverSignalCodec.TryParseAccept(
+                        rejectedSignal.Concat(new byte[] { 0xf8, 0x06, 0x01 }).ToArray(), out _),
+                "A rejected or non-canonical Direct accept was mishandled.");
+
+            var commitSignal = ProductionDirectCutoverSignalCodec.CreateCommit(
+                barrierId, proposal.BarrierSha256);
+            Require(ProductionDirectCutoverSignalCodec.TryParseCommit(
+                        commitSignal, out var commit) && commit.BarrierId == barrierId &&
+                    commit.BarrierSha256.SequenceEqual(proposal.BarrierSha256),
+                "A canonical Direct cutover commit did not round-trip.");
+            var fallbackSignal = ProductionDirectCutoverSignalCodec.CreateFallback(
+                barrierId, "DIRECT_FAILURE", 17);
+            Require(ProductionDirectCutoverSignalCodec.TryParseFallback(
+                        fallbackSignal, out var fallbackSignalValue) &&
+                    fallbackSignalValue.BarrierId == barrierId &&
+                    fallbackSignalValue.ReasonCode == "DIRECT_FAILURE" &&
+                    fallbackSignalValue.LastReceivedDirectFrameSequence == 17,
+                "A canonical Direct fallback did not round-trip.");
+            RequireThrows<ArgumentException>(
+                () => ProductionDirectCutoverSignalCodec.CreateAccept(
+                    barrierId, proposal.BarrierSha256, accepted: true, "NOT_EMPTY"),
+                "An accepted cutover signal retained a rejection reason.");
+        }
+
+        private static void ValidateCrossPlatformDirectCutoverVector()
+        {
+            var connectionId = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+            var barrierId = Guid.Parse("fedcba98-7654-3210-ffff-eeee00001111");
+            var binding = Enumerable.Range(1, 32).Select(value => (byte)value).ToArray();
+            var proposal = ProductionDirectCutoverCodec.CreateProposal(
+                connectionId,
+                0x0102030405060708UL,
+                Direction.AndroidToPc,
+                barrierId,
+                binding,
+                new[]
+                {
+                    new ProductionDirectSessionCutoverBarrier
+                    {
+                        SessionId = Guid.Parse("ffffffff-0000-0000-0000-000000000001"),
+                        FirstDirectSequence = 300
+                    },
+                    new ProductionDirectSessionCutoverBarrier
+                    {
+                        SessionId = Guid.Parse("00000000-ffff-eeee-dddd-ccccbbbb0002"),
+                        FirstDirectSequence = 1
+                    }
+                },
+                1_250);
+            const string expectedWire =
+                "0A10FEDCBA9876543210FFFFEEEE0000111112200102030405060708090A0B0C0D0E0F10" +
+                "1112131415161718191A1B1C1D1E1F201A140A1000000000FFFFEEEEDDDDCCCCBBBB0002" +
+                "18011A150A10FFFFFFFF00000000000000000000000118AC0220E209";
+            const string expectedDigest =
+                "8322FE77ACA31E9DF68620A041E9B596A84F00357A290CC88A1493A5E63303EC";
+            Require(Convert.ToHexString(proposal.WireBytes) == expectedWire &&
+                    Convert.ToHexString(proposal.BarrierSha256) == expectedDigest,
+                "The shared Android/Windows Direct cutover vector changed.");
+            Require(ProductionDirectCutoverCodec.TryParseProposal(
+                        proposal.WireBytes,
+                        connectionId,
+                        0x0102030405060708UL,
+                        Direction.AndroidToPc,
+                        out var parsed) &&
+                    parsed.BarrierSha256.SequenceEqual(proposal.BarrierSha256) &&
+                    parsed.WireBytes.SequenceEqual(proposal.WireBytes),
+                "The shared Android/Windows Direct cutover vector did not round-trip exactly.");
+        }
+
+        private static async Task ValidatePerAndroidDeviceRouteActorsAsync()
+        {
+            using var registry = new ProductionDirectPeerRouteRegistry();
+            registry.ObserveRelay(connected: true, generation: 17);
+            var androidOne = Guid.NewGuid();
+            var androidTwo = Guid.NewGuid();
+
+            var parallel = Enumerable.Range(0, 16)
+                .Select(_ => Task.Run(() =>
+                {
+                    Require(registry.TryGetOrCreate(androidOne, out var value),
+                        "The peer registry rejected a valid Android device ID.");
+                    return value;
+                }))
+                .ToArray();
+            var actors = await Task.WhenAll(parallel).ConfigureAwait(false);
+            Require(registry.TryGetOrCreate(androidTwo, out var actorTwo),
+                "The peer registry rejected the second Android device ID.");
+            Require(actors.All(value => ReferenceEquals(value, actors[0])) &&
+                    !ReferenceEquals(actors[0], actorTwo) &&
+                    !registry.TryGetOrCreate(Guid.Empty, out _),
+                "The route registry did not maintain one actor per Android device ID.");
+            var actorOne = actors[0];
+
+            var firstFence = RouteFence(1);
+            Require(actorOne.TryBeginDirect(
+                        firstFence,
+                        ProductionDirectAuthenticatedPathKind.LocalAreaNetwork) &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.NegotiatingDirect &&
+                    actorOne.Snapshot.RelayGeneration == 17 && actorOne.Snapshot.RelayConnected,
+                "A valid peer did not enter Direct negotiation beside the current Relay.");
+            Require(actorOne.TryMarkDirectionActive(
+                        firstFence,
+                        ProductionDirectPeerDirection.PcToAndroid) &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.NegotiatingDirect,
+                "A single active direction incorrectly reported a Direct carrier.");
+            Require(actorOne.TryMarkDirectionActive(
+                        firstFence,
+                        ProductionDirectPeerDirection.AndroidToPc) &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.LocalAreaNetworkDirect,
+                "Two active LAN directions did not aggregate to LAN Direct.");
+
+            var secondFence = RouteFence(2);
+            Require(actorTwo.TryBeginDirect(
+                        secondFence,
+                        ProductionDirectAuthenticatedPathKind.NatTraversal) &&
+                    actorTwo.TryMarkDirectionActive(
+                        secondFence,
+                        ProductionDirectPeerDirection.AndroidToPc) &&
+                    actorTwo.TryMarkDirectionActive(
+                        secondFence,
+                        ProductionDirectPeerDirection.PcToAndroid) &&
+                    actorTwo.Snapshot.Carrier == ProductionDirectPeerCarrier.NatTraversalDirect,
+                "Two active NAT directions did not aggregate to NAT Direct.");
+
+            Require(!actorOne.TryBeginDirect(
+                        RouteFence(0),
+                        ProductionDirectAuthenticatedPathKind.LocalAreaNetwork) &&
+                    !actorOne.TryBeginDirect(
+                        RouteFence(3),
+                        (ProductionDirectAuthenticatedPathKind)999) &&
+                    !actorOne.TryMarkDirectionActive(firstFence, (ProductionDirectPeerDirection)999),
+                "An unknown or invalid Direct lifecycle value did not fail closed.");
+
+            var relayBeforeFault = actorOne.Snapshot.RelayGeneration;
+            Require(registry.TryRetirePeer(androidOne, firstFence, "QUIC_CLOSED") &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.Relay &&
+                    actorOne.Snapshot.RelayGeneration == relayBeforeFault &&
+                    actorOne.Snapshot.RelayConnected &&
+                    actorOne.Snapshot.LastDirectFault == "QUIC_CLOSED" &&
+                    actorTwo.Snapshot.Carrier == ProductionDirectPeerCarrier.NatTraversalDirect &&
+                    actorTwo.Snapshot.RelayGeneration == relayBeforeFault,
+                "A Direct fault changed Relay generation or retired another Android peer.");
+            Require(!registry.TryRetirePeer(androidOne, firstFence, "STALE") &&
+                    actorTwo.Snapshot.Carrier == ProductionDirectPeerCarrier.NatTraversalDirect,
+                "A stale Direct fault mutated current peer state.");
+
+            var successor = RouteFence(4);
+            Require(actorOne.TryBeginDirect(
+                        successor,
+                        ProductionDirectAuthenticatedPathKind.NatTraversal) &&
+                    !actorOne.TryBeginDirect(
+                        firstFence,
+                        ProductionDirectAuthenticatedPathKind.LocalAreaNetwork) &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.NegotiatingDirect,
+                "A stale fence replaced a newer peer negotiation.");
+
+            registry.ObserveRelay(connected: false, generation: 18);
+            Require(actorOne.Snapshot.RelayGeneration == 18 && !actorOne.Snapshot.RelayConnected &&
+                    actorTwo.Snapshot.RelayGeneration == 18 && !actorTwo.Snapshot.RelayConnected &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.NegotiatingDirect &&
+                    actorTwo.Snapshot.Carrier == ProductionDirectPeerCarrier.NatTraversalDirect,
+                "Relay observation changed an independent Direct lifecycle or generation.");
+            Require(registry.RetireAllDirect("NETWORK_CHANGED") == 2 &&
+                    actorOne.Snapshot.Carrier == ProductionDirectPeerCarrier.Relay &&
+                    actorTwo.Snapshot.Carrier == ProductionDirectPeerCarrier.Relay &&
+                    actorOne.Snapshot.RelayGeneration == 18 && !actorOne.Snapshot.RelayConnected &&
+                    actorTwo.Snapshot.RelayGeneration == 18 && !actorTwo.Snapshot.RelayConnected &&
+                    actorOne.Snapshot.LastDirectFault == "NETWORK_CHANGED" &&
+                    actorTwo.Snapshot.LastDirectFault == "NETWORK_CHANGED" &&
+                    registry.RetireAllDirect("DUPLICATE") == 0,
+                "Network retirement changed Relay state or did not retire every exact Direct fence once.");
+            Require(registry.Remove(androidOne) && !registry.TryGet(androidOne, out _) &&
+                    actorOne.Snapshot.Disposed &&
+                    actorTwo.Snapshot.Carrier == ProductionDirectPeerCarrier.Relay,
+                "Removing one Android peer affected another peer actor.");
+            Require(ProductionAgentRuntime.FormatSessionCarrier(
+                        ProductionDirectPeerCarrier.NegotiatingDirect) ==
+                    ProductionSessionCarrier.NegotiatingDirect &&
+                    ProductionAgentRuntime.FormatSessionCarrier(
+                        ProductionDirectPeerCarrier.LocalAreaNetworkDirect) ==
+                    ProductionSessionCarrier.LanDirect &&
+                    ProductionAgentRuntime.FormatSessionCarrier(
+                        ProductionDirectPeerCarrier.NatTraversalDirect) ==
+                    ProductionSessionCarrier.NatDirect &&
+                    ProductionAgentRuntime.FormatSessionCarrier(
+                        (ProductionDirectPeerCarrier)999) == ProductionSessionCarrier.Relay,
+                "The Agent control status carrier mapping did not fail closed.");
+        }
+
+        private static ProductionDirectPeerPathFence RouteFence(ulong epoch) => new()
+        {
+            PathEpoch = epoch,
+            ConnectionId = epoch == 0 ? Guid.Empty : Guid.Parse(
+                "10000000-0000-0000-0000-" + epoch.ToString("x12")),
+            AttemptId = epoch == 0 ? Guid.Empty : Guid.Parse(
+                "20000000-0000-0000-0000-" + epoch.ToString("x12"))
+        };
 
         private static void ValidateEpochRateAndFailureCooldown()
         {

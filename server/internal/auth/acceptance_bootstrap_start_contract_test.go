@@ -95,6 +95,10 @@ func TestAcceptanceDirectShadowUsesIsolatedPrewarmedState(t *testing.T) {
 	probe := string(probeData)
 	for _, contract := range []string{
 		"[switch]$EnableDirectTransportShadow",
+		"[switch]$EnableDirectDataPlane",
+		"$env:TERMLINK_DIRECT_ROUTING_PERMITTED = $directRoutingPermitted",
+		"$env:TERMLINK_SINGLE_NODE_DIRECT_ROUTING_PERMITTED = $directRoutingPermitted",
+		"TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING",
 		"compose\\direct-transport.compose.yml",
 		"compose\\acceptance.direct-transport.compose.yml",
 		"Set-TermLinkAcceptanceDirectComposeEnvironment",
@@ -176,9 +180,11 @@ func TestAcceptanceDirectShadowUsesIsolatedPrewarmedState(t *testing.T) {
 	}
 	for _, contract := range []string{
 		"TERMLINK_ACCEPTANCE_REQUIRE_DIRECT_TRANSPORT",
+		"TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING",
 		"/v1/transport/config",
 		"/v1/transport/tickets",
 		"direct_transport_shadow_multipair_v2",
+		"direct_session_cutover_v1",
 	} {
 		if !strings.Contains(probe, contract) {
 			t.Fatalf("acceptance Direct runtime probe omitted %q", contract)

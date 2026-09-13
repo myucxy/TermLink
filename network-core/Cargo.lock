@@ -486,6 +486,7 @@ dependencies = [
  "termlink-direct-nat",
  "termlink-direct-path",
  "termlink-direct-quic",
+ "termlink-direct-route",
  "termlink-direct-wire",
  "tokio",
 ]
@@ -518,6 +519,10 @@ dependencies = [
  "termlink-direct-wire",
  "tokio",
 ]
+
+[[package]]
+name = "termlink-direct-route"
+version = "0.1.0"
 
 [[package]]
 name = "termlink-direct-wire"

@@ -57,7 +57,7 @@ internal fun configuredProductServerUrl(
     return ServerUrlPolicy.normalize(candidate, allowCleartextForLocalTest = localCleartext)
 }
 
-private fun isExplicitLocalTestUrl(value: String): Boolean {
+internal fun isExplicitLocalTestUrl(value: String): Boolean {
     val uri = runCatching { java.net.URI(value.trim()) }.getOrNull() ?: return false
     if (!uri.scheme.equals("http", ignoreCase = true)) return false
     val host = uri.host?.lowercase() ?: return false
@@ -68,6 +68,14 @@ private fun isExplicitLocalTestUrl(value: String): Boolean {
         octets[0] == 127 ||
         octets[0] == 192 && octets[1] == 168 ||
         octets[0] == 172 && octets[1] in 16..31
+}
+
+internal fun normalizeProductServerUrl(value: String): String {
+    val candidate = value.trim()
+    val allowCleartext = BuildConfig.DEBUG &&
+        BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST &&
+        isExplicitLocalTestUrl(candidate)
+    return ServerUrlPolicy.normalize(candidate, allowCleartextForLocalTest = allowCleartext)
 }
 
 val PRODUCT_PUBLIC_SERVER_URL: String = configuredProductServerUrl(
@@ -127,6 +135,18 @@ enum class ProductPrimaryDestination(val label: String) {
     DEVICES("Devices"),
     SESSIONS("Sessions"),
     SETTINGS("Settings"),
+}
+
+/**
+ * Coarse carrier used by a PC device for session data.  This is deliberately
+ * independent from the realtime connection and the session control state:
+ * Relay remains the fail-closed default whenever the path is unknown.
+ */
+enum class PcCarrierState {
+    RELAY,
+    NEGOTIATING_DIRECT,
+    LAN_DIRECT,
+    NAT_DIRECT,
 }
 
 /** User-facing app chrome theme. Terminal colors intentionally remain independent. */
@@ -865,6 +885,10 @@ data class ProductSnapshot(
     val serverUrl: String? = null,
     val devices: List<DeviceSummary> = emptyList(),
     val pcs: List<PcSummary> = emptyList(),
+    /** Carrier state keyed by the server-issued PC device ID, never by session ID. */
+    val pcCarrierStates: Map<UUID, PcCarrierState> = emptyMap(),
+    /** Exact active-session carrier; missing and late-unlisted sessions are Relay. */
+    val sessionCarrierStates: Map<UUID, PcCarrierState> = emptyMap(),
     val sessions: List<SessionSummary> = emptyList(),
     val remoteFileBrowser: RemoteFileBrowserState = RemoteFileBrowserState(),
     val remoteDownloads: List<RemoteDownloadRecord> = emptyList(),
@@ -898,6 +922,14 @@ fun ProductSnapshot.withLocalActivity(entry: ActivityEntry): ProductSnapshot = c
 
 fun ProductSnapshot.isConnected(): Boolean = connectionState == ProductConnectionState.CONNECTED
 
+/**
+ * Resolves only an exact session-scoped carrier. A device-level Direct path
+ * does not prove that a late session was included in both cutover barriers.
+ */
+fun ProductSnapshot.carrierForSession(session: SessionSummary): PcCarrierState {
+    return sessionCarrierStates[session.id] ?: PcCarrierState.RELAY
+}
+
 /** Removes one session and every snapshot-owned reference to its history in one state transition. */
 internal fun ProductSnapshot.withoutSession(sessionId: UUID): ProductSnapshot {
     val removedHistoryObjectIds = history.asSequence()
@@ -906,6 +938,7 @@ internal fun ProductSnapshot.withoutSession(sessionId: UUID): ProductSnapshot {
     return copy(
         sessions = sessions.filterNot { it.id == sessionId },
         sessionStates = sessionStates - sessionId,
+        sessionCarrierStates = sessionCarrierStates - sessionId,
         sessionOpenFailures = sessionOpenFailures - sessionId,
         sessionTitles = sessionTitles - sessionId,
         history = history.filterNot { it.sessionId == sessionId },

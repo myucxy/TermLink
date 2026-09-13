@@ -2,6 +2,7 @@ package transport
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -61,5 +62,33 @@ func TestDirectSignalPublishValidationPreservesWireLimits(t *testing.T) {
 	request.Sender.SupportsMultipairV2 = true
 	if err := request.Validate(); err != nil {
 		t.Fatalf("negotiated multipair publish: %v", err)
+	}
+	request.SignalType = SignalCutoverProposal
+	if err := request.Validate(); !errors.Is(err, ErrDirectStateInvalid) {
+		t.Fatalf("unnegotiated direct-data publish error=%v, want invalid", err)
+	}
+	request.Sender.SupportsDirectDataV1 = true
+	if err := request.Validate(); err != nil {
+		t.Fatalf("negotiated direct-data publish: %v", err)
+	}
+}
+
+func TestDirectSignalRouteRequestValidation(t *testing.T) {
+	request := DirectSignalRouteRequest{
+		AccountID: uuid.New(), ConnectionID: uuid.New(), SenderID: uuid.New(),
+		RecipientID: uuid.New(), PathEpoch: 1,
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("valid route request: %v", err)
+	}
+	invalid := request
+	invalid.RecipientID = invalid.SenderID
+	if err := invalid.Validate(); !errors.Is(err, ErrDirectStateInvalid) {
+		t.Fatalf("same-device route error=%v, want invalid", err)
+	}
+	invalid = request
+	invalid.PathEpoch = uint64(math.MaxInt64) + 1
+	if err := invalid.Validate(); !errors.Is(err, ErrDirectStateInvalid) {
+		t.Fatalf("overflow route epoch error=%v, want invalid", err)
 	}
 }

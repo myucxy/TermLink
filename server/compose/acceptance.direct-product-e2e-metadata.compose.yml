@@ -1,0 +1,8 @@
+# This overlay is selected only by Start-ProductionAcceptance.ps1 when its
+# explicit -EnableDirectDataPlane switch is present. It must never be included
+# by the normal production deployment matrix.
+services:
+  server:
+    environment:
+      TERMLINK_DIRECT_PRODUCT_E2E_METADATA_ENABLED: "true"
+      TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256: ${TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256:?exact acceptance server image content digest is required}

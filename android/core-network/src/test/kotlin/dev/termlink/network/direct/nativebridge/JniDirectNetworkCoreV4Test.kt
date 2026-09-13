@@ -140,6 +140,92 @@ class JniDirectNetworkCoreV4Test {
     }
 
     @Test
+    fun successfulPromotionUsesOnlyOpaqueTokenAndDisablesOrdinaryV4Calls() {
+        val methods = FakeV4Methods()
+        val handle = createdHandle(methods)
+        val winner = pair(1)
+        assertIs<DirectNativeResultV4.Success<Unit>>(handle.gather(gather()))
+        methods.events += candidateBatchEvent(batch = 1, count = 1, total = 1, complete = true)
+        assertIs<DirectNativeResultV4.Success<DirectNativeEventV4?>>(handle.poll())
+        assertIs<DirectNativeResultV4.Success<Unit>>(
+            handle.beginChecks(begin(pairs = listOf(winner), total = 1, complete = true)),
+        )
+        methods.events += pairValidatedEvent(winner)
+        assertIs<DirectNativeResultV4.Success<DirectNativeEventV4?>>(handle.poll())
+
+        var receivedOpaqueToken = 0L
+        assertIs<DirectNativeResultV4.Success<Unit>>(
+            handle.promoteNomination(commit(winner)) { token ->
+                receivedOpaqueToken = token
+                0
+            },
+        )
+        assertEquals(41L, receivedOpaqueToken)
+        assertEquals(0, methods.commitCalls)
+        assertFailure(handle.poll(), DirectNativeSyntheticReasonV4.HANDLE_CLOSED)
+        assertFailure(
+            handle.cancel(7, ByteArray(16) { 7 }),
+            DirectNativeSyntheticReasonV4.HANDLE_CLOSED,
+        )
+        assertFailure(
+            handle.promoteNomination(commit(winner)) { error("must not run twice") },
+            DirectNativeSyntheticReasonV4.HANDLE_CLOSED,
+        )
+        assertEquals(0, methods.cancelCalls)
+        handle.close()
+        handle.close()
+        assertEquals(1, methods.destroyCalls)
+    }
+
+    @Test
+    fun failedPromotionConsumesAttemptAndDisablesEveryOrdinaryV4Call() {
+        val methods = FakeV4Methods()
+        val handle = createdHandle(methods)
+        val winner = pair(1)
+        assertIs<DirectNativeResultV4.Success<Unit>>(handle.gather(gather()))
+        methods.events += candidateBatchEvent(batch = 1, count = 1, total = 1, complete = true)
+        assertIs<DirectNativeResultV4.Success<DirectNativeEventV4?>>(handle.poll())
+        assertIs<DirectNativeResultV4.Success<Unit>>(
+            handle.beginChecks(begin(pairs = listOf(winner), total = 1, complete = true)),
+        )
+        methods.events += pairValidatedEvent(winner)
+        assertIs<DirectNativeResultV4.Success<DirectNativeEventV4?>>(handle.poll())
+
+        var promotionCalls = 0
+        val failure = assertIs<DirectNativeResultV4.Failure>(
+            handle.promoteNomination(commit(winner)) {
+                promotionCalls++
+                DirectNativeStatusV5.PROTOCOL
+            },
+        )
+        assertEquals(DirectNativeSyntheticReasonV4.FFI_CALL_FAILED, failure.relayOnly.reason)
+        assertEquals(DirectNativeStatusV5.PROTOCOL, failure.nativeStatus)
+        assertEquals(1, promotionCalls)
+
+        assertFailure(handle.poll(), DirectNativeSyntheticReasonV4.HANDLE_CLOSED)
+        assertFailure(
+            handle.cancel(7, ByteArray(16) { 7 }),
+            DirectNativeSyntheticReasonV4.HANDLE_CLOSED,
+        )
+        assertFailure(
+            handle.networkChanged(7, ByteArray(16) { 7 }),
+            DirectNativeSyntheticReasonV4.HANDLE_CLOSED,
+        )
+        assertFailure(
+            handle.promoteNomination(commit(winner)) {
+                promotionCalls++
+                DirectNativeStatusV5.OK
+            },
+            DirectNativeSyntheticReasonV4.HANDLE_CLOSED,
+        )
+        assertEquals(1, promotionCalls)
+        assertEquals(0, methods.cancelCalls)
+        handle.close()
+        handle.close()
+        assertEquals(1, methods.destroyCalls)
+    }
+
+    @Test
     fun staleAndMalformedEventsNeverBecomeCurrentAndNonContiguousGenerationRetiresHandle() {
         val methods = FakeV4Methods()
         val handle = createdHandle(methods)

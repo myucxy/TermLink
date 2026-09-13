@@ -28,7 +28,15 @@ namespace TermLink.ProductionDirectNative.Validation
                 await ValidatePollDisposeExternalSynchronizationAsync().ConfigureAwait(false);
                 ValidateRealAbiLibraryIfRequested();
                 ProductionDirectNativeV4Validation.Validate();
+                await ValidateV4PromotionLinearizationAsync().ConfigureAwait(false);
+#if !TERMLINK_SKIP_DIRECT_V5_VALIDATION
+                await ProductionDirectNativeV5Validation.ValidateAsync().ConfigureAwait(false);
+#endif
+#if TERMLINK_SKIP_DIRECT_V5_VALIDATION
                 Console.WriteLine("Production direct native ABI v3/v4 validation passed.");
+#else
+                Console.WriteLine("Production direct native ABI v3/v4/v5 validation passed.");
+#endif
                 return 0;
             }
             catch (Exception error)
@@ -394,6 +402,214 @@ namespace TermLink.ProductionDirectNative.Validation
         private static ProductionDirectNativeBoundary Boundary(FakeNativeApi api) =>
             new(enabled: true, queueCapacity: 32, loader: new FakeLoader(api));
 
+        private static async Task ValidateV4PromotionLinearizationAsync()
+        {
+            {
+                var fixture = PromotionFixture();
+                using var boundary = fixture.Boundary;
+                var operation = new FakePromotionOperationV4(status: 0);
+                var stale = boundary.TryPromoteNomination(
+                    PromotionRequest(fixture.Request, attemptId: Guid.NewGuid()), operation);
+                Require(stale.CommandResult == ProductionDirectNativeCommandResult.IgnoredStale &&
+                        !stale.EnteredNativeSeam && operation.Calls == 0 && fixture.Api.DestroyCalls == 0,
+                    "A stale V4 owner crossed the V5 promotion seam.");
+
+                var promoted = boundary.TryPromoteNomination(fixture.Request, operation);
+                Require(promoted.CommandResult == ProductionDirectNativeCommandResult.Accepted &&
+                        promoted.EnteredNativeSeam && promoted.NativeCallCompleted &&
+                        promoted.NativeStatus == 0 && operation.Calls == 1 &&
+                        operation.ObservedHandleValue != 0 && fixture.Api.DestroyCalls == 1 &&
+                        !boundary.Snapshot.NativeAvailable,
+                    "A valid V4 owner was not consumed exactly once by V5 promotion.");
+                var retry = boundary.TryPromoteNomination(fixture.Request, operation);
+                Require(retry.CommandResult == ProductionDirectNativeCommandResult.RelayFallback &&
+                        !retry.EnteredNativeSeam && operation.Calls == 1 && fixture.Api.DestroyCalls == 1 &&
+                        boundary.CommitNomination(fixture.Request) ==
+                            ProductionDirectNativeCommandResult.RelayFallback,
+                    "A promoted V4 socket could be retried or shadow-committed.");
+            }
+
+            {
+                var fixture = PromotionFixture();
+                using var boundary = fixture.Boundary;
+                var operation = new FakePromotionOperationV4(status: -8);
+                var failed = boundary.TryPromoteNomination(fixture.Request, operation);
+                var retry = boundary.TryPromoteNomination(fixture.Request, operation);
+                Require(failed.CommandResult == ProductionDirectNativeCommandResult.RelayFallback &&
+                        failed.EnteredNativeSeam && failed.NativeCallCompleted && failed.NativeStatus == -8 &&
+                        !retry.EnteredNativeSeam && operation.Calls == 1 && fixture.Api.DestroyCalls == 1,
+                    "A non-OK V5 promotion result left the V4 socket reusable.");
+            }
+
+            {
+                var fixture = PromotionFixture();
+                using var boundary = fixture.Boundary;
+                var operation = new FakePromotionOperationV4(throwOnInvoke: true);
+                var failed = boundary.TryPromoteNomination(fixture.Request, operation);
+                var retry = boundary.TryPromoteNomination(fixture.Request, operation);
+                Require(failed.CommandResult == ProductionDirectNativeCommandResult.RelayFallback &&
+                        failed.EnteredNativeSeam && !failed.NativeCallCompleted &&
+                        !retry.EnteredNativeSeam && operation.Calls == 1 && fixture.Api.DestroyCalls == 1,
+                    "An exceptional V5 promotion left the V4 socket reusable.");
+            }
+
+            // Promotion wins: cancel and dispose must remain outside the seam
+            // until its synchronous operation and V4 retirement are complete.
+            {
+                var fixture = PromotionFixture();
+                var entered = new ManualResetEventSlim(false);
+                var release = new ManualResetEventSlim(false);
+                var operation = new FakePromotionOperationV4(status: 0, entered: entered, release: release);
+                var promote = Task.Run(() => fixture.Boundary.TryPromoteNomination(fixture.Request, operation));
+                Require(entered.Wait(TimeSpan.FromSeconds(5)), "V4 promotion did not enter its native seam.");
+                var cancel = Task.Run(() => fixture.Boundary.Cancel(
+                    fixture.Request.Epoch, fixture.Request.AttemptId));
+                var dispose = Task.Run(fixture.Boundary.Dispose);
+                Require(!cancel.Wait(TimeSpan.FromMilliseconds(100)) &&
+                        !dispose.Wait(TimeSpan.FromMilliseconds(100)) && fixture.Api.DestroyCalls == 0,
+                    "Cancel or dispose crossed a live V4 promotion seam.");
+                release.Set();
+                var promoted = await promote.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                var cancelled = await cancel.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                await dispose.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                Require(promoted.CommandResult == ProductionDirectNativeCommandResult.Accepted &&
+                        cancelled == ProductionDirectNativeCommandResult.RelayFallback &&
+                        fixture.Api.CancelCalls == 0 && fixture.Api.DestroyCalls == 1 &&
+                        fixture.Api.DisposeCalls == 1 && fixture.Boundary.Snapshot.Disposed,
+                    "Promotion/cancel/dispose did not select exactly one V4 owner.");
+                entered.Dispose();
+                release.Dispose();
+            }
+
+            // Control wins: promotion must never receive the retired handle.
+            await ValidateControlWinsPromotionAsync(networkChanged: false).ConfigureAwait(false);
+            await ValidateControlWinsPromotionAsync(networkChanged: true).ConfigureAwait(false);
+
+            {
+                var fixture = PromotionFixture();
+                fixture.Boundary.Dispose();
+                var operation = new FakePromotionOperationV4(status: 0);
+                var result = fixture.Boundary.TryPromoteNomination(fixture.Request, operation);
+                Require(result.CommandResult == ProductionDirectNativeCommandResult.RelayFallback &&
+                        !result.EnteredNativeSeam && operation.Calls == 0 &&
+                        fixture.Api.DestroyCalls == 1 && fixture.Api.DisposeCalls == 1,
+                    "A disposed V4 boundary exposed its native handle to promotion.");
+            }
+
+            Require(!typeof(ProductionDirectNativeBoundaryV4).GetMethods(
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic)
+                    .Any(method => method.ReturnType == typeof(IntPtr)),
+                "The V4 boundary exposes a raw native handle return path.");
+        }
+
+        private static async Task ValidateControlWinsPromotionAsync(bool networkChanged)
+        {
+            var fixture = PromotionFixture();
+            using var boundary = fixture.Boundary;
+            fixture.Api.ControlEntered = new ManualResetEventSlim(false);
+            fixture.Api.ControlRelease = new ManualResetEventSlim(false);
+            var control = Task.Run(() => networkChanged
+                ? boundary.NetworkChanged(fixture.Request.Epoch, fixture.Request.AttemptId)
+                : boundary.Cancel(fixture.Request.Epoch, fixture.Request.AttemptId));
+            Require(fixture.Api.ControlEntered.Wait(TimeSpan.FromSeconds(5)),
+                "V4 control did not acquire the owner seam.");
+            var operation = new FakePromotionOperationV4(status: 0);
+            var promote = Task.Run(() => boundary.TryPromoteNomination(fixture.Request, operation));
+            Require(!promote.Wait(TimeSpan.FromMilliseconds(100)) && fixture.Api.DestroyCalls == 0,
+                "Promotion crossed a live V4 control seam.");
+            fixture.Api.ControlRelease.Set();
+            var controlResult = await control.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            var promotionResult = await promote.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            Require(controlResult == ProductionDirectNativeCommandResult.Accepted &&
+                    promotionResult.CommandResult == ProductionDirectNativeCommandResult.RelayFallback &&
+                    !promotionResult.EnteredNativeSeam && operation.Calls == 0 &&
+                    fixture.Api.DestroyCalls == 1 &&
+                    (networkChanged ? fixture.Api.NetworkChangedCalls == 1 : fixture.Api.CancelCalls == 1),
+                "V4 control/promotion did not select exactly one owner.");
+            fixture.Api.ControlEntered.Dispose();
+            fixture.Api.ControlRelease.Dispose();
+        }
+
+        private static (ProductionDirectNativeBoundaryV4 Boundary, FakePromotionApiV4 Api,
+            ProductionDirectCommitRequestV4 Request) PromotionFixture()
+        {
+            var api = new FakePromotionApiV4();
+            var boundary = new ProductionDirectNativeBoundaryV4(true, 8, new FakePromotionLoaderV4(api));
+            var epoch = 23UL;
+            var attempt = Guid.NewGuid();
+            var round = Guid.NewGuid();
+            var expires = DateTimeOffset.UtcNow.AddMinutes(1).ToUnixTimeMilliseconds();
+            var pair = new ProductionDirectCandidatePairV4
+            {
+                Rank = 1,
+                Initiator = PromotionCandidate("192.0.2.31", 31_031, expires),
+                Responder = PromotionCandidate("198.51.100.32", 31_032, expires)
+            };
+            SetPrivate(boundary, "epoch", epoch);
+            SetPrivate(boundary, "attemptId", attempt);
+            SetPrivate(boundary, "checkRoundId", round);
+            SetPrivate(boundary, "role", ProductionDirectNativeRole.Initiator);
+            SetPrivate(boundary, "planComplete", true);
+            var validated = (Dictionary<string, ProductionDirectCandidatePairV4>)typeof(
+                ProductionDirectNativeBoundaryV4).GetField("validatedPairs",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                ?.GetValue(boundary);
+            if (validated == null) throw new InvalidOperationException("V4 validation fixture drifted.");
+            validated.Add(pair.Key, pair);
+            return (boundary, api, new ProductionDirectCommitRequestV4
+            {
+                Epoch = epoch,
+                AttemptId = attempt,
+                CheckRoundId = round,
+                NominationId = Guid.NewGuid(),
+                WinningPair = pair,
+                Role = ProductionDirectNativeRole.Initiator,
+                TimeoutMilliseconds = 1_000,
+                PeerCertificateSha256 = Enumerable.Repeat((byte)0x61, 32).ToArray(),
+                PeerDeviceSigningPublicKey = Enumerable.Repeat((byte)0x62, 32).ToArray(),
+                LocalProofNonce = Enumerable.Repeat((byte)0x63, 16).ToArray(),
+                NowMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+        }
+
+        private static ProductionDirectCandidateV4 PromotionCandidate(
+            string address, int port, long expires) => new()
+        {
+            CandidateId = Guid.NewGuid(),
+            RelatedCandidateId = Guid.Empty,
+            Endpoint = new ProductionDirectNativeEndpoint(IPAddress.Parse(address), port),
+            Kind = ProductionDirectCandidateKindV4.Host,
+            Priority = 100,
+            NetworkCost = 10,
+            ExpiresAtMilliseconds = expires
+        };
+
+        private static ProductionDirectCommitRequestV4 PromotionRequest(
+            ProductionDirectCommitRequestV4 source,
+            Guid? attemptId = null) => new()
+        {
+            Epoch = source.Epoch,
+            AttemptId = attemptId ?? source.AttemptId,
+            CheckRoundId = source.CheckRoundId,
+            NominationId = source.NominationId,
+            WinningPair = source.WinningPair,
+            Role = source.Role,
+            TimeoutMilliseconds = source.TimeoutMilliseconds,
+            PeerCertificateSha256 = source.PeerCertificateSha256.ToArray(),
+            PeerDeviceSigningPublicKey = source.PeerDeviceSigningPublicKey.ToArray(),
+            LocalProofNonce = source.LocalProofNonce.ToArray(),
+            NowMilliseconds = source.NowMilliseconds
+        };
+
+        private static void SetPrivate<T>(object target, string name, T value)
+        {
+            var field = target.GetType().GetField(name,
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (field == null) throw new InvalidOperationException("Missing fixture field " + name + ".");
+            field.SetValue(target, value);
+        }
+
         private static ProductionDirectNativeGatherRequest Gather(ulong epoch, Guid attempt) => new()
         {
             Epoch = epoch,
@@ -412,32 +628,32 @@ namespace TermLink.ProductionDirectNative.Validation
             ulong epoch,
             Guid attempt,
             ProductionDirectNativeEndpoint localBind) => new()
-        {
-            Epoch = epoch,
-            AttemptId = attempt,
-            ConnectionId = Guid.NewGuid(),
-            LocalDeviceId = Guid.NewGuid(),
-            PeerDeviceId = Guid.NewGuid(),
-            Role = ProductionDirectNativeRole.Initiator,
-            TimeoutMilliseconds = 1_000,
-            LocalBind = localBind,
-            RemoteCandidate = new ProductionDirectNativeEndpoint(IPAddress.Parse("198.51.100.20"), 34_780),
-            StunServers = Array.Empty<ProductionDirectNativeEndpoint>(),
-            Ticket = Enumerable.Range(1, 128).Select(value => (byte)value).ToArray(),
-            ServerSigningPublicKey = Enumerable.Repeat((byte)0x11, 32).ToArray(),
-            PeerCertificateSha256 = Enumerable.Repeat((byte)0x22, 32).ToArray(),
-            PeerDeviceSigningPublicKey = Enumerable.Repeat((byte)0x33, 32).ToArray(),
-            LocalSendProbeHmacKey = Enumerable.Repeat((byte)0x44, 32).ToArray(),
-            PeerReceiveProbeHmacKey = Enumerable.Repeat((byte)0x45, 32).ToArray(),
-            TicketId = Guid.NewGuid(),
-            NominationId = Guid.NewGuid(),
-            InitiatorCandidateId = Guid.NewGuid(),
-            ResponderCandidateId = Guid.NewGuid(),
-            LocalProbeNonce = Enumerable.Repeat((byte)0x55, 16).ToArray(),
-            PeerProbeNonce = Enumerable.Repeat((byte)0x55, 16).ToArray(),
-            LocalProofNonce = Enumerable.Repeat((byte)0x77, 16).ToArray(),
-            NowMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-        };
+            {
+                Epoch = epoch,
+                AttemptId = attempt,
+                ConnectionId = Guid.NewGuid(),
+                LocalDeviceId = Guid.NewGuid(),
+                PeerDeviceId = Guid.NewGuid(),
+                Role = ProductionDirectNativeRole.Initiator,
+                TimeoutMilliseconds = 1_000,
+                LocalBind = localBind,
+                RemoteCandidate = new ProductionDirectNativeEndpoint(IPAddress.Parse("198.51.100.20"), 34_780),
+                StunServers = Array.Empty<ProductionDirectNativeEndpoint>(),
+                Ticket = Enumerable.Range(1, 128).Select(value => (byte)value).ToArray(),
+                ServerSigningPublicKey = Enumerable.Repeat((byte)0x11, 32).ToArray(),
+                PeerCertificateSha256 = Enumerable.Repeat((byte)0x22, 32).ToArray(),
+                PeerDeviceSigningPublicKey = Enumerable.Repeat((byte)0x33, 32).ToArray(),
+                LocalSendProbeHmacKey = Enumerable.Repeat((byte)0x44, 32).ToArray(),
+                PeerReceiveProbeHmacKey = Enumerable.Repeat((byte)0x45, 32).ToArray(),
+                TicketId = Guid.NewGuid(),
+                NominationId = Guid.NewGuid(),
+                InitiatorCandidateId = Guid.NewGuid(),
+                ResponderCandidateId = Guid.NewGuid(),
+                LocalProbeNonce = Enumerable.Repeat((byte)0x55, 16).ToArray(),
+                PeerProbeNonce = Enumerable.Repeat((byte)0x55, 16).ToArray(),
+                LocalProofNonce = Enumerable.Repeat((byte)0x77, 16).ToArray(),
+                NowMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            };
 
         private static TermLinkDirectEventV2 CandidatesEvent(
             ulong epoch,
@@ -590,6 +806,103 @@ namespace TermLink.ProductionDirectNative.Validation
         private static void Require(bool condition, string message)
         {
             if (!condition) throw new InvalidOperationException(message);
+        }
+
+        private sealed class FakePromotionOperationV4 : IProductionDirectNativePromotionOperationV4
+        {
+            private readonly int status;
+            private readonly bool throwOnInvoke;
+            private readonly ManualResetEventSlim entered;
+            private readonly ManualResetEventSlim release;
+            private int calls;
+            private long observedHandleValue;
+
+            internal FakePromotionOperationV4(
+                int status = 0,
+                bool throwOnInvoke = false,
+                ManualResetEventSlim entered = null,
+                ManualResetEventSlim release = null)
+            {
+                this.status = status;
+                this.throwOnInvoke = throwOnInvoke;
+                this.entered = entered;
+                this.release = release;
+            }
+
+            internal int Calls => Volatile.Read(ref calls);
+            internal long ObservedHandleValue => Interlocked.Read(ref observedHandleValue);
+
+            public int Invoke(
+                IntPtr transientV4Handle,
+                ref TermLinkDirectCommitNominationV4 nomination)
+            {
+                Interlocked.Increment(ref calls);
+                Interlocked.Exchange(ref observedHandleValue, transientV4Handle.ToInt64());
+                if (nomination.AbiVersion != ProductionDirectNativeAbiV4.AbiVersion ||
+                    nomination.StructSize != ProductionDirectNativeAbiV4.CommitNominationSize ||
+                    nomination.SelectionConfirmed != 1)
+                    throw new InvalidOperationException("Malformed V4 promotion nomination.");
+                entered?.Set();
+                release?.Wait(TimeSpan.FromSeconds(5));
+                if (throwOnInvoke) throw new InvalidOperationException("Injected promotion failure.");
+                return status;
+            }
+        }
+
+        private sealed class FakePromotionLoaderV4 : IProductionDirectNativeLoaderV4
+        {
+            private readonly IProductionDirectNativeApiV4 api;
+            internal FakePromotionLoaderV4(IProductionDirectNativeApiV4 api) => this.api = api;
+            public bool TryLoad(out IProductionDirectNativeApiV4 value, out string error)
+            {
+                value = api;
+                error = string.Empty;
+                return true;
+            }
+        }
+
+        private sealed class FakePromotionApiV4 : IProductionDirectNativeApiV4
+        {
+            private int cancelCalls;
+            private int networkChangedCalls;
+            private int destroyCalls;
+            private int disposeCalls;
+
+            internal ManualResetEventSlim ControlEntered { get; set; }
+            internal ManualResetEventSlim ControlRelease { get; set; }
+            internal int CancelCalls => Volatile.Read(ref cancelCalls);
+            internal int NetworkChangedCalls => Volatile.Read(ref networkChangedCalls);
+            internal int DestroyCalls => Volatile.Read(ref destroyCalls);
+            internal int DisposeCalls => Volatile.Read(ref disposeCalls);
+
+            public uint AbiVersion() => ProductionDirectNativeAbiV4.AbiVersion;
+            public IntPtr Create(ref TermLinkDirectCreateV4 create) => new(0x4A11);
+            public int Gather(IntPtr handle, ref TermLinkDirectGatherV4 gather) => 0;
+            public int BeginChecks(IntPtr handle, ref TermLinkDirectBeginChecksV4 begin) => 0;
+            public int AppendCheckPairs(IntPtr handle, ref TermLinkDirectAppendCheckPairsV4 append) => 0;
+            public int CommitNomination(IntPtr handle, ref TermLinkDirectCommitNominationV4 commit) => 0;
+            public int Cancel(IntPtr handle, ref TermLinkDirectControlV4 control)
+            {
+                Interlocked.Increment(ref cancelCalls);
+                WaitInControl();
+                return 0;
+            }
+            public int NetworkChanged(IntPtr handle, ref TermLinkDirectControlV4 control)
+            {
+                Interlocked.Increment(ref networkChangedCalls);
+                WaitInControl();
+                return 0;
+            }
+            public int SubmitSignature(IntPtr handle, ref TermLinkDirectSignatureV4 signature) => 0;
+            public int PollEvent(IntPtr handle, ref TermLinkDirectEventV4 output) => 0;
+            public void Destroy(IntPtr handle) => Interlocked.Increment(ref destroyCalls);
+            public void Dispose() => Interlocked.Increment(ref disposeCalls);
+
+            private void WaitInControl()
+            {
+                ControlEntered?.Set();
+                ControlRelease?.Wait(TimeSpan.FromSeconds(5));
+            }
         }
 
         private sealed class FakeLoader : IProductionDirectNativeLoader

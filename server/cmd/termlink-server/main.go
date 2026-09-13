@@ -99,6 +99,10 @@ func runProduction() error {
 	if err != nil {
 		return fmt.Errorf("load production config: %w", err)
 	}
+	directAcceptanceMetadataConfig, err := loadDirectAcceptanceMetadataConfig(cfg.PublicURL)
+	if err != nil {
+		return err
+	}
 	configureLogging(cfg.LogLevel)
 	repository, err := store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{
 		MaxConns: cfg.PostgresMaxConns, MinConns: cfg.PostgresMinConns,
@@ -311,21 +315,20 @@ func runProduction() error {
 		metrics = observability.New(repository.Pool)
 		observer = metrics
 	}
-	hub := realtime.NewHubWithObserver(repository, coordinator, slog.Default(), observer)
-	defer func() {
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = hub.Close(shutdown)
-	}()
 	fileTransferHub := filetransfer.NewHub(repository, slog.Default())
 	defer func() {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = fileTransferHub.Close(shutdown)
 	}()
-	directTransportEnabled, err := optionalFeatureFlag("TERMLINK_DIRECT_TRANSPORT_ENABLED")
+	directTransportEnabled, directRoutingPermitted, err := directTransportFeatureFlags()
 	if err != nil {
 		return err
+	}
+	if !directTransportEnabled && strings.TrimSpace(os.Getenv("TERMLINK_DIRECT_ROUTING_PERMITTED")) != "" {
+		// The transport switch is the emergency fail-safe. A stale or invalid
+		// routing value must never prevent the independent Relay from starting.
+		slog.Warn("direct routing setting ignored while direct transport is disabled")
 	}
 	directSTUNServers, err := parseDirectSTUNServers(os.Getenv("TERMLINK_DIRECT_STUN_SERVERS"))
 	if err != nil {
@@ -338,7 +341,9 @@ func runProduction() error {
 	var directAuthentication auth.Middleware
 	if directTransportEnabled {
 		if cfg.RuntimeMode == config.RuntimeModeSingleNode {
-			directTickets, err = transport.NewRouteTicketService(repository, directTransportKey, directSTUNServers...)
+			directTickets, err = transport.NewRouteTicketServiceWithRouting(
+				repository, directTransportKey, directRoutingPermitted, directSTUNServers...,
+			)
 			if err == nil {
 				directHub = transport.NewHub(directTickets)
 				directAuthentication = auth.Middleware{Tokens: verifier, Devices: repository, Nonces: coordinator, SubjectKey: subjectKey}
@@ -363,7 +368,9 @@ func runProduction() error {
 					var directState *kv.DirectTransportState
 					directState, err = kv.NewDirectTransportState(directValkey.Client, "")
 					if err == nil {
-						directTickets, err = transport.NewSharedRouteTicketService(directRepository, directState, directTransportKey, directSTUNServers...)
+						directTickets, err = transport.NewSharedRouteTicketServiceWithRouting(
+							directRepository, directState, directTransportKey, directRoutingPermitted, directSTUNServers...,
+						)
 					}
 					if err == nil {
 						directHub, err = transport.NewSharedHub(directTickets, directState)
@@ -408,6 +415,18 @@ func runProduction() error {
 			_ = directHub.Close(shutdown)
 		}()
 	}
+	hub := realtime.NewHubWithObserverAndOptions(
+		repository,
+		coordinator,
+		slog.Default(),
+		observer,
+		directRealtimeHubOptions(directHub != nil, directRoutingPermitted),
+	)
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = hub.Close(shutdown)
+	}()
 	var localDiscovery *auth.OIDCDiscovery
 	var localOIDCHTTPClient *http.Client
 	var identityProfiles interface {
@@ -464,6 +483,14 @@ func runProduction() error {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/realtime", authentication.Authenticate(hub.Handler()))
 	mux.Handle("/v1/file-transfers", authentication.Authenticate(fileTransferHub.Handler()))
+	if err := registerDirectAcceptanceMetadataRoute(
+		mux,
+		directAcceptanceMetadataConfig,
+		directHub != nil,
+		directRoutingPermitted,
+	); err != nil {
+		return err
+	}
 	if directHub != nil && directTickets != nil {
 		registerDirectTransportRoutes(mux,
 			directAuthentication.Authenticate(directTickets.ConfigHandler()),
@@ -503,8 +530,8 @@ func runProduction() error {
 		go accountDeletionRunner.Run(ctx)
 	}
 	go fileoperationcleanup.New(repository, fileoperationcleanup.Options{Logger: slog.Default()}).Run(ctx)
-	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil)
-	applicationHandler := http.Handler(mux)
+	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil, "direct_routing_permitted", directHub != nil && directRoutingPermitted)
+	applicationHandler := hideDirectAcceptanceMetadataWhenDisabled(directAcceptanceMetadataConfig, mux)
 	if metrics != nil {
 		applicationHandler = metrics.HTTPMiddleware(applicationHandler)
 	}
@@ -588,6 +615,22 @@ func optionalFeatureFlag(name string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid boolean value for %s", name)
 	}
+}
+
+func directTransportFeatureFlags() (transportEnabled, routingPermitted bool, err error) {
+	transportEnabled, err = optionalFeatureFlag("TERMLINK_DIRECT_TRANSPORT_ENABLED")
+	if err != nil || !transportEnabled {
+		// DIRECT_TRANSPORT_ENABLED is the emergency fail-safe. When it is off,
+		// even a stale or malformed routing value is deliberately ignored so the
+		// unrelated Relay can always start.
+		return transportEnabled, false, err
+	}
+	routingPermitted, err = optionalFeatureFlag("TERMLINK_DIRECT_ROUTING_PERMITTED")
+	return transportEnabled, routingPermitted, err
+}
+
+func directRealtimeHubOptions(directTransportReady, routingPermitted bool) realtime.HubOptions {
+	return realtime.HubOptions{DirectTransportDataV1: directTransportReady && routingPermitted}
 }
 
 func readOptionalSecretFile(name string) (string, error) {

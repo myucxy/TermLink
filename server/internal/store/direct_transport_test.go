@@ -10,7 +10,7 @@ import (
 func TestDirectTransportAuthoritySQLRetainsEverySecurityFence(t *testing.T) {
 	for name, query := range map[string]string{
 		"allocate": allocateDirectTransportEpochSQL,
-		"recheck":  authorizeDirectTransportPairSQL,
+		"recheck":  authorizeDirectTransportSignalSQL,
 	} {
 		normalized := strings.ToLower(strings.Join(strings.Fields(query), " "))
 		for _, required := range []string{
@@ -25,6 +25,11 @@ func TestDirectTransportAuthoritySQLRetainsEverySecurityFence(t *testing.T) {
 				t.Fatalf("%s direct authority SQL lost fence %q", name, required)
 			}
 		}
+	}
+	normalizedSignal := strings.ToLower(strings.Join(strings.Fields(authorizeDirectTransportSignalSQL), " "))
+	if !strings.Contains(normalizedSignal, "source.id=$4 or target.id=$4") ||
+		!strings.Contains(normalizedSignal, "case when source.id=$4 then source.key_id else target.key_id end") {
+		t.Fatal("signal authority SQL does not bind the current key ID to the ticket responder")
 	}
 	if !strings.Contains(strings.ToLower(allocateDirectTransportEpochSQL), "on conflict") ||
 		!strings.Contains(strings.ToLower(allocateDirectTransportEpochSQL), "last_epoch+1") {

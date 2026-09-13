@@ -32,6 +32,7 @@ const (
 	sharedOpTimeout     = 2 * time.Second
 	sharedRetryMinimum  = 250 * time.Millisecond
 	sharedRetryMaximum  = 5 * time.Second
+	peerAddShardCount   = 64
 )
 
 type Hub struct {
@@ -50,22 +51,28 @@ type Hub struct {
 	started      bool
 	closed       bool
 	ready        atomic.Bool
+	// A shared presence registration performs network I/O before the local
+	// peer map can be updated. Serialize only equal-device replacements so two
+	// concurrent WebSocket handshakes cannot commit generations to shared state
+	// in one order and publish them locally in the opposite order.
+	peerAddShards [peerAddShardCount]sync.Mutex
 }
 
 type signalPeer struct {
-	hub       *Hub
-	socket    *websocket.Conn
-	principal auth.Principal
-	send      chan []byte
-	done      chan struct{}
-	once      sync.Once
-	queued    atomic.Int64
-	rateMu    sync.Mutex
-	windowAt  time.Time
-	frames    int
-	bytes     int
-	presence  DirectPresence
-	multipair bool
+	hub        *Hub
+	socket     *websocket.Conn
+	principal  auth.Principal
+	send       chan []byte
+	done       chan struct{}
+	once       sync.Once
+	queued     atomic.Int64
+	rateMu     sync.Mutex
+	windowAt   time.Time
+	frames     int
+	bytes      int
+	presence   DirectPresence
+	multipair  bool
+	directData bool
 }
 
 type signalClientHello struct {
@@ -218,6 +225,9 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		send: make(chan []byte, signalQueueFrames), done: make(chan struct{}), windowAt: time.Now(),
 		multipair: slices.Contains(hello.Capabilities, "direct_transport_shadow_multipair_v2"),
 	}
+	peer.directData = h.tickets.DirectRoutingPermitted() &&
+		slices.Contains(hello.Capabilities, "direct_transport_data_v1") &&
+		slices.Contains(hello.Capabilities, "direct_session_cutover_v1")
 	if !h.add(peer) {
 		closeSignalSocket(socket, websocket.CloseTryAgainLater, "transport signalling shutting down")
 		return
@@ -226,6 +236,13 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	welcomeCapabilities := []string{"direct_transport_shadow_v1"}
 	if peer.multipair {
 		welcomeCapabilities = append(welcomeCapabilities, "direct_transport_shadow_multipair_v2")
+	}
+	if peer.directData {
+		welcomeCapabilities = append(
+			welcomeCapabilities,
+			"direct_transport_data_v1",
+			"direct_session_cutover_v1",
+		)
 	}
 	welcome := map[string]any{
 		"type": "SERVER_WELCOME", "protocol_version": 1,
@@ -249,6 +266,10 @@ func validSignalHello(hello signalClientHello, deviceType string) bool {
 }
 
 func (h *Hub) add(peer *signalPeer) bool {
+	shard := &h.peerAddShards[int(peer.principal.Device.ID[0])%len(h.peerAddShards)]
+	shard.Lock()
+	defer shard.Unlock()
+
 	if h.state != nil {
 		if !h.ready.Load() {
 			return false
@@ -256,6 +277,7 @@ func (h *Hub) add(peer *signalPeer) bool {
 		peer.presence = DirectPresence{
 			AccountID: peer.principal.UserID, DeviceID: peer.principal.Device.ID,
 			Mailbox: h.mailbox, PeerGeneration: uuid.New(), SupportsMultipairV2: peer.multipair,
+			SupportsDirectDataV1: peer.directData,
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		registration, err := h.state.RegisterPresence(ctx, peer.presence)
@@ -320,11 +342,23 @@ func (p *signalPeer) readLoop() {
 }
 
 func (h *Hub) route(sender *signalPeer, frame []byte) error {
+	// The socket close which retires a replaced connection can race with one
+	// final ReadMessage. Fence that frame against the authoritative local
+	// generation before it can consume sequence state or reach the recipient.
+	h.mu.Lock()
+	current := h.peers[sender.principal.Device.ID] == sender
+	h.mu.Unlock()
+	if !current {
+		return ErrTransportDenied
+	}
 	envelope, err := UnmarshalSignal(frame)
 	if err != nil || !bytes.Equal(envelope.SenderDeviceID, sender.principal.Device.ID[:]) {
 		return ErrTransportDenied
 	}
 	if envelope.SignalType > SignalPathClose && !sender.multipair {
+		return ErrTransportDenied
+	}
+	if isDirectDataControlSignal(envelope.SignalType) && !sender.directData {
 		return ErrTransportDenied
 	}
 	recipientID, err := uuid.FromBytes(envelope.RecipientDeviceID)
@@ -336,6 +370,14 @@ func (h *Hub) route(sender *signalPeer, frame []byte) error {
 		recipient := h.peers[recipientID]
 		h.mu.Unlock()
 		if recipient != nil && !recipient.multipair {
+			return ErrTransportDenied
+		}
+	}
+	if isDirectDataControlSignal(envelope.SignalType) {
+		h.mu.Lock()
+		recipient := h.peers[recipientID]
+		h.mu.Unlock()
+		if (h.state == nil && recipient == nil) || (recipient != nil && !recipient.directData) {
 			return ErrTransportDenied
 		}
 	}
@@ -361,6 +403,9 @@ func (h *Hub) route(sender *signalPeer, frame []byte) error {
 	h.mu.Unlock()
 	if recipient != nil {
 		if envelope.SignalType > SignalPathClose && !recipient.multipair {
+			return ErrTransportDenied
+		}
+		if isDirectDataControlSignal(envelope.SignalType) && !recipient.directData {
 			return ErrTransportDenied
 		}
 		recipient.enqueue(frame)
@@ -497,15 +542,21 @@ func (h *Hub) deliverSharedSignal(delivery DirectMailboxDelivery) {
 		peer = nil
 	}
 	h.mu.Unlock()
-	if peer != nil && !peer.multipair {
+	if peer != nil && (!peer.multipair || !peer.directData) {
 		envelope, err := UnmarshalSignal(delivery.Frame)
-		if err != nil || envelope.SignalType > SignalPathClose {
+		if err != nil ||
+			(envelope.SignalType > SignalPathClose && !peer.multipair) ||
+			(isDirectDataControlSignal(envelope.SignalType) && !peer.directData) {
 			peer = nil
 		}
 	}
 	if peer != nil {
 		peer.enqueue(delivery.Frame)
 	}
+}
+
+func isDirectDataControlSignal(signalType SignalType) bool {
+	return signalType >= SignalCutoverProposal && signalType <= SignalFallback
 }
 
 func (h *Hub) refreshSharedState(ctx context.Context) error {

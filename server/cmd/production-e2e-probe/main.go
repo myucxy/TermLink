@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -528,13 +529,20 @@ func (p *probe) verifyDirectTransport(source, target *identity) error {
 	if err != nil {
 		return fmt.Errorf("verify Direct transport config: %w", err)
 	}
+	expectDataPlane := os.Getenv("TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING") == "1"
 	protocol, ok := positiveInt64Field(config, "protocol_version")
-	if !ok || protocol != 1 || config["direct_routing_permitted"] != false {
-		return errors.New("Direct transport config is not fail-closed protocol v1")
+	if !ok || protocol != 1 || config["direct_routing_permitted"] != expectDataPlane {
+		return errors.New("Direct transport config does not match the explicit acceptance routing gate")
 	}
 	capabilities, ok := config["capabilities"].([]any)
 	if !ok || !containsString(capabilities, "direct_transport_shadow_multipair_v2") {
 		return errors.New("Direct transport multipair capability is unavailable")
+	}
+	if containsString(capabilities, "direct_transport_data_v1") != expectDataPlane {
+		return errors.New("Direct transport data capability does not match the explicit acceptance routing gate")
+	}
+	if containsString(capabilities, "direct_session_cutover_v1") != expectDataPlane {
+		return errors.New("Direct session cutover capability does not match the explicit acceptance routing gate")
 	}
 	connectionID := uuid.New()
 	ticket, err := p.signedJSON(source, http.MethodPost, "/v1/transport/tickets", map[string]any{
@@ -713,14 +721,22 @@ func (p *probe) connectDirectSignals(device *identity, role string) (*websocket.
 		return nil, errors.New("Direct signalling subprotocol negotiation failed")
 	}
 	_ = connection.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	capabilities := []string{
+		"direct_transport_v1",
+		"direct_transport_shadow_multipair_v2",
+	}
+	if os.Getenv("TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING") == "1" {
+		capabilities = append(
+			capabilities,
+			"direct_transport_data_v1",
+			"direct_session_cutover_v1",
+		)
+	}
 	hello, err := json.Marshal(map[string]any{
 		"type":              "CLIENT_HELLO",
 		"role":              role,
 		"protocol_versions": []int{1},
-		"capabilities": []string{
-			"direct_transport_v1",
-			"direct_transport_shadow_multipair_v2",
-		},
+		"capabilities":      capabilities,
 	})
 	if err != nil {
 		closeWebSocket(connection)
@@ -746,7 +762,10 @@ func (p *probe) connectDirectSignals(device *identity, role string) (*websocket.
 		return nil, errors.New("Direct signalling welcome is invalid")
 	}
 	defer clear(welcomeBytes)
-	if err := validateDirectSignalWelcome(welcomeBytes); err != nil {
+	if err := validateDirectSignalWelcome(
+		welcomeBytes,
+		os.Getenv("TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING") == "1",
+	); err != nil {
 		closeWebSocket(connection)
 		return nil, err
 	}
@@ -755,7 +774,7 @@ func (p *probe) connectDirectSignals(device *identity, role string) (*websocket.
 	return connection, nil
 }
 
-func validateDirectSignalWelcome(welcomeBytes []byte) error {
+func validateDirectSignalWelcome(welcomeBytes []byte, expectDataPlane bool) error {
 	var welcome struct {
 		Type                string   `json:"type"`
 		ProtocolVersion     int      `json:"protocol_version"`
@@ -763,15 +782,24 @@ func validateDirectSignalWelcome(welcomeBytes []byte) error {
 		HeartbeatIntervalMS int64    `json:"heartbeat_interval_ms"`
 		MaxSignalFrameBytes int64    `json:"max_signal_frame_bytes"`
 	}
+	expectedCapabilities := []string{
+		"direct_transport_shadow_v1",
+		"direct_transport_shadow_multipair_v2",
+	}
+	if expectDataPlane {
+		expectedCapabilities = append(
+			expectedCapabilities,
+			"direct_transport_data_v1",
+			"direct_session_cutover_v1",
+		)
+	}
 	if err := json.Unmarshal(welcomeBytes, &welcome); err != nil ||
 		welcome.Type != "SERVER_WELCOME" ||
 		welcome.ProtocolVersion != 1 ||
 		welcome.HeartbeatIntervalMS < 1_000 ||
 		welcome.HeartbeatIntervalMS > 45_000 ||
 		welcome.MaxSignalFrameBytes != 65536 ||
-		len(welcome.Capabilities) != 2 ||
-		welcome.Capabilities[0] != "direct_transport_shadow_v1" ||
-		welcome.Capabilities[1] != "direct_transport_shadow_multipair_v2" {
+		!slices.Equal(welcome.Capabilities, expectedCapabilities) {
 		return errors.New("Direct signalling welcome contract is invalid")
 	}
 	return nil
@@ -1445,9 +1473,26 @@ func (p *probe) connectRealtime(device *identity, role string) (*websocket.Conn,
 		return nil, err
 	}
 	_ = connection.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	capabilities := []string{
+		"cumulative_ack",
+		"e2ee_x25519_chacha20poly1305",
+		"flow_control_v1",
+		"lease_v1",
+		"bounded_event_replay_v1",
+		"host_history_v1",
+		"liveness_probe_v1",
+	}
+	expectDirectDataPlane := os.Getenv("TERMLINK_ACCEPTANCE_EXPECT_DIRECT_ROUTING") == "1"
+	if expectDirectDataPlane {
+		capabilities = append(
+			capabilities,
+			"direct_transport_data_v1",
+			"direct_session_cutover_v1",
+		)
+	}
 	hello, _ := json.Marshal(map[string]any{
 		"role": role, "protocol_versions": []int{1},
-		"capabilities": []string{"cumulative_ack", "e2ee_x25519_chacha20poly1305", "flow_control_v1", "lease_v1", "bounded_event_replay_v1", "host_history_v1", "liveness_probe_v1"},
+		"capabilities": capabilities,
 	})
 	if err := connection.WriteMessage(websocket.TextMessage, hello); err != nil {
 		connection.Close()
@@ -1455,13 +1500,36 @@ func (p *probe) connectRealtime(device *identity, role string) (*websocket.Conn,
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(15 * time.Second))
 	messageType, welcome, err := connection.ReadMessage()
-	if err != nil || messageType != websocket.TextMessage || !bytes.Contains(welcome, []byte(`"type":"welcome"`)) {
+	if err != nil || messageType != websocket.TextMessage ||
+		validateProductionRealtimeWelcome(welcome, expectDirectDataPlane) != nil {
 		connection.Close()
 		return nil, errors.New("Realtime welcome is invalid")
 	}
 	_ = connection.SetReadDeadline(time.Time{})
 	_ = connection.SetWriteDeadline(time.Time{})
 	return connection, nil
+}
+
+func validateProductionRealtimeWelcome(welcomeBytes []byte, expectDirectDataPlane bool) error {
+	var welcome struct {
+		Type            string   `json:"type"`
+		ProtocolVersion int      `json:"protocol_version"`
+		ConnectionID    string   `json:"connection_id"`
+		Capabilities    []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(welcomeBytes, &welcome); err != nil ||
+		welcome.Type != "welcome" || welcome.ProtocolVersion != 1 {
+		return errors.New("Realtime welcome structure is invalid")
+	}
+	if connectionID, err := uuid.Parse(welcome.ConnectionID); err != nil || connectionID == uuid.Nil {
+		return errors.New("Realtime welcome connection ID is invalid")
+	}
+	hasData := slices.Contains(welcome.Capabilities, "direct_transport_data_v1")
+	hasCutover := slices.Contains(welcome.Capabilities, "direct_session_cutover_v1")
+	if hasData != expectDirectDataPlane || hasCutover != expectDirectDataPlane {
+		return errors.New("Realtime Direct capability bundle does not match the acceptance routing gate")
+	}
+	return nil
 }
 
 func (p *probe) tokenFor(device *identity) (string, error) {

@@ -29,6 +29,18 @@ use termlink_direct_nat::{
     validate_candidate_endpoint,
 };
 
+mod direct_data;
+
+pub use direct_data::{
+    AuthenticatedDirectConnection, DIRECT_FLOW_WINDOW_BYTES, DirectConnectionControl,
+    DirectDataReader, DirectDataWriter, DirectEndpoint, DirectFrameBody, DirectLivenessTracker,
+    DirectPathFrame, DirectPingV1, DirectPongV1, DirectTransportReceiptV1,
+    FIRST_DIRECT_DATA_FRAME_SEQ, INITIAL_DIRECT_LIVENESS_FRAME_SEQ,
+    MAX_DIRECT_DATA_FRAME_WIRE_BYTES, MAX_DIRECT_FRAME_SEQ, MAX_REALTIME_ENVELOPE_BYTES,
+    ReceivedDirectFrame, decode_direct_path_frame, encode_direct_path_frame,
+    exchange_and_authenticate_direct_connection,
+};
+
 pub const ALPN: &[u8] = b"termlink-direct/1";
 pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-TERMLINK-DIRECT-V1";
 pub const QUIC_MTU: u16 = 1200;
@@ -1298,6 +1310,18 @@ fn server_config(
     identity: TemporaryIdentity,
     pinned_client_certificate_sha256: [u8; 32],
 ) -> Result<ServerConfig, QuicError> {
+    server_config_with_transport(
+        identity,
+        pinned_client_certificate_sha256,
+        transport_config(),
+    )
+}
+
+fn server_config_with_transport(
+    identity: TemporaryIdentity,
+    pinned_client_certificate_sha256: [u8; 32],
+    transport: Arc<TransportConfig>,
+) -> Result<ServerConfig, QuicError> {
     let client_verifier = Arc::new(FingerprintClientVerifier {
         expected: pinned_client_certificate_sha256,
         hints: Vec::new(),
@@ -1318,13 +1342,25 @@ fn server_config(
         .max_incoming(1)
         .incoming_buffer_size(4 * 1024)
         .incoming_buffer_size_total(4 * 1024);
-    config.transport = transport_config();
+    config.transport = transport;
     Ok(config)
 }
 
 fn client_config(
     identity: TemporaryIdentity,
     pinned_server_certificate_sha256: [u8; 32],
+) -> Result<ClientConfig, QuicError> {
+    client_config_with_transport(
+        identity,
+        pinned_server_certificate_sha256,
+        transport_config(),
+    )
+}
+
+fn client_config_with_transport(
+    identity: TemporaryIdentity,
+    pinned_server_certificate_sha256: [u8; 32],
+    transport: Arc<TransportConfig>,
 ) -> Result<ClientConfig, QuicError> {
     let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .dangerous()
@@ -1341,7 +1377,7 @@ fn client_config(
     tls.resumption = Resumption::disabled();
     let crypto = QuicClientConfig::try_from(tls).map_err(|_| QuicError::Certificate)?;
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(transport_config());
+    config.transport_config(transport);
     Ok(config)
 }
 
@@ -1385,6 +1421,7 @@ pub enum QuicError {
     Write(quinn::WriteError),
     Read(quinn::ReadToEndError),
     ClosedStream(quinn::ClosedStream),
+    DirectRead(quinn::ReadExactError),
     EndpointClosed,
     UnsafeConfiguration,
     SocketIdentityChanged,
@@ -1393,6 +1430,12 @@ pub enum QuicError {
     TlsExporter,
     InvalidPeerProof,
     InvalidPing,
+    InvalidDirectFrame,
+    InvalidDirectSequence,
+    InvalidDirectReceipt,
+    UnexpectedPong,
+    LivenessTimeout,
+    Cancelled,
     Timeout,
     UnexpectedRemote,
     InvalidCandidate,
@@ -1409,6 +1452,7 @@ impl fmt::Display for QuicError {
             Self::Write(_) => "QUIC shadow write failed",
             Self::Read(_) => "QUIC shadow read failed",
             Self::ClosedStream(_) => "QUIC shadow stream closed",
+            Self::DirectRead(_) => "QUIC direct stream read failed",
             Self::EndpointClosed => "QUIC endpoint closed",
             Self::UnsafeConfiguration => "QUIC safety policy was weakened",
             Self::SocketIdentityChanged => "QUIC did not consume the probed UDP socket",
@@ -1417,6 +1461,12 @@ impl fmt::Display for QuicError {
             Self::TlsExporter => "QUIC TLS exporter failed",
             Self::InvalidPeerProof => "QUIC peer device proof is invalid",
             Self::InvalidPing => "QUIC shadow ping is invalid",
+            Self::InvalidDirectFrame => "QUIC direct data frame is invalid",
+            Self::InvalidDirectSequence => "QUIC direct frame sequence is invalid",
+            Self::InvalidDirectReceipt => "QUIC direct transport receipt is invalid",
+            Self::UnexpectedPong => "QUIC direct pong does not match the active ping",
+            Self::LivenessTimeout => "QUIC direct path liveness timed out",
+            Self::Cancelled => "QUIC direct operation was cancelled",
             Self::Timeout => "QUIC shadow operation timed out",
             Self::UnexpectedRemote => "QUIC peer endpoint does not match the nominated candidate",
             Self::InvalidCandidate => "QUIC nominated candidate is invalid",
@@ -1444,6 +1494,7 @@ from_error!(quinn::ConnectionError, Connection);
 from_error!(quinn::WriteError, Write);
 from_error!(quinn::ReadToEndError, Read);
 from_error!(quinn::ClosedStream, ClosedStream);
+from_error!(quinn::ReadExactError, DirectRead);
 
 #[cfg(test)]
 mod tests {

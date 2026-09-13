@@ -5,6 +5,9 @@
     <AssemblyName>TermLink.ProductionDirectTransport.Validation</AssemblyName>
     <RootNamespace>TermLink.ProductionDirectTransport.Validation</RootNamespace>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'DirectAcceptance' And '$(TermLinkDirectDataPlaneAcceptance)' == 'true'">
+    <DefineConstants>$(DefineConstants);TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE</DefineConstants>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />
     <ProjectReference Include="..\..\src\Protocol\TermLink.Protocol.csproj" />

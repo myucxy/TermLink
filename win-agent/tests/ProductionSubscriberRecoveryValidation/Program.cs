@@ -32,6 +32,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 ValidateFullSubscriberWindowRecoversAcrossSubscribeGeneration(runtimeType);
                 ValidateAuthorizedRecipientSigningKeyContract(runtimeType);
                 ValidateDirectPeerProviderIsolation(runtimeType);
+                ValidateInputReplayAdmissionIsHardBounded(runtimeType);
                 ValidateNetworkAvailabilityRelayFirst(runtimeType);
                 ValidateRetainedRouteSkipsForcedRefresh(runtimeType);
                 ValidateSharedAccountLeaseInput(runtimeType);
@@ -115,6 +116,89 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             foreach (var item in value)
                 if (item != 0) return false;
             return true;
+        }
+
+        private static void ValidateInputReplayAdmissionIsHardBounded(Type runtimeType)
+        {
+            var remember = runtimeType.GetMethod("TryRememberInputRequest", InstanceFlags);
+            Require(remember != null, "Input replay admission boundary is unavailable.");
+            var runtime = RuntimeHelpers.GetUninitializedObject(runtimeType);
+            SetField(runtimeType, runtime, "inputReplayRecords",
+                NewRuntimeField(runtimeType, "inputReplayRecords"));
+            SetField(runtimeType, runtime, "inputReplayOrder",
+                NewRuntimeField(runtimeType, "inputReplayOrder"));
+            SetField(runtimeType, runtime, "inputReplayAdmissionSync", new object());
+
+            const int maximum = 4096;
+            var sessionId = Guid.NewGuid();
+            var senderId = Guid.NewGuid();
+            var digest = new byte[32];
+            for (var index = 0; index < digest.Length; index++)
+                digest[index] = checked((byte)(index + 1));
+            var admittedIds = new Guid[maximum];
+            for (var index = 0; index < maximum; index++)
+            {
+                admittedIds[index] = Guid.NewGuid();
+                var arguments = new object[]
+                {
+                    admittedIds[index], sessionId, senderId, digest, false, false
+                };
+                Require((bool)remember.Invoke(runtime, arguments) &&
+                        !(bool)arguments[4] && !(bool)arguments[5],
+                    "A replay request inside the hard bound was not admitted.");
+            }
+
+            var records = GetField(runtimeType, runtime, "inputReplayRecords");
+            Require(CollectionCount(records) == maximum,
+                "Input replay ledger did not reach its configured hard bound.");
+            var overflowArguments = new object[]
+            {
+                Guid.NewGuid(), sessionId, senderId, digest, false, false
+            };
+            Require(!(bool)remember.Invoke(runtime, overflowArguments) &&
+                    !(bool)overflowArguments[4] && (bool)overflowArguments[5] &&
+                    CollectionCount(records) == maximum,
+                "Pending replay pressure crossed the hard memory bound.");
+
+            var duplicateArguments = new object[]
+            {
+                admittedIds[1], sessionId, senderId, digest, false, false
+            };
+            Require((bool)remember.Invoke(runtime, duplicateArguments) &&
+                    (bool)duplicateArguments[4] && !(bool)duplicateArguments[5],
+                "An exact duplicate was rejected merely because the ledger was full.");
+            var conflictingDigest = (byte[])digest.Clone();
+            conflictingDigest[0] ^= 0x5a;
+            var conflictArguments = new object[]
+            {
+                admittedIds[1], sessionId, senderId, conflictingDigest, false, false
+            };
+            Require(!(bool)remember.Invoke(runtime, conflictArguments) &&
+                    !(bool)conflictArguments[4] && !(bool)conflictArguments[5],
+                "A conflicting Envelope reused an admitted input ID.");
+
+            var completed = DictionaryValue(records, admittedIds[0]);
+            var resultField = completed.GetType().GetField("Result", InstanceFlags);
+            var sequenceField = completed.GetType().GetField("ResultSequence", InstanceFlags);
+            Require(resultField != null && sequenceField != null,
+                "Input replay completion fields are unavailable.");
+            var resultType = runtimeType.Assembly.GetType(
+                "TermLink.LocalIpc.LocalRemoteInputResult",
+                throwOnError: true);
+            resultField.SetValue(completed, Enum.Parse(resultType, "Accepted"));
+            sequenceField.SetValue(completed, 7UL);
+            var completedDigest = (byte[])completed.GetType().GetField(
+                "EnvelopeSha256", InstanceFlags).GetValue(completed);
+            var replacementArguments = new object[]
+            {
+                Guid.NewGuid(), sessionId, senderId, digest, false, false
+            };
+            Require((bool)remember.Invoke(runtime, replacementArguments) &&
+                    !(bool)replacementArguments[4] && !(bool)replacementArguments[5] &&
+                    CollectionCount(records) == maximum && IsAllZero(completedDigest),
+                "A completed replay record was not securely evicted for new admission.");
+            Array.Clear(conflictingDigest, 0, conflictingDigest.Length);
+            Array.Clear(digest, 0, digest.Length);
         }
 
         private static void ValidateDirectPeerProviderIsolation(Type runtimeType)
@@ -861,7 +945,13 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                     request.RequestUri.AbsolutePath.EndsWith("/lease", StringComparison.Ordinal),
                     "Shared lease validation issued an unexpected Server request.");
                 leaseRequests++;
-                return Task.FromResult(LeaseResponse(holderId, leaseId, 7L, expiresAt));
+                return Task.FromResult(LeaseResponse(
+                    holderId,
+                    LeaseRequestSender(request),
+                    leaseId,
+                    7L,
+                    expiresAt,
+                    "COLLABORATIVE"));
             });
             using var context = CreateLeaseValidationRuntime(
                 runtimeType,
@@ -875,14 +965,14 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             Require(InvokeLeaseMatches(
                 leaseMatches, context.Runtime, sessionId, secondSenderId, leaseId, 7L),
                 "A second Server-authorized same-account Android was rejected by holder identity.");
-            Require(leaseRequests == 1,
-                "A shared lease cache was not reused across authorized same-account senders.");
+            Require(leaseRequests == 2,
+                "A shared lease authorization was incorrectly reused for another sender.");
 
             clearConnection.Invoke(context.Runtime, Array.Empty<object>());
             Require(InvokeLeaseMatches(
                 leaseMatches, context.Runtime, sessionId, secondSenderId, leaseId, 7L),
                 "A reconnected same-account Android was rejected after the old holder cache was cleared.");
-            Require(leaseRequests == 2,
+            Require(leaseRequests == 3,
                 "Realtime reconnect did not force a fresh Server lease observation.");
         }
 
@@ -909,7 +999,13 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 if (request.RequestUri.AbsolutePath.EndsWith("/lease", StringComparison.Ordinal))
                 {
                     leaseRequests++;
-                    return Task.FromResult(LeaseResponse(holderId, leaseId, 11L, expiresAt));
+                    return Task.FromResult(LeaseResponse(
+                        holderId,
+                        LeaseRequestSender(request),
+                        leaseId,
+                        11L,
+                        expiresAt,
+                        "SINGLE"));
                 }
                 Require(request.RequestUri.AbsolutePath.EndsWith("/grants", StringComparison.Ordinal),
                     "Lease authorization issued an unexpected Server request.");
@@ -929,9 +1025,15 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                     leaseMatches, context.Runtime, sessionId, authorizedSenderId, leaseId, 10L),
                     "Input with a stale lease version crossed the active fence.");
                 Require(!InvokeLeaseMatches(
+                    leaseMatches, context.Runtime, sessionId, authorizedSenderId, leaseId, 11L),
+                    "A non-holder crossed a SINGLE control policy on Direct input.");
+                Require(InvokeLeaseMatches(
+                    leaseMatches, context.Runtime, sessionId, holderId, leaseId, 11L),
+                    "The current SINGLE control-policy holder was rejected.");
+                Require(!InvokeLeaseMatches(
                     leaseMatches, context.Runtime, sessionId, unknownSenderId, leaseId, 11L),
                     "An unknown or cross-account sender used another device's valid lease.");
-                Require(leaseRequests == 2 && grantRequests == 1,
+                Require(leaseRequests == 4 && grantRequests == 1,
                     "Lease fencing or sender authorization did not use the expected Server checks.");
             }
 
@@ -943,9 +1045,11 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 expiredRequests++;
                 return Task.FromResult(LeaseResponse(
                     holderId,
+                    LeaseRequestSender(request),
                     leaseId,
                     11L,
-                    DateTime.UtcNow.AddSeconds(-1)));
+                    DateTime.UtcNow.AddSeconds(-1),
+                    "SINGLE"));
             });
             using (var context = CreateLeaseValidationRuntime(
                 runtimeType,
@@ -1150,6 +1254,8 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             SetField(runtimeType, runtime, "credentials", credentials);
             SetField(runtimeType, runtime, "http", http);
             SetField(runtimeType, runtime, "leaseStatuses", NewRuntimeField(runtimeType, "leaseStatuses"));
+            SetField(runtimeType, runtime, "inputLeaseAuthorizations",
+                NewRuntimeField(runtimeType, "inputLeaseAuthorizations"));
             SetField(runtimeType, runtime, "authorizedRecipients", NewRuntimeField(runtimeType, "authorizedRecipients"));
             SetField(runtimeType, runtime, "subscribers", NewRuntimeField(runtimeType, "subscribers"));
             SetField(runtimeType, runtime, "connectionSubscriberRoutes", NewRuntimeField(runtimeType, "connectionSubscriberRoutes"));
@@ -1212,15 +1318,32 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
 
         private static HttpResponseMessage LeaseResponse(
             Guid holderId,
+            Guid authorizedSenderId,
             Guid leaseId,
             long version,
-            DateTime expiresAtUtc)
+            DateTime expiresAtUtc,
+            string controlMode)
         {
             return JsonResponse(
                 "{\"holder_device_id\":\"" + holderId.ToString("D") +
                 "\",\"lease_id\":\"" + leaseId.ToString("D") +
                 "\",\"version\":" + version +
-                ",\"expires_at\":\"" + expiresAtUtc.ToUniversalTime().ToString("O") + "\"}");
+                ",\"expires_at\":\"" + expiresAtUtc.ToUniversalTime().ToString("O") +
+                "\",\"authorized_sender_device_id\":\"" + authorizedSenderId.ToString("D") +
+                "\",\"control_mode\":\"" + controlMode +
+                "\",\"policy_version\":1}");
+        }
+
+        private static Guid LeaseRequestSender(HttpRequestMessage request)
+        {
+            var query = request?.RequestUri?.Query;
+            const string prefix = "?sender_device_id=";
+            Require(!string.IsNullOrEmpty(query) && query.StartsWith(prefix, StringComparison.Ordinal),
+                "Direct input lease authorization omitted its sender binding.");
+            Require(Guid.TryParse(Uri.UnescapeDataString(query.Substring(prefix.Length)), out var sender) &&
+                    sender != Guid.Empty,
+                "Direct input lease authorization used an invalid sender binding.");
+            return sender;
         }
 
         private static string AuthorizedRecipientsBody(

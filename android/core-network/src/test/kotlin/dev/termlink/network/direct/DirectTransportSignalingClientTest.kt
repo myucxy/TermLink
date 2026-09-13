@@ -64,38 +64,438 @@ class DirectTransportSignalingClientTest {
     }
 
     @Test
-    fun configRequiresShadowCapabilitiesAndForbidsDirectRouting() {
+    fun configAcceptsServerDataGateAndItsWithdrawalWithoutChangingShadowRequirements() {
         val server = MockWebServer()
         val signing = TicketSigningFixture()
-        val valid = configJson(signing)
-        server.enqueue(MockResponse().setResponseCode(200).setBody(valid))
+        server.enqueue(MockResponse().setResponseCode(200).setBody(configJson(signing)))
+        server.enqueue(MockResponse().setResponseCode(200).setBody(configJson(signing, directData = true)))
+        server.enqueue(MockResponse().setResponseCode(200).setBody(configJson(signing)))
+        server.start()
+        val fixture = fixture(server, enabled = true)
+        try {
+            val defaultConfig = fixture.client.fetchConfig() as DirectSignalingCallResult.Success
+            assertFalse(defaultConfig.value.directRoutingPermitted)
+            assertFalse(DirectTransportSignalingClient.hasDirectDataCapabilities(defaultConfig.value))
+
+            val routedConfig = fixture.client.fetchConfig() as DirectSignalingCallResult.Success
+            assertTrue(routedConfig.value.directRoutingPermitted)
+            assertTrue(
+                DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY in routedConfig.value.capabilities,
+            )
+            assertTrue(
+                DirectTransportSignalingClient.DIRECT_SESSION_CUTOVER_CAPABILITY in
+                    routedConfig.value.capabilities,
+            )
+            assertTrue(DirectTransportSignalingClient.hasDirectDataCapabilities(routedConfig.value))
+
+            val withdrawnConfig = fixture.client.fetchConfig() as DirectSignalingCallResult.Success
+            assertFalse(withdrawnConfig.value.directRoutingPermitted)
+            assertFalse(DirectTransportSignalingClient.hasDirectDataCapabilities(withdrawnConfig.value))
+        } finally {
+            fixture.close()
+            server.shutdown()
+            signing.destroy()
+        }
+    }
+
+    @Test
+    fun legacyDataOnlyConfigParsesButCannotPermitDirectCutover() {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
         server.enqueue(
             MockResponse().setResponseCode(200).setBody(
-                valid.replace("\"direct_routing_permitted\":false", "\"direct_routing_permitted\":true"),
-            ),
-        )
-        server.enqueue(
-            MockResponse().setResponseCode(200).setBody(
-                valid.replace("direct_transport_shadow_v1", "direct_transport_v1"),
+                configJson(
+                    signing,
+                    directRoutingPermitted = true,
+                    capabilitiesOverride = listOf(
+                        "direct_signaling_v1",
+                        "direct_transport_shadow_v1",
+                        "direct_transport_data_v1",
+                    ),
+                ),
             ),
         )
         server.start()
         val fixture = fixture(server, enabled = true)
         try {
-            val accepted = fixture.client.fetchConfig()
-            assertTrue(accepted is DirectSignalingCallResult.Success)
-            assertFalse((accepted as DirectSignalingCallResult.Success).value.directRoutingPermitted)
-            repeat(2) {
-                val rejected = fixture.client.fetchConfig()
-                assertEquals(
-                    DirectSignalingFaultCode.INVALID_CONFIGURATION,
-                    (rejected as DirectSignalingCallResult.Fault).fault.code,
-                )
+            val legacy = fixture.client.fetchConfig() as DirectSignalingCallResult.Success
+            assertTrue(legacy.value.directRoutingPermitted)
+            assertTrue(
+                DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY in legacy.value.capabilities,
+            )
+            assertFalse(
+                DirectTransportSignalingClient.DIRECT_SESSION_CUTOVER_CAPABILITY in
+                    legacy.value.capabilities,
+            )
+            assertFalse(DirectTransportSignalingClient.hasDirectDataCapabilities(legacy.value))
+        } finally {
+            fixture.close()
+            server.shutdown()
+            signing.destroy()
+        }
+    }
+
+    @Test
+    fun configRejectsInconsistentUnknownAndDuplicateCapabilities() {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
+        val invalidConfigs = listOf(
+            configJson(signing, directRoutingPermitted = true),
+            configJson(signing, directData = true, directRoutingPermitted = false),
+            configJson(
+                signing,
+                capabilitiesOverride = listOf("direct_signaling_v1", "direct_transport_v1"),
+            ),
+            configJson(
+                signing,
+                capabilitiesOverride = listOf(
+                    "direct_signaling_v1",
+                    "direct_transport_shadow_v1",
+                    "direct_future_v1",
+                ),
+            ),
+            configJson(
+                signing,
+                capabilitiesOverride = listOf(
+                    "direct_signaling_v1",
+                    "direct_transport_shadow_v1",
+                    "direct_signaling_v1",
+                ),
+            ),
+            configJson(
+                signing,
+                directRoutingPermitted = true,
+                capabilitiesOverride = listOf(
+                    "direct_signaling_v1",
+                    "direct_transport_shadow_v1",
+                    "direct_transport_data_v1",
+                    "direct_transport_data_v1",
+                ),
+            ),
+        )
+        invalidConfigs.forEach { body ->
+            server.enqueue(MockResponse().setResponseCode(200).setBody(body))
+        }
+        server.start()
+        val fixture = fixture(server, enabled = true)
+        try {
+            invalidConfigs.forEach {
+                val rejected = fixture.client.fetchConfig() as DirectSignalingCallResult.Fault
+                assertEquals(DirectSignalingFaultCode.INVALID_CONFIGURATION, rejected.fault.code)
             }
         } finally {
             fixture.close()
             server.shutdown()
             signing.destroy()
+        }
+    }
+
+    @Test
+    fun routedConfigPreservesShadowTicketAndSocketWithoutAdvertisingDataCapability() = runBlocking {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
+        val local = UUID.randomUUID()
+        val target = UUID.randomUUID()
+        val connection = UUID.randomUUID()
+        val ticket = signing.ticket(local, target, connection, now)
+        val hello = CompletableDeferred<String>()
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                configJson(signing, multipair = true, directData = true),
+            ),
+        )
+        server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(ticket)))
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        hello.complete(text)
+                        webSocket.send(validWelcome(multipair = true))
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val fixture = fixture(server, enabled = true, deviceId = local, multipair = true)
+        try {
+            val config = fixture.client.fetchConfig() as DirectSignalingCallResult.Success
+            assertTrue(DirectTransportSignalingClient.hasDirectDataCapabilities(config.value))
+            val issued = fixture.client.issueTicket(target, connection, config.value)
+            assertTrue(issued is DirectSignalingCallResult.Success)
+
+            assertTrue(fixture.client.startSignaling())
+            val clientHello = withTimeout(5_000) { hello.await() }
+            assertTrue(clientHello.contains(DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY))
+            assertFalse(clientHello.contains(DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY))
+            assertTrue(
+                fixture.client.state.first { it is DirectTransportSignalingState.Connected } is
+                    DirectTransportSignalingState.Connected,
+            )
+        } finally {
+            fixture.close()
+            server.shutdown()
+            signing.destroy()
+            ticket.fill(0)
+        }
+    }
+
+    @Test
+    fun enabledDataCapabilitiesAreAdvertisedOnceButADataOnlyEchoKeepsShadowConnected() = runBlocking {
+        val server = MockWebServer()
+        val hello = CompletableDeferred<String>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        hello.complete(text)
+                        webSocket.send(
+                            validWelcome(
+                                capabilitiesOverride = listOf(
+                                    "direct_transport_shadow_v1",
+                                    "direct_transport_data_v1",
+                                ),
+                            ),
+                        )
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val local = UUID.randomUUID()
+        val peer = UUID.randomUUID()
+        val fixture = fixture(server, enabled = true, deviceId = local, directData = true)
+        try {
+            assertTrue(fixture.client.startSignaling())
+            val clientHello = withTimeout(5_000) { hello.await() }
+            assertEquals(1, clientHello.windowed(
+                DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY.length,
+            ).count { it == DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY })
+            assertEquals(1, clientHello.windowed(
+                DirectTransportSignalingClient.DIRECT_SESSION_CUTOVER_CAPABILITY.length,
+            ).count { it == DirectTransportSignalingClient.DIRECT_SESSION_CUTOVER_CAPABILITY })
+            val connected = fixture.client.state.first {
+                it is DirectTransportSignalingState.Connected
+            } as DirectTransportSignalingState.Connected
+            val snapshot = fixture.client.negotiatedCapabilities.value
+            assertEquals(connected.generation, snapshot.generation)
+            assertTrue(DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY in snapshot.capabilities)
+            assertFalse(
+                DirectTransportSignalingClient.DIRECT_SESSION_CUTOVER_CAPABILITY in
+                    snapshot.capabilities,
+            )
+            assertFalse(fixture.client.isDirectDataV1Negotiated(connected.generation))
+
+            assertTrue(
+                fixture.client.send(
+                    signal(UUID.randomUUID(), local, peer, 1).toBuilder()
+                        .setSignalType(TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE)
+                        .build(),
+                ),
+            )
+            assertFalse(
+                fixture.client.send(
+                    signal(UUID.randomUUID(), local, peer, 1).toBuilder()
+                        .setSignalType(
+                            TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_PROPOSAL,
+                        )
+                        .build(),
+                ),
+            )
+            val fault = fixture.client.state.value as DirectTransportSignalingState.Fault
+            assertEquals(DirectSignalingFaultCode.SIGNAL_FRAME_REJECTED, fault.fault.code)
+        } finally {
+            fixture.close()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun echoedDataCapabilityPublishesGenerationAndAllowsCutoverSignalsBothWays() = runBlocking {
+        val server = MockWebServer()
+        val serverSocket = CompletableDeferred<WebSocket>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        webSocket.send(validWelcome(directData = true))
+                        serverSocket.complete(webSocket)
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val local = UUID.randomUUID()
+        val peer = UUID.randomUUID()
+        val connection = UUID.randomUUID()
+        val fixture = fixture(server, enabled = true, deviceId = local, directData = true)
+        try {
+            val received = async(start = CoroutineStart.UNDISPATCHED) {
+                fixture.client.incoming.take(4).toList()
+            }
+            assertTrue(fixture.client.startSignaling())
+            val connected = fixture.client.state.first {
+                it is DirectTransportSignalingState.Connected
+            } as DirectTransportSignalingState.Connected
+            val negotiated = fixture.client.negotiatedCapabilities.value
+            assertEquals(connected.generation, negotiated.generation)
+            assertTrue(DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY in negotiated.capabilities)
+            assertTrue(
+                DirectTransportSignalingClient.DIRECT_SESSION_CUTOVER_CAPABILITY in
+                    negotiated.capabilities,
+            )
+            assertTrue(fixture.client.isDirectDataV1Negotiated(connected.generation))
+
+            val cutoverTypes = listOf(
+                TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_PROPOSAL,
+                TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_ACCEPT,
+                TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_CUTOVER_COMMIT,
+                TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_FALLBACK,
+            )
+            cutoverTypes.forEachIndexed { index, type ->
+                assertTrue(
+                    fixture.client.send(
+                        signal(connection, local, peer, (index + 1).toLong()).toBuilder()
+                            .setSignalType(type)
+                            .build(),
+                    ),
+                )
+            }
+            val activeServerSocket = withTimeout(5_000) { serverSocket.await() }
+            cutoverTypes.forEachIndexed { index, type ->
+                val envelope = signal(connection, peer, local, (index + 1).toLong()).toBuilder()
+                    .setSignalType(type)
+                    .build()
+                assertTrue(activeServerSocket.send(OkioByteString.of(*envelope.toByteArray())))
+            }
+            assertEquals(cutoverTypes, withTimeout(5_000) { received.await() }.map { it.signalType })
+
+            fixture.client.close()
+            val retired = fixture.client.negotiatedCapabilities.value
+            assertTrue(retired.generation > connected.generation)
+            assertTrue(retired.capabilities.isEmpty())
+            assertFalse(fixture.client.isDirectDataV1Negotiated(connected.generation))
+        } finally {
+            fixture.close()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun reconnectImmediatelyRevokesDataUntilTheNextGenerationEchoesIt() = runBlocking {
+        val server = MockWebServer()
+        val firstSocket = CompletableDeferred<WebSocket>()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        webSocket.send(validWelcome(directData = true))
+                        firstSocket.complete(webSocket)
+                    }
+                },
+            ),
+        )
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        webSocket.send(validWelcome())
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, reason)
+                    }
+                },
+            ),
+        )
+        server.start()
+        val fixture = fixture(server, enabled = true, directData = true)
+        try {
+            assertTrue(fixture.client.startSignaling())
+            val firstConnected = fixture.client.state.first {
+                it is DirectTransportSignalingState.Connected
+            } as DirectTransportSignalingState.Connected
+            assertTrue(fixture.client.isDirectDataV1Negotiated(firstConnected.generation))
+            assertTrue(withTimeout(5_000) { firstSocket.await() }.close(1000, "replace generation"))
+
+            val secondConnected = withTimeout(5_000) {
+                fixture.client.state.first {
+                    it is DirectTransportSignalingState.Connected &&
+                        it.generation != firstConnected.generation
+                }
+            } as DirectTransportSignalingState.Connected
+            val snapshot = fixture.client.negotiatedCapabilities.value
+            assertEquals(secondConnected.generation, snapshot.generation)
+            assertTrue(snapshot.capabilities.isNotEmpty())
+            assertFalse(DirectTransportSignalingClient.DIRECT_DATA_CAPABILITY in snapshot.capabilities)
+            assertFalse(fixture.client.isDirectDataV1Negotiated(firstConnected.generation))
+            assertFalse(fixture.client.isDirectDataV1Negotiated(secondConnected.generation))
+        } finally {
+            fixture.close()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun welcomeRejectsUnadvertisedOrDuplicateDataCapability() = runBlocking {
+        val cases = listOf(
+            false to validWelcome(directData = true),
+            true to validWelcome(
+                capabilitiesOverride = listOf(
+                    "direct_transport_shadow_v1",
+                    "direct_session_cutover_v1",
+                ),
+            ),
+            true to validWelcome(
+                capabilitiesOverride = listOf(
+                    "direct_transport_shadow_v1",
+                    "direct_transport_data_v1",
+                    "direct_transport_data_v1",
+                ),
+            ),
+        )
+        cases.forEach { (directDataEnabled, welcome) ->
+            val server = MockWebServer()
+            server.enqueue(
+                MockResponse().withWebSocketUpgrade(
+                    object : WebSocketListener() {
+                        override fun onMessage(webSocket: WebSocket, text: String) {
+                            webSocket.send(welcome)
+                        }
+
+                        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                            webSocket.close(code, reason)
+                        }
+                    },
+                ),
+            )
+            server.start()
+            val fixture = fixture(server, enabled = true, directData = directDataEnabled)
+            try {
+                assertTrue(fixture.client.startSignaling())
+                val fault = withTimeout(5_000) {
+                    fixture.client.state.first {
+                        it is DirectTransportSignalingState.Fault &&
+                            it.fault.code == DirectSignalingFaultCode.SIGNAL_PROTOCOL_REJECTED
+                    }
+                } as DirectTransportSignalingState.Fault
+                assertFalse(fault.willRetry)
+                assertTrue(fixture.client.negotiatedCapabilities.value.capabilities.isEmpty())
+            } finally {
+                fixture.close()
+                server.shutdown()
+            }
         }
     }
 
@@ -797,6 +1197,7 @@ class DirectTransportSignalingClientTest {
         deviceId: UUID = UUID.randomUUID(),
         retryDelay: DirectSignalingRetryDelay = DirectSignalingRetryDelay { },
         multipair: Boolean = false,
+        directData: Boolean = false,
         httpClient: OkHttpClient = OkHttpClient(),
     ): ClientFixture {
         val identity = DeviceIdentity.generate()
@@ -809,6 +1210,7 @@ class DirectTransportSignalingClientTest {
             ticketSignatureVerifier = bouncyTicketVerifier(),
             feature = DirectTransportSignalingFeature(enabled),
             multipairV2Enabled = multipair,
+            directDataV1Enabled = directData,
             httpClient = httpClient,
             clockMillis = { now },
             random = FixedSecureRandom(),
@@ -831,17 +1233,44 @@ class DirectTransportSignalingClientTest {
             stunServers = listOf("stun:one.test:3478"),
         )
 
-    private fun configJson(signing: TicketSigningFixture, multipair: Boolean = false): String {
-        val optional = if (multipair) ",\"direct_transport_shadow_multipair_v2\"" else ""
-        return """{"protocol_version":1,"capabilities":["direct_signaling_v1","direct_transport_shadow_v1"$optional],"direct_routing_permitted":false,"ticket_signing_keys":[{"key_id":"${signing.keyId}","algorithm":"Ed25519","public_key":"${signing.publicKey.base64Url()}"}],"stun_servers":["stun:one.test:3478"]}"""
+    private fun configJson(
+        signing: TicketSigningFixture,
+        multipair: Boolean = false,
+        directData: Boolean = false,
+        directRoutingPermitted: Boolean = directData,
+        capabilitiesOverride: List<String>? = null,
+    ): String {
+        val capabilities = capabilitiesOverride ?: buildList {
+            add("direct_signaling_v1")
+            add("direct_transport_shadow_v1")
+            if (multipair) add("direct_transport_shadow_multipair_v2")
+            if (directData) {
+                add("direct_transport_data_v1")
+                add("direct_session_cutover_v1")
+            }
+        }
+        val capabilityJson = capabilities.joinToString(",") { "\"$it\"" }
+        return """{"protocol_version":1,"capabilities":[$capabilityJson],"direct_routing_permitted":$directRoutingPermitted,"ticket_signing_keys":[{"key_id":"${signing.keyId}","algorithm":"Ed25519","public_key":"${signing.publicKey.base64Url()}"}],"stun_servers":["stun:one.test:3478"]}"""
     }
 
     private fun ticketResponse(ticket: ByteArray): String =
         """{"protocol_version":1,"ticket_protobuf":"${ticket.base64Url()}"}"""
 
-    private fun validWelcome(multipair: Boolean = false): String {
-        val optional = if (multipair) ",\"direct_transport_shadow_multipair_v2\"" else ""
-        return """{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1"$optional],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}"""
+    private fun validWelcome(
+        multipair: Boolean = false,
+        directData: Boolean = false,
+        capabilitiesOverride: List<String>? = null,
+    ): String {
+        val capabilities = capabilitiesOverride ?: buildList {
+            add("direct_transport_shadow_v1")
+            if (multipair) add("direct_transport_shadow_multipair_v2")
+            if (directData) {
+                add("direct_transport_data_v1")
+                add("direct_session_cutover_v1")
+            }
+        }
+        val capabilityJson = capabilities.joinToString(",") { "\"$it\"" }
+        return """{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":[$capabilityJson],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}"""
     }
 
     private fun signal(

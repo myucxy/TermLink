@@ -56,6 +56,12 @@ import okhttp3.WebSocketListener
 import okio.ByteString as OkioByteString
 import kotlin.coroutines.resume
 
+/** Capabilities negotiated by one independently reconnectable signalling generation. */
+internal data class DirectTransportSignalingNegotiatedCapabilities(
+    val generation: Int,
+    val capabilities: Set<String>,
+)
+
 /**
  * Production direct-transport signalling control plane.
  *
@@ -74,6 +80,8 @@ internal class DirectTransportSignalingClient(
     private val feature: DirectTransportSignalingFeature = DirectTransportSignalingFeature(),
     /** Advertise multipair only after the caller has proved that native ABI v4 is usable. */
     private val multipairV2Enabled: Boolean = false,
+    /** Advertise production data cutover only when a non-Shadow caller explicitly opts in. */
+    private val directDataV1Enabled: Boolean = false,
     httpClient: OkHttpClient = OkHttpClient(),
     parentScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val clockMillis: () -> Long = System::currentTimeMillis,
@@ -119,14 +127,20 @@ internal class DirectTransportSignalingClient(
     private var queuedOutgoingBytes = 0
     private var socket: WebSocket? = null
     private var connectedGeneration = 0
+    private var connectedCapabilities: Set<String> = emptySet()
     private var retryJob: Job? = null
     private var handshakeJob: Job? = null
     private var currentAttempt = 0
     private val mutableState = MutableStateFlow<DirectTransportSignalingState>(
         if (feature.enabled) DirectTransportSignalingState.Idle else DirectTransportSignalingState.Disabled,
     )
+    private val mutableNegotiatedCapabilities = MutableStateFlow(
+        DirectTransportSignalingNegotiatedCapabilities(0, emptySet()),
+    )
 
     val state: StateFlow<DirectTransportSignalingState> = mutableState.asStateFlow()
+    val negotiatedCapabilities: StateFlow<DirectTransportSignalingNegotiatedCapabilities> =
+        mutableNegotiatedCapabilities.asStateFlow()
     val multipairV2Active: Boolean
         get() = multipairV2Configured.get()
     val incoming: Flow<TransportSignalEnvelopeV1> = incomingChannel.receiveAsFlow().map { queued ->
@@ -203,8 +217,7 @@ internal class DirectTransportSignalingClient(
         if (closed.get()) return closedFault()
         if (targetDeviceId == NIL_UUID || targetDeviceId == deviceId || connectionId.version() != 4 ||
             config.protocolVersion != PROTOCOL_VERSION ||
-            !validConfigCapabilities(config.capabilities) ||
-            config.directRoutingPermitted
+            !validConfigCapabilities(config.capabilities, config.directRoutingPermitted)
         ) {
             return DirectSignalingCallResult.Fault(
                 DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
@@ -250,8 +263,7 @@ internal class DirectTransportSignalingClient(
         if (closed.get()) return closedFault()
         if (targetDeviceId == NIL_UUID || targetDeviceId == deviceId || connectionId.version() != 4 ||
             config.protocolVersion != PROTOCOL_VERSION ||
-            !validConfigCapabilities(config.capabilities) ||
-            config.directRoutingPermitted
+            !validConfigCapabilities(config.capabilities, config.directRoutingPermitted)
         ) {
             return DirectSignalingCallResult.Fault(
                 DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
@@ -316,14 +328,26 @@ internal class DirectTransportSignalingClient(
             return false
         }
         val bytes = envelope.toByteArray()
-        val valid = validateSignal(envelope, bytes, outbound = true)
+        val signalType = envelope.signalType.number
+        val dataControl = signalType in DIRECT_DATA_SIGNAL_TYPES
+        val valid = validateSignal(
+            envelope,
+            bytes,
+            outbound = true,
+            directDataAllowed = !dataControl || isDirectDataV1Negotiated(),
+        )
         if (!valid || bytes.size > MAX_SIGNAL_FRAME_BYTES) {
             bytes.fill(0)
             retireWithFault(DirectSignalingFaultCode.SIGNAL_FRAME_REJECTED, retryable = false)
             return false
         }
         var overflow = false
+        var dataCapabilityRejected = false
         val accepted = synchronized(lock) {
+            if (dataControl && !isDirectDataV1NegotiatedLocked(generation.get())) {
+                dataCapabilityRejected = true
+                return@synchronized false
+            }
             val cursor = envelope.cursor()
             val nonce = envelope.nonceKey()
             val previous = outgoingCursors[cursor] ?: 0
@@ -352,7 +376,9 @@ internal class DirectTransportSignalingClient(
             }
         }
         bytes.fill(0)
-        if (overflow) {
+        if (dataCapabilityRejected) {
+            retireWithFault(DirectSignalingFaultCode.SIGNAL_FRAME_REJECTED, retryable = false)
+        } else if (overflow) {
             retireWithFault(DirectSignalingFaultCode.SIGNAL_QUEUE_OVERFLOW, retryable = false)
         } else if (!accepted) {
             retireWithFault(DirectSignalingFaultCode.SIGNAL_REPLAYED, retryable = false)
@@ -363,12 +389,14 @@ internal class DirectTransportSignalingClient(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         val active = synchronized(lock) {
-            generation.incrementAndGet()
+            val retiredGeneration = generation.incrementAndGet()
             retryJob?.cancel()
             retryJob = null
             handshakeJob?.cancel()
             handshakeJob = null
             connectedGeneration = 0
+            connectedCapabilities = emptySet()
+            publishNegotiatedCapabilitiesLocked(retiredGeneration, emptySet())
             clearOutgoingQueueLocked()
             incomingCursors.clear()
             outgoingCursors.clear()
@@ -463,8 +491,14 @@ internal class DirectTransportSignalingClient(
     )
 
     private fun openSocket(attempt: Int) {
-        if (closed.get() || !feature.enabled) return
-        val nextGeneration = generation.incrementAndGet()
+        val nextGeneration = synchronized(lock) {
+            if (closed.get() || !feature.enabled) return
+            val next = generation.incrementAndGet()
+            connectedGeneration = 0
+            connectedCapabilities = emptySet()
+            publishNegotiatedCapabilitiesLocked(next, emptySet())
+            next
+        }
         mutableState.value = DirectTransportSignalingState.Connecting(attempt)
         val opened = runCatching {
             val proof = DirectTransportSignalingProof.createSignalProof(
@@ -510,6 +544,10 @@ internal class DirectTransportSignalingClient(
                 putJsonArray("capabilities") {
                     add(JsonPrimitive(DIRECT_TRANSPORT_CAPABILITY))
                     if (multipairV2Configured.get()) add(JsonPrimitive(DIRECT_MULTIPAIR_CAPABILITY))
+                    if (directDataV1Enabled) {
+                        add(JsonPrimitive(DIRECT_DATA_CAPABILITY))
+                        add(JsonPrimitive(DIRECT_SESSION_CUTOVER_CAPABILITY))
+                    }
                 }
             }
             if (!webSocket.send(JSON.encodeToString(JsonObject.serializer(), hello))) {
@@ -519,7 +557,12 @@ internal class DirectTransportSignalingClient(
 
         override fun onMessage(webSocket: WebSocket, text: String) {
             if (!isCurrent(webSocket)) return
-            if (welcomed || text.encodeToByteArray().size > MAX_HELLO_BYTES || !validateWelcome(text)) {
+            val negotiated = if (!welcomed && text.encodeToByteArray().size <= MAX_HELLO_BYTES) {
+                validateWelcome(text)
+            } else {
+                null
+            }
+            if (negotiated == null) {
                 acceptingBinary = false
                 webSocket.close(1002, "invalid transport welcome")
                 handleSocketFault(
@@ -536,6 +579,8 @@ internal class DirectTransportSignalingClient(
                     false
                 } else {
                     connectedGeneration = listenerGeneration
+                    connectedCapabilities = negotiated
+                    publishNegotiatedCapabilitiesLocked(listenerGeneration, negotiated)
                     currentAttempt = 0
                     handshakeJob?.cancel()
                     handshakeJob = null
@@ -579,7 +624,13 @@ internal class DirectTransportSignalingClient(
                 rejectIncoming(webSocket, DirectSignalingFaultCode.SIGNAL_FRAME_REJECTED)
                 return
             }
-            if (!validateSignal(envelope, raw, outbound = false)) {
+            if (!validateSignal(
+                    envelope,
+                    raw,
+                    outbound = false,
+                    directDataAllowed = isDirectDataV1Negotiated(listenerGeneration),
+                )
+            ) {
                 raw.fill(0)
                 rejectIncoming(webSocket, DirectSignalingFaultCode.SIGNAL_FRAME_REJECTED)
                 return
@@ -684,10 +735,12 @@ internal class DirectTransportSignalingClient(
         val shouldRetry = retryable && attempt <= MAX_SIGNAL_RETRIES
         val active = synchronized(lock) {
             if (generation.get() != expectedGeneration) return
-            generation.incrementAndGet()
+            val retiredGeneration = generation.incrementAndGet()
             handshakeJob?.cancel()
             handshakeJob = null
             connectedGeneration = 0
+            connectedCapabilities = emptySet()
+            publishNegotiatedCapabilitiesLocked(retiredGeneration, emptySet())
             clearOutgoingQueueLocked()
             socket.also { socket = null }
         }
@@ -759,10 +812,10 @@ internal class DirectTransportSignalingClient(
         val protocol = value.requiredInt("protocol_version")
         require(protocol == PROTOCOL_VERSION)
         val capabilities = value.requiredStringList("capabilities", MAX_CONFIG_CAPABILITIES)
-        require(validConfigCapabilities(capabilities.toSet()))
+        require(capabilities.distinct().size == capabilities.size)
         require(capabilities.all(CAPABILITY_PATTERN::matches))
         val directRoutingPermitted = value.requiredBoolean("direct_routing_permitted")
-        require(!directRoutingPermitted) { "direct routing must remain disabled in shadow mode" }
+        require(validConfigCapabilities(capabilities.toSet(), directRoutingPermitted))
         val keyElements = value["ticket_signing_keys"] as? JsonArray ?: error("keys missing")
         require(keyElements.size in 1..MAX_TICKET_SIGNING_KEYS)
         val keys = LinkedHashMap<String, DirectTicketSigningKey>(keyElements.size)
@@ -834,13 +887,16 @@ internal class DirectTransportSignalingClient(
         envelope: TransportSignalEnvelopeV1,
         wire: ByteArray,
         outbound: Boolean,
+        directDataAllowed: Boolean,
     ): Boolean = runCatching {
         require(wire.size in 1..MAX_SIGNAL_FRAME_BYTES)
         require(wire.contentEquals(canonicalSignal(envelope).toByteArray()))
         require(envelope.protocolVersion == PROTOCOL_VERSION)
+        val signalType = envelope.signalType.number
         require(
-            envelope.signalType.number in 1..10 ||
-                multipairV2Configured.get() && envelope.signalType.number in 11..14,
+            signalType in 1..5 || signalType == 10 ||
+                directDataAllowed && signalType in DIRECT_DATA_SIGNAL_TYPES ||
+                multipairV2Configured.get() && signalType in 11..14,
         )
         require(envelope.connectionId.isNonZeroId())
         require(envelope.senderDeviceId.size() == ID_BYTES)
@@ -860,8 +916,9 @@ internal class DirectTransportSignalingClient(
         require(envelope.ciphertext.size() in MIN_CIPHERTEXT_BYTES..MAX_SIGNAL_CIPHERTEXT_BYTES)
     }.isSuccess
 
-    private fun validateWelcome(text: String): Boolean = runCatching {
-        val value = JSON.parseToJsonElement(text) as? JsonObject ?: return@runCatching false
+    private fun validateWelcome(text: String): Set<String>? = runCatching {
+        val value = JSON.parseToJsonElement(text) as? JsonObject
+            ?: error("welcome must be an object")
         val required = setOf(
             "type",
             "protocol_version",
@@ -877,10 +934,41 @@ internal class DirectTransportSignalingClient(
         } else {
             listOf(DIRECT_SHADOW_CAPABILITY)
         }
-        require(value.requiredStringList("capabilities", MAX_CONFIG_CAPABILITIES) == expectedCapabilities)
+        val capabilities = value.requiredStringList("capabilities", MAX_CONFIG_CAPABILITIES)
+        require(capabilities.distinct().size == capabilities.size)
+        val validCapabilities = capabilities == expectedCapabilities ||
+            directDataV1Enabled && capabilities == expectedCapabilities + DIRECT_DATA_CAPABILITY ||
+            directDataV1Enabled && capabilities == expectedCapabilities + listOf(
+                DIRECT_DATA_CAPABILITY,
+                DIRECT_SESSION_CUTOVER_CAPABILITY,
+            )
+        require(validCapabilities)
         require(value.requiredInt("heartbeat_interval_ms") in 1_000..45_000)
         require(value.requiredInt("max_signal_frame_bytes") == MAX_SIGNAL_FRAME_BYTES)
-    }.isSuccess
+        capabilities.toSet()
+    }.getOrNull()
+
+    internal fun isDirectDataV1Negotiated(
+        expectedGeneration: Int = generation.get(),
+    ): Boolean = synchronized(lock) {
+        isDirectDataV1NegotiatedLocked(expectedGeneration)
+    }
+
+    private fun isDirectDataV1NegotiatedLocked(expectedGeneration: Int): Boolean =
+        !closed.get() && expectedGeneration > 0 && generation.get() == expectedGeneration &&
+            connectedGeneration == expectedGeneration && socket != null &&
+            DIRECT_DATA_CAPABILITY in connectedCapabilities &&
+            DIRECT_SESSION_CUTOVER_CAPABILITY in connectedCapabilities
+
+    private fun publishNegotiatedCapabilitiesLocked(
+        capabilityGeneration: Int,
+        capabilities: Set<String>,
+    ) {
+        mutableNegotiatedCapabilities.value = DirectTransportSignalingNegotiatedCapabilities(
+            generation = capabilityGeneration,
+            capabilities = capabilities.toSet(),
+        )
+    }
 
     private fun flushOutgoingQueueLocked(webSocket: WebSocket): Boolean {
         while (outgoingQueue.isNotEmpty()) {
@@ -904,15 +992,6 @@ internal class DirectTransportSignalingClient(
         outgoingQueue.clear()
         queuedOutgoingBytes = 0
     }
-
-    /**
-     * The config endpoint is server-wide and may expose the optional v2 capability to old v3
-     * clients. Such clients must ignore it and keep advertising only v1; they must never emit a
-     * type 11-14 frame. A v4 caller, conversely, requires the capability before it starts v2.
-     */
-    private fun validConfigCapabilities(capabilities: Set<String>): Boolean =
-        capabilities == SHADOW_CONFIG_CAPABILITIES ||
-            capabilities == SHADOW_CONFIG_CAPABILITIES + DIRECT_MULTIPAIR_CAPABILITY
 
     private fun rememberCursor(target: LinkedHashMap<SignalCursor, Long>, cursor: SignalCursor, seq: Long) {
         target[cursor] = seq
@@ -1167,6 +1246,8 @@ internal class DirectTransportSignalingClient(
         internal const val DIRECT_SIGNALING_CAPABILITY = "direct_signaling_v1"
         internal const val DIRECT_SHADOW_CAPABILITY = "direct_transport_shadow_v1"
         internal const val DIRECT_MULTIPAIR_CAPABILITY = "direct_transport_shadow_multipair_v2"
+        internal const val DIRECT_DATA_CAPABILITY = "direct_transport_data_v1"
+        internal const val DIRECT_SESSION_CUTOVER_CAPABILITY = "direct_session_cutover_v1"
         internal const val MAX_SIGNAL_FRAME_BYTES = 64 * 1_024
         internal const val MAX_QUEUED_SIGNAL_FRAMES = 32
         internal const val MAX_QUEUED_SIGNAL_BYTES = 512 * 1_024L
@@ -1200,6 +1281,7 @@ internal class DirectTransportSignalingClient(
         private const val RETRY_BASE_MILLIS = 250L
         private const val RETRY_MAX_MILLIS = 30_000L
         private const val MAX_CLOSE_REASON_CHARS = 120
+        private val DIRECT_DATA_SIGNAL_TYPES = 6..9
         private val CAPABILITY_PATTERN = Regex("[a-z][a-z0-9._-]{0,63}")
         private val CONFIG_KEYS = setOf(
             "protocol_version",
@@ -1218,6 +1300,38 @@ internal class DirectTransportSignalingClient(
         private val JSON = Json { ignoreUnknownKeys = false; explicitNulls = false }
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val NIL_UUID = UUID(0, 0)
+
+        /**
+         * Reports only the server-side data-routing gate. Shadow/v4 callers must still keep their
+         * native `directRoutingPermitted` false and must not advertise [DIRECT_DATA_CAPABILITY].
+         */
+        internal fun hasDirectDataCapabilities(config: DirectTransportServerConfig): Boolean =
+            config.protocolVersion == PROTOCOL_VERSION &&
+                config.directRoutingPermitted &&
+                validConfigCapabilities(config.capabilities, directRoutingPermitted = true) &&
+                DIRECT_DATA_CAPABILITY in config.capabilities &&
+                DIRECT_SESSION_CUTOVER_CAPABILITY in config.capabilities
+
+        /**
+         * The config endpoint is server-wide. It may expose optional multipair and direct-data
+         * capabilities to a Shadow client, but no unknown or duplicated capability is accepted.
+         * Data permission is valid only when the matching capability is present.
+         */
+        private fun validConfigCapabilities(
+            capabilities: Set<String>,
+            directRoutingPermitted: Boolean,
+        ): Boolean {
+            val hasDirectData = DIRECT_DATA_CAPABILITY in capabilities
+            if (directRoutingPermitted != hasDirectData) return false
+            val hasSessionCutover = DIRECT_SESSION_CUTOVER_CAPABILITY in capabilities
+            if (hasSessionCutover && !hasDirectData) return false
+            val shadowCapabilities = capabilities - setOf(
+                DIRECT_DATA_CAPABILITY,
+                DIRECT_SESSION_CUTOVER_CAPABILITY,
+            )
+            return shadowCapabilities == SHADOW_CONFIG_CAPABILITIES ||
+                shadowCapabilities == SHADOW_CONFIG_CAPABILITIES + DIRECT_MULTIPAIR_CAPABILITY
+        }
 
         private fun normalizeRoot(value: String, allowCleartext: Boolean): String {
             val normalized = value.trimEnd('/')

@@ -71,26 +71,33 @@ GET\n
 升级后客户端先发送不超过 4 KiB 的 UTF-8 JSON：
 
 ```json
-{"type":"CLIENT_HELLO","protocol_versions":[1],"capabilities":["direct_transport_v1","direct_transport_shadow_multipair_v2"],"role":"android"}
+{"type":"CLIENT_HELLO","protocol_versions":[1],"capabilities":["direct_transport_v1","direct_transport_shadow_multipair_v2","direct_transport_data_v1","direct_session_cutover_v1"],"role":"android"}
 ```
 
 `role` 只能是 `pc` 或 `android` 并与注册设备一致。服务端返回：
 
 ```json
-{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}
+{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2","direct_transport_data_v1","direct_session_cutover_v1"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}
 ```
 
 之后只接受 binary `TransportSignalEnvelopeV1`；信令存活使用 WebSocket ping/pong，连续 45 秒没有
 有效 pong 才重建信令 socket。服务端不生成 signal ACK，outer `signal_ack` 是两个 E2EE peer
 之间的内存游标。JSON 未知字段忽略，缺少上述必填字段、协商不到 version 1，或 Welcome 没有
 `direct_transport_shadow_v1` 就只关闭信令 lane。配置端点还必须同时发布 `direct_signaling_v1` 和
-`direct_transport_shadow_v1`，且 `direct_routing_permitted` 必须为 `false`。客户端 Hello 中的
-`direct_transport_v1` 仅是协议协商请求，不能解释为服务端允许生产数据切流。
+`direct_transport_shadow_v1`。生产数据切流还要求配置端点的 `direct_routing_permitted=true`，以及
+配置、Realtime Welcome 和 Transport Signalling Welcome 同时协商 `direct_transport_data_v1` 与
+`direct_session_cutover_v1`；缺少任一能力都必须继续使用 Relay。客户端 Hello 中的
+`direct_transport_v1` 仅是协议协商请求，不能单独解释为服务端允许生产数据切流。
 
 `direct_transport_shadow_multipair_v2` 是独立的双端能力：服务端只有在当前发送端与接收端的
 presence 都协商成功时才转发 signal type 11..14。Valkey presence 的 schema/capability 也参与
 generation fence；旧 schema 或任一不支持的 peer 只能继续 V1。拒绝 V2 信令不能消费该方向的
 signal sequence/nonce，也不得影响 Realtime Relay。
+
+`direct_transport_data_v1` 表示能够承载 Direct Envelope，`direct_session_cutover_v1` 表示能够按
+会话、方向和 barrier 做增量切换/注销/回退。两者必须成对协商，避免旧的方向级实现把晚加入会话
+误报为 Direct，或在单会话关闭时退休同方向的其他会话。服务端只在显式 routing gate 打开且当前
+两端的 signalling presence 都声明二者时转发 signal type 6..9；legacy data-only peer 保持 Relay。
 
 连接监督必须使用独立控制执行器处理 socket 生命周期、ping/pong、认证刷新与订阅。各会话的
 Envelope 应用在有界串行队列中运行；单会话队列饱和时发送现有 Flow Control 或暂停该会话，
@@ -305,20 +312,53 @@ DIRECT_ACTIVE --重新优化--> RELAY_ONLY -> 更高 epoch 的 GATHERING
   提议时已预留的 next seq 开始。两方向用独立 barrier ID/事务切换，不能替对方选择 seq。
 - proposal 发出后仍通过 Relay 正常发送，同时从 barrier 起在每方向最多缓存 256 个或 8 MiB
   原始 Envelope（先到者为限）。缓存越界就放弃切换，不暂停会话。accept 回显 proposal 的
-  确定性 SHA-256；提议方随后发 commit，对端验证并回发完全相同的 commit。提议方收到 echo
-  前，Relay 保持权威路径。
+  确定性 SHA-256。接收方必须先等待每个 session 的公共连续应用游标达到
+  `first_direct_seq - 1` 才能 accept；超时整笔拒绝并保持 Relay，避免 Direct 越过尚在途的
+  Relay 前缀而误触发 History Gap。提议方随后发 commit，对端先安装接收 barrier，再回发完全
+  相同的 commit。提议方收到 echo 前，Relay 保持权威路径。
+- `barrier_sha256` 由 native FFI 再次权威校验，不只依赖平台 codec：输入为
+  `SHA256("TERMLINK-DIRECT-CUTOVER-V1\0" || connection_id || path_epoch_be64 ||
+  deterministic DirectCutoverProposalV1)`；direction 决定每个 session 仅编码字段 2 或字段 3，session
+  必须按无符号 16 字节 ID 排序，未使用的 FFI session 槽不进入 protobuf。
 - commit echo 后先在 direct 重放 barrier 以来的缓存，再在 `duplicate_grace_ms` 内把同一
   序列化 Envelope 同时发给 Relay 和 direct；接收端使用既有 session/direction seq 去重。
   宽限结束才进入该方向 direct-only，WSS 心跳仍继续。另一方向可仍是 Relay。
+- 首个生产版本使用最小、双端完全相同的显式白名单：Android→PC 仅 `INPUT_EVENT`，PC→Android
+  仅 `OUTPUT_CHUNK`。`GAP`、`INPUT_ACCEPTED`/`INPUT_REJECTED`、Resize、Lease、History、终止、
+  lifecycle、`HEARTBEAT`、`GOODBYE`、`SESSION_UPSERT`、`SESSION_REMOVED`、`SUBSCRIBE`、
+  `UNSUBSCRIBE`、`OUTPUT_ACK`、`FLOW_CONTROL`、未指定和未知类型全部走 Relay。分类只读取已经
+  解析的 Envelope 元数据，真正发送、缓存和回退仍使用第一次序列化的原始 Envelope bytes，
+  禁止 parse 后重新序列化。以后扩大白名单必须两端同版、逐类型增加授权和故障测试。
+- Direct `INPUT_EVENT` 虽不经过 Relay 的逐帧路由检查，Windows Agent 在写入 SessionHost 前仍须
+  向服务端查询绑定到 `(session_id, sender_device_id)` 的最新控制授权，并同时验证发送设备仍有
+  CONTROL/MANAGE 权限、lease ID/version/expiry、policy version 和控制模式。`SINGLE`/`TAKEOVER`
+  只允许当前 holder；`COLLABORATIVE` 才允许同一已订阅会话中的其他已授权设备。该决定只缓存
+  1 秒；查询失败、字段缺失或策略变化均拒绝输入但不终止 Relay。PC 本地持久化的 input ID +
+  exact Envelope digest fence 仍是最终 at-most-once 边界。
+- Relay 控制帧与 Direct 数据帧共享同一会话 Envelope seq，因此两种载波必须先进入按 peer
+  隔离的单写者公共入口，再按 `(direction, session_id)` 重排后交给现有会话处理器。宽限期内
+  Direct 副本先到时先暂存，等 Relay 同序列副本对照或宽限到期；同 seq 同 bytes 只应用一次，
+  在 native 仍保留该 seq 的入站摘要时发现同 seq 不同 bytes，立即退休该 Direct epoch，并以
+  Relay 与现有 durable ACK 恢复为准。平台把 application cursor 推进到该 seq 后，native 可释放
+  对应 bytes/摘要；之后到达的旧 seq 必须先经过平台现有 journal/durable-ACK digest fence，再交给
+  native 标记为 DROP，冲突仍由平台保留权威 Relay bytes 并触发既有恢复流程。
 - `DirectTransportReceiptV1` 只用于释放发送端的有界直连重发缓存。它不表示 terminal-core 已
   应用，不可写入 ACK 数据库，也不可生成 `OUTPUT_ACK`。每个 epoch/direction 的 direct
   `frame_seq` 独立从 1 递增；receipt 只确认对端方向的 frame seq。PC authoritative journal 仍保留
   到现有 cumulative application ACK；Android 的 input/resize/lease 等语义 outbox 仍保留到
-  对应 result 或既有幂等完成条件，transport receipt 不得删除它们。
+  对应 result 或既有幂等完成条件，transport receipt 不得删除它们。V1 是单一可靠有序 stream，
+  因此 `missing` 必须为空；receipt 本身不产生 receipt，禁止 receipt-of-receipt 循环。
 - direct 异常时，本地路由立刻选择 Relay。所有尚未收到 transport receipt 的 Envelope data frame 按
   原始 Envelope bytes 通过 WSS 重发；未来 Envelope 继续使用已有 next seq。重复由现有协议
   去除。已经收到 transport receipt 但尚未获得应用确认的数据，从上述 journal/semantic outbox
   继续按现有 ACK、input ID 和结果状态机恢复；缺口继续走现有 Gap/Snapshot 规则。
+- 方向从 `DIRECT_ACTIVE` 回退后进入当前 epoch 内部的 drain-only 状态：已经分配并进入可靠流发送
+  future 的迟到 Direct Envelope 只消耗该方向 transport `frame_seq`，不交付应用、也不生成 receipt；
+  每方向最多容忍与发送缓存硬上限一致的 256 帧，第 257 帧按协议违规拒绝。该方向保持 Relay 且
+  在更高 path epoch 前不得再次切流。初始 `RELAY_ONLY` 或仍在协商阶段收到 Direct Envelope 必须
+  fail closed，不能借 drain 规则静默吞掉。native path 进入 failed/cancelled/
+  network-changed 终态后拒绝接管所有新的 Relay/Direct ingress，只允许平台排空此前已归 native
+  所有的 route actions、incoming bytes 和事件。
 - fallback notice 只帮助对端快速收敛；信令断开、notice 丢失或对端较慢均不得阻塞本地回退。
 
 ## 稳定性、退避与资源隔离

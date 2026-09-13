@@ -161,6 +161,14 @@ internal class ProductionDeviceConnectionSupervisor(
         socket.send(envelope)
     }
 
+    fun sendExact(
+        envelope: dev.termlink.protocol.realtime.v1.Envelope,
+        exactBytes: ByteArray,
+    ): Boolean = synchronized(lock) {
+        if (closed.get() || phase != Phase.CONNECTED || activeConnectOwner != null) return@synchronized false
+        socket.sendExact(envelope, exactBytes)
+    }
+
     fun sendForConnectedGeneration(
         envelope: dev.termlink.protocol.realtime.v1.Envelope,
         expectedGeneration: Int,
@@ -172,6 +180,22 @@ internal class ProductionDeviceConnectionSupervisor(
             return@synchronized false
         }
         socket.send(envelope).also { sent ->
+            if (sent) onSent(expectedGeneration)
+        }
+    }
+
+    fun sendExactForConnectedGeneration(
+        envelope: dev.termlink.protocol.realtime.v1.Envelope,
+        exactBytes: ByteArray,
+        expectedGeneration: Int,
+        onSent: (Int) -> Unit = { },
+    ): Boolean = synchronized(lock) {
+        if (expectedGeneration <= 0 || closed.get() || phase != Phase.CONNECTED ||
+            activeConnectOwner != null || socket.diagnostics().connectedGeneration != expectedGeneration
+        ) {
+            return@synchronized false
+        }
+        socket.sendExact(envelope, exactBytes).also { sent ->
             if (sent) onSent(expectedGeneration)
         }
     }

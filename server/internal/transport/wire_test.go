@@ -49,6 +49,7 @@ func TestUnmarshalSignalValidatesOpaqueOuterEnvelope(t *testing.T) {
 		"explicit default ack": insertExplicitZeroACK(frame),
 		"zero epoch":           testSignalFrame(connection, sender, recipient, 0, 1, SignalPathOffer, 32),
 		"zero seq":             testSignalFrame(connection, sender, recipient, 1, 0, SignalPathOffer, 32),
+		"non UTF-8 key ID":     testSignalFrameWithKey(connection, sender, recipient, 1, 1, SignalPathOffer, 32, []byte{0xff}),
 		"short cipher":         testSignalFrame(connection, sender, recipient, 1, 1, SignalPathOffer, 15),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -69,6 +70,10 @@ func TestUnmarshalSignalValidatesOpaqueOuterEnvelope(t *testing.T) {
 }
 
 func testSignalFrame(connection, sender, recipient uuid.UUID, epoch, sequence uint64, signalType SignalType, cipherBytes int) []byte {
+	return testSignalFrameWithKey(connection, sender, recipient, epoch, sequence, signalType, cipherBytes, []byte("pair-key"))
+}
+
+func testSignalFrameWithKey(connection, sender, recipient uuid.UUID, epoch, sequence uint64, signalType SignalType, cipherBytes int, keyID []byte) []byte {
 	var frame []byte
 	frame = appendVarintField(frame, 1, 1)
 	frame = appendVarintField(frame, 2, uint64(signalType))
@@ -78,7 +83,7 @@ func testSignalFrame(connection, sender, recipient uuid.UUID, epoch, sequence ui
 	frame = appendVarintField(frame, 6, epoch)
 	frame = appendVarintField(frame, 7, sequence)
 	frame = appendVarintField(frame, 9, uint64(time.Now().UnixMilli()))
-	frame = appendBytesField(frame, 10, []byte("pair-key"))
+	frame = appendBytesField(frame, 10, keyID)
 	nonce := make([]byte, 12)
 	binary.BigEndian.PutUint64(nonce[:8], sequence)
 	binary.BigEndian.PutUint32(nonce[8:], uint32(signalType))

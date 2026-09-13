@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 termlink-direct-nat = { path = "../termlink-direct-nat" }
 termlink-direct-path = { path = "../termlink-direct-path" }
 termlink-direct-quic = { path = "../termlink-direct-quic" }
+termlink-direct-route = { path = "../termlink-direct-route" }
 termlink-direct-wire = { path = "../termlink-direct-wire" }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 ring = { version = "=0.17.14", default-features = false, features = ["std"] }

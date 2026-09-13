@@ -1,8 +1,12 @@
 package dev.termlink.product
 
 import dev.termlink.model.DeviceTrustState
+import dev.termlink.model.DeviceSummary
+import dev.termlink.model.DeviceType
+import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
+import dev.termlink.network.direct.ProductionDirectCarrier
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
@@ -37,6 +41,113 @@ import org.junit.Test
 import okhttp3.OkHttpClient
 
 class ProductContractsTest {
+    @Test
+    fun directDataPlaneHelloCapabilitiesAreOptionalAndGatedTogether() {
+        assertEquals(emptySet<String>(), productRealtimeOptionalCapabilities(false))
+        assertEquals(
+            setOf(
+                "direct_session_cutover_v1",
+                "direct_transport_data_v1",
+            ),
+            productRealtimeOptionalCapabilities(true),
+        )
+    }
+
+    @Test
+    fun publicDirectCarriersMapToTheProductProjectionWithoutGrantingAuthority() {
+        assertEquals(PcCarrierState.RELAY, ProductionDirectCarrier.RELAY.toPcCarrierState())
+        assertEquals(PcCarrierState.NEGOTIATING_DIRECT, ProductionDirectCarrier.NEGOTIATING.toPcCarrierState())
+        assertEquals(PcCarrierState.LAN_DIRECT, ProductionDirectCarrier.LAN_DIRECT.toPcCarrierState())
+        assertEquals(PcCarrierState.NAT_DIRECT, ProductionDirectCarrier.NAT_DIRECT.toPcCarrierState())
+    }
+
+    @Test
+    fun directRuntimeProjectionRequiresTheExactOwnerMultiplexerAndCoordinator() {
+        val owner = Any()
+        val multiplexer = Any()
+        val coordinator = Any()
+
+        assertTrue(
+            directRuntimeProjectionClaimMatches(
+                owner,
+                multiplexer,
+                coordinator,
+                owner,
+                multiplexer,
+                coordinator,
+            ),
+        )
+        assertFalse(
+            directRuntimeProjectionClaimMatches(
+                owner,
+                multiplexer,
+                Any(),
+                owner,
+                multiplexer,
+                coordinator,
+            ),
+        )
+    }
+
+    @Test
+    fun directCarrierProjectionKeepsOnlyTrustedOnlinePcDevicesAndOmitsRelay() {
+        val onlineDirect = UUID.randomUUID()
+        val offline = UUID.randomUUID()
+        val revoked = UUID.randomUUID()
+        val explicitRelay = UUID.randomUUID()
+        val devices = listOf(
+            directDevice(onlineDirect, DeviceTrustState.TRUSTED),
+            directDevice(offline, DeviceTrustState.TRUSTED),
+            directDevice(revoked, DeviceTrustState.REVOKED),
+            directDevice(explicitRelay, DeviceTrustState.TRUSTED),
+        )
+        val pcs = listOf(
+            directPc(onlineDirect, online = true),
+            directPc(offline, online = false),
+            directPc(revoked, online = true),
+            directPc(explicitRelay, online = true),
+        )
+
+        assertEquals(
+            mapOf(onlineDirect to PcCarrierState.NAT_DIRECT),
+            retainAuthoritativePcCarrierStates(
+                carrierStates = mapOf(
+                    onlineDirect to PcCarrierState.NAT_DIRECT,
+                    offline to PcCarrierState.LAN_DIRECT,
+                    revoked to PcCarrierState.NEGOTIATING_DIRECT,
+                    explicitRelay to PcCarrierState.RELAY,
+                    UUID.randomUUID() to PcCarrierState.LAN_DIRECT,
+                ),
+                devices = devices,
+                pcs = pcs,
+            ),
+        )
+    }
+
+    @Test
+    fun directSessionCarrierProjectionNeverExpandsOnePcPathToUnlistedSessions() {
+        val deviceId = UUID.randomUUID()
+        val pc = directPc(deviceId, online = true)
+        val directSession = directSession(pc.id, online = true)
+        val lateSession = directSession(pc.id, online = true)
+        val offlineSession = directSession(pc.id, online = false)
+
+        assertEquals(
+            mapOf(directSession.id to PcCarrierState.LAN_DIRECT),
+            retainAuthoritativeSessionCarrierStates(
+                carrierStates = mapOf(
+                    directSession.id to PcCarrierState.LAN_DIRECT,
+                    lateSession.id to PcCarrierState.RELAY,
+                    offlineSession.id to PcCarrierState.NAT_DIRECT,
+                    UUID.randomUUID() to PcCarrierState.NAT_DIRECT,
+                ),
+                devices = listOf(directDevice(deviceId, DeviceTrustState.TRUSTED)),
+                pcs = listOf(pc),
+                sessions = listOf(directSession, lateSession, offlineSession),
+            ),
+        )
+    }
+
     @Test
     fun directShadowUsesAnIndependentHttpResourceDomainFromRelay() {
         val relay = OkHttpClient()
@@ -1215,12 +1326,15 @@ class ProductContractsTest {
 
     @Test
     fun authenticationExpiryClearsTheVisibleAccountIdentity() {
+        val directDeviceId = UUID.randomUUID()
         val expired = authenticationExpiredSnapshot(
             snapshot = ProductSnapshot(
                 signedIn = true,
                 accountLabel = "alice@example.test",
                 authenticationState = ProductAuthenticationState.AUTHENTICATED,
                 connectionState = ProductConnectionState.CONNECTED,
+                pcCarrierStates = mapOf(directDeviceId to PcCarrierState.LAN_DIRECT),
+                sessionCarrierStates = mapOf(UUID.randomUUID() to PcCarrierState.LAN_DIRECT),
             ),
             message = "Authentication expired",
         )
@@ -1230,6 +1344,8 @@ class ProductContractsTest {
         assertEquals(ProductAuthenticationState.SIGNED_OUT, expired.authenticationState)
         assertEquals(ProductConnectionState.ERROR, expired.connectionState)
         assertEquals("Authentication expired", expired.connectionError)
+        assertTrue(expired.pcCarrierStates.isEmpty())
+        assertTrue(expired.sessionCarrierStates.isEmpty())
     }
 
     @Test
@@ -1301,6 +1417,47 @@ class ProductContractsTest {
             }
             """.trimIndent(),
         ).jsonObject,
+    )
+
+    private fun directDevice(
+        id: UUID,
+        trustState: DeviceTrustState,
+    ): DeviceSummary = DeviceSummary(
+        id = id,
+        type = DeviceType.PC_AGENT,
+        name = "pc",
+        keyId = "key",
+        exchangePublicKey = ByteArray(32),
+        signingPublicKey = ByteArray(32),
+        trustState = trustState,
+        createdAt = Instant.EPOCH,
+    )
+
+    private fun directPc(
+        deviceId: UUID,
+        online: Boolean,
+    ): PcSummary = PcSummary(
+        id = UUID.randomUUID(),
+        deviceId = deviceId,
+        name = "pc",
+        agentVersion = "test",
+        remoteRoutingEnabled = true,
+        online = online,
+        lastSeenAt = Instant.EPOCH,
+    )
+
+    private fun directSession(pcId: UUID, online: Boolean): SessionSummary = SessionSummary(
+        id = UUID.randomUUID(),
+        pcId = pcId,
+        shellType = "powershell",
+        encryptedTitle = null,
+        state = SessionState.RUNNING,
+        columns = 80,
+        rows = 24,
+        lastOutputSequence = 0u,
+        createdAt = Instant.EPOCH,
+        endedAt = null,
+        online = online,
     )
 
     private class FakeCipher : AuthStateCipher {

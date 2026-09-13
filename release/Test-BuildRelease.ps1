@@ -122,6 +122,8 @@ $appShipWrapperPath = Join-Path $repositoryRoot 'scripts\Publish-AppShipProducti
 $setupBuilderPath = Join-Path $repositoryRoot 'win-agent\package\Build-Setup.ps1'
 $msixBuilderPath = Join-Path $repositoryRoot 'win-agent\package\Build-Msix.ps1'
 $installerValidatorPath = Join-Path $repositoryRoot 'win-agent\tests\Validate-WindowsInstaller.ps1'
+$directNativeBuilderPath = Join-Path $repositoryRoot 'win-agent\scripts\Build-DirectCoreNative.ps1'
+$agentProjectPath = Join-Path $repositoryRoot 'win-agent\src\Agent\TermLink.Agent.csproj'
 
 $tokens = $null
 $parseErrors = $null
@@ -160,6 +162,8 @@ $appShipWrapperSource = Get-Content -LiteralPath $appShipWrapperPath -Raw
 $setupBuilderSource = Get-Content -LiteralPath $setupBuilderPath -Raw
 $msixBuilderSource = Get-Content -LiteralPath $msixBuilderPath -Raw
 $installerValidatorSource = Get-Content -LiteralPath $installerValidatorPath -Raw
+$directNativeBuilderSource = Get-Content -LiteralPath $directNativeBuilderPath -Raw
+$agentProjectSource = Get-Content -LiteralPath $agentProjectPath -Raw
 Assert-True ($releaseScriptSource.Contains('status --porcelain --untracked-files=normal')) `
     'Server source identity does not inspect the worktree status.'
 Assert-True ($releaseScriptSource.Contains('$serverSourceRevision-dirty')) `
@@ -190,6 +194,7 @@ foreach ($marker in @(
     'TermLink.Setup.Payload.zip',
     'TermLink.TerminalCore.dll',
     'termlink_terminal_ffi.dll',
+    'termlink_direct_ffi.dll',
     '[IO.FileMode]::CreateNew',
     '[IO.FileAttributes]::ReparsePoint',
     '$ownedPayloadBinaries',
@@ -199,6 +204,34 @@ foreach ($marker in @(
 }
 Assert-True ($verificationScriptSource.Contains("`$_.Name -match '^TermLink(?:\..+)?\.(exe|dll)`$'")) `
     'Production Setup verifier does not cover every TermLink-owned payload binary.'
+foreach ($builder in @(
+    [pscustomobject]@{ Name = 'Setup'; Source = $setupBuilderSource },
+    [pscustomobject]@{ Name = 'MSIX'; Source = $msixBuilderSource })) {
+    Assert-True ($builder.Source.Contains('Build-DirectCoreNative.ps1')) `
+        "Windows $($builder.Name) builder does not freshly build network-core."
+    Assert-True ($builder.Source.Contains('termlink_direct_ffi.dll')) `
+        "Windows $($builder.Name) builder does not require the Direct native DLL."
+    Assert-True ($builder.Source.Contains('differs from the native artifact built for this release')) `
+        "Windows $($builder.Name) builder does not compare the packaged Direct DLL with this build."
+}
+foreach ($marker in @(
+    "`$requiredToolchain = '1.97.1'",
+    "`$targetTriple = 'x86_64-pc-windows-msvc'",
+    '-p termlink-direct-ffi',
+    '--release',
+    '--locked',
+    '--offline',
+    '--target $targetTriple',
+    'network-core\target\$targetTriple\release\termlink_direct_ffi.dll')) {
+    Assert-True ($directNativeBuilderSource.Contains($marker)) `
+        "Direct native build script is missing its pinned build contract: $marker"
+}
+Assert-True ($agentProjectSource.Contains('network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll')) `
+    'Agent project does not package the explicit Windows target Direct DLL.'
+Assert-True (-not $agentProjectSource.Contains('network-core\target\release\termlink_direct_ffi.dll')) `
+    'Agent project still permits the ambiguous non-target Direct DLL fallback.'
+Assert-True ($agentProjectSource.Contains('ValidateTermLinkDirectNativeLibrary')) `
+    'Agent Release builds do not fail closed when the Direct DLL is missing.'
 Assert-True ($installerValidatorSource.Contains('$acceptedSignatureStatuses -contains $signature.Status')) `
     'MSIX development validation does not enforce an explicit signature-status allowlist.'
 foreach ($status in @('Valid', 'UnknownError', 'NotTrusted')) {

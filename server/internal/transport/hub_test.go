@@ -2,7 +2,10 @@ package transport
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/auth"
@@ -36,7 +39,7 @@ func TestHubRoutesBothDirectionsAndCleansDisconnectedPeer(t *testing.T) {
 	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{account: {
 		pc: {ID: pc, Type: "PC_AGENT", TrustState: "TRUSTED"}, android: {ID: android, Type: "ANDROID", TrustState: "TRUSTED"},
 	}}}
-	tickets := testTicketService(t, resolver)
+	tickets := testTicketServiceWithRouting(t, resolver, true)
 	connection := uuid.New()
 	pcPrincipal := testPrincipal(account, pc, "PC_AGENT")
 	androidPrincipal := testPrincipal(account, android, "ANDROID")
@@ -77,6 +80,26 @@ func TestHubRoutesBothDirectionsAndCleansDisconnectedPeer(t *testing.T) {
 	if got := <-androidPeer.send; string(got) != string(multipairFrame) {
 		t.Fatal("multipair frame was not routed byte-identically")
 	}
+	directFrame := testSignalFrame(connection, pc, android, epoch, 3, SignalCutoverProposal, 32)
+	if err := hub.route(pcPeer, directFrame); err == nil {
+		t.Fatal("direct-data signal was accepted without negotiated capability")
+	}
+	pcPeer.directData = true
+	if err := hub.route(pcPeer, directFrame); err == nil {
+		t.Fatal("direct-data signal was accepted for an unsupported recipient")
+	}
+	androidPeer.directData = true
+	for index, signalType := range []SignalType{
+		SignalCutoverProposal, SignalCutoverAccept, SignalCutoverCommit, SignalFallback,
+	} {
+		directFrame = testSignalFrame(connection, pc, android, epoch, uint64(index+3), signalType, 32)
+		if err := hub.route(pcPeer, directFrame); err != nil {
+			t.Fatalf("negotiated direct-data signal %d: %v", signalType, err)
+		}
+		if got := <-androidPeer.send; string(got) != string(directFrame) {
+			t.Fatalf("direct-data signal %d was not routed byte-identically", signalType)
+		}
+	}
 	androidFrame := testSignalFrame(connection, android, pc, epoch, 1, SignalPathAnswer, 32)
 	if err := hub.route(androidPeer, androidFrame); err != nil {
 		t.Fatalf("Android route: %v", err)
@@ -91,7 +114,10 @@ func TestHubRoutesBothDirectionsAndCleansDisconnectedPeer(t *testing.T) {
 	if remains {
 		t.Fatal("disconnected peer remained registered")
 	}
-	if err := hub.route(pcPeer, testSignalFrame(connection, pc, android, epoch, 3, SignalPathClose, 32)); err != nil {
+	if err := hub.route(pcPeer, testSignalFrame(connection, pc, android, epoch, 7, SignalFallback, 32)); err == nil {
+		t.Fatal("direct-data control was accepted without an online negotiated recipient")
+	}
+	if err := hub.route(pcPeer, testSignalFrame(connection, pc, android, epoch, 7, SignalPathClose, 32)); err != nil {
 		t.Fatalf("offline recipient should not fail sender route: %v", err)
 	}
 	select {
@@ -132,6 +158,43 @@ func TestSharedMailboxNeverDeliversMultipairToUnsupportedRecipient(t *testing.T)
 			default:
 				if test.delivered {
 					t.Fatal("mailbox dropped multipair for a supported recipient")
+				}
+			}
+		})
+	}
+}
+
+func TestSharedMailboxNeverDeliversDirectDataControlToUnsupportedRecipient(t *testing.T) {
+	account, recipientID, generation := uuid.New(), uuid.New(), uuid.New()
+	frame := testSignalFrame(uuid.New(), uuid.New(), recipientID, 1, 1, SignalCutoverCommit, 32)
+
+	for _, test := range []struct {
+		name       string
+		supported  bool
+		wantQueued bool
+	}{
+		{name: "unsupported"},
+		{name: "supported", supported: true, wantQueued: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hub := NewHub(nil)
+			peer := testSignalPeer(hub, testPrincipal(account, recipientID, "ANDROID"), 1)
+			peer.multipair = true
+			peer.directData = test.supported
+			peer.presence.PeerGeneration = generation
+			hub.peers[recipientID] = peer
+			hub.deliverSharedSignal(DirectMailboxDelivery{
+				RecipientID: recipientID, PeerGeneration: generation, Frame: frame,
+			})
+
+			select {
+			case got := <-peer.send:
+				if !test.wantQueued || string(got) != string(frame) {
+					t.Fatalf("mailbox delivered direct data=%t frame=%x", test.wantQueued, got)
+				}
+			default:
+				if test.wantQueued {
+					t.Fatal("mailbox dropped direct-data control for a supported recipient")
 				}
 			}
 		})
@@ -214,6 +277,110 @@ func TestReplacingSignalPeerCannotRemoveItsSuccessor(t *testing.T) {
 		t.Fatal("old peer removal deleted its live replacement")
 	}
 	hub.remove(replacement)
+}
+
+func TestReplacedSignalPeerCannotRouteAfterGenerationChanges(t *testing.T) {
+	account, pc, android := uuid.New(), uuid.New(), uuid.New()
+	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{account: {
+		pc: {ID: pc, Type: "PC_AGENT", TrustState: "TRUSTED"}, android: {ID: android, Type: "ANDROID", TrustState: "TRUSTED"},
+	}}}
+	tickets := testTicketService(t, resolver)
+	connection := uuid.New()
+	principal := testPrincipal(account, pc, "PC_AGENT")
+	if _, err := tickets.Issue(context.Background(), principal, android, connection); err != nil {
+		t.Fatal(err)
+	}
+	epoch := tickets.connections[connectionKey{accountID: account, connection: connection}].pathEpoch
+	hub := NewHub(tickets)
+	old := testSignalPeer(hub, principal, 1)
+	replacement := testSignalPeer(hub, principal, 1)
+	recipient := testSignalPeer(hub, testPrincipal(account, android, "ANDROID"), 1)
+	if !hub.add(old) || !hub.add(recipient) || !hub.add(replacement) {
+		t.Fatal("add peers")
+	}
+	frame := testSignalFrame(connection, pc, android, epoch, 1, SignalPathOffer, 32)
+	if err := hub.route(old, frame); !errors.Is(err, ErrTransportDenied) {
+		t.Fatalf("stale generation route error=%v, want denied", err)
+	}
+	select {
+	case <-recipient.send:
+		t.Fatal("stale generation reached recipient")
+	default:
+	}
+	if err := hub.route(replacement, frame); err != nil {
+		t.Fatalf("current generation route: %v", err)
+	}
+	if got := <-recipient.send; string(got) != string(frame) {
+		t.Fatal("current generation frame was not routed byte-identically")
+	}
+}
+
+type orderedPresenceState struct {
+	*sharedStateStub
+	mu             sync.Mutex
+	registrations  []DirectPresence
+	firstCommitted chan struct{}
+	releaseFirst   chan struct{}
+	secondEntered  chan struct{}
+}
+
+func (s *orderedPresenceState) RegisterPresence(_ context.Context, presence DirectPresence) (DirectPresenceRegistration, error) {
+	s.mu.Lock()
+	index := len(s.registrations)
+	s.registrations = append(s.registrations, presence)
+	s.mu.Unlock()
+	if index == 0 {
+		close(s.firstCommitted)
+		<-s.releaseFirst
+	} else if index == 1 {
+		close(s.secondEntered)
+	}
+	return DirectPresenceRegistration{Registered: true, Replaced: index > 0}, nil
+}
+
+func TestConcurrentSameDeviceAddsKeepLocalAndSharedGenerationAligned(t *testing.T) {
+	state := &orderedPresenceState{
+		sharedStateStub: newSharedStateStub(), firstCommitted: make(chan struct{}),
+		releaseFirst: make(chan struct{}), secondEntered: make(chan struct{}),
+	}
+	account, device := uuid.New(), uuid.New()
+	principal := testPrincipal(account, device, "PC_AGENT")
+	hub := &Hub{
+		state: state, mailbox: DirectMailbox{InstanceID: uuid.New(), Generation: uuid.New()},
+		peers: map[uuid.UUID]*signalPeer{}, faultWake: make(chan struct{}, 1),
+	}
+	hub.ready.Store(true)
+	first := testSignalPeer(hub, principal, 1)
+	second := testSignalPeer(hub, principal, 1)
+	firstDone, secondDone := make(chan bool, 1), make(chan bool, 1)
+	go func() { firstDone <- hub.add(first) }()
+	<-state.firstCommitted
+	go func() { secondDone <- hub.add(second) }()
+
+	select {
+	case <-state.secondEntered:
+		t.Fatal("same-device replacement entered shared registration before its predecessor committed locally")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(state.releaseFirst)
+	if !<-firstDone || !<-secondDone {
+		t.Fatal("concurrent peer add failed")
+	}
+	select {
+	case <-state.secondEntered:
+	default:
+		t.Fatal("replacement did not register after predecessor completed")
+	}
+
+	state.mu.Lock()
+	registered := state.registrations[len(state.registrations)-1]
+	state.mu.Unlock()
+	hub.mu.Lock()
+	current := hub.peers[device]
+	hub.mu.Unlock()
+	if current != second || registered.PeerGeneration != second.presence.PeerGeneration {
+		t.Fatalf("local/shared generations diverged: current=%p replacement=%p shared=%s local=%s", current, second, registered.PeerGeneration, second.presence.PeerGeneration)
+	}
 }
 
 func testSignalPeer(hub *Hub, principal auth.Principal, capacity int) *signalPeer {

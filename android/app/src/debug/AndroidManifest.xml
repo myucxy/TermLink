@@ -15,5 +15,13 @@
                 <action android:name="dev.termlink.product.debug.TAIL_FIRST_E2E" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name="dev.termlink.product.debug.DirectProductE2EReceiver"
+            android:enabled="${termlinkDirectProductE2EEnabled}"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.termlink.product.debug.DIRECT_PRODUCT_E2E" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

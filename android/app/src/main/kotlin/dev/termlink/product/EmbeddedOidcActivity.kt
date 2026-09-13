@@ -62,7 +62,18 @@ internal class EmbeddedOidcActivity : ComponentActivity() {
         }
         authorizationRequest = launch.request
         authorizationUri = authorizationRequest.toUri()
-        serverRoot = Uri.parse(BuildConfig.TERMLINK_SERVER_URL.trimEnd('/'))
+        // The embedded authorization surface must follow the same endpoint
+        // selected on the sign-in page.  Reading the persisted value here
+        // avoids sending a registration flow back to the build-time default.
+        val configuredServerUrl = runCatching {
+            normalizeProductServerUrl(
+                OidcSessionStore(applicationContext).serverUrl ?: PRODUCT_PUBLIC_SERVER_URL,
+            )
+        }.getOrElse {
+            finishWithInvalidRequest()
+            return
+        }
+        serverRoot = Uri.parse(configuredServerUrl)
         registrationFlow = savedInstanceState?.getBoolean(STATE_REGISTRATION_FLOW, launch.registrationFlow)
             ?: launch.registrationFlow
         registrationHandedOffToAuthorization = savedInstanceState

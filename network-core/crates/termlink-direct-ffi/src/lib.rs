@@ -17,6 +17,8 @@ mod v3;
 pub use v3::*;
 mod v4;
 pub use v4::*;
+mod v5;
+pub use v5::*;
 
 pub const MAX_QUEUE_CAPACITY: usize = 256;
 pub const ABI_VERSION_V1: u32 = 1;

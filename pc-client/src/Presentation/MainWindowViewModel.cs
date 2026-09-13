@@ -70,7 +70,9 @@ public sealed record SessionListItemViewModel(
     bool IsError,
     bool CanStop)
 {
-    public string DetailText => $"{ShellType} · {LastActivityText}";
+    public SessionDataPlaneCarrier Carrier { get; init; }
+    public string CarrierText => PresentationText.SessionCarrier(Carrier);
+    public string DetailText => $"{ShellType} · {CarrierText} · {LastActivityText}";
 }
 
 public sealed class SessionsPageViewModel : PageViewModel
@@ -100,12 +102,27 @@ public sealed class DevicesPageViewModel : PageViewModel
 
 public sealed class AccountPageViewModel : ObservableObject
 {
+    private const string DefaultServerUrl = "https://termlink.kget.cc:8910";
     private string pcName = Environment.MachineName;
     private bool accountLinked;
     private string currentUsername = string.Empty;
     private string currentNickname = string.Empty;
+    private string serverUrl = DefaultServerUrl;
+    private bool serverUrlDirty;
 
     public string PcName { get => pcName; set => SetProperty(ref pcName, value); }
+    public string ServerUrl
+    {
+        get => serverUrl;
+        set
+        {
+            if (SetProperty(ref serverUrl, value)) serverUrlDirty = true;
+        }
+    }
+    internal void ApplyServerUrl(string value)
+    {
+        if (!serverUrlDirty) SetProperty(ref serverUrl, value, nameof(ServerUrl));
+    }
     public bool AccountLinked { get => accountLinked; internal set => SetProperty(ref accountLinked, value); }
     public string CurrentUsername
     {
@@ -350,6 +367,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             parameter is Guid deviceId ? RevokeDeviceAsync(deviceId, cancellationToken) : Task.CompletedTask);
         BeginAccountAuthorizationCommand = new AsyncCommand((_, cancellationToken) =>
             BeginAccountAuthorizationAsync(cancellationToken));
+        ConfigureServerCommand = new AsyncCommand((_, cancellationToken) =>
+            ConfigureServerAsync(cancellationToken));
         SignOutCommand = new AsyncCommand((_, cancellationToken) => SignOutAsync(cancellationToken));
         OpenTerminalCommandEditorCommand = new AsyncCommand((parameter, _) =>
         {
@@ -425,6 +444,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand GrantDeviceCommand { get; }
     public AsyncCommand RevokeDeviceCommand { get; }
     public AsyncCommand BeginAccountAuthorizationCommand { get; }
+    public AsyncCommand ConfigureServerCommand { get; }
     public AsyncCommand SignOutCommand { get; }
     public AsyncCommand OpenTerminalCommandEditorCommand { get; }
     public AsyncCommand AddTerminalCommandCommand { get; }
@@ -602,6 +622,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Account.AccountLinked = snapshot.AccountLinked;
         Account.CurrentUsername = snapshot.AccountUsername;
         Account.CurrentNickname = snapshot.AccountNickname;
+        if (!string.IsNullOrWhiteSpace(snapshot.ServerOrigin))
+            Account.ApplyServerUrl(snapshot.ServerOrigin);
         accountStateKnown = true;
         if (string.IsNullOrWhiteSpace(Account.PcName)) Account.PcName = snapshot.Identity.Name;
         ObservableCollectionDiff.Apply(Sessions.Sessions, snapshot.Sessions, item => item.SessionId);
@@ -708,6 +730,32 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await ShowFailureAsync(error);
         }
+    }
+
+    private async Task ConfigureServerAsync(CancellationToken cancellationToken)
+    {
+        var serverUrl = Account.ServerUrl.Trim();
+        if (serverUrl.Length == 0)
+        {
+            ShowNotice(UiNoticeSeverity.Warning, PresentationText.ServerUrlRequired, string.Empty);
+            return;
+        }
+        if (string.Equals(
+                serverUrl.TrimEnd('/'),
+                Diagnostics.ServerOrigin.TrimEnd('/'),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            ShowNotice(UiNoticeSeverity.Info, PresentationText.ServerUrlUnchanged, string.Empty);
+            return;
+        }
+        if (!await RequestConfirmationAsync(
+                PresentationText.ConfirmServerChangeTitle,
+                PresentationText.ConfirmServerChangeDetail,
+                cancellationToken).ConfigureAwait(true)) return;
+        await MutateAsync(
+            token => client.ConfigureServerAsync(serverUrl, token),
+            PresentationText.ServerUrlUpdated,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private async Task SignOutAsync(CancellationToken cancellationToken)
@@ -1166,7 +1214,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             session.State == ManagedSessionState.Connected,
             session.State is ManagedSessionState.Starting or ManagedSessionState.Disconnected,
             session.State is ManagedSessionState.Interrupted or ManagedSessionState.Faulted,
-            session.State is not ManagedSessionState.Ended);
+            session.State is not ManagedSessionState.Ended)
+        {
+            Carrier = SessionDataPlaneCarrierContract.Normalize(session.Carrier),
+        };
     }
 
     private static DeviceListItemViewModel CreateDeviceItem(AccountDeviceSnapshot device) => new(

@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "kind": "termlink.direct-product-e2e-matrix",
+  "scenarios": [
+    {
+      "id": "relay_lan_direct_relay",
+      "topology": "physical_same_lan",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay"],
+      "required_fault_actions": ["interrupt_direct_quic", "restore_direct_quic"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded", "marker_exactly_once_before_during_after"]
+    },
+    {
+      "id": "relay_nat_direct_relay",
+      "topology": "physical_distinct_nat",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "nat_direct", "relay"],
+      "required_fault_actions": ["interrupt_direct_quic", "restore_direct_quic"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["srflx_candidate_observed", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded", "marker_exactly_once_before_during_after"]
+    },
+    {
+      "id": "direct_udp_firewall_denied",
+      "topology": "physical_distinct_nat",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "relay"],
+      "required_fault_actions": ["block_direct_udp", "restore_direct_udp"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["bounded_negotiation_timeout", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "relay_remains_usable", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "direct_quic_interruption",
+      "topology": "any_committed_direct",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay"],
+      "required_fault_actions": ["interrupt_direct_quic", "restore_direct_quic"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["exact_bytes_replayed_on_relay", "transport_receipt_does_not_advance_durable_ack", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "signalling_wss_interruption",
+      "topology": "any_committed_direct",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay"],
+      "required_fault_actions": ["interrupt_signalling_wss", "restore_signalling_wss"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["signalling_failure_isolated", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "relay_remains_usable", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "relay_wss_interruption",
+      "topology": "relay_connected",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "relay"],
+      "required_fault_actions": ["interrupt_relay_wss", "restore_relay_wss"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "increment_once",
+      "required_assertions": ["relay_failure_isolated", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_increment_once", "outbox_converges_after_restore", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "android_lock_wake",
+      "topology": "physical_android_lockable",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay"],
+      "required_fault_actions": [],
+      "required_device_actions": ["lock_android", "wake_android"],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged_unless_os_closes_relay",
+      "required_assertions": ["windows_processes_unchanged", "session_resumes_without_recreate", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded", "cursor_contiguous_after_wake"]
+    },
+    {
+      "id": "android_network_switch",
+      "topology": "physical_wifi_mobile_switch",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "nat_direct", "relay"],
+      "required_fault_actions": ["switch_android_network", "restore_android_network"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "bounded_by_realtime_socket_change",
+      "required_assertions": ["network_generation_advances", "path_epoch_retires", "agent_process_unchanged", "session_host_process_unchanged", "session_resumes_without_recreate", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "long_output_continuous_resize",
+      "topology": "any_committed_direct",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay"],
+      "required_fault_actions": ["interrupt_direct_quic", "restore_direct_quic"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": ["start_long_output", "resize_window", "stop_long_output"],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["at_least_three_resizes", "frame_set_complete", "final_geometry_correct", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "two_android_peer_isolation",
+      "topology": "two_independent_android_identities",
+      "minimum_android_devices": 2,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay"],
+      "required_fault_actions": ["interrupt_one_peer_direct_quic", "restore_one_peer_direct_quic"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["peer_epochs_independent", "healthy_peer_not_retired", "slow_peer_does_not_block_other", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    },
+    {
+      "id": "late_session_incremental_cutover",
+      "topology": "physical_same_lan",
+      "minimum_android_devices": 1,
+      "expected_carriers": ["relay", "negotiating", "lan_direct", "relay", "negotiating", "lan_direct"],
+      "required_fault_actions": ["delay_late_session_negotiation", "restore_late_session_negotiation"],
+      "required_device_actions": [],
+      "required_windows_lab_actions": [],
+      "relay_generation_expectation": "unchanged",
+      "required_assertions": ["existing_session_remains_direct", "late_session_relay_until_own_barrier", "late_session_commits_incrementally", "agent_process_unchanged", "session_host_process_unchanged", "relay_generation_unchanged", "no_history_gap", "no_duplicate_apply", "no_digest_conflict", "durable_ack_bounded"]
+    }
+  ]
+}

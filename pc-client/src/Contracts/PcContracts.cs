@@ -37,6 +37,112 @@ public enum ManagedSessionState
     Faulted = 5,
 }
 
+/// <summary>
+/// The data-plane carrier currently used by a managed session.
+/// Relay is deliberately the zero/default value so older Agent IPC responses
+/// remain safe while the optional carrier field is rolled out.
+/// </summary>
+public enum SessionDataPlaneCarrier : byte
+{
+    Relay = 0,
+    Negotiating = 1,
+    LanDirect = 2,
+    NatDirect = 3,
+}
+
+/// <summary>
+/// Compatibility seam for the optional Agent IPC carrier field. The desktop
+/// client may be newer than the Agent, so absence or an unrecognised value
+/// must never be interpreted as a direct path.
+/// </summary>
+public static class SessionDataPlaneCarrierContract
+{
+    private static readonly string[] CarrierPropertyNames =
+    [
+        "Carrier",
+        "DataPlaneCarrier",
+        "TransportCarrier",
+        "ConnectionCarrier",
+    ];
+
+    public static SessionDataPlaneCarrier ReadFromAgentSummary(object? summary)
+    {
+        if (summary is null) return SessionDataPlaneCarrier.Relay;
+
+        var type = summary.GetType();
+        foreach (var name in CarrierPropertyNames)
+        {
+            var property = type.GetProperty(name, System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.IgnoreCase);
+            if (property is null || property.GetIndexParameters().Length != 0) continue;
+            try
+            {
+                return Parse(property.GetValue(summary));
+            }
+            catch (Exception error) when (error is MemberAccessException or System.Reflection.TargetInvocationException)
+            {
+                return SessionDataPlaneCarrier.Relay;
+            }
+        }
+
+        return SessionDataPlaneCarrier.Relay;
+    }
+
+    public static SessionDataPlaneCarrier Normalize(SessionDataPlaneCarrier value) =>
+        Enum.IsDefined(value) ? value : SessionDataPlaneCarrier.Relay;
+
+    public static SessionDataPlaneCarrier Parse(object? value)
+    {
+        if (value is SessionDataPlaneCarrier carrier) return Normalize(carrier);
+        if (value is Enum enumValue)
+            return ParseName(Enum.GetName(enumValue.GetType(), enumValue));
+        if (value is string text) return ParseName(text);
+
+        // Numeric values are accepted only for the frozen 0..3 wire mapping.
+        // Any other value is intentionally treated as Relay.
+        if (value is byte or sbyte or short or ushort or int or uint or long or ulong)
+        {
+            try
+            {
+                var numeric = Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture);
+                return numeric switch
+                {
+                    0 => SessionDataPlaneCarrier.Relay,
+                    1 => SessionDataPlaneCarrier.Negotiating,
+                    2 => SessionDataPlaneCarrier.LanDirect,
+                    3 => SessionDataPlaneCarrier.NatDirect,
+                    _ => SessionDataPlaneCarrier.Relay,
+                };
+            }
+            catch (OverflowException)
+            {
+                return SessionDataPlaneCarrier.Relay;
+            }
+        }
+
+        return SessionDataPlaneCarrier.Relay;
+    }
+
+    private static SessionDataPlaneCarrier ParseName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return SessionDataPlaneCarrier.Relay;
+        var normalized = new string(value
+            .Where(char.IsLetterOrDigit)
+            .ToArray())
+            .ToUpperInvariant();
+        return normalized switch
+        {
+            "RELAY" or "RELAYONLY" or "SERVERRELAY" or "WEBSOCKETRELAY" => SessionDataPlaneCarrier.Relay,
+            "NEGOTIATING" or "NEGOTIATINGDIRECT" or "DIRECTNEGOTIATING" or "DIRECTPENDING" => SessionDataPlaneCarrier.Negotiating,
+            "LANDIRECT" or "LAN" or "LOCALDIRECT" or "LOCALNETWORKDIRECT" or
+                "LOCALAREANETWORKDIRECT" => SessionDataPlaneCarrier.LanDirect,
+            "NATDIRECT" or "NAT" or "UDPDIRECT" or "QUICDIRECT" or "DIRECTNAT" or
+                "NATTRAVERSALDIRECT" => SessionDataPlaneCarrier.NatDirect,
+            _ => SessionDataPlaneCarrier.Relay,
+        };
+    }
+}
+
 public static class PcCapabilityIds
 {
     public const string RealtimeTerminalV1 = "realtime_terminal_v1";
@@ -81,7 +187,8 @@ public sealed record ManagedSessionSnapshot(
     ManagedSessionState State,
     int ViewerCount,
     DateTimeOffset LastActivityAt,
-    ulong LastSequence);
+    ulong LastSequence,
+    SessionDataPlaneCarrier Carrier = SessionDataPlaneCarrier.Relay);
 
 public sealed record AccountDeviceSnapshot(
     Guid DeviceId,

@@ -42,6 +42,25 @@ try { PcContractValidator.Validate(invalid); }
 catch (InvalidDataException) { rejected = true; }
 Require(rejected, "An oversized terminal command capability set was accepted.");
 
+Require(SessionDataPlaneCarrierContract.ReadFromAgentSummary(new { Carrier = "LAN_DIRECT" }) ==
+        SessionDataPlaneCarrier.LanDirect,
+    "The optional Agent carrier field did not map LAN direct.");
+Require(SessionDataPlaneCarrierContract.ReadFromAgentSummary(new { DataPlaneCarrier = "NAT_DIRECT" }) ==
+        SessionDataPlaneCarrier.NatDirect,
+    "The optional Agent carrier alias did not map NAT direct.");
+Require(SessionDataPlaneCarrierContract.ReadFromAgentSummary(new { Carrier = "LocalAreaNetworkDirect" }) ==
+        SessionDataPlaneCarrier.LanDirect,
+    "The Windows Agent carrier name did not map LAN direct.");
+Require(SessionDataPlaneCarrierContract.ReadFromAgentSummary(new { Carrier = "NatTraversalDirect" }) ==
+        SessionDataPlaneCarrier.NatDirect,
+    "The Windows Agent carrier name did not map NAT direct.");
+Require(SessionDataPlaneCarrierContract.ReadFromAgentSummary(new { Carrier = "future-direct-mode" }) ==
+        SessionDataPlaneCarrier.Relay,
+    "An unknown Agent carrier was not failed closed to Relay.");
+Require(SessionDataPlaneCarrierContract.ReadFromAgentSummary(new { }) ==
+        SessionDataPlaneCarrier.Relay,
+    "A legacy Agent response without a carrier was not failed closed to Relay.");
+
 Console.WriteLine("PC architecture contracts, refresh coalescing, revision suppression, and differential collections passed.");
 
 static ManagedSessionSnapshot Session(string id, string title) =>

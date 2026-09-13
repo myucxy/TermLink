@@ -54,6 +54,7 @@ import java.io.Closeable
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
+import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -125,6 +126,33 @@ fun interface InputSequenceProvider {
     fun next(): Long
 }
 
+/**
+ * Optional notification issued only after the renderer cursor is durably
+ * committed. Direct uses it to release ingress digest/byte state; failures are
+ * peer-local and must never suppress the authoritative Relay OUTPUT_ACK.
+ */
+fun interface ProductionDirectAppliedCursorObserver {
+    fun onDurablyApplied(sessionId: UUID, highestContiguousSequence: Long)
+}
+
+/**
+ * One already-consumed Envelope sequence held for a cutover proposal.
+ * Publishing or cancelling only opens the send gate: either way the next
+ * Envelope consumes this sequence, so AEAD nonces are never skipped or reused.
+ */
+internal class ProductionDirectSequenceReservation internal constructor(
+    val sequence: Long,
+) {
+    private val released = AtomicBoolean(false)
+    private val sendGate = CompletableDeferred<Unit>()
+
+    fun releaseForSending() {
+        if (released.compareAndSet(false, true)) sendGate.complete(Unit)
+    }
+
+    internal suspend fun awaitReleased() = sendGate.await()
+}
+
 private class InMemoryInputSequenceProvider : InputSequenceProvider {
     private val sequence = AtomicLong(0)
 
@@ -135,6 +163,155 @@ private const val TERMINATION_REASON_USER_REQUESTED = "USER_REQUESTED"
 private const val HOST_HISTORY_RESPONSE_CHUNK_BYTES = 512 * 1024
 private const val MAX_HOST_HISTORY_OBJECT_BYTES = 64 * 1024 * 1024
 private const val HOST_HISTORY_REQUEST_TIMEOUT_MILLIS = 30_000L
+private const val MAX_SEMANTIC_INPUT_OUTBOX_ENTRIES = 128
+private const val MAX_SEMANTIC_INPUT_OUTBOX_BYTES = 8 * 1024 * 1024
+
+/**
+ * The identity/fence that makes one semantic input safe to replay. A transport
+ * generation is deliberately not part of this fence: a temporary Relay
+ * reconnect must not discard an input whose application result is still
+ * unknown. Key and control-owner changes are hard fences and clear the entry.
+ */
+internal data class SemanticInputFence(
+    val sessionId: UUID,
+    val peerDeviceId: UUID,
+    val keyEpoch: Long,
+    val controlGeneration: Long,
+) {
+    init {
+        require(keyEpoch > 0) { "semantic input key epoch must be positive" }
+        require(controlGeneration >= 0) { "semantic input control generation must not be negative" }
+    }
+}
+
+internal class SemanticInputOutboxOverflowException(message: String) : IllegalStateException(message)
+
+private class SemanticInputFenceChangedException(message: String) : IllegalStateException(message)
+
+/**
+ * Bounded, zeroing storage for semantic INPUT_EVENT envelopes.
+ *
+ * The entry is removed only after the matching application result has been
+ * accepted by the ordered session. Transport success, reconnects, and carrier
+ * receipts do not mutate this store. Callers receive copies for replay so the
+ * stored bytes remain available until INPUT_ACCEPTED/INPUT_REJECTED or a hard
+ * lifecycle/key/owner fence retires them.
+ */
+internal class SemanticInputOutbox(
+    private val maxEntries: Int = MAX_SEMANTIC_INPUT_OUTBOX_ENTRIES,
+    private val maxBytes: Int = MAX_SEMANTIC_INPUT_OUTBOX_BYTES,
+) : Closeable {
+    private data class Entry(
+        val inputId: UUID,
+        val fence: SemanticInputFence,
+        val envelopeSequence: Long,
+        val transportGeneration: Int,
+        val envelopeBytes: ByteArray,
+    ) {
+        fun destroy() = envelopeBytes.fill(0)
+    }
+
+    private val lock = Any()
+    private val entries = LinkedHashMap<UUID, Entry>()
+    private var storedBytes = 0
+
+    init {
+        require(maxEntries > 0) { "semantic input outbox entry limit must be positive" }
+        require(maxBytes > 0) { "semantic input outbox byte limit must be positive" }
+    }
+
+    internal val size: Int
+        get() = synchronized(lock) { entries.size }
+
+    internal val byteCount: Int
+        get() = synchronized(lock) { storedBytes }
+
+    /** Stores the first serialized Envelope bytes; never replaces an existing input ID. */
+    internal fun put(
+        inputId: UUID,
+        fence: SemanticInputFence,
+        envelopeSequence: Long,
+        transportGeneration: Int,
+        exactEnvelopeBytes: ByteArray,
+    ) {
+        require(envelopeSequence > 0) { "semantic input envelope sequence must be positive" }
+        require(transportGeneration >= 0) { "semantic input transport generation must not be negative" }
+        require(exactEnvelopeBytes.isNotEmpty()) { "semantic input envelope must not be empty" }
+        synchronized(lock) {
+            check(!entries.containsKey(inputId)) {
+                "semantic input ID is already present in the outbox"
+            }
+            if (entries.size >= maxEntries) {
+                throw SemanticInputOutboxOverflowException(
+                    "semantic input outbox entry limit reached",
+                )
+            }
+            if (exactEnvelopeBytes.size > maxBytes - storedBytes) {
+                throw SemanticInputOutboxOverflowException(
+                    "semantic input outbox byte limit reached",
+                )
+            }
+            val stored = exactEnvelopeBytes.copyOf()
+            entries[inputId] = Entry(
+                inputId = inputId,
+                fence = fence,
+                envelopeSequence = envelopeSequence,
+                transportGeneration = transportGeneration,
+                envelopeBytes = stored,
+            )
+            storedBytes += stored.size
+        }
+    }
+
+    /** Returns an exact copy only when the session, peer, key, and owner fence still match. */
+    internal fun copyForRelay(inputId: UUID, currentFence: SemanticInputFence): ByteArray? =
+        synchronized(lock) {
+            val entry = entries[inputId] ?: return@synchronized null
+            if (entry.fence != currentFence) return@synchronized null
+            entry.envelopeBytes.copyOf()
+        }
+
+    /** Returns stable replay identities; transport generations never own them. */
+    internal fun pendingInputIds(currentFence: SemanticInputFence): List<UUID> =
+        synchronized(lock) {
+            entries.values.asSequence()
+                .filter { it.fence == currentFence }
+                .map(Entry::inputId)
+                .toList()
+        }
+
+    /** Retires an entry only for the matching session/peer/key/owner fence. */
+    internal fun complete(inputId: UUID, currentFence: SemanticInputFence): Boolean =
+        synchronized(lock) {
+            val entry = entries[inputId] ?: return@synchronized false
+            if (entry.fence != currentFence) return@synchronized false
+            entries.remove(inputId)
+            storedBytes -= entry.envelopeBytes.size
+            entry.destroy()
+            true
+        }
+
+    /** Clears all entries and overwrites every retained Envelope byte. */
+    internal fun clear() {
+        synchronized(lock) {
+            entries.values.forEach(Entry::destroy)
+            entries.clear()
+            storedBytes = 0
+        }
+    }
+
+    override fun close() = clear()
+}
+
+/** Carrier-neutral semantic replay surface over the first serialized bytes. */
+internal interface SemanticInputRelayReplay {
+    fun copyPendingInputEnvelopeForRelay(inputId: UUID): ByteArray?
+
+    suspend fun resendPendingInputOverRelay(
+        inputId: UUID,
+        expectedConnectedGeneration: Int? = null,
+    ): Boolean
+}
 
 data class ProductionHostHistoryObject(
     val kind: HostHistoryObjectKindV1,
@@ -178,6 +355,14 @@ data class ProductionRealtimeSessionDiagnostics(
     val flowControlSendCount: Long,
     val lastReceivedSequence: Long,
     val lastHandledSequence: Long,
+    /** Highest sequence accepted by the authoritative session reducer. */
+    val contiguousAppliedSequence: Long = 0,
+    /** Number of duplicate ordered events rejected by the reducer. */
+    val duplicateEventCount: Long = 0,
+    /** Number of ordered events rejected after a sequence discontinuity. */
+    val historyGapCount: Long = 0,
+    /** Highest durable acknowledgement currently exposed by the reducer. */
+    val durableAck: Long = 0,
     val multiplexer: ProductionRealtimeMultiplexerDiagnostics,
 )
 
@@ -216,6 +401,8 @@ class ProductionRealtimeSessionClient(
     initialObservedLocalInputEpoch: Long = 0,
     private val acknowledgementObserver: suspend (Long, Long) -> DurableAckCommit,
     private val acknowledgementResetObserver: suspend (Long) -> DurableAckCommit,
+    private val directAppliedCursorObserver: ProductionDirectAppliedCursorObserver =
+        ProductionDirectAppliedCursorObserver { _, _ -> },
     private val authoritativeMetadataRefreshObserver: suspend () -> Unit = {},
     private val metadataRefreshCooldownMillis: Long = 10_000,
     private val previousEpochGraceMillis: Long = 30_000,
@@ -231,7 +418,7 @@ class ProductionRealtimeSessionClient(
     private val rendererFatalObserver: (ProductionRendererFatalFailure) -> Unit = {},
     private val sessionDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     private val controlDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
-) : RemoteSessionOutbound, Closeable {
+) : RemoteSessionOutbound, Closeable, SemanticInputRelayReplay {
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     // JNI parsing/rendering and long replay are serialized per session away
     // from Main. NativeTerminalEngine posts view invalidation back to Main.
@@ -252,12 +439,15 @@ class ProductionRealtimeSessionClient(
     private val rendererFatal = AtomicBoolean(false)
     private val nextMetadataRefreshAtMillis = AtomicLong(0)
     private val sendMutex = Mutex()
+    private val directSequenceReservationLock = Any()
+    private var directSequenceReservation: ProductionDirectSequenceReservation? = null
     private val incomingProcessingMutex = Mutex()
     private val controlRequestMutex = Mutex()
     private val controlArbitrationMutex = Mutex()
     private val materialLock = Any()
     private val observedLocalInputEpoch = AtomicLong(initialObservedLocalInputEpoch)
     private val pendingInputs = ConcurrentHashMap<UUID, CompletableDeferred<Unit>>()
+    private val semanticInputOutbox = SemanticInputOutbox()
     private val pendingTerminations = ConcurrentHashMap<UUID, CompletableDeferred<Boolean>>()
     private val pendingHostHistory = ConcurrentHashMap<UUID, HostHistoryAccumulator>()
     private val reconnectMutex = Mutex()
@@ -271,6 +461,7 @@ class ProductionRealtimeSessionClient(
     private var subscriberRefreshJob: Job? = null
     private var previousMaterialRetirementJob: Job? = null
     private var reconnectAttempt = 0
+    @Volatile
     private var controlGeneration = 0L
     private var restoreControlAfterReconnect = false
     private val mutableTransportState = MutableStateFlow<ProductionTransportState>(ProductionTransportState.Connecting)
@@ -311,6 +502,9 @@ class ProductionRealtimeSessionClient(
     private val flowControlSendCount = AtomicLong(0)
     private val lastReceivedSequence = AtomicLong(0)
     private val lastHandledSequence = AtomicLong(0)
+    private val contiguousAppliedSequence = AtomicLong(0)
+    private val duplicateEventCount = AtomicLong(0)
+    private val historyGapCount = AtomicLong(0)
     private val rejectedThroughGeneration = AtomicInteger(0)
     private val transportTransitionGeneration = AtomicLong(0)
     /** Guarded by [incomingProcessingMutex]. */
@@ -598,6 +792,10 @@ class ProductionRealtimeSessionClient(
         flowControlSendCount = flowControlSendCount.get(),
         lastReceivedSequence = lastReceivedSequence.get(),
         lastHandledSequence = lastHandledSequence.get(),
+        contiguousAppliedSequence = contiguousAppliedSequence.get(),
+        duplicateEventCount = duplicateEventCount.get(),
+        historyGapCount = historyGapCount.get(),
+        durableAck = session.state.value.lastAckedSequence,
         multiplexer = transport.diagnostics(),
     )
 
@@ -630,6 +828,15 @@ class ProductionRealtimeSessionClient(
             if (controlGeneration != requestGeneration) {
                 false
             } else {
+                val previous = session.state.value as? RemoteSessionState.Controlling
+                if (previous == null ||
+                    previous.leaseId != lease.leaseId ||
+                    previous.leaseVersion != lease.version
+                ) {
+                    controlGeneration++
+                    failPendingInputs("control owner changed")
+                    semanticInputOutbox.clear()
+                }
                 session.grantControl(lease.leaseId, lease.expiresAtEpochMillis, lease.version)
                 restoreControlAfterReconnect = true
                 true
@@ -815,6 +1022,8 @@ class ProductionRealtimeSessionClient(
         val current = controlArbitrationMutex.withLock {
             controlGeneration++
             restoreControlAfterReconnect = false
+            failPendingInputs("control lease released")
+            semanticInputOutbox.clear()
             session.state.value as? RemoteSessionState.Controlling
         } ?: return
         withContext(Dispatchers.IO) {
@@ -985,6 +1194,10 @@ class ProductionRealtimeSessionClient(
                             }
                         }
                     }
+                    // An input encrypted under the retired key cannot be
+                    // safely replayed after an authoritative key fence.
+                    failPendingInputs("session key material changed")
+                    semanticInputOutbox.clear()
                 }
                 if (mutableTransportState.value is ProductionTransportState.Connected) {
                     resume(session.state.value.lastAckedSequence)
@@ -1072,7 +1285,66 @@ class ProductionRealtimeSessionClient(
     override suspend fun persistAcknowledgement(
         expectedRendererGeneration: Long,
         highestContiguousSequence: Long,
-    ): DurableAckCommit = acknowledgementObserver(expectedRendererGeneration, highestContiguousSequence)
+    ): DurableAckCommit {
+        val committed = acknowledgementObserver(expectedRendererGeneration, highestContiguousSequence)
+        // This callback is deliberately after durable persistence and before
+        // RemoteTerminalSession emits OUTPUT_ACK. Direct owns neither action.
+        runCatching {
+            directAppliedCursorObserver.onDurablyApplied(config.sessionId, committed.sequence)
+        }
+        return committed
+    }
+
+    /**
+     * Reserves the exact next outbound Envelope sequence before a cutover
+     * proposal is sent. Until [ProductionDirectSequenceReservation.releaseForSending]
+     * is called, outbound sends wait without holding [sendMutex].
+     */
+    internal suspend fun reserveNextEnvelopeSequenceForDirectCutover():
+        ProductionDirectSequenceReservation {
+        while (true) {
+            val existing = synchronized(directSequenceReservationLock) {
+                directSequenceReservation
+            }
+            if (existing != null) return existing
+            return sendMutex.withLock {
+                synchronized(directSequenceReservationLock) {
+                    directSequenceReservation?.let { return@withLock it }
+                    val sequence = envelopeSequenceProvider.next()
+                    require(sequence > 0) {
+                        "envelope sequence provider returned a non-positive value"
+                    }
+                    ProductionDirectSequenceReservation(sequence).also {
+                        directSequenceReservation = it
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * One-shot Relay fallback for bytes already serialized by this session.
+     * It deliberately bypasses the Direct gateway; semantic retry ownership
+     * remains in this client's input outbox until INPUT_ACCEPTED/REJECTED.
+     */
+    internal fun sendRelayExactFromDirect(exactEnvelopeBytes: ByteArray): Boolean {
+        if (closed.get() || closing.get() || exactEnvelopeBytes.isEmpty()) return false
+        val envelope = runCatching { Envelope.parseFrom(exactEnvelopeBytes) }.getOrNull()
+            ?: return false
+        if (envelope.messageType != MessageType.INPUT_EVENT ||
+            envelope.direction != dev.termlink.protocol.realtime.v1.Direction.ANDROID_TO_PC ||
+            !envelope.sessionId.toByteArray().contentEquals(
+                ProductionRealtimeClient.uuidBytes(config.sessionId),
+            ) ||
+            !envelope.senderDeviceId.toByteArray().contentEquals(
+                ProductionRealtimeClient.uuidBytes(config.androidDeviceId),
+            ) ||
+            !envelope.recipientDeviceId.toByteArray().contentEquals(
+                ProductionRealtimeClient.uuidBytes(config.pcDeviceId),
+            )
+        ) return false
+        return transport.sendRelayExact(envelope, exactEnvelopeBytes)
+    }
 
     override suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit =
         acknowledgementResetObserver(expectedRendererGeneration)
@@ -1124,14 +1396,47 @@ class ProductionRealtimeSessionClient(
         val connectedGeneration = transport.currentConnectedGeneration()
         try {
             check(pendingInputs.putIfAbsent(input.inputId, pending) == null) { "input ID is already pending" }
-            sendEncrypted(
-                MessageType.INPUT_EVENT,
-                plaintext,
-                expectedConnectedGeneration = connectedGeneration,
-            )
+            controlArbitrationMutex.withLock {
+                val current = session.state.value as? RemoteSessionState.Controlling
+                    ?: throw SemanticInputFenceChangedException("control owner is no longer active")
+                if (current.leaseId != controlling.leaseId ||
+                    current.leaseVersion != controlling.leaseVersion
+                ) {
+                    throw SemanticInputFenceChangedException("control owner changed while sending input")
+                }
+                val controlGenerationSnapshot = controlGeneration
+                sendEncrypted(
+                    MessageType.INPUT_EVENT,
+                    plaintext,
+                    expectedConnectedGeneration = connectedGeneration,
+                    onEnvelopeCreated = { envelope, keyEpoch, exactEnvelopeBytes ->
+                        if (controlGeneration != controlGenerationSnapshot) {
+                            throw SemanticInputFenceChangedException("control owner changed while sending input")
+                        }
+                        semanticInputOutbox.put(
+                            inputId = input.inputId,
+                            fence = SemanticInputFence(
+                                sessionId = config.sessionId,
+                                peerDeviceId = config.pcDeviceId,
+                                keyEpoch = keyEpoch,
+                                controlGeneration = controlGenerationSnapshot,
+                            ),
+                            envelopeSequence = envelope.seq,
+                            transportGeneration = connectedGeneration,
+                            exactEnvelopeBytes = exactEnvelopeBytes,
+                        )
+                    },
+                )
+            }
             withTimeout(inputAcceptanceTimeoutMillis) { pending.await() }
         } catch (_: TimeoutCancellationException) {
             throw RemoteInputDeliveryUnknownException("input acceptance timed out")
+        } catch (error: SemanticInputOutboxOverflowException) {
+            // A bounded outbox must fail closed without tearing down a healthy
+            // Relay connection or pretending the input was delivered.
+            throw RemoteInputDeliveryUnknownException(error.message ?: "semantic input outbox is full")
+        } catch (error: SemanticInputFenceChangedException) {
+            throw RemoteInputDeliveryUnknownException(error.message ?: "control owner changed while sending input")
         } catch (error: RemoteInputRejectedException) {
             throw error
         } catch (error: RemoteInputDeliveryUnknownException) {
@@ -1147,6 +1452,82 @@ class ProductionRealtimeSessionClient(
             plaintext.fill(0)
             canonicalBytes.fill(0)
         }
+    }
+
+    /** Number of semantic inputs still awaiting an application result. */
+    internal fun semanticInputOutboxSize(): Int = semanticInputOutbox.size
+
+    /** Bytes retained by the semantic input outbox; useful for boundedness diagnostics. */
+    internal fun semanticInputOutboxByteCount(): Int = semanticInputOutbox.byteCount
+
+    override fun copyPendingInputEnvelopeForRelay(inputId: UUID): ByteArray? {
+        if (closed.get()) return null
+        return semanticInputOutbox.copyForRelay(inputId, currentSemanticInputFence())
+    }
+
+    override suspend fun resendPendingInputOverRelay(
+        inputId: UUID,
+        expectedConnectedGeneration: Int?,
+    ): Boolean = controlArbitrationMutex.withLock controlLock@{
+        if (closed.get() || closing.get()) return@controlLock false
+        sendMutex.withLock sendLock@{
+            if (closed.get() || closing.get()) return@sendLock false
+            // Key rotation is serialized by sendMutex and control-owner changes
+            // are serialized by controlArbitrationMutex. Taking the exact copy
+            // only after both locks are held prevents a stale input from being
+            // replayed between a hard-fence clear and the Relay write.
+            val exactEnvelopeBytes = semanticInputOutbox.copyForRelay(
+                inputId,
+                currentSemanticInputFence(),
+            ) ?: return@sendLock false
+            try {
+                // Parsing validates metadata for the endpoint fence. The exact
+                // retained bytes, not protobuf reserialization, are sent on Relay.
+                sendExactEnvelopeOverRelayLocked(exactEnvelopeBytes, expectedConnectedGeneration)
+            } finally {
+                exactEnvelopeBytes.fill(0)
+            }
+        }
+    }
+
+    /** Caller owns both controlArbitrationMutex and sendMutex. */
+    private suspend fun sendExactEnvelopeOverRelayLocked(
+        exactEnvelopeBytes: ByteArray,
+        expectedConnectedGeneration: Int?,
+    ): Boolean {
+        val envelope = Envelope.parseFrom(exactEnvelopeBytes)
+        require(envelope.messageType == MessageType.INPUT_EVENT) {
+            "semantic replay Envelope must be INPUT_EVENT"
+        }
+        require(envelope.sessionId.toByteArray().contentEquals(ProductionRealtimeClient.uuidBytes(config.sessionId))) {
+            "semantic replay Envelope session mismatch"
+        }
+        require(envelope.senderDeviceId.toByteArray().contentEquals(ProductionRealtimeClient.uuidBytes(config.androidDeviceId))) {
+            "semantic replay Envelope sender mismatch"
+        }
+        require(envelope.recipientDeviceId.toByteArray().contentEquals(ProductionRealtimeClient.uuidBytes(config.pcDeviceId))) {
+            "semantic replay Envelope recipient mismatch"
+        }
+        if (closed.get() || closing.get()) return false
+        return if (expectedConnectedGeneration != null) {
+            transport.sendRelayExactForConnectedGeneration(
+                envelope,
+                exactEnvelopeBytes,
+                expectedConnectedGeneration,
+            )
+        } else {
+            transport.sendRelayExact(envelope, exactEnvelopeBytes)
+        }
+    }
+
+    private fun currentSemanticInputFence(): SemanticInputFence {
+        val keyEpoch = synchronized(materialLock) { currentMaterial.epoch }
+        return SemanticInputFence(
+            sessionId = config.sessionId,
+            peerDeviceId = config.pcDeviceId,
+            keyEpoch = keyEpoch,
+            controlGeneration = controlGeneration,
+        )
     }
 
     private fun TerminalInput.toWireInput(): TerminalInputV1 {
@@ -1287,6 +1668,10 @@ class ProductionRealtimeSessionClient(
 
     private fun closeInternal(transportAlreadyClosed: Boolean) {
         if (!closed.compareAndSet(false, true)) return
+        synchronized(directSequenceReservationLock) {
+            directSequenceReservation?.releaseForSending()
+            directSequenceReservation = null
+        }
         cancelSessionReconcile()
         reconnectJob?.cancel()
         reconnectStabilityJob?.cancel()
@@ -1297,6 +1682,7 @@ class ProductionRealtimeSessionClient(
             it.completeExceptionally(RemoteInputDeliveryUnknownException("production session closed"))
         }
         pendingInputs.clear()
+        semanticInputOutbox.clear()
         pendingTerminations.values.forEach {
             it.completeExceptionally(
                 ProductionTransportException("production session closed during termination request"),
@@ -1420,15 +1806,36 @@ class ProductionRealtimeSessionClient(
         acknowledgement: Long = 0,
         expectedConnectedGeneration: Int? = null,
         allowWhileClosing: Boolean = false,
+        onEnvelopeCreated: ((Envelope, Long, ByteArray) -> Unit)? = null,
     ) {
         try {
             sendMutex.withLock {
                 check(!closed.get() && (allowWhileClosing || !closing.get())) {
                     "production session client is closed"
                 }
-                val sequence = envelopeSequenceProvider.next()
+                // A cutover proposal must be visible on the independent
+                // signalling lane before the sequence named by its barrier can
+                // be used. Waiting while holding the session send mutex keeps
+                // later Relay control frames ordered; releasing the reservation
+                // itself never takes this mutex.
+                val reserved = synchronized(directSequenceReservationLock) {
+                    directSequenceReservation
+                }
+                reserved?.awaitReleased()
+                val sequence = synchronized(directSequenceReservationLock) {
+                    val current = directSequenceReservation
+                    if (current != null) {
+                        check(current === reserved) {
+                            "Direct sequence reservation changed while awaiting publication"
+                        }
+                        directSequenceReservation = null
+                        current.sequence
+                    } else {
+                        envelopeSequenceProvider.next()
+                    }
+                }
                 require(sequence > 0) { "envelope sequence provider returned a non-positive value" }
-                val (nonce, key, keyIdSnapshot) = synchronized(materialLock) {
+                val (materialSnapshot, keyEpochSnapshot) = synchronized(materialLock) {
                     val snapshot = currentMaterial.keyId.copyOf()
                     Triple(
                         SessionCrypto.nonce(noncePrefix, sequence.toULong()),
@@ -1439,8 +1846,9 @@ class ProductionRealtimeSessionClient(
                             snapshot,
                         ),
                         snapshot,
-                    )
+                    ) to currentMaterial.epoch
                 }
+                val (nonce, key, keyIdSnapshot) = materialSnapshot
                 try {
                     val envelope = ProductionRealtimeClient.encryptedEnvelope(
                         sessionId = config.sessionId,
@@ -1455,13 +1863,27 @@ class ProductionRealtimeSessionClient(
                         plaintext = plaintext,
                         recipientId = config.pcDeviceId,
                     )
-                    val sent = if (expectedConnectedGeneration != null) {
-                        transport.sendForConnectedGeneration(envelope, expectedConnectedGeneration)
-                    } else {
-                        transport.send(envelope)
-                    }
-                    if (!sent) {
-                        throw ProductionTransportException("realtime socket is not connected")
+                    // Serialize once. The semantic outbox, Direct routing and
+                    // Relay fallback all consume this exact byte sequence.
+                    val exactEnvelopeBytes = envelope.toByteArray()
+                    try {
+                        onEnvelopeCreated?.let { callback ->
+                            callback(envelope, keyEpochSnapshot, exactEnvelopeBytes)
+                        }
+                        val sent = if (expectedConnectedGeneration != null) {
+                            transport.sendExactForConnectedGeneration(
+                                envelope,
+                                exactEnvelopeBytes,
+                                expectedConnectedGeneration,
+                            )
+                        } else {
+                            transport.sendExact(envelope, exactEnvelopeBytes)
+                        }
+                        if (!sent) {
+                            throw ProductionTransportException("realtime socket is not connected")
+                        }
+                    } finally {
+                        exactEnvelopeBytes.fill(0)
                     }
                 } finally {
                     key.fill(0)
@@ -1534,6 +1956,7 @@ class ProductionRealtimeSessionClient(
             }
         }
         failPendingInputs(reason)
+        semanticInputOutbox.clear()
         mutableTransportState.value = ProductionTransportState.Failed(reason)
         // This transport is a session-scoped endpoint over a device-wide
         // WebSocket. The product owner retires this endpoint and rebuilds the
@@ -1754,7 +2177,7 @@ class ProductionRealtimeSessionClient(
                     require(
                         (envelope.messageType == MessageType.INPUT_ACCEPTED) == result.accepted,
                     ) { "InputResult type and accepted flag disagree" }
-                    val pending = pendingInputs.remove(inputId)
+                    val pending = pendingInputs[inputId]
                     try {
                         val accepted = requireApplied(
                             acceptOrdered(
@@ -1768,20 +2191,26 @@ class ProductionRealtimeSessionClient(
                                 ),
                             ),
                         )
-                        if (pending != null) {
-                            if (!accepted) {
-                                pending.completeExceptionally(
-                                    RemoteInputDeliveryUnknownException("history gap prevents input confirmation"),
-                                )
-                            } else if (envelope.messageType == MessageType.INPUT_ACCEPTED && result.accepted) {
-                                pending.complete(Unit)
-                            } else {
-                                pending.completeExceptionally(
-                                    RemoteInputRejectedException(result.reasonCode.ifBlank { "input rejected" }),
-                                )
+                        if (!accepted) {
+                            if (pending != null) pendingInputs.remove(inputId, pending)
+                            pending?.completeExceptionally(
+                                RemoteInputDeliveryUnknownException("history gap prevents input confirmation"),
+                            )
+                        } else {
+                            semanticInputOutbox.complete(inputId, currentSemanticInputFence())
+                            if (pending != null) pendingInputs.remove(inputId, pending)
+                            if (pending != null) {
+                                if (envelope.messageType == MessageType.INPUT_ACCEPTED && result.accepted) {
+                                    pending.complete(Unit)
+                                } else {
+                                    pending.completeExceptionally(
+                                        RemoteInputRejectedException(result.reasonCode.ifBlank { "input rejected" }),
+                                    )
+                                }
                             }
                         }
                     } catch (error: Throwable) {
+                        if (pending != null) pendingInputs.remove(inputId, pending)
                         pending?.completeExceptionally(error)
                         throw error
                     }
@@ -1797,6 +2226,15 @@ class ProductionRealtimeSessionClient(
                         )
                         requireApplied(acceptance)
                         if (acceptance is EventAcceptance.Applied) {
+                            val previous = session.state.value as? RemoteSessionState.Controlling
+                            if (previous == null ||
+                                previous.leaseId != leaseId ||
+                                previous.leaseVersion != payload.version
+                            ) {
+                                controlGeneration++
+                                failPendingInputs("control owner changed")
+                                semanticInputOutbox.clear()
+                            }
                             session.grantControl(leaseId, payload.expiresAtMs, payload.version)
                             restoreControlAfterReconnect = true
                         }
@@ -1817,6 +2255,8 @@ class ProductionRealtimeSessionClient(
                         if (acceptance is EventAcceptance.Applied) {
                             controlGeneration++
                             restoreControlAfterReconnect = false
+                            failPendingInputs("control lease revoked")
+                            semanticInputOutbox.clear()
                             if (payload.localInputEpoch > 0) {
                                 observedLocalInputEpoch.accumulateAndGet(payload.localInputEpoch, ::maxOf)
                             }
@@ -1828,6 +2268,10 @@ class ProductionRealtimeSessionClient(
                 else -> error("unsupported production message type ${envelope.messageType}")
             }
             if (envelope.seq > 0L) lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
+            if (session.state.value is RemoteSessionState.Exited) {
+                failPendingInputs("remote session ended")
+                semanticInputOutbox.clear()
+            }
             // A zero-window Host History endpoint remains usable after the
             // authoritative lifecycle has ended. It cannot receive terminal
             // replay or input, but it still needs the subscriber route long
@@ -1966,6 +2410,13 @@ class ProductionRealtimeSessionClient(
         context.stage = IncomingFailureStage.ENGINE_ACCEPT
         val stateBefore = session.state.value
         val acceptance = session.accept(event)
+        when (acceptance) {
+            is EventAcceptance.Applied ->
+                contiguousAppliedSequence.accumulateAndGet(acceptance.sequence, ::maxOf)
+            is EventAcceptance.Duplicate -> duplicateEventCount.incrementAndGet()
+            is EventAcceptance.HistoryGap -> historyGapCount.incrementAndGet()
+            EventAcceptance.IgnoredAfterExit -> Unit
+        }
         if (acceptance is EventAcceptance.HistoryGap && stateBefore !is RemoteSessionState.HistoryGap) {
             val output = event as? RemoteSessionEvent.Output
             val cause = when {
@@ -2096,6 +2547,7 @@ class ProductionRealtimeSessionClient(
                 }
                 cancelPendingReconnect()
                 mutableTransportState.value = ProductionTransportState.Connected
+                resendPendingSemanticInputsOverRelay(connectedGeneration)
                 // Wire subscription and its receive window are control-plane
                 // work. They must be published for the successor generation
                 // even while JNI/replay still occupies the renderer lane. The
@@ -2180,6 +2632,20 @@ class ProductionRealtimeSessionClient(
         !closed.get() && !closing.get() && !rendererFatal.get() &&
             transportTransitionGeneration.get() == transition &&
             transport.currentConnectedGeneration() == connectedGeneration
+
+    /**
+     * Relay recovery is driven by the semantic outbox, not a retiring Direct
+     * actor. A transport send never removes an entry; only its authenticated
+     * INPUT_ACCEPTED/INPUT_REJECTED result or a hard authority fence can do so.
+     */
+    private suspend fun resendPendingSemanticInputsOverRelay(connectedGeneration: Int) {
+        for (inputId in semanticInputOutbox.pendingInputIds(currentSemanticInputFence())) {
+            if (closed.get() || closing.get() ||
+                transport.currentConnectedGeneration() != connectedGeneration
+            ) return
+            if (!resendPendingInputOverRelay(inputId, connectedGeneration)) return
+        }
+    }
 
     private fun scheduleConnectedSessionProjection(transition: Long, connectedGeneration: Int) {
         if (hostHistoryOnlyMode) return

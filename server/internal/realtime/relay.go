@@ -67,16 +67,29 @@ var optionalCapabilities = []string{
 	"host_history_v1",
 }
 
+const (
+	directTransportDataV1Capability  = "direct_transport_data_v1"
+	directSessionCutoverV1Capability = "direct_session_cutover_v1"
+)
+
+// HubOptions controls optional capabilities advertised by this Hub instance.
+// Required Relay capabilities remain fixed so an optional transport can never
+// make the authoritative WSS path unavailable to an older client.
+type HubOptions struct {
+	DirectTransportDataV1 bool
+}
+
 type Hub struct {
-	store         routeAuthorityStore
-	policyStore   controlPolicyStore
-	leases        liveSessionStore
-	logger        *slog.Logger
-	observer      Observer
-	mu            sync.RWMutex
-	peers         map[uuid.UUID]*peer
-	subscriptions map[uuid.UUID]map[uuid.UUID]*peer
-	closed        bool
+	store                 routeAuthorityStore
+	policyStore           controlPolicyStore
+	leases                liveSessionStore
+	logger                *slog.Logger
+	observer              Observer
+	directTransportDataV1 bool
+	mu                    sync.RWMutex
+	peers                 map[uuid.UUID]*peer
+	subscriptions         map[uuid.UUID]map[uuid.UUID]*peer
+	closed                bool
 	// Fixed shards serialize each identity-scoped Valkey reservation with its
 	// connection owner without making unrelated devices wait for the same
 	// network round trip. ReleaseLiveSession has no generation parameter, so a
@@ -154,6 +167,13 @@ func (noopObserver) EnvelopeRouted(string, string, string, int, time.Duration) {
 func (noopObserver) SlowConsumerDisconnected()                                 {}
 
 func NewHubWithObserver(repository *store.Postgres, leases liveSessionStore, logger *slog.Logger, observer Observer) *Hub {
+	return NewHubWithObserverAndOptions(repository, leases, logger, observer, HubOptions{})
+}
+
+// NewHubWithObserverAndOptions keeps optional capability negotiation local to
+// one Hub. In particular, enabling production Direct data on one instance does
+// not mutate package state or affect concurrent Relay instances.
+func NewHubWithObserverAndOptions(repository *store.Postgres, leases liveSessionStore, logger *slog.Logger, observer Observer, options HubOptions) *Hub {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -166,7 +186,11 @@ func NewHubWithObserver(repository *store.Postgres, leases liveSessionStore, log
 		authorityStore = repository
 		policyStore = repository
 	}
-	return &Hub{store: authorityStore, policyStore: policyStore, leases: leases, logger: logger, observer: observer, peers: map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{}}
+	return &Hub{
+		store: authorityStore, policyStore: policyStore, leases: leases, logger: logger, observer: observer,
+		directTransportDataV1: options.DirectTransportDataV1,
+		peers:                 map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{},
+	}
 }
 
 func (h *Hub) Handler() http.Handler { return http.HandlerFunc(h.serveHTTP) }
@@ -350,7 +374,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return
 	}
-	negotiated := negotiatedCapabilities(hello.Capabilities)
+	negotiated := h.negotiatedCapabilities(hello.Capabilities)
 	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), controlSend: make(chan []byte, 4), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{}, subscriptionFrames: map[uuid.UUID][]byte{}, subscriptionACKs: map[uuid.UUID]uint64{}, subscriptionControls: map[uuid.UUID]retainedSubscriberControl{}, controlPolicies: map[uuid.UUID]cachedControlPolicy{}, lastSequences: map[uuid.UUID]uint64{}, pcReplayRoutes: map[pcRouteKey]*pcReplayRoute{}, capabilities: capabilitySet(negotiated)}
 	if !h.add(connection) {
 		closeSocket(socket, websocket.CloseTryAgainLater, "relay shutting down")
@@ -416,6 +440,20 @@ func negotiatedCapabilities(offered []string) []string {
 		if slices.Contains(offered, capability) {
 			result = append(result, capability)
 		}
+	}
+	return result
+}
+
+func (h *Hub) negotiatedCapabilities(offered []string) []string {
+	result := negotiatedCapabilities(offered)
+	if h != nil && h.directTransportDataV1 &&
+		slices.Contains(offered, directTransportDataV1Capability) &&
+		slices.Contains(offered, directSessionCutoverV1Capability) {
+		result = append(
+			result,
+			directTransportDataV1Capability,
+			directSessionCutoverV1Capability,
+		)
 	}
 	return result
 }

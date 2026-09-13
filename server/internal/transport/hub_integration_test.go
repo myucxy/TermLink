@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -85,6 +86,65 @@ func TestSignalWebSocketRoutesOpaqueFrameBetweenAuthenticatedPair(t *testing.T) 
 	}
 }
 
+func TestSignalWebSocketWelcomeNegotiatesDirectDataOnlyWithAllPrerequisites(t *testing.T) {
+	account, pc := uuid.New(), uuid.New()
+	_, private, _ := ed25519.GenerateKey(rand.Reader)
+	device := auth.Device{
+		ID: pc, UserID: account, Type: "PC_AGENT", TrustState: "TRUSTED",
+		SigningPublicKey: private.Public().(ed25519.PublicKey),
+	}
+	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{account: {
+		pc: {ID: pc, Type: "PC_AGENT", TrustState: "TRUSTED"},
+	}}}
+	middleware := auth.Middleware{
+		Tokens:  fixedTransportVerifier{identity: auth.Identity{Issuer: "test", Subject: "account", TokenID: "token"}},
+		Devices: transportAuthDevices{devices: map[uuid.UUID]auth.Device{pc: device}},
+		Nonces:  acceptTransportNonces{}, SubjectKey: make([]byte, 32),
+	}
+
+	for _, test := range []struct {
+		name               string
+		serverPermitted    bool
+		clientCapabilities []string
+		wantDirectData     bool
+	}{
+		{
+			name: "server_gate_disabled", serverPermitted: false,
+			clientCapabilities: []string{"direct_transport_v1", "direct_transport_shadow_multipair_v2", "direct_transport_data_v1", "direct_session_cutover_v1"},
+		},
+		{
+			name: "client_data_only_fails_closed", serverPermitted: true,
+			clientCapabilities: []string{"direct_transport_v1", "direct_transport_data_v1"},
+		},
+		{
+			name: "server_and_client_capabilities_present", serverPermitted: true,
+			clientCapabilities: []string{"direct_transport_v1", "direct_transport_data_v1", "direct_session_cutover_v1"},
+			wantDirectData:     true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, err := NewRouteTicketServiceWithRouting(
+				resolver, make([]byte, ed25519.SeedSize), test.serverPermitted,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(AuthenticateSignals(middleware, NewHub(service).Handler()))
+			defer server.Close()
+			socket, welcomeCapabilities := dialSignalSocketWithCapabilities(
+				t, server.URL, pc, private, "pc", test.clientCapabilities,
+			)
+			defer socket.Close()
+			if got := slices.Contains(welcomeCapabilities, "direct_transport_data_v1"); got != test.wantDirectData {
+				t.Fatalf("Welcome direct data=%t capabilities=%v, want %t", got, welcomeCapabilities, test.wantDirectData)
+			}
+			if got := slices.Contains(welcomeCapabilities, "direct_session_cutover_v1"); got != test.wantDirectData {
+				t.Fatalf("Welcome session cutover=%t capabilities=%v, want %t", got, welcomeCapabilities, test.wantDirectData)
+			}
+		})
+	}
+}
+
 func TestSignalWebSocketRejectsOrdinaryDeviceProofDomain(t *testing.T) {
 	account, pc := uuid.New(), uuid.New()
 	_, private, _ := ed25519.GenerateKey(rand.Reader)
@@ -120,6 +180,21 @@ func TestSignalWebSocketRejectsOrdinaryDeviceProofDomain(t *testing.T) {
 
 func dialSignalSocket(t *testing.T, serverURL string, deviceID uuid.UUID, private ed25519.PrivateKey, role string) *websocket.Conn {
 	t.Helper()
+	socket, _ := dialSignalSocketWithCapabilities(
+		t, serverURL, deviceID, private, role, []string{"direct_transport_v1"},
+	)
+	return socket
+}
+
+func dialSignalSocketWithCapabilities(
+	t *testing.T,
+	serverURL string,
+	deviceID uuid.UUID,
+	private ed25519.PrivateKey,
+	role string,
+	capabilities []string,
+) (*websocket.Conn, []string) {
+	t.Helper()
 	timestamp := time.Now().UnixMilli()
 	nonceBytes := make([]byte, 16)
 	_, _ = rand.Read(nonceBytes)
@@ -141,18 +216,21 @@ func dialSignalSocket(t *testing.T, serverURL string, deviceID uuid.UUID, privat
 		}
 		t.Fatal(err)
 	}
-	hello := map[string]any{"type": "CLIENT_HELLO", "role": role, "protocol_versions": []int{1}, "capabilities": []string{"direct_transport_v1"}}
+	hello := map[string]any{"type": "CLIENT_HELLO", "role": role, "protocol_versions": []int{1}, "capabilities": capabilities}
 	if err := socket.WriteJSON(hello); err != nil {
 		t.Fatal(err)
 	}
-	var welcome map[string]any
+	var welcome struct {
+		Type         string   `json:"type"`
+		Capabilities []string `json:"capabilities"`
+	}
 	if err := socket.ReadJSON(&welcome); err != nil {
 		t.Fatal(err)
 	}
-	if welcome["type"] != "SERVER_WELCOME" {
+	if welcome.Type != "SERVER_WELCOME" {
 		t.Fatalf("unexpected welcome: %+v", welcome)
 	}
-	return socket
+	return socket, welcome.Capabilities
 }
 
 func formatInt64(value int64) string {

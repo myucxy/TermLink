@@ -5,7 +5,31 @@
     <AssemblyName>TermLink.Agent</AssemblyName>
     <RootNamespace>TermLink.Agent</RootNamespace>
     <DefineConstants>$(DefineConstants);TERMLINK_PRODUCTION_RUNTIME</DefineConstants>
+    <Configurations>Debug;Release;DirectAcceptance</Configurations>
+    <TermLinkDirectDataPlaneAcceptance Condition="'$(TermLinkDirectDataPlaneAcceptance)' == ''">false</TermLinkDirectDataPlaneAcceptance>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'DirectAcceptance' And '$(TermLinkDirectDataPlaneAcceptance)' == 'true'">
+    <DefineConstants>$(DefineConstants);TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE</DefineConstants>
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="TermLink.DirectDataPlaneAcceptance"
+                      Value="$(TermLinkDirectDataPlaneAcceptance)" />
+  </ItemGroup>
+  <Target Name="ValidateTermLinkDirectDataPlaneAcceptanceGate" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <_TermLinkDirectDataPlaneAcceptanceSymbolPresent>$([System.Text.RegularExpressions.Regex]::IsMatch('$(DefineConstants)', '(^|[;,\s])TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE($|[;,\s])'))</_TermLinkDirectDataPlaneAcceptanceSymbolPresent>
+    </PropertyGroup>
+    <Error Condition="'$(TermLinkDirectDataPlaneAcceptance)' != 'true' And '$(TermLinkDirectDataPlaneAcceptance)' != 'false'"
+           Text="TermLinkDirectDataPlaneAcceptance must be exactly true or false." />
+    <Error Condition="'$(TermLinkDirectDataPlaneAcceptance)' == 'true' And '$(Configuration)' != 'DirectAcceptance'"
+           Text="Direct data-plane acceptance can only be compiled with Configuration=DirectAcceptance." />
+    <Error Condition="'$(Configuration)' == 'DirectAcceptance' And '$(TermLinkDirectDataPlaneAcceptance)' != 'true'"
+           Text="Configuration=DirectAcceptance requires TermLinkDirectDataPlaneAcceptance=true." />
+    <Error Condition="'$(_TermLinkDirectDataPlaneAcceptanceSymbolPresent)' == 'True' And ('$(Configuration)' != 'DirectAcceptance' Or '$(TermLinkDirectDataPlaneAcceptance)' != 'true')"
+           Text="TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE cannot be injected outside the explicit DirectAcceptance build gate." />
+  </Target>
   <ItemGroup>
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
@@ -31,16 +55,19 @@
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
-  <ItemGroup Condition="Exists('..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll')">
-    <None Include="..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll"
+  <PropertyGroup>
+    <TermLinkDirectNativeLibrary>$(MSBuildThisFileDirectory)..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll</TermLinkDirectNativeLibrary>
+  </PropertyGroup>
+  <Target Name="ValidateTermLinkDirectNativeLibrary"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(Configuration)' == 'Release' Or '$(Configuration)' == 'DirectAcceptance'">
+    <Error Condition="!Exists('$(TermLinkDirectNativeLibrary)')"
+           Text="The pinned network-core native library is missing. Run win-agent/scripts/Build-DirectCoreNative.ps1 before building $(Configuration): $(TermLinkDirectNativeLibrary)" />
+  </Target>
+  <ItemGroup Condition="Exists('$(TermLinkDirectNativeLibrary)')">
+    <None Include="$(TermLinkDirectNativeLibrary)"
           Link="termlink_direct_ffi.dll"
-          CopyToOutputDirectory="PreserveNewest"
-          CopyToPublishDirectory="PreserveNewest" />
-  </ItemGroup>
-  <ItemGroup Condition="!Exists('..\..\..\network-core\target\x86_64-pc-windows-msvc\release\termlink_direct_ffi.dll') And Exists('..\..\..\network-core\target\release\termlink_direct_ffi.dll')">
-    <None Include="..\..\..\network-core\target\release\termlink_direct_ffi.dll"
-          Link="termlink_direct_ffi.dll"
-          CopyToOutputDirectory="PreserveNewest"
-          CopyToPublishDirectory="PreserveNewest" />
+          CopyToOutputDirectory="Always"
+          CopyToPublishDirectory="Always" />
   </ItemGroup>
 </Project>

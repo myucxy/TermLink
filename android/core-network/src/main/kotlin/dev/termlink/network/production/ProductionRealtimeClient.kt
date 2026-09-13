@@ -74,10 +74,24 @@ data class ProductionRealtimeSocketDiagnostics(
     val droppedApplicationFrames: Long = 0,
 )
 
+/**
+ * Capabilities actually negotiated for one physical WebSocket generation.
+ * An empty set is published before each generation starts and whenever its
+ * connection is retired, so a capability from an older socket cannot be used
+ * to authorize work on a replacement socket.
+ */
+data class ProductionRealtimeNegotiatedCapabilities(
+    val generation: Int,
+    val capabilities: Set<String>,
+)
+
 private val REALTIME_CAPABILITY_IDENTIFIER = Regex("[a-z][a-z0-9._-]{0,63}")
 
-internal fun productionRealtimeCapabilities(additional: Set<String>): List<String> {
-    require(additional.all(REALTIME_CAPABILITY_IDENTIFIER::matches)) {
+internal fun productionRealtimeCapabilities(
+    required: Set<String>,
+    optionalAdvertised: Set<String> = emptySet(),
+): List<String> {
+    require((required + optionalAdvertised).all(REALTIME_CAPABILITY_IDENTIFIER::matches)) {
         "Realtime capabilities must use stable protocol identifiers"
     }
     return (listOf(
@@ -90,7 +104,97 @@ internal fun productionRealtimeCapabilities(additional: Set<String>): List<Strin
         "terminal_presentation_metadata_v1",
         "terminal_typed_input_v1",
         "host_history_v1",
-    ) + additional).distinct().sorted()
+    ) + required + optionalAdvertised).distinct().sorted()
+}
+
+/**
+ * Owns one exact wire representation of an Envelope.
+ *
+ * The byte array is deliberately exposed as a borrowed view: callers must use
+ * it before releasing their [ProductionReceivedEnvelope].  Sharing this owner
+ * between wrappers keeps a root reservation from clearing bytes still needed
+ * by a downstream view.  The last release clears the backing array exactly
+ * once.
+ */
+internal class ProductionRawEnvelopeOwner private constructor(
+    private val bytes: ByteArray,
+) : AutoCloseable {
+    private val references = AtomicInteger(1)
+    private val cleared = AtomicBoolean(false)
+
+    fun retain(): ProductionRawEnvelopeOwner {
+        while (true) {
+            val current = references.get()
+            check(current > 0 && !cleared.get()) { "raw Envelope bytes have been released" }
+            if (references.compareAndSet(current, current + 1)) return this
+        }
+    }
+
+    fun borrowedBytes(): ByteArray {
+        check(!cleared.get()) { "raw Envelope bytes have been released" }
+        return bytes
+    }
+
+    fun copyBytes(): ByteArray = borrowedBytes().copyOf()
+
+    override fun close() {
+        val remaining = references.decrementAndGet()
+        check(remaining >= 0) { "raw Envelope owner released more than once" }
+        if (remaining == 0 && cleared.compareAndSet(false, true)) {
+            bytes.fill(0)
+        }
+    }
+
+    companion object {
+        fun take(bytes: ByteArray): ProductionRawEnvelopeOwner {
+            return ProductionRawEnvelopeOwner(bytes)
+        }
+    }
+}
+
+/**
+ * Authenticated transport owner of one exact Envelope serialization.
+ *
+ * [ProductionRelayCarrierOwner] is fenced by the physical Relay generation. A
+ * Direct owner carries the complete native path fence; an epoch on its own is
+ * deliberately never sufficient to authorize delivery.
+ */
+internal sealed interface ProductionEnvelopeCarrierOwner
+
+internal data class ProductionRelayCarrierOwner(
+    val generation: Int,
+) : ProductionEnvelopeCarrierOwner {
+    init {
+        require(generation > 0) { "Relay carrier generation must be positive" }
+    }
+}
+
+internal class ProductionDirectCarrierOwner(
+    val peerDeviceId: UUID,
+    val pathEpoch: Long,
+    connectionId: ByteArray,
+    attemptId: ByteArray,
+) : ProductionEnvelopeCarrierOwner {
+    val connectionId: ByteArray = connectionId.copyOf()
+    val attemptId: ByteArray = attemptId.copyOf()
+
+    init {
+        require(peerDeviceId != UUID(0, 0)) { "Direct peer device ID is required" }
+        require(pathEpoch > 0) { "Direct path epoch must be positive" }
+        require(this.connectionId.size == 16 && this.connectionId.any { it != 0.toByte() }) {
+            "Direct connection ID must contain 16 non-zero bytes"
+        }
+        require(this.attemptId.size == 16 && this.attemptId.any { it != 0.toByte() }) {
+            "Direct attempt ID must contain 16 non-zero bytes"
+        }
+    }
+
+    internal fun ownedCopy(): ProductionDirectCarrierOwner = ProductionDirectCarrierOwner(
+        peerDeviceId = peerDeviceId,
+        pathEpoch = pathEpoch,
+        connectionId = connectionId,
+        attemptId = attemptId,
+    )
 }
 
 class ProductionReceivedEnvelope internal constructor(
@@ -98,11 +202,41 @@ class ProductionReceivedEnvelope internal constructor(
     val wireBytes: Int,
     val generation: Int,
     private val releaseReservation: (Int) -> Unit,
+    rawBytes: ByteArray? = null,
+    rawOwner: ProductionRawEnvelopeOwner? = null,
+    internal val carrierOwner: ProductionEnvelopeCarrierOwner =
+        ProductionRelayCarrierOwner(generation),
 ) : AutoCloseable {
+    init {
+        require(rawBytes == null || rawOwner == null) {
+            "raw Envelope bytes and owner cannot both be supplied"
+        }
+    }
+
+    private val ownedRawBytes = rawOwner ?: ProductionRawEnvelopeOwner.take(
+        rawBytes ?: envelope.toByteArray(),
+    )
     private val released = AtomicBoolean(false)
 
+    /** Borrowed exact bytes received on the wire; do not retain after [close]. */
+    val rawBytes: ByteArray
+        get() = ownedRawBytes.borrowedBytes()
+
+    /** Alias that makes the no-reserialize contract explicit to transport callers. */
+    val exactBytes: ByteArray
+        get() = ownedRawBytes.borrowedBytes()
+
+    /** Copies the exact bytes while this reservation is still live. */
+    fun copyRawBytes(): ByteArray = ownedRawBytes.copyBytes()
+
     override fun close() {
-        if (released.compareAndSet(false, true)) releaseReservation(wireBytes)
+        if (released.compareAndSet(false, true)) {
+            try {
+                releaseReservation(wireBytes)
+            } finally {
+                ownedRawBytes.close()
+            }
+        }
     }
 
     /**
@@ -110,14 +244,31 @@ class ProductionReceivedEnvelope internal constructor(
      * ciphertext. The observer runs exactly once when downstream processing
      * releases the frame, including channel cancellation paths.
      */
-    internal fun withCloseObserver(observer: () -> Unit): ProductionReceivedEnvelope =
-        ProductionReceivedEnvelope(envelope, wireBytes, generation) {
-            try {
-                this.close()
-            } finally {
-                observer()
-            }
+    internal fun withCloseObserver(observer: () -> Unit): ProductionReceivedEnvelope {
+        val retainedOwner = ownedRawBytes.retain()
+        return try {
+            ProductionReceivedEnvelope(
+                envelope = envelope,
+                wireBytes = wireBytes,
+                generation = generation,
+                releaseReservation = {
+                    try {
+                        this.close()
+                    } finally {
+                        observer()
+                    }
+                },
+                rawOwner = retainedOwner,
+                carrierOwner = when (val owner = carrierOwner) {
+                    is ProductionRelayCarrierOwner -> owner.copy()
+                    is ProductionDirectCarrierOwner -> owner.ownedCopy()
+                },
+            )
+        } catch (error: Throwable) {
+            retainedOwner.close()
+            throw error
         }
+    }
 }
 
 /**
@@ -129,9 +280,14 @@ internal interface ProductionRealtimeSocket : Closeable {
     val receivedEnvelopes: Flow<ProductionReceivedEnvelope>
     val receivePressure: StateFlow<ProductionReceivePressure>
     val state: SharedFlow<RealtimeState>
+    /** Exact capability echo for the current authenticated socket generation. */
+    val negotiatedCapabilities: StateFlow<ProductionRealtimeNegotiatedCapabilities>
+        get() = EMPTY_REALTIME_NEGOTIATED_CAPABILITIES
 
     fun connect()
     fun send(envelope: Envelope): Boolean
+    /** Sends [exactBytes] without protobuf parse/re-serialization on the wire. */
+    fun sendExact(envelope: Envelope, exactBytes: ByteArray): Boolean = send(envelope)
     fun supportsLivenessProbe(expectedGeneration: Int): Boolean = false
     suspend fun probeLiveness(expectedGeneration: Int, timeoutMillis: Long): Boolean = false
     fun disconnect(reason: String)
@@ -145,6 +301,10 @@ internal interface ProductionRealtimeSocket : Closeable {
     )
 }
 
+private val EMPTY_REALTIME_NEGOTIATED_CAPABILITIES = MutableStateFlow(
+    ProductionRealtimeNegotiatedCapabilities(0, emptySet()),
+)
+
 class ProductionRealtimeClient(
     rootUrl: String,
     private val tokenProvider: AccessTokenProvider,
@@ -154,6 +314,7 @@ class ProductionRealtimeClient(
     additionalCapabilities: Set<String> = emptySet(),
     httpClient: OkHttpClient = defaultHttpClient,
     allowCleartextForLocalTest: Boolean = false,
+    optionalAdvertisedCapabilities: Set<String> = emptySet(),
 ) : ProductionRealtimeSocket {
     private val websocketUrl = normalizeWebSocket(rootUrl, allowCleartextForLocalTest) + "/v1/realtime"
     // Callers normally share their REST client with realtime. REST defaults
@@ -182,16 +343,26 @@ class ProductionRealtimeClient(
         extraBufferCapacity = 4,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
-    // Snapshot the caller's explicit requirements. A mutable Set changing
-    // between reconnects must not silently alter the advertised or required
-    // protocol contract for this client instance.
+    // `additionalCapabilities` remains the source-compatible required set.
+    // Optional capabilities are advertised in Hello but never required in
+    // Welcome. Snapshot both inputs so a mutable caller Set cannot alter the
+    // protocol contract between reconnects.
     private val requiredWelcomeCapabilities = additionalCapabilities.toSet()
-    private val advertisedCapabilities = productionRealtimeCapabilities(requiredWelcomeCapabilities)
+    private val optionalHelloCapabilities = optionalAdvertisedCapabilities.toSet()
+    private val advertisedCapabilities = productionRealtimeCapabilities(
+        required = requiredWelcomeCapabilities,
+        optionalAdvertised = optionalHelloCapabilities,
+    )
+    private val advertisedCapabilitySet = advertisedCapabilities.toSet()
     private val sendLock = Any()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var connectedGeneration: Int = 0
     private var connectedCapabilities: Set<String> = emptySet()
     private var pendingLivenessProbe: PendingLivenessProbe? = null
+
+    private val mutableNegotiatedCapabilities = MutableStateFlow(
+        ProductionRealtimeNegotiatedCapabilities(0, emptySet()),
+    )
 
     private val incomingReceived: Flow<ProductionReceivedEnvelope> = incomingChannel.receiveAsFlow()
     // Compatibility view for transport-level callers that only need the
@@ -204,6 +375,8 @@ class ProductionRealtimeClient(
     override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incomingReceived
     override val receivePressure: StateFlow<ProductionReceivePressure> = mutableReceivePressure.asStateFlow()
     override val state: SharedFlow<RealtimeState> = mutableState.asSharedFlow()
+    override val negotiatedCapabilities: StateFlow<ProductionRealtimeNegotiatedCapabilities> =
+        mutableNegotiatedCapabilities.asStateFlow()
 
     init {
         require(role == "pc" || role == "android") { "role must be pc or android" }
@@ -219,6 +392,7 @@ class ProductionRealtimeClient(
             socket = null
             connectedGeneration = 0
             connectedCapabilities = emptySet()
+            publishNegotiatedCapabilitiesLocked(nextGeneration, emptySet())
         }
         // A new socket can replay from the session ACK. Keep duplicate
         // rejection within one generation, while allowing a durable replay
@@ -257,6 +431,39 @@ class ProductionRealtimeClient(
 
     /** Sends a validated opaque Envelope on the currently connected socket. */
     override fun send(envelope: Envelope): Boolean {
+        val bytes = envelope.toByteArray()
+        return try {
+            sendExact(envelope, bytes)
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
+    /**
+     * Sends the caller-provided protobuf bytes verbatim. Parsing only
+     * authenticates that the bytes describe [envelope]; the WebSocket payload
+     * is built from [exactBytes] itself so unknown fields and field ordering are
+     * preserved for Relay fallback.
+     */
+    override fun sendExact(envelope: Envelope, exactBytes: ByteArray): Boolean {
+        validateOutgoingEnvelope(envelope)
+        require(exactBytes.isNotEmpty() && exactBytes.size <= MAX_FRAME_BYTES) {
+            "exact Envelope bytes must be between 1 and $MAX_FRAME_BYTES bytes"
+        }
+        val parsed = runCatching { Envelope.parseFrom(exactBytes) }.getOrElse { error ->
+            throw IllegalArgumentException("exact Envelope bytes are malformed", error)
+        }
+        require(parsed == envelope) {
+            "exact Envelope bytes do not match the parsed Envelope"
+        }
+        return synchronized(sendLock) {
+            val active = socket
+            if (active == null || connectedGeneration != generation.get()) return@synchronized false
+            active.send(OkioByteString.of(*exactBytes))
+        }
+    }
+
+    private fun validateOutgoingEnvelope(envelope: Envelope) {
         require(envelope.protocolVersion == 1) { "unsupported Envelope protocol version" }
         require(envelope.senderDeviceId.toByteArray().contentEquals(uuidBytes(deviceId))) {
             "Envelope sender does not match this device"
@@ -264,16 +471,6 @@ class ProductionRealtimeClient(
         require(envelope.sessionId.size() == 16) { "Envelope session ID must be 16 bytes" }
         require(envelope.recipientDeviceId.isEmpty || envelope.recipientDeviceId.size() == 16) {
             "Envelope recipient must be empty or 16 bytes"
-        }
-        val bytes = envelope.toByteArray()
-        return try {
-            synchronized(sendLock) {
-                val active = socket
-                if (active == null || connectedGeneration != generation.get()) return false
-                active.send(OkioByteString.of(*bytes))
-            }
-        } finally {
-            bytes.fill(0)
         }
     }
 
@@ -339,10 +536,11 @@ class ProductionRealtimeClient(
     override fun disconnect(reason: String) {
         if (closed.get()) return
         val active = synchronized(sendLock) {
-            generation.incrementAndGet()
+            val retiredGeneration = generation.incrementAndGet()
             cancelPendingLivenessProbeLocked()
             connectedGeneration = 0
             connectedCapabilities = emptySet()
+            publishNegotiatedCapabilitiesLocked(retiredGeneration, emptySet())
             val current = socket
             socket = null
             current
@@ -353,13 +551,14 @@ class ProductionRealtimeClient(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        generation.incrementAndGet()
         synchronized(sendLock) {
+            val retiredGeneration = generation.incrementAndGet()
             cancelPendingLivenessProbeLocked()
             socket?.close(1000, "client closed")
             socket = null
             connectedGeneration = 0
             connectedCapabilities = emptySet()
+            publishNegotiatedCapabilitiesLocked(retiredGeneration, emptySet())
         }
         mutableState.tryEmit(RealtimeState.Closed)
         lastIncomingSequences.clear()
@@ -414,6 +613,7 @@ class ProductionRealtimeClient(
                             welcomed = true
                             connectedGeneration = listenerGeneration
                             connectedCapabilities = negotiated
+                            publishNegotiatedCapabilitiesLocked(listenerGeneration, negotiated)
                             true
                         }
                     }
@@ -449,55 +649,70 @@ class ProductionRealtimeClient(
                 return
             }
             val raw = bytes.toByteArray()
-            val envelope = try {
-                runCatching { Envelope.parseFrom(raw) }.getOrElse {
+            var handedOff = false
+            try {
+                val envelope = runCatching { Envelope.parseFrom(raw) }.getOrElse {
                     logBinaryDrop("socket_envelope_malformed", bytes)
                     return
                 }
-            } finally {
-                raw.fill(0)
-            }
-            if (!validateIncoming(envelope)) {
-                logEnvelopeAdmission("socket_envelope_metadata_rejected", envelope, bytes.size)
-                return
-            }
-            if (!reserveIncoming(raw.size, listenerGeneration)) {
-                droppedApplicationFrames.incrementAndGet()
-                // Publish observed last so it is also a completion watermark
-                // for the admission decision of this serial WebSocket callback.
-                observedApplicationFrames.incrementAndGet()
-                logEnvelopeAdmission(
-                    decision = "socket_reservation_rejected",
-                    envelope = envelope,
-                    wireBytes = raw.size,
-                )
-                failReceiveIntegrity(webSocket, "realtime receive reservation overflow")
-                return
-            }
-            val received = ProductionReceivedEnvelope(
-                envelope = envelope,
-                wireBytes = raw.size,
-                generation = listenerGeneration,
-                releaseReservation = ::releaseIncoming,
-            )
-            val admission = incomingChannel.trySend(received)
-            if (admission.isFailure) {
-                droppedApplicationFrames.incrementAndGet()
-                logEnvelopeAdmission(
-                    decision = if (admission.isClosed) {
-                        "socket_channel_closed"
-                    } else {
-                        "socket_channel_full"
-                    },
-                    envelope = envelope,
-                    wireBytes = raw.size,
-                )
-                received.close()
-                if (!admission.isClosed) {
-                    failReceiveIntegrity(webSocket, "realtime receive channel overflow")
+                if (!validateIncoming(envelope)) {
+                    logEnvelopeAdmission("socket_envelope_metadata_rejected", envelope, bytes.size)
+                    return
                 }
+                if (!reserveIncoming(raw.size, listenerGeneration)) {
+                    droppedApplicationFrames.incrementAndGet()
+                    // Publish observed last so it is also a completion watermark
+                    // for the admission decision of this serial WebSocket callback.
+                    observedApplicationFrames.incrementAndGet()
+                    logEnvelopeAdmission(
+                        decision = "socket_reservation_rejected",
+                        envelope = envelope,
+                        wireBytes = raw.size,
+                    )
+                    failReceiveIntegrity(webSocket, "realtime receive reservation overflow")
+                    return
+                }
+                val received = try {
+                    ProductionReceivedEnvelope(
+                        envelope = envelope,
+                        wireBytes = raw.size,
+                        generation = listenerGeneration,
+                        releaseReservation = ::releaseIncoming,
+                        rawBytes = raw,
+                    ).also { handedOff = true }
+                } catch (error: Throwable) {
+                    releaseIncoming(raw.size)
+                    throw error
+                }
+                val admission = try {
+                    incomingChannel.trySend(received)
+                } catch (error: Throwable) {
+                    received.close()
+                    throw error
+                }
+                if (admission.isFailure) {
+                    droppedApplicationFrames.incrementAndGet()
+                    logEnvelopeAdmission(
+                        decision = if (admission.isClosed) {
+                            "socket_channel_closed"
+                        } else {
+                            "socket_channel_full"
+                        },
+                        envelope = envelope,
+                        wireBytes = raw.size,
+                    )
+                    received.close()
+                    if (!admission.isClosed) {
+                        failReceiveIntegrity(webSocket, "realtime receive channel overflow")
+                    }
+                }
+                observedApplicationFrames.incrementAndGet()
+            } finally {
+                // Once handed off, the owner attached to `received` controls
+                // clearing. Every parse/rejection/exception path still clears
+                // the callback's temporary copy here.
+                if (!handedOff) raw.fill(0)
             }
-            observedApplicationFrames.incrementAndGet()
         }
 
         private fun failReceiveIntegrity(webSocket: WebSocket, reason: String) {
@@ -516,7 +731,12 @@ class ProductionRealtimeClient(
          */
         private fun logBinaryDrop(decision: String, bytes: OkioByteString) {
             val envelope = if (bytes.size <= MAX_FRAME_BYTES) {
-                runCatching { Envelope.parseFrom(bytes.toByteArray()) }.getOrNull()
+                val raw = bytes.toByteArray()
+                try {
+                    runCatching { Envelope.parseFrom(raw) }.getOrNull()
+                } finally {
+                    raw.fill(0)
+                }
             } else {
                 null
             }
@@ -555,7 +775,10 @@ class ProductionRealtimeClient(
                 return
             }
             acceptingBinary = false
-            synchronized(sendLock) { cancelPendingLivenessProbeLocked(listenerGeneration) }
+            synchronized(sendLock) {
+                cancelPendingLivenessProbeLocked(listenerGeneration)
+                retireNegotiatedCapabilitiesLocked(listenerGeneration)
+            }
             val status = response?.code
             val reason = t.message ?: "realtime failed"
             response?.close()
@@ -571,7 +794,10 @@ class ProductionRealtimeClient(
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (!isCurrent(webSocket) || closed.get()) return
             acceptingBinary = false
-            synchronized(sendLock) { cancelPendingLivenessProbeLocked(listenerGeneration) }
+            synchronized(sendLock) {
+                cancelPendingLivenessProbeLocked(listenerGeneration)
+                retireNegotiatedCapabilitiesLocked(listenerGeneration)
+            }
             mutableState.tryEmit(RealtimeState.Failed(reason.ifBlank { "socket closed ($code)" }))
         }
 
@@ -612,16 +838,21 @@ class ProductionRealtimeClient(
                 return@runCatching if (requiredWelcomeCapabilities.isEmpty()) emptySet() else null
             }
             val capabilities = capabilitiesElement as? JsonArray ?: return@runCatching null
-            val negotiated = HashSet<String>(capabilities.size)
+            val serverCapabilities = HashSet<String>(capabilities.size)
             for (element in capabilities) {
                 val primitive = element as? JsonPrimitive ?: return@runCatching null
                 if (!primitive.isString) return@runCatching null
                 val capability = primitive.content
                 if (!REALTIME_CAPABILITY_IDENTIFIER.matches(capability) ||
-                    !negotiated.add(capability)
+                    !serverCapabilities.add(capability)
                 ) return@runCatching null
             }
-            if (negotiated.containsAll(requiredWelcomeCapabilities)) negotiated else null
+            if (!serverCapabilities.containsAll(requiredWelcomeCapabilities)) return@runCatching null
+
+            // A Relay may add future valid identifiers. Preserve the existing
+            // forward-compatible handshake behavior, but only expose values
+            // this client advertised as negotiated capabilities.
+            serverCapabilities.filterTo(linkedSetOf()) { it in advertisedCapabilitySet }.toSet()
         }.getOrNull()
 
         private fun handleLivenessPong(text: String): Boolean = runCatching {
@@ -656,6 +887,23 @@ class ProductionRealtimeClient(
         if (expectedGeneration != null && pending.generation != expectedGeneration) return
         pendingLivenessProbe = null
         pending.completion.complete(false)
+    }
+
+    private fun retireNegotiatedCapabilitiesLocked(expectedGeneration: Int) {
+        if (connectedGeneration != expectedGeneration) return
+        connectedGeneration = 0
+        connectedCapabilities = emptySet()
+        publishNegotiatedCapabilitiesLocked(expectedGeneration, emptySet())
+    }
+
+    private fun publishNegotiatedCapabilitiesLocked(
+        capabilityGeneration: Int,
+        capabilities: Set<String>,
+    ) {
+        mutableNegotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(
+            generation = capabilityGeneration,
+            capabilities = capabilities.toSet(),
+        )
     }
 
     private data class PendingLivenessProbe(

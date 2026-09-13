@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -155,8 +156,22 @@ func TestPositiveInt64FieldAcceptsIntegerDecodedWithUseNumber(t *testing.T) {
 
 func TestValidateDirectSignalWelcomeMatchesProductionMultipairContract(t *testing.T) {
 	valid := []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`)
-	if err := validateDirectSignalWelcome(valid); err != nil {
+	if err := validateDirectSignalWelcome(valid, false); err != nil {
 		t.Fatalf("valid Direct signal welcome rejected: %v", err)
+	}
+	validDataPlane := []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2","direct_transport_data_v1","direct_session_cutover_v1"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`)
+	if err := validateDirectSignalWelcome(validDataPlane, true); err != nil {
+		t.Fatalf("valid Direct data-plane welcome rejected: %v", err)
+	}
+	if err := validateDirectSignalWelcome(validDataPlane, false); err == nil {
+		t.Fatal("data-plane capability was accepted without the explicit acceptance gate")
+	}
+	if err := validateDirectSignalWelcome(valid, true); err == nil {
+		t.Fatal("missing data-plane capability was accepted with the explicit acceptance gate")
+	}
+	legacyDataOnly := []byte(`{"type":"SERVER_WELCOME","protocol_version":1,"capabilities":["direct_transport_shadow_v1","direct_transport_shadow_multipair_v2","direct_transport_data_v1"],"heartbeat_interval_ms":15000,"max_signal_frame_bytes":65536}`)
+	if err := validateDirectSignalWelcome(legacyDataOnly, true); err == nil {
+		t.Fatal("legacy data-only welcome was accepted without session cutover capability")
 	}
 
 	invalid := map[string][]byte{
@@ -169,8 +184,42 @@ func TestValidateDirectSignalWelcomeMatchesProductionMultipairContract(t *testin
 	}
 	for name, value := range invalid {
 		t.Run(name, func(t *testing.T) {
-			if err := validateDirectSignalWelcome(value); err == nil {
+			if err := validateDirectSignalWelcome(value, false); err == nil {
 				t.Fatal("invalid Direct signal welcome accepted")
+			}
+		})
+	}
+}
+
+func TestValidateProductionRealtimeWelcomeRequiresCompleteDirectBundle(t *testing.T) {
+	connectionID := uuid.NewString()
+	base := fmt.Sprintf(
+		`{"type":"welcome","protocol_version":1,"connection_id":%q,"capabilities":["cumulative_ack"]}`,
+		connectionID,
+	)
+	if err := validateProductionRealtimeWelcome([]byte(base), false); err != nil {
+		t.Fatalf("Relay-only Realtime welcome rejected: %v", err)
+	}
+	direct := fmt.Sprintf(
+		`{"type":"welcome","protocol_version":1,"connection_id":%q,"capabilities":["cumulative_ack","direct_transport_data_v1","direct_session_cutover_v1"]}`,
+		connectionID,
+	)
+	if err := validateProductionRealtimeWelcome([]byte(direct), true); err != nil {
+		t.Fatalf("Direct Realtime welcome rejected: %v", err)
+	}
+	for name, raw := range map[string]string{
+		"legacy data only": fmt.Sprintf(
+			`{"type":"welcome","protocol_version":1,"connection_id":%q,"capabilities":["direct_transport_data_v1"]}`,
+			connectionID,
+		),
+		"cutover only": fmt.Sprintf(
+			`{"type":"welcome","protocol_version":1,"connection_id":%q,"capabilities":["direct_session_cutover_v1"]}`,
+			connectionID,
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateProductionRealtimeWelcome([]byte(raw), true); err == nil {
+				t.Fatal("partial Direct capability bundle was accepted")
 			}
 		})
 	}

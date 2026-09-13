@@ -5,6 +5,7 @@ import dev.termlink.product.debug.tailFirstLiveMarker
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.net.URI
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.int
@@ -17,6 +18,22 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TailFirstE2EDebugContractTest {
+    @Test
+    fun directDataPlaneCanRunOnlyInAnIsolatedPrivateNetworkDebugBuild() {
+        if (!BuildConfig.TERMLINK_DIRECT_TRANSPORT_DATA_PLANE) return
+        val host = URI(BuildConfig.TERMLINK_SERVER_URL).host.lowercase()
+        val octets = host.split('.').mapNotNull(String::toIntOrNull)
+        val privateHost = host == "localhost" || host.endsWith(".localhost") || host == "::1" ||
+            octets.size == 4 && octets.all { it in 0..255 } && (
+                octets[0] == 10 || octets[0] == 127 ||
+                    octets[0] == 192 && octets[1] == 168 ||
+                    octets[0] == 172 && octets[1] in 16..31
+                )
+        assertTrue(BuildConfig.TERMLINK_DIRECT_TRANSPORT_SHADOW)
+        assertTrue(privateHost)
+        assertTrue(BuildConfig.APPLICATION_ID != "dev.termlink.harness")
+    }
+
     @Test
     fun liveMarkerIsUniqueAndCannotHardWrapAtTheMinimumTerminalWidth() {
         val runId = "post-upgrade-0.1.37-streamed-20260829-r13-frame-capture-visible"
@@ -40,7 +57,7 @@ class TailFirstE2EDebugContractTest {
         assertTrue(generatedContract.toString().replace('\\', '/').contains("generateDebugTailFirstE2EContract"))
         assertEquals(1, contract.getValue("schema_version").jsonPrimitive.int)
         assertEquals("explicit_broadcast_run_as_file", contract.string("transport"))
-        assertEquals(PACKAGE_NAME, contract.string("package_name"))
+        assertEquals(BuildConfig.APPLICATION_ID, contract.string("package_name"))
         assertEquals(RECEIVER_CLASS, contract.string("receiver_class"))
         assertEquals(ACTION, contract.string("broadcast_action"))
         assertEquals("no_backup/tail-first-e2e/response.json", contract.string("response_relative_path"))
@@ -85,7 +102,6 @@ class TailFirstE2EDebugContractTest {
 
     private companion object {
         const val CONTRACT_ASSET = "termlink-tail-first-e2e-contract-v1.json"
-        const val PACKAGE_NAME = "dev.termlink.harness"
         const val RECEIVER_CLASS = "dev.termlink.product.debug.TailFirstE2EReceiver"
         const val ACTION = "dev.termlink.product.debug.TAIL_FIRST_E2E"
         const val MINIMUM_TERMINAL_COLUMNS = 80

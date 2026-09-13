@@ -157,6 +157,48 @@ namespace TermLink.Agent
         public byte[] DirectPathBinding { get; init; }
     }
 
+    /// <summary>
+    /// Synchronous, one-shot bridge into the ABI v5 promotion call. The V4
+    /// handle is valid only for the duration of <see cref="Invoke"/> while the
+    /// V4 owner lock is held. Implementations must neither retain nor expose it.
+    /// </summary>
+    internal interface IProductionDirectNativePromotionOperationV4
+    {
+        int Invoke(
+            IntPtr transientV4Handle,
+            ref TermLinkDirectCommitNominationV4 nomination);
+    }
+
+    internal readonly struct ProductionDirectNativePromotionResultV4
+    {
+        private ProductionDirectNativePromotionResultV4(
+            ProductionDirectNativeCommandResult commandResult,
+            bool enteredNativeSeam,
+            bool nativeCallCompleted,
+            int nativeStatus)
+        {
+            CommandResult = commandResult;
+            EnteredNativeSeam = enteredNativeSeam;
+            NativeCallCompleted = nativeCallCompleted;
+            NativeStatus = nativeStatus;
+        }
+
+        internal ProductionDirectNativeCommandResult CommandResult { get; }
+        internal bool EnteredNativeSeam { get; }
+        internal bool NativeCallCompleted { get; }
+        internal int NativeStatus { get; }
+
+        internal static ProductionDirectNativePromotionResultV4 NotInvoked(
+            ProductionDirectNativeCommandResult result) => new(result, false, false, 0);
+
+        internal static ProductionDirectNativePromotionResultV4 Completed(int status) =>
+            new(status == 0 ? ProductionDirectNativeCommandResult.Accepted :
+                ProductionDirectNativeCommandResult.RelayFallback, true, true, status);
+
+        internal static ProductionDirectNativePromotionResultV4 Faulted() =>
+            new(ProductionDirectNativeCommandResult.RelayFallback, true, false, 0);
+    }
+
     internal interface IProductionDirectShadowNativeV4 : IDisposable
     {
         ProductionDirectNativeSnapshot Snapshot { get; }
@@ -172,11 +214,25 @@ namespace TermLink.Agent
     }
 
     /// <summary>
+    /// One-shot source for transferring a nominated V4 socket into V5.  The
+    /// implementation keeps the V4 owner lock held for the complete native
+    /// call, so no opaque handle can escape into orchestration code.
+    /// </summary>
+    internal interface IProductionDirectPromotableNativeV4 :
+        IProductionDirectShadowNativeV4
+    {
+        ProductionDirectNativePromotionResultV4 TryPromoteNomination(
+            ProductionDirectCommitRequestV4 request,
+            IProductionDirectNativePromotionOperationV4 operation);
+    }
+
+    /// <summary>
     /// Owned-copy CLR boundary for the independent ABI v4 socket owner. It is
     /// intentionally incapable of observing or replacing Relay/session state.
     /// Every validation failure retires only this Direct handle.
     /// </summary>
-    internal sealed class ProductionDirectNativeBoundaryV4 : IProductionDirectShadowNativeV4
+    internal sealed class ProductionDirectNativeBoundaryV4 :
+        IProductionDirectPromotableNativeV4
     {
         private readonly object sync = new();
         private readonly bool enabled;
@@ -203,6 +259,7 @@ namespace TermLink.Agent
         private bool gatheringComplete;
         private bool planComplete;
         private bool committed;
+        private bool promotionAttempted;
         private bool disposed;
         private ProductionDirectNativeSnapshot snapshot;
 
@@ -350,7 +407,8 @@ namespace TermLink.Agent
                 if (!CanCallLocked()) return ProductionDirectNativeCommandResult.RelayFallback;
                 if (request == null || !Current(request.Epoch, request.AttemptId))
                     return ProductionDirectNativeCommandResult.IgnoredStale;
-                if (committed || !planComplete || request.CheckRoundId != checkRoundId || request.Role != role ||
+                if (committed || promotionAttempted || !planComplete ||
+                    request.CheckRoundId != checkRoundId || request.Role != role ||
                     request.NominationId == Guid.Empty || request.WinningPair == null ||
                     !validatedPairs.TryGetValue(request.WinningPair.Key, out var validated) ||
                     !validated.Equals(request.WinningPair)) return InvalidLocked();
@@ -365,6 +423,76 @@ namespace TermLink.Agent
                 }
                 catch (Exception error) when (error is not OutOfMemoryException) { return PanicLocked(); }
                 finally { ZeroCommit(ref native); }
+            }
+        }
+
+        /// <summary>
+        /// Atomically consumes the current validated V4 attempt into a caller-
+        /// supplied ABI v5 promotion operation. The operation executes while
+        /// this boundary's owner lock is held; cancel, network change, dispose,
+        /// and successor commands therefore linearize entirely before or after
+        /// it. Crossing the operation seam is destructive even when native v5
+        /// rejects or throws: V4 is retired in all cases and cannot be retried.
+        /// </summary>
+        public ProductionDirectNativePromotionResultV4 TryPromoteNomination(
+            ProductionDirectCommitRequestV4 request,
+            IProductionDirectNativePromotionOperationV4 operation)
+        {
+            lock (sync)
+            {
+                if (!CanCallLocked())
+                    return ProductionDirectNativePromotionResultV4.NotInvoked(
+                        ProductionDirectNativeCommandResult.RelayFallback);
+                if (request == null || !Current(request.Epoch, request.AttemptId))
+                    return ProductionDirectNativePromotionResultV4.NotInvoked(
+                        ProductionDirectNativeCommandResult.IgnoredStale);
+                if (operation == null || committed || promotionAttempted || !planComplete ||
+                    request.CheckRoundId != checkRoundId || request.Role != role ||
+                    request.NominationId == Guid.Empty || request.WinningPair == null ||
+                    !validatedPairs.TryGetValue(request.WinningPair.Key, out var validated) ||
+                    !validated.Equals(request.WinningPair))
+                {
+                    InvalidLocked();
+                    return ProductionDirectNativePromotionResultV4.NotInvoked(
+                        ProductionDirectNativeCommandResult.RelayFallback);
+                }
+
+                TermLinkDirectCommitNominationV4 native;
+                try { native = EncodeCommit(request); }
+                catch (Exception error) when (IsInputError(error))
+                {
+                    InvalidLocked();
+                    return ProductionDirectNativePromotionResultV4.NotInvoked(
+                        ProductionDirectNativeCommandResult.RelayFallback);
+                }
+
+                // This assignment is the managed one-shot linearization point.
+                // It intentionally precedes the external call: once the V5
+                // call can observe the V4 socket, no result permits a retry.
+                promotionAttempted = true;
+                try
+                {
+                    var status = operation.Invoke(handle, ref native);
+                    snapshot = RelaySnapshot(status == 0 ? ProductionDirectNativeFault.None :
+                        ProductionDirectNativeFault.WorkerStopped, status == 0 ?
+                        ProductionDirectNativeReason.None : ProductionDirectNativeReason.Internal, false);
+                    return ProductionDirectNativePromotionResultV4.Completed(status);
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    snapshot = RelaySnapshot(ProductionDirectNativeFault.NativePanic,
+                        ProductionDirectNativeReason.Internal, false);
+                    return ProductionDirectNativePromotionResultV4.Faulted();
+                }
+                finally
+                {
+                    // Native V4 either transferred its sole socket or must
+                    // abandon it. Destroying the bridge is safe in both cases
+                    // and guarantees that a failed V5 activation cannot reuse
+                    // the old attempt.
+                    RetireHandleLocked();
+                    ZeroCommit(ref native);
+                }
             }
         }
 
@@ -895,7 +1023,8 @@ namespace TermLink.Agent
         {
             candidateBatchSequence = 0; candidateTotal = 0; pairBatchSequence = 0;
             pairTotal = 0; checkRoundId = Guid.Empty; role = default; gatheringComplete = false;
-            planComplete = false; committed = false; pendingSignatures.Clear(); localCandidates.Clear();
+            planComplete = false; committed = false; promotionAttempted = false;
+            pendingSignatures.Clear(); localCandidates.Clear();
             plannedPairs.Clear(); validatedPairs.Clear();
         }
 
@@ -904,7 +1033,8 @@ namespace TermLink.Agent
             foreach (var pair in values) plannedPairs.Add(pair.Key, pair);
         }
 
-        private bool CanCallLocked() => enabled && !disposed && api != null && handle != IntPtr.Zero;
+        private bool CanCallLocked() => enabled && !disposed && !promotionAttempted &&
+            api != null && handle != IntPtr.Zero;
         private bool Current(ulong valueEpoch, Guid valueAttempt) => valueEpoch == epoch && valueAttempt == attemptId &&
             valueEpoch != 0 && valueAttempt != Guid.Empty;
 

@@ -401,6 +401,36 @@ func (v *Valkey) GetLease(ctx context.Context, sessionID uuid.UUID) (Lease, erro
 	return lease, nil
 }
 
+var isLeaseParticipantActiveScript = redis.NewScript(`
+local current=redis.call('GET',KEYS[1])
+if not current or current~=ARGV[1] then return 0 end
+local clock=redis.call('TIME')
+local now=tonumber(clock[1])*1000+math.floor(tonumber(clock[2])/1000)
+redis.call('ZREMRANGEBYSCORE',KEYS[2],'-inf',now)
+local remaining=redis.call('ZCARD',KEYS[2])
+if remaining==0 then
+  redis.call('DEL',KEYS[1],KEYS[2])
+  return 0
+end
+local score=redis.call('ZSCORE',KEYS[2],ARGV[2])
+if score and tonumber(score)>now then return 1 end
+return 0`)
+
+// IsLeaseParticipantActive atomically verifies the exact lease fence and one
+// participant's independent TTL. It never adds a participant or extends a key.
+func (v *Valkey) IsLeaseParticipantActive(ctx context.Context, lease Lease, deviceID uuid.UUID) (bool, error) {
+	if lease.SessionID == uuid.Nil || lease.HolderDeviceID == uuid.Nil || lease.ID == uuid.Nil || lease.Version < 1 || deviceID == uuid.Nil {
+		return false, errors.New("invalid lease participant query")
+	}
+	value := lease.HolderDeviceID.String() + "|" + lease.ID.String() + "|" + strconv.FormatInt(lease.Version, 10)
+	key := "lease:" + lease.SessionID.String()
+	result, err := isLeaseParticipantActiveScript.Run(ctx, v.Client, []string{key, key + ":participants"}, value, deviceID.String()).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
 func parseLeaseValue(sessionID uuid.UUID, value string) (Lease, error) {
 	parts := strings.Split(value, "|")
 	if len(parts) != 3 {

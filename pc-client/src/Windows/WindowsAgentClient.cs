@@ -95,6 +95,17 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             .ConfigureAwait(false);
     }
 
+    public async ValueTask ConfigureServerAsync(string serverUrl, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(serverUrl))
+            throw new ArgumentException("A server URL is required.", nameof(serverUrl));
+        await SendRequiredAsync(new RegistryRequest
+        {
+            Command = RegistryCommand.ConfigureServer,
+            ServerUrl = serverUrl.Trim()
+        }, 30_000, cancellationToken).ConfigureAwait(false);
+    }
+
     public async ValueTask RetryConnectionAsync(CancellationToken cancellationToken) =>
         await SendRequiredAsync(
             new RegistryRequest { Command = RegistryCommand.RetryProductionConnection },
@@ -674,7 +685,8 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                     MapSessionState(session.Lifecycle),
                     remote?.ViewerCount ?? 0,
                     new DateTimeOffset(DateTime.SpecifyKind(session.LastActivityUtc, DateTimeKind.Utc)),
-                    session.LastSequence);
+                    session.LastSequence,
+                    SessionDataPlaneCarrierContract.ReadFromAgentSummary(remote));
             })
             .OrderByDescending(session => session.LastActivityAt)
             .ToArray();

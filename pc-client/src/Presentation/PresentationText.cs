@@ -1,4 +1,5 @@
 using System.Globalization;
+using TermLink.Pc.Contracts;
 using TermLink.Platform;
 
 namespace TermLink.Presentation;
@@ -74,6 +75,18 @@ public static class PresentationText
         "The account credential expired or was revoked. Sign in again and the Agent will reconnect automatically.");
     public static string SignInAgain => Pick("立即重新登录", "Sign in again now");
     public static string SignInDetail => Pick("登录同一账户后，Android 可以发现并访问这台终端。", "Sign in with the same account so Android can discover this terminal.");
+    public static string ServerUrl => Pick("服务端地址", "Server URL");
+    public static string ServerUrlDetail => Pick(
+        "所有账户、会话和文件请求都会使用此 HTTPS 地址。",
+        "All account, session, and file requests use this HTTPS address.");
+    public static string ServerUrlHint => Pick("https://example.com:8910", "https://example.com:8910");
+    public static string ServerUrlRequired => Pick("请输入服务端地址。", "Enter a server URL.");
+    public static string ServerUrlUnchanged => Pick("服务端地址未更改。", "The server URL is unchanged.");
+    public static string ServerUrlUpdated => Pick("服务端地址已更新，请重新登录账户。", "The server URL was updated. Sign in to the account again.");
+    public static string ConfirmServerChangeTitle => Pick("切换服务端地址？", "Change server URL?");
+    public static string ConfirmServerChangeDetail => Pick(
+        "当前账户凭据和远程同步会被清除，本地会话保持运行；切换后需要重新登录。",
+        "Current account credentials and remote synchronization will be cleared. Local sessions stay open; sign in again after switching.");
     public static string BrowserAccountAuthorization => Pick("使用网页登录或注册", "Sign in or register on the web");
     public static string BrowserAccountAuthorizationDetail => Pick(
         "TermLink 将打开系统浏览器并通过安全回调完成授权。注册策略、邀请码和邮箱验证码均由服务端页面处理。",
@@ -284,6 +297,14 @@ public static class PresentationText
     public static string SessionFaulted => Pick("异常", "Faulted");
     public static string Viewers(int count) => Pick($"{count} 个查看者", $"{count} viewers");
     public static string LastActive(string value) => Pick($"最后活动 {value}", $"Last active {value}");
+    public static string SessionCarrier(SessionDataPlaneCarrier carrier) =>
+        SessionDataPlaneCarrierContract.Normalize(carrier) switch
+        {
+            SessionDataPlaneCarrier.Negotiating => Pick("协商中", "Negotiating"),
+            SessionDataPlaneCarrier.LanDirect => Pick("局域网直连", "LAN direct"),
+            SessionDataPlaneCarrier.NatDirect => Pick("NAT 直连", "NAT direct"),
+            _ => Pick("服务器中转", "Relay"),
+        };
     public static string RelayNotConfigured => Pick("服务器未连接", "Server disconnected");
     public static string RelayConnecting => Pick("正在连接服务器", "Connecting to server");
     public static string RelayConnected => Pick("服务器已连接", "Server connected");

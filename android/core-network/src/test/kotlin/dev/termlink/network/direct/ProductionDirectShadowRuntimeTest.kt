@@ -48,6 +48,23 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionDirectShadowRuntimeTest {
     private val now = 1_900_000_000_000L
+
+    @Test
+    fun peerSelectionIsBoundedRoundRobinAndSkipsIneligiblePeers() {
+        val peers = listOf("first", "second", "third")
+        val first = requireNotNull(selectNextProductionDirectPeer(peers, 0) { it != "third" })
+        val second = requireNotNull(
+            selectNextProductionDirectPeer(peers, first.nextCursor) { it != "third" },
+        )
+        val wrapped = requireNotNull(
+            selectNextProductionDirectPeer(peers, second.nextCursor) { it != "third" },
+        )
+
+        assertEquals("first", first.value)
+        assertEquals("second", second.value)
+        assertEquals("first", wrapped.value)
+        assertEquals(null, selectNextProductionDirectPeer(peers, 2) { false })
+    }
     private val androidId = UUID.fromString("10111213-1415-4617-9819-1a1b1c1d1e1f")
     private val pcId = UUID.fromString("20212223-2425-4627-a829-2a2b2c2d2e2f")
     private val pairwise = ByteArray(32) { (it + 1).toByte() }

@@ -211,7 +211,7 @@ namespace TermLink.Tray
             var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             var bufferRoot = Path.Combine(localData, "TermLink", "Agent");
             var pipeName = TermLinkControlPipe.DefaultName();
-            var serverUrl = ProductionEnrollment.PublicServerUrl;
+            var serverUrl = ProductionEnrollment.ConfiguredServerUrl();
             string statusJson = null;
             var shutdown = false;
             var restart = false;

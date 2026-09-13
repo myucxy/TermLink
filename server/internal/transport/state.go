@@ -51,6 +51,7 @@ type DirectStateStore interface {
 	RemovePresence(context.Context, DirectPresence) (bool, error)
 
 	ConsumeSignalBudget(context.Context, DirectSignalBudgetRequest) (DirectSignalBudgetStatus, error)
+	ResolveSignalResponder(context.Context, DirectSignalRouteRequest) (uuid.UUID, error)
 	AuthorizeAndPublish(context.Context, DirectSignalPublishRequest) (DirectSignalPublishResult, error)
 }
 
@@ -133,11 +134,12 @@ type DirectMailboxRegistration struct {
 }
 
 type DirectPresence struct {
-	AccountID           uuid.UUID
-	DeviceID            uuid.UUID
-	Mailbox             DirectMailbox
-	PeerGeneration      uuid.UUID
-	SupportsMultipairV2 bool
+	AccountID            uuid.UUID
+	DeviceID             uuid.UUID
+	Mailbox              DirectMailbox
+	PeerGeneration       uuid.UUID
+	SupportsMultipairV2  bool
+	SupportsDirectDataV1 bool
 }
 
 func (p DirectPresence) Validate() error {
@@ -166,6 +168,27 @@ const (
 	DirectSignalBudgetStalePresence
 )
 
+// DirectSignalRouteRequest identifies one immutable ticket route. Shared
+// service instances resolve its original responder before consulting the
+// durable current device-key authority; this lookup never advances replay
+// state or extends route lifetime.
+type DirectSignalRouteRequest struct {
+	AccountID    uuid.UUID
+	ConnectionID uuid.UUID
+	SenderID     uuid.UUID
+	RecipientID  uuid.UUID
+	PathEpoch    uint64
+}
+
+func (r DirectSignalRouteRequest) Validate() error {
+	if r.AccountID == uuid.Nil || r.ConnectionID == uuid.Nil || r.ConnectionID.Version() != 4 ||
+		r.SenderID == uuid.Nil || r.RecipientID == uuid.Nil || r.SenderID == r.RecipientID ||
+		r.PathEpoch == 0 || r.PathEpoch > math.MaxInt64 {
+		return ErrDirectStateInvalid
+	}
+	return nil
+}
+
 type DirectSignalPublishRequest struct {
 	AccountID      uuid.UUID
 	ConnectionID   uuid.UUID
@@ -185,7 +208,8 @@ func (r DirectSignalPublishRequest) Validate() error {
 		r.PathEpoch == 0 || r.PathEpoch > math.MaxInt64 || r.SignalSequence == 0 || r.SignalSequence > math.MaxInt64 ||
 		r.SignalType < SignalPathOffer || r.SignalType > SignalNominationResultV2 || r.SentAt.IsZero() ||
 		len(r.Frame) == 0 || len(r.Frame) > MaxSignalBytes ||
-		(r.SignalType > SignalPathClose && !r.Sender.SupportsMultipairV2) {
+		(r.SignalType > SignalPathClose && !r.Sender.SupportsMultipairV2) ||
+		(isDirectDataControlSignal(r.SignalType) && !r.Sender.SupportsDirectDataV1) {
 		return ErrDirectStateInvalid
 	}
 	return r.Sender.Validate()

@@ -5,6 +5,7 @@ members = [
     "crates/termlink-direct-nat",
     "crates/termlink-direct-quic",
     "crates/termlink-direct-path",
+    "crates/termlink-direct-route",
     "crates/termlink-direct-ffi",
 ]
 

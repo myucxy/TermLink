@@ -109,16 +109,19 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
             var subscriberType = runtimeType.GetNestedType("Subscriber", BindingFlags.NonPublic);
             var subscribersField = runtimeType.GetField("subscribers", flags);
             var routesField = runtimeType.GetField("connectionSubscriberRoutes", flags);
+            var hostHistoryRequestsField = runtimeType.GetField("hostHistoryRequests", flags);
             var retireRoute = runtimeType.GetMethod("RetireLocatedSessionRoute", flags);
             Require(subscriberType != null && subscribersField != null &&
-                    routesField != null && retireRoute != null,
+                    routesField != null && hostHistoryRequestsField != null && retireRoute != null,
                 "The production exact-route retirement boundary is unavailable.");
 
             var runtime = RuntimeHelpers.GetUninitializedObject(runtimeType);
             var subscribers = Activator.CreateInstance(subscribersField.FieldType);
             var routes = Activator.CreateInstance(routesField.FieldType);
+            var hostHistoryRequests = Activator.CreateInstance(hostHistoryRequestsField.FieldType);
             subscribersField.SetValue(runtime, subscribers);
             routesField.SetValue(runtime, routes);
+            hostHistoryRequestsField.SetValue(runtime, hostHistoryRequests);
 
             var sender = Guid.NewGuid();
             var firstSession = Guid.NewGuid();
@@ -145,11 +148,12 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 second);
 
             retireRoute.Invoke(runtime, new[] { (object)firstSession, sender, first });
-            Require(!ContainsRoute(routes, firstSession, sender) &&
+            Require(ContainsRoute(routes, firstSession, sender) &&
                     !ContainsSessionSubscriber(subscribers, firstSession, sender) &&
-                    IsAllZero(firstKey) &&
-                    (bool)subscriberType.GetField("Removed", flags).GetValue(first),
-                "The failed production route was not removed and zeroized.");
+                    !IsAllZero(firstKey) &&
+                    !(bool)subscriberType.GetField("Removed", flags).GetValue(first),
+                "The failed active subscription did not detach while retaining its " +
+                "connection-owned exact-ciphertext route.");
             Require(ContainsRoute(routes, secondSession, sender) &&
                     ContainsSessionSubscriber(subscribers, secondSession, sender) &&
                     !IsAllZero(secondKey) &&

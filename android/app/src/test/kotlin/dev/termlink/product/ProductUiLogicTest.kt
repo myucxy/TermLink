@@ -92,6 +92,56 @@ class ProductUiLogicTest {
     }
 
     @Test
+    fun sessionCarrierProjectionUsesExactSessionIdAndDefaultsToRelay() {
+        val session = session(
+            UUID.fromString("00000000-0000-0000-0000-000000000041"),
+            SessionState.RUNNING,
+            Instant.EPOCH,
+        )
+        assertEquals(
+            PcCarrierState.LAN_DIRECT,
+            resolvePcCarrierForSession(session, mapOf(session.id to PcCarrierState.LAN_DIRECT)),
+        )
+        assertEquals(
+            PcCarrierState.RELAY,
+            resolvePcCarrierForSession(session, mapOf(session.pcId to PcCarrierState.NAT_DIRECT)),
+        )
+        assertEquals(
+            PcCarrierState.RELAY,
+            resolvePcCarrierForSession(session, emptyMap()),
+        )
+    }
+
+    @Test
+    fun carrierProjectionDoesNotChangeSessionActionEnablement() {
+        val live = session(
+            UUID.fromString("00000000-0000-0000-0000-000000000042"),
+            SessionState.RUNNING,
+            Instant.EPOCH,
+            online = true,
+        )
+        val deviceId = UUID.fromString("20000000-0000-0000-0000-000000000042")
+        val direct = ProductSnapshot(
+            pcs = listOf(pc(live.pcId, deviceId, online = true)),
+            sessions = listOf(live),
+            pcCarrierStates = mapOf(deviceId to PcCarrierState.NAT_DIRECT),
+            sessionCarrierStates = mapOf(live.id to PcCarrierState.NAT_DIRECT),
+        )
+        val relay = direct.copy(sessionCarrierStates = emptyMap())
+
+        assertEquals(PcCarrierState.NAT_DIRECT, direct.carrierForSession(live))
+        assertEquals(PcCarrierState.RELAY, relay.carrierForSession(live))
+        val actionForCarrier: (PcCarrierState) -> SessionDestructiveAction = {
+            sessionDestructiveAction(live.online)
+        }
+        assertEquals(actionForCarrier(PcCarrierState.RELAY), actionForCarrier(PcCarrierState.NAT_DIRECT))
+        assertEquals(
+            sessionControlRequestEffectKey(true, 7L, live.online, RemoteSessionState.Live(3)),
+            sessionControlRequestEffectKey(true, 7L, live.online, RemoteSessionState.Live(3)),
+        )
+    }
+
+    @Test
     fun deviceSessionActivityUsesOnlyTheSessionOnlineFlag() {
         val pcOnlineSessionOffline = isDeviceSessionActive(sessionOnline = false)
         val pcOfflineSessionOnline = isDeviceSessionActive(sessionOnline = true)

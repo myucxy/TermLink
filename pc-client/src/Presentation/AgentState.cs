@@ -9,6 +9,8 @@ namespace TermLink.Presentation;
 public interface IAgentClient
 {
     ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken);
+    ValueTask ConfigureServerAsync(string serverUrl, CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException("Server URL configuration is unavailable on this platform."));
     ValueTask SetRemoteAccessAsync(bool enabled, CancellationToken cancellationToken);
     ValueTask RetryConnectionAsync(CancellationToken cancellationToken);
     ValueTask StopSessionAsync(Guid sessionId, CancellationToken cancellationToken);

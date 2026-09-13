@@ -178,6 +178,16 @@ try {
         $null = & (Join-Path $projectRoot 'scripts\Build-TerminalCoreNative.ps1') `
             -CargoPath $CargoPath `
             -OutputDirectory $layout
+        $directNativeBuildOutput = @(& (Join-Path $projectRoot 'scripts\Build-DirectCoreNative.ps1') `
+            -CargoPath $CargoPath `
+            -OutputDirectory $layout)
+        $directNativeBuild = @($directNativeBuildOutput | Where-Object {
+            $_ -is [psobject] -and $_.PSObject.Properties['NativeLibrary'] -and
+            $_.PSObject.Properties['Sha256']
+        } | Select-Object -Last 1)
+        Assert-True ($directNativeBuild.Count -eq 1) `
+            'The network-core native build did not return verifiable artifact evidence.'
+        $directNativeBuild = $directNativeBuild[0]
         $projects = @(
             (Join-Path $PSScriptRoot '..\src\Agent\TermLink.Agent.csproj'),
             (Join-Path $PSScriptRoot '..\src\SessionHost\TermLink.SessionHost.csproj'),
@@ -267,6 +277,14 @@ try {
             'The setup is missing the Windows terminal-core managed runtime.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'termlink_terminal_ffi.dll') -PathType Leaf) `
             'The setup is missing the Windows terminal-core native runtime.'
+        $directNativePath = Join-Path $layout 'termlink_direct_ffi.dll'
+        Assert-True (Test-Path -LiteralPath $directNativePath -PathType Leaf) `
+            'The setup is missing the Windows network-core native runtime.'
+        Assert-True ([string]::Equals(
+                (Get-Sha256Hex -Path $directNativePath),
+                [string]$directNativeBuild.Sha256,
+                [StringComparison]::Ordinal)) `
+            'The setup network-core DLL differs from the native artifact built for this release.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'coreclr.dll') -PathType Leaf) `
             'The setup payload is not self-contained.'
         [IO.File]::WriteAllBytes(
@@ -285,7 +303,8 @@ try {
         $ownedBinaries = @(Get-ChildItem -LiteralPath $layout -File |
             Where-Object {
                 $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
-                $_.Name -ceq 'termlink_terminal_ffi.dll'
+                $_.Name -ceq 'termlink_terminal_ffi.dll' -or
+                $_.Name -ceq 'termlink_direct_ffi.dll'
             } | Sort-Object Name)
         Assert-True ($ownedBinaries.Count -ge 4) 'No TermLink binaries were found in the setup payload.'
         foreach ($binary in $ownedBinaries) {
@@ -328,6 +347,7 @@ try {
             SelfContained = $true
             EmbeddedPayload = $true
             SignedPayloadBinaries = $ownedBinaries.Count
+            DirectNativeBuildSha256 = [string]$directNativeBuild.Sha256
             Sha256 = Get-Sha256Hex -Path $resolvedOutput
         }
     }

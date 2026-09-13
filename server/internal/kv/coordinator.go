@@ -45,6 +45,7 @@ type Coordinator interface {
 	ForceRelease(context.Context, uuid.UUID) (Lease, bool, error)
 	ForceReleaseForOperation(context.Context, uuid.UUID, uuid.UUID, string) (Lease, bool, error)
 	GetLease(context.Context, uuid.UUID) (Lease, error)
+	IsLeaseParticipantActive(context.Context, Lease, uuid.UUID) (bool, error)
 	Renew(context.Context, Lease, time.Duration) (Lease, error)
 	RenewForDevice(context.Context, Lease, uuid.UUID, time.Duration) (Lease, error)
 

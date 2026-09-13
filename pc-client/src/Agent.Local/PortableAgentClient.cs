@@ -41,6 +41,10 @@ public sealed class PortableAgentClient : IAgentClient, IAsyncDisposable
     public ValueTask SetRemoteAccessAsync(bool enabled, CancellationToken cancellationToken) =>
         SendEmptyAsync(LocalAgentCommand.SetRemoteAccess, new SetRemoteAccessPayload(enabled), cancellationToken);
 
+    public ValueTask ConfigureServerAsync(string serverUrl, CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException(
+            "Server URL configuration is currently available through the Windows Agent."));
+
     public ValueTask RetryConnectionAsync(CancellationToken cancellationToken) =>
         SendEmptyAsync(LocalAgentCommand.RetryConnection, null, cancellationToken);
 

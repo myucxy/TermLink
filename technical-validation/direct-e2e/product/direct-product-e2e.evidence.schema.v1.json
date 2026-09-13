@@ -1,0 +1,358 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://termlink.dev/schemas/direct-product-e2e-evidence-v1.json",
+  "title": "TermLink Direct product E2E evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "matrix_version",
+    "scope",
+    "outcome",
+    "real_network_test_executed",
+    "started_utc",
+    "completed_utc",
+    "artifacts",
+    "server",
+    "devices",
+    "diagnostics",
+    "fault_adapter",
+    "checks",
+    "scenarios",
+    "failure"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "termlink.direct-product-e2e-evidence" },
+    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+    "matrix_version": { "const": 1 },
+    "scope": { "enum": ["preflight_only", "full_matrix"] },
+    "outcome": { "enum": ["preflight_passed", "product_e2e_passed", "product_e2e_incomplete", "failed"] },
+    "real_network_test_executed": { "type": "boolean" },
+    "started_utc": { "type": "string", "format": "date-time" },
+    "completed_utc": { "type": ["string", "null"], "format": "date-time" },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["android", "windows"],
+      "properties": {
+        "android": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "contract_schema_version", "application_id_sha256", "receiver_class_sha256", "data_plane_acceptance"],
+          "properties": {
+            "sha256": { "$ref": "#/$defs/nullableSha256" },
+            "contract_schema_version": { "type": ["integer", "null"], "minimum": 1 },
+            "application_id_sha256": { "$ref": "#/$defs/nullableSha256" },
+            "receiver_class_sha256": { "$ref": "#/$defs/nullableSha256" },
+            "data_plane_acceptance": { "type": ["boolean", "null"] }
+          }
+        },
+        "windows": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "assembly_configuration", "data_plane_acceptance"],
+          "properties": {
+            "sha256": { "$ref": "#/$defs/nullableSha256" },
+            "assembly_configuration": { "type": ["string", "null"], "maxLength": 32 },
+            "data_plane_acceptance": { "type": ["boolean", "null"] }
+          }
+        }
+      }
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin_sha256", "build_sha256", "acceptance_environment", "direct_transport_enabled", "direct_routing_permitted", "capabilities"],
+      "properties": {
+        "origin_sha256": { "$ref": "#/$defs/sha256" },
+        "build_sha256": { "$ref": "#/$defs/nullableSha256" },
+        "acceptance_environment": { "type": ["boolean", "null"] },
+        "direct_transport_enabled": { "type": ["boolean", "null"] },
+        "direct_routing_permitted": { "type": ["boolean", "null"] },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" }
+        }
+      }
+    },
+    "devices": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "adapter_ready", "hook_ready"],
+        "properties": {
+          "role": { "enum": ["primary_android", "secondary_android"] },
+          "adapter_ready": { "type": "boolean" },
+          "hook_ready": { "type": "boolean" }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["android_required", "windows_required", "android_available", "windows_available"],
+      "properties": {
+        "android_required": { "$ref": "#/$defs/nameSet" },
+        "windows_required": { "$ref": "#/$defs/nameSet" },
+        "android_available": { "$ref": "#/$defs/nameSet" },
+        "windows_available": { "$ref": "#/$defs/nameSet" }
+      }
+    },
+    "fault_adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready", "process_scoped", "cleanup_guaranteed", "isolated_channels", "supported_actions"],
+      "properties": {
+        "ready": { "type": "boolean" },
+        "process_scoped": { "type": "boolean" },
+        "cleanup_guaranteed": { "type": "boolean" },
+        "isolated_channels": { "$ref": "#/$defs/nameSet" },
+        "supported_actions": { "$ref": "#/$defs/nameSet" }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "result"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9_]{1,96}$" },
+          "result": { "enum": ["passed", "failed"] }
+        }
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 10,
+      "items": { "$ref": "#/$defs/scenario" }
+    },
+    "failure": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "stage"],
+          "properties": {
+            "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,96}$" },
+            "stage": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "scope": { "const": "preflight_only" } } },
+      "then": {
+        "properties": {
+          "real_network_test_executed": { "const": false },
+          "outcome": { "enum": ["preflight_passed", "failed"] },
+          "scenarios": {
+            "items": { "properties": { "status": { "const": "not_run" } } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "product_e2e_passed" } } },
+      "then": {
+        "properties": {
+          "scope": { "const": "full_matrix" },
+          "real_network_test_executed": { "const": true },
+          "failure": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "product_e2e_incomplete" } } },
+      "then": {
+        "properties": {
+          "scope": { "const": "full_matrix" },
+          "failure": { "type": "null" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nullableSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "nameSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9_]{1,96}$" }
+    },
+    "appProcessIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "start_time_utc"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1 },
+        "start_time_utc": { "type": "string", "format": "date-time" }
+      }
+    },
+    "processIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "start_time_utc", "image_sha256"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1 },
+        "start_time_utc": { "type": "string", "format": "date-time" },
+        "image_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "device_role",
+        "session_role",
+        "observed_utc",
+        "carrier",
+        "candidate_kinds",
+        "fallback_reason",
+        "path_epoch",
+        "relay_generation",
+        "signalling_generation",
+        "network_generation",
+        "app_process",
+        "agent_process",
+        "session_host_process",
+        "last_received_sequence",
+        "contiguous_applied_sequence",
+        "durable_ack",
+        "transport_receipt_high_watermark",
+        "gap_count",
+        "duplicate_drop_count",
+        "duplicate_apply_count",
+        "digest_conflict_count",
+        "marker_digest",
+        "viewport_digest",
+        "direct_frame_received_count",
+        "direct_frame_sent_count",
+        "direct_receipt_count",
+        "outbox_depth",
+        "queue_depth",
+        "relay_replay_bytes",
+        "relay_replay_count"
+      ],
+      "properties": {
+        "phase": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+        "device_role": { "enum": ["primary_android", "secondary_android"] },
+        "session_role": { "enum": ["primary", "late"] },
+        "observed_utc": { "type": "string", "format": "date-time" },
+        "carrier": { "enum": ["relay", "negotiating", "lan_direct", "nat_direct"] },
+        "candidate_kinds": { "$ref": "#/$defs/nameSet" },
+        "fallback_reason": { "type": "string", "maxLength": 96 },
+        "path_epoch": { "type": "integer", "minimum": 0 },
+        "relay_generation": { "type": "integer", "minimum": 0 },
+        "signalling_generation": { "type": "integer", "minimum": 0 },
+        "network_generation": { "type": "integer", "minimum": 0 },
+        "app_process": { "$ref": "#/$defs/appProcessIdentity" },
+        "agent_process": { "$ref": "#/$defs/processIdentity" },
+        "session_host_process": { "$ref": "#/$defs/processIdentity" },
+        "last_received_sequence": { "type": "integer", "minimum": 0 },
+        "contiguous_applied_sequence": { "type": "integer", "minimum": 0 },
+        "durable_ack": { "type": "integer", "minimum": 0 },
+        "transport_receipt_high_watermark": { "type": "integer", "minimum": 0 },
+        "gap_count": { "type": "integer", "minimum": 0 },
+        "duplicate_drop_count": { "type": "integer", "minimum": 0 },
+        "duplicate_apply_count": { "type": "integer", "minimum": 0 },
+        "digest_conflict_count": { "type": "integer", "minimum": 0 },
+        "marker_digest": { "$ref": "#/$defs/sha256" },
+        "viewport_digest": { "$ref": "#/$defs/sha256" },
+        "direct_frame_received_count": { "type": "integer", "minimum": 0 },
+        "direct_frame_sent_count": { "type": "integer", "minimum": 0 },
+        "direct_receipt_count": { "type": "integer", "minimum": 0 },
+        "outbox_depth": { "type": "integer", "minimum": 0 },
+        "queue_depth": { "type": "integer", "minimum": 0 },
+        "relay_replay_bytes": { "type": "integer", "minimum": 0 },
+        "relay_replay_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "executed",
+        "status",
+        "reason_code",
+        "expected_carrier_sequence",
+        "carrier_sequence",
+        "fault_actions",
+        "fault_actions_executed",
+        "assertions",
+        "samples"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]{1,96}$" },
+        "executed": { "type": "boolean" },
+        "status": { "enum": ["not_run", "passed", "failed", "skipped", "blocked"] },
+        "reason_code": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[A-Z0-9_]{1,96}$" }
+          ]
+        },
+        "expected_carrier_sequence": {
+          "type": "array",
+          "items": { "enum": ["relay", "negotiating", "lan_direct", "nat_direct"] }
+        },
+        "carrier_sequence": {
+          "type": "array",
+          "items": { "enum": ["relay", "negotiating", "lan_direct", "nat_direct"] }
+        },
+        "fault_actions": { "$ref": "#/$defs/nameSet" },
+        "fault_actions_executed": { "$ref": "#/$defs/nameSet" },
+        "assertions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "result"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z0-9_]{1,96}$" },
+              "result": { "enum": ["not_run", "passed", "failed"] }
+            }
+          }
+        },
+        "samples": { "type": "array", "items": { "$ref": "#/$defs/sample" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "passed" } } },
+          "then": {
+            "properties": {
+              "executed": { "const": true },
+              "reason_code": { "type": "null" },
+              "samples": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["not_run", "skipped"] } } },
+          "then": { "properties": { "executed": { "const": false } } }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["skipped", "blocked", "failed"] } } },
+          "then": { "properties": { "reason_code": { "type": "string" } } }
+        }
+      ]
+    }
+  }
+}

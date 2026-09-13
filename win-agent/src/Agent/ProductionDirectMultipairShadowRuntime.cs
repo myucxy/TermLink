@@ -38,6 +38,9 @@ namespace TermLink.Agent
         private readonly Func<TimeSpan, CancellationToken, Task> delay;
         private readonly Func<long> clockMilliseconds;
         private readonly ProductionDirectTransportDiagnostics diagnostics;
+        private readonly IProductionDirectShadowSignaling sharedSignaling;
+        private readonly Func<ProductionDirectDataPromotionHandoff, CancellationToken, Task<bool>>
+            promoteToDataRuntimeAsync;
         private readonly object sync = new();
         private readonly CancellationTokenSource lifetime = new();
         private readonly SemaphoreSlim wake = new(0, 1);
@@ -45,7 +48,10 @@ namespace TermLink.Agent
         private long laneGeneration;
         private Task worker;
         private Attempt active;
+        private PromotionLease currentPromotion;
+        private long promotionGeneration;
         private bool relayConnected;
+        private bool handoffActive;
         private long relayGeneration;
         private long networkGeneration;
         private int disposed;
@@ -64,7 +70,10 @@ namespace TermLink.Agent
             Func<TimeSpan, CancellationToken, Task> delay = null,
             Func<long> clockMilliseconds = null,
             Func<bool> nativeCapability = null,
-            ProductionDirectTransportDiagnostics diagnostics = null)
+            ProductionDirectTransportDiagnostics diagnostics = null,
+            IProductionDirectShadowSignaling sharedSignaling = null,
+            Func<ProductionDirectDataPromotionHandoff, CancellationToken, Task<bool>>
+                promoteToDataRuntimeAsync = null)
         {
             if (localDeviceId == Guid.Empty) throw new ArgumentException("A local device is required.");
             if (!ProductionDirectTransportSignalingClient.ValidKeyId(signalKeyId))
@@ -82,6 +91,15 @@ namespace TermLink.Agent
             this.delay = delay ?? Task.Delay;
             this.clockMilliseconds = clockMilliseconds ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             this.diagnostics = diagnostics;
+            this.sharedSignaling = sharedSignaling;
+            this.promoteToDataRuntimeAsync = promoteToDataRuntimeAsync;
+            if (sharedSignaling != null)
+            {
+                lane = new SignalingLane(++laneGeneration, sharedSignaling, ownsSignaling: false)
+                {
+                    Started = true
+                };
+            }
             snapshot = new ProductionDirectShadowSnapshot
             {
                 State = enabled ? ProductionDirectShadowState.WaitingForRelay : ProductionDirectShadowState.Disabled,
@@ -90,6 +108,23 @@ namespace TermLink.Agent
         }
 
         public ProductionDirectShadowSnapshot Snapshot { get { lock (sync) return snapshot; } }
+
+        /// <summary>
+        /// Feeds pre-promotion signalling from the single process-wide reader.
+        /// In shared mode this runtime never calls Start/ReadSignalsAsync on
+        /// the signalling client and never disposes that shared client.
+        /// </summary>
+        internal bool TryDispatchPrePromotionSignal(TransportSignalEnvelopeV1 envelope)
+        {
+            if (sharedSignaling == null || envelope == null ||
+                Volatile.Read(ref disposed) != 0 ||
+                (int)envelope.SignalType is not (>= 1 and <= 5) and not (>= 11 and <= 14) &&
+                envelope.SignalType != TransportSignalTypeV1.PathClose)
+                return false;
+            SignalingLane current;
+            lock (sync) current = lane;
+            return current?.Incoming.Writer.TryWrite(envelope.Clone()) == true;
+        }
 
         public bool Start()
         {
@@ -117,7 +152,8 @@ namespace TermLink.Agent
                 relayConnected = connected;
                 supervisor.ObserveRelayConnected(connected);
                 if (!connected) current = active;
-                if (!connected && snapshot.State is not ProductionDirectShadowState.Disabled and not ProductionDirectShadowState.Stopped)
+                if (!connected && !handoffActive &&
+                    snapshot.State is not ProductionDirectShadowState.Disabled and not ProductionDirectShadowState.Stopped)
                     PublishLocked(ProductionDirectShadowState.WaitingForRelay, "RELAY_UNAVAILABLE", current);
             }
             if (current != null) Retire(current, "RELAY_UNAVAILABLE", false);
@@ -127,14 +163,25 @@ namespace TermLink.Agent
         public void NotifyNetworkChanged()
         {
             Attempt current;
+            bool promoted;
             lock (sync)
             {
                 networkGeneration = checked(networkGeneration + 1);
                 current = active;
+                promoted = handoffActive;
+                if (current == null && promoted)
+                    InvalidatePromotionLocked(currentPromotion);
                 if (current == null)
                     ObserveDiagnosticsLocked(snapshot.State, "NETWORK_CHANGED", null);
             }
             if (current != null) Retire(current, "NETWORK_CHANGED", true);
+            else if (promoted)
+            {
+                supervisor.NotifyNetworkChanged();
+                Publish(relayConnected ? ProductionDirectShadowState.RelayOnly :
+                    ProductionDirectShadowState.WaitingForRelay, "NETWORK_CHANGED", null);
+                if (relayConnected) Wake();
+            }
         }
 
         private async Task RunAsync(CancellationToken token)
@@ -144,6 +191,7 @@ namespace TermLink.Agent
                 try { await wake.WaitAsync(token).ConfigureAwait(false); }
                 catch (OperationCanceledException) { break; }
                 if (!RelayConnected()) continue;
+                if (HandoffActive()) continue;
                 try { await RunAttemptAsync(token).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
                 catch (Exception error) when (error is not OutOfMemoryException)
@@ -152,7 +200,7 @@ namespace TermLink.Agent
                     if (current != null) Retire(current, "DIRECT_MULTIPAIR_FAILED", false);
                     else Publish(ProductionDirectShadowState.RelayOnly, "DIRECT_MULTIPAIR_FAILED", null);
                 }
-                if (!token.IsCancellationRequested && RelayConnected())
+                if (!token.IsCancellationRequested && RelayConnected() && !HandoffActive())
                 {
                     try { await delay(RetryDelay, token).ConfigureAwait(false); }
                     catch (OperationCanceledException) { break; }
@@ -309,8 +357,14 @@ namespace TermLink.Agent
                     if (!TrySubmitPendingBatches(attempt)) return;
                 }
 
-                if (!TrySubmitPendingBatches(attempt) || !TryCommitPendingNomination(attempt) ||
+                if (!TrySubmitPendingBatches(attempt) ||
+                    !await TryCommitPendingNominationAsync(attempt, token).ConfigureAwait(false) ||
                     !TryComplete(attempt)) return;
+                if (attempt.Promoted)
+                {
+                    CompletePromotionHandoff(attempt);
+                    return;
+                }
                 await delay(TimeSpan.FromMilliseconds(10), token).ConfigureAwait(false);
             }
         }
@@ -635,7 +689,9 @@ namespace TermLink.Agent
             return true;
         }
 
-        private bool TryCommitPendingNomination(Attempt attempt)
+        private async Task<bool> TryCommitPendingNominationAsync(
+            Attempt attempt,
+            CancellationToken token)
         {
             if (attempt.PendingNomination == null || attempt.CommitSubmitted ||
                 !attempt.ValidatedPairs.TryGetValue(attempt.SelectedPair.Key, out var validated)) return true;
@@ -649,7 +705,7 @@ namespace TermLink.Agent
             var proofNonce = RandomNumberGenerator.GetBytes(32);
             try
             {
-                var result = attempt.Native.CommitNomination(new ProductionDirectCommitRequestV4
+                var nomination = new ProductionDirectCommitRequestV4
                 {
                     Epoch = attempt.Epoch, AttemptId = attempt.AttemptId, CheckRoundId = attempt.CheckRoundId,
                     NominationId = attempt.NominationId, WinningPair = attempt.SelectedPair,
@@ -657,7 +713,67 @@ namespace TermLink.Agent
                     PeerCertificateSha256 = attempt.RemoteCertificateSha256,
                     PeerDeviceSigningPublicKey = attempt.Peer.SigningPublicKey,
                     LocalProofNonce = proofNonce, NowMilliseconds = clockMilliseconds()
-                });
+                };
+                if (promoteToDataRuntimeAsync != null)
+                {
+                    if (attempt.Native is not IProductionDirectPromotableNativeV4 promotable)
+                        return Fail(attempt, "DIRECT_PROMOTION_UNAVAILABLE");
+                    PromotionLease lease;
+                    lock (sync)
+                    {
+                        if (disposed != 0 || !ReferenceEquals(active, attempt) ||
+                            relayGeneration < 1 || currentPromotion != null)
+                            return false;
+                        lease = new PromotionLease(++promotionGeneration, attempt);
+                        currentPromotion = lease;
+                    }
+                    using var handoff = new ProductionDirectDataPromotionHandoff(
+                        attempt.Peer.DeviceId,
+                        attempt.ConnectionId,
+                        attempt.Peer.KeyEpoch,
+                        relayGeneration,
+                        attempt.LocalSequence,
+                        attempt.LastRemoteSequence,
+                        attempt.LastRemoteAcknowledgement,
+                        attempt.Peer.PairwiseKey,
+                        signalKeyId,
+                        promotable,
+                        nomination,
+                        identity.Sign,
+                        binding => ObservePromotedReady(lease, binding),
+                        reason => ObservePromotedFailure(lease, reason));
+                    bool promoted;
+                    try
+                    {
+                        promoted = await promoteToDataRuntimeAsync(handoff, token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception error) when (error is not OutOfMemoryException)
+                    {
+                        promoted = false;
+                    }
+                    if (!promoted)
+                    {
+                        lock (sync) InvalidatePromotionLocked(lease);
+                        return Fail(attempt, "DIRECT_PROMOTION_FAILED");
+                    }
+                    IProductionDirectShadowNativeV4 transferred;
+                    lock (sync)
+                    {
+                        if (disposed != 0 || !ReferenceEquals(active, attempt) ||
+                            !ReferenceEquals(currentPromotion, lease) || lease.Retired)
+                            return false;
+                        transferred = attempt.Native;
+                        attempt.Native = null;
+                        attempt.CommitSubmitted = true;
+                        attempt.Promoted = true;
+                    }
+                    try { transferred?.Dispose(); }
+                    catch (Exception error) when (error is not OutOfMemoryException) { }
+                    return true;
+                }
+
+                var result = attempt.Native.CommitNomination(nomination);
                 if (result != ProductionDirectNativeCommandResult.Accepted)
                     return Fail(attempt, "DIRECT_NOMINATION_NATIVE_REJECTED");
                 attempt.CommitSubmitted = true;
@@ -955,6 +1071,8 @@ namespace TermLink.Agent
             {
                 if (!ReferenceEquals(active, attempt)) return;
                 active = null; native = attempt.Native; attempt.Native = null;
+                if (ReferenceEquals(currentPromotion?.Attempt, attempt))
+                    InvalidatePromotionLocked(currentPromotion);
                 PublishLocked(relayConnected ? ProductionDirectShadowState.RelayOnly :
                     ProductionDirectShadowState.WaitingForRelay, reason, attempt);
             }
@@ -964,11 +1082,15 @@ namespace TermLink.Agent
                 else native?.Cancel(attempt.Epoch, attempt.AttemptId);
             }
             catch (Exception error) when (error is not OutOfMemoryException) { }
-            finally { native?.Dispose(); }
-            if (networkChanged) supervisor.NotifyNetworkChanged();
-            else if (!string.Equals(reason, "RELAY_UNAVAILABLE", StringComparison.Ordinal))
-                supervisor.TryFallbackAttempt(attempt.SupervisorToken, reason);
-            attempt.Dispose();
+            try { native?.Dispose(); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+            try
+            {
+                if (networkChanged) supervisor.NotifyNetworkChanged();
+                else if (!string.Equals(reason, "RELAY_UNAVAILABLE", StringComparison.Ordinal))
+                    supervisor.TryFallbackAttempt(attempt.SupervisorToken, reason);
+            }
+            finally { attempt.Dispose(); }
             Wake();
         }
 
@@ -978,7 +1100,15 @@ namespace TermLink.Agent
             lock (sync)
             {
                 if (lane != null && lane.IsTerminal) { stale = lane; lane = null; }
-                if (lane == null) lane = new SignalingLane(++laneGeneration, signalingFactory());
+                if (lane == null)
+                {
+                    if (sharedSignaling != null)
+                        lane = new SignalingLane(++laneGeneration, sharedSignaling,
+                            ownsSignaling: false) { Started = true };
+                    else
+                        lane = new SignalingLane(++laneGeneration, signalingFactory(),
+                            ownsSignaling: true);
+                }
                 result = lane;
             }
             if (stale != null) await stale.DisposeAsync().ConfigureAwait(false);
@@ -1005,6 +1135,98 @@ namespace TermLink.Agent
 
         private bool IsCurrent(Attempt value) { lock (sync) return ReferenceEquals(active, value); }
         private bool RelayConnected() { lock (sync) return relayConnected; }
+        private bool HandoffActive() { lock (sync) return handoffActive; }
+
+        private void CompletePromotionHandoff(Attempt attempt)
+        {
+            string earlyFailure = null;
+            PromotionLease lease;
+            lock (sync)
+            {
+                lease = currentPromotion;
+                if (!ReferenceEquals(active, attempt) || lease == null ||
+                    !ReferenceEquals(lease.Attempt, attempt) || lease.Retired) return;
+                active = null;
+                earlyFailure = lease.FailureReason;
+                handoffActive = string.IsNullOrEmpty(earlyFailure);
+                if (handoffActive)
+                {
+                    lease.HandedOff = true;
+                    PublishLocked(lease.Ready
+                            ? ProductionDirectShadowState.ShadowReadyNotRouted
+                            : ProductionDirectShadowState.Negotiating,
+                        lease.Ready ? string.Empty : "DIRECT_V5_PROMOTED", attempt);
+                }
+                else
+                {
+                    InvalidatePromotionLocked(lease);
+                    PublishLocked(relayConnected ? ProductionDirectShadowState.RelayOnly :
+                        ProductionDirectShadowState.WaitingForRelay,
+                        earlyFailure,
+                        attempt);
+                }
+            }
+            if (!string.IsNullOrEmpty(earlyFailure))
+            {
+                supervisor.TryFallbackAttempt(attempt.SupervisorToken, earlyFailure);
+                if (relayConnected) Wake();
+            }
+            attempt.Dispose();
+        }
+
+        private void ObservePromotedReady(PromotionLease lease, byte[] binding)
+        {
+            try
+            {
+                if (binding?.Length != 32 || IsAllZero(binding))
+                    throw new InvalidDataException("DIRECT_PROMOTED_BINDING_INVALID");
+                lock (sync)
+                {
+                    if (disposed != 0 || lease == null || lease.Retired || lease.Ready ||
+                        !ReferenceEquals(currentPromotion, lease)) return;
+                    supervisor.MarkShadowReady(lease.Attempt.SupervisorToken, binding);
+                    lease.Ready = true;
+                    if (!lease.HandedOff) return;
+                    PublishLocked(ProductionDirectShadowState.ShadowReadyNotRouted,
+                        string.Empty, lease.Attempt);
+                }
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                ObservePromotedFailure(lease, "DIRECT_PROMOTED_READY_FAILED");
+            }
+        }
+
+        private void ObservePromotedFailure(PromotionLease lease, string reason)
+        {
+            string failure;
+            ProductionDirectAttemptToken supervisorToken;
+            lock (sync)
+            {
+                if (disposed != 0 || lease == null || lease.Retired || lease.Ready ||
+                    !ReferenceEquals(currentPromotion, lease)) return;
+                failure = string.IsNullOrWhiteSpace(reason)
+                    ? "DIRECT_PROMOTED_FAILED" : reason;
+                lease.FailureReason = failure;
+                if (!lease.HandedOff) return;
+                supervisorToken = lease.Attempt.SupervisorToken;
+                var attempt = lease.Attempt;
+                InvalidatePromotionLocked(lease);
+                PublishLocked(relayConnected ? ProductionDirectShadowState.RelayOnly :
+                    ProductionDirectShadowState.WaitingForRelay,
+                    failure,
+                    attempt);
+            }
+            supervisor.TryFallbackAttempt(supervisorToken, failure);
+            if (relayConnected) Wake();
+        }
+
+        private void InvalidatePromotionLocked(PromotionLease lease)
+        {
+            if (lease != null) lease.Retired = true;
+            if (ReferenceEquals(currentPromotion, lease)) currentPromotion = null;
+            handoffActive = false;
+        }
         private void Publish(ProductionDirectShadowState state, string reason, Attempt attempt)
         { lock (sync) PublishLocked(state, reason, attempt); }
         private void PublishLocked(ProductionDirectShadowState state, string reason, Attempt attempt)
@@ -1044,7 +1266,11 @@ namespace TermLink.Agent
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
             lifetime.Cancel(); Attempt current; Task running; SignalingLane currentLane;
-            lock (sync) { current = active; running = worker; currentLane = lane; lane = null; }
+            lock (sync)
+            {
+                current = active; running = worker; currentLane = lane; lane = null;
+                if (current == null) InvalidatePromotionLocked(currentPromotion);
+            }
             if (current != null) Retire(current, "STOPPED", false);
             lock (sync) PublishLocked(ProductionDirectShadowState.Stopped, "STOPPED", null);
             if (currentLane != null) await currentLane.DisposeAsync().ConfigureAwait(false);
@@ -1075,12 +1301,30 @@ namespace TermLink.Agent
             public bool Complete { get; }
         }
 
+        private sealed class PromotionLease
+        {
+            internal PromotionLease(long generation, Attempt attempt)
+            {
+                Generation = generation;
+                Attempt = attempt ?? throw new ArgumentNullException(nameof(attempt));
+            }
+            internal long Generation { get; }
+            internal Attempt Attempt { get; }
+            internal bool HandedOff { get; set; }
+            internal bool Ready { get; set; }
+            internal bool Retired { get; set; }
+            internal string FailureReason { get; set; }
+        }
+
         private sealed class SignalingLane : IAsyncDisposable
         {
             private int terminal; private int disposed;
-            public SignalingLane(long generation, IProductionDirectShadowSignaling signaling)
+            private readonly bool ownsSignaling;
+            public SignalingLane(long generation, IProductionDirectShadowSignaling signaling,
+                bool ownsSignaling)
             {
                 Generation = generation; Signaling = signaling ?? throw new ArgumentNullException(nameof(signaling));
+                this.ownsSignaling = ownsSignaling;
                 Incoming = Channel.CreateBounded<TransportSignalEnvelopeV1>(new BoundedChannelOptions(64)
                 { FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = true });
             }
@@ -1094,7 +1338,8 @@ namespace TermLink.Agent
             public async ValueTask DisposeAsync()
             {
                 if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-                MarkTerminal(); Incoming.Writer.TryComplete(); await Signaling.DisposeAsync().ConfigureAwait(false);
+                MarkTerminal(); Incoming.Writer.TryComplete();
+                if (ownsSignaling) await Signaling.DisposeAsync().ConfigureAwait(false);
                 if (Reader != null) { try { await Reader.ConfigureAwait(false); } catch (OperationCanceledException) { } }
                 while (Incoming.Reader.TryRead(out _)) { }
             }
@@ -1176,6 +1421,9 @@ namespace TermLink.Agent
             public bool AckSent { get; set; }
             public bool LocalResultSent { get; set; }
             public bool ShadowReady { get; set; }
+            public bool Promoted { get; set; }
+            public bool PromotionReady { get; set; }
+            public string PromotionFailure { get; set; }
             public void ReleaseSecretsAfterReady()
             {
                 Peer.Dispose();
@@ -1187,12 +1435,22 @@ namespace TermLink.Agent
 
             public void Dispose()
             {
-                Native?.Dispose(); Native = null; Peer.Dispose();
-                Zero(Ticket.WireBytes); Zero(LocalCertificateSha256); Zero(RemoteCertificateSha256);
-                Zero(ConnectivityNonce); Zero(LocalSendProbeKey); Zero(PeerReceiveProbeKey);
-                Zero(LocalPathBinding); Zero(PeerPathBinding);
-                LocalCandidates.Clear(); RemoteCandidates.Clear(); PlannedPairs.Clear(); ValidatedPairs.Clear();
-                PendingBatches.Clear(); WirePairKeys.Clear();
+                var ownedNative = Native;
+                Native = null;
+                try { ownedNative?.Dispose(); }
+                catch (Exception error) when (error is not OutOfMemoryException) { }
+                finally
+                {
+                    try { Peer.Dispose(); }
+                    finally
+                    {
+                        Zero(Ticket.WireBytes); Zero(LocalCertificateSha256); Zero(RemoteCertificateSha256);
+                        Zero(ConnectivityNonce); Zero(LocalSendProbeKey); Zero(PeerReceiveProbeKey);
+                        Zero(LocalPathBinding); Zero(PeerPathBinding);
+                        LocalCandidates.Clear(); RemoteCandidates.Clear(); PlannedPairs.Clear(); ValidatedPairs.Clear();
+                        PendingBatches.Clear(); WirePairKeys.Clear();
+                    }
+                }
             }
             private static void Zero(byte[] value) { if (value != null) CryptographicOperations.ZeroMemory(value); }
         }

@@ -49,11 +49,168 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okio.ByteString as OkioByteString
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
+    @Test
+    fun endpointReservationRetainsExactWireBytesUntilConsumerRelease(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId)
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        endpoint.sendSubscribe(sessionId)
+
+        val canonical = incomingEnvelope(
+            sessionId = sessionId,
+            senderId = UUID.randomUUID(),
+            recipientId = UUID.randomUUID(),
+            sequence = 1,
+        )
+        val exact = byteArrayOf(0x98.toByte(), 0x06, 0x7b) + canonical.toByteArray()
+        val expected = exact.copyOf()
+        val delivered = async {
+            endpoint.receivedEnvelopes.first().also { received ->
+                assertArrayEquals(expected, received.exactBytes)
+            }
+        }
+
+        socket.deliver(
+            ProductionReceivedEnvelope(
+                envelope = Envelope.parseFrom(exact),
+                wireBytes = exact.size,
+                generation = 1,
+                releaseReservation = { socket.releasedReservations.incrementAndGet() },
+                rawBytes = exact,
+            ),
+        )
+        runCurrent()
+
+        val endpointEnvelope = delivered.await()
+        assertArrayEquals(expected, exact)
+        endpointEnvelope.close()
+        assertTrue(exact.all { it == 0.toByte() })
+        assertEquals(1, socket.releasedReservations.get())
+        multiplexer.close()
+    }
+
+    @Test
+    fun endpointExactSendPreservesBytesAndGenerationGate(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val senderId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId)
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        val envelope = Envelope.newBuilder()
+            .setProtocolVersion(1)
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
+            .setSenderDeviceId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(senderId)))
+            .setDirection(Direction.ANDROID_TO_PC)
+            .setMessageType(MessageType.INPUT_EVENT)
+            .setSeq(1)
+            .build()
+        val exact = byteArrayOf(0x98.toByte(), 0x06, 0x7b) + envelope.toByteArray()
+        val parsed = Envelope.parseFrom(exact)
+
+        assertTrue(endpoint.sendExactForConnectedGeneration(parsed, exact, expectedGeneration = 1))
+        assertArrayEquals(exact, socket.sentExactBytes.single())
+        socket.activateGeneration(2)
+        assertTrue(!endpoint.sendExactForConnectedGeneration(parsed, exact, expectedGeneration = 1))
+        assertEquals(1, socket.sentExactBytes.size)
+        multiplexer.close()
+    }
+
+    @Test
+    fun endpointRelayExactBypassesDirectGatewayAndPreservesBytes(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val peerDeviceId = UUID.randomUUID()
+        val senderId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId, peerDeviceId)
+        val directOffers = AtomicInteger(0)
+        val directHandle = multiplexer.installDirectDataGateway(
+            object : ProductionRealtimeDirectDataGateway {
+                override fun offerRelay(
+                    peerDeviceId: UUID,
+                    received: ProductionReceivedEnvelope,
+                ): Boolean = false
+
+                override fun routeEligibleOutbound(
+                    peerDeviceId: UUID,
+                    envelope: Envelope,
+                    exactEnvelopeBytes: ByteArray,
+                    relayFallback: () -> Boolean,
+                ): Boolean {
+                    directOffers.incrementAndGet()
+                    return relayFallback()
+                }
+            },
+        )
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        val envelope = Envelope.newBuilder()
+            .setProtocolVersion(1)
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
+            .setSenderDeviceId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(senderId)))
+            .setRecipientDeviceId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(peerDeviceId)))
+            .setDirection(Direction.ANDROID_TO_PC)
+            .setMessageType(MessageType.INPUT_EVENT)
+            .setSeq(1)
+            .build()
+        val exact = byteArrayOf(0x98.toByte(), 0x06, 0x7b) + envelope.toByteArray()
+        val parsed = Envelope.parseFrom(exact)
+
+        assertTrue(endpoint.sendRelayExact(parsed, exact))
+        assertEquals(0, directOffers.get())
+        assertArrayEquals(exact, socket.sentExactBytes.single())
+
+        directHandle.close()
+        multiplexer.close()
+    }
+
+    @Test
+    fun endpointRelayExactHonorsGenerationAndClosedFences(): Unit = runTest {
+        val socket = FakeSocket()
+        val sessionId = UUID.randomUUID()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = multiplexer.register(sessionId, UUID.randomUUID())
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+
+        val envelope = Envelope.newBuilder()
+            .setProtocolVersion(1)
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId)))
+            .setDirection(Direction.ANDROID_TO_PC)
+            .setMessageType(MessageType.INPUT_EVENT)
+            .setSeq(1)
+            .build()
+        val exact = envelope.toByteArray()
+
+        assertTrue(endpoint.sendRelayExactForConnectedGeneration(envelope, exact, expectedGeneration = 1))
+        socket.activateGeneration(2)
+        assertTrue(!endpoint.sendRelayExactForConnectedGeneration(envelope, exact, expectedGeneration = 1))
+        assertEquals(1, socket.sentExactBytes.size)
+
+        endpoint.close()
+        val closedFailure = runCatching { endpoint.sendRelayExact(envelope, exact) }.exceptionOrNull()
+        assertTrue(closedFailure is IllegalStateException)
+        assertEquals(1, socket.sentExactBytes.size)
+        multiplexer.close()
+    }
+
     @Test
     fun directObserverSeesRelayGenerationWithoutReceivingRelayOwnership(): Unit = runTest {
         val socket = FakeSocket()
@@ -1617,6 +1774,7 @@ class ProductionRealtimeMultiplexerTest {
         @Volatile private var sendEntered: CountDownLatch? = null
         @Volatile private var sendRelease: CountDownLatch? = null
         val sentEnvelopes = CopyOnWriteArrayList<Envelope>()
+        val sentExactBytes = CopyOnWriteArrayList<ByteArray>()
 
         override val receivedEnvelopes = incoming.receiveAsFlow()
         override val receivePressure: StateFlow<ProductionReceivePressure> = mutablePressure
@@ -1661,6 +1819,11 @@ class ProductionRealtimeMultiplexerTest {
             }
             sentEnvelopes += envelope
             return true
+        }
+
+        override fun sendExact(envelope: Envelope, exactBytes: ByteArray): Boolean {
+            sentExactBytes += exactBytes.copyOf()
+            return send(envelope)
         }
 
         override fun supportsLivenessProbe(expectedGeneration: Int): Boolean =

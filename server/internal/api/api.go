@@ -1462,14 +1462,41 @@ func (a *API) getLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 400, "INVALID_SESSION_ID", err)
 		return
 	}
+	senderText := strings.TrimSpace(r.URL.Query().Get("sender_device_id"))
 	permission, err := a.Store.SessionPermission(r.Context(), p.UserID, p.Device.ID, sessionID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	if permission != "MANAGE" {
-		writeError(w, r, 403, "MANAGE_NOT_GRANTED", store.ErrDenied)
+		if senderText != "" {
+			writeError(w, r, http.StatusForbidden, "CONTROL_NOT_GRANTED", store.ErrDenied)
+		} else {
+			writeError(w, r, http.StatusForbidden, "MANAGE_NOT_GRANTED", store.ErrDenied)
+		}
 		return
+	}
+	var senderID uuid.UUID
+	var senderPermission string
+	var policy store.SessionControlPolicy
+	if senderText != "" {
+		var parseErr error
+		senderID, parseErr = uuid.Parse(senderText)
+		if parseErr != nil || senderID == uuid.Nil || senderID.String() != senderText {
+			writeError(w, r, http.StatusBadRequest, "INVALID_DEVICE_ID", errors.New("invalid sender device ID"))
+			return
+		}
+		var permissionErr, policyErr error
+		senderPermission, permissionErr = a.Store.SessionPermission(
+			r.Context(), p.UserID, senderID, sessionID,
+		)
+		policy, policyErr = a.Store.SessionControlPolicy(
+			r.Context(), p.UserID, senderID, sessionID,
+		)
+		if permissionErr != nil || policyErr != nil || !store.IsPCAgentDeviceType(p.Device.Type) || policy.PCDeviceID != p.Device.ID {
+			writeError(w, r, http.StatusForbidden, "CONTROL_NOT_GRANTED", store.ErrDenied)
+			return
+		}
 	}
 	lease, err := a.Valkey.GetLease(r.Context(), sessionID)
 	if errors.Is(err, redis.Nil) {
@@ -1480,8 +1507,46 @@ func (a *API) getLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, 503, "LEASE_UNAVAILABLE", err)
 		return
 	}
+	if senderText != "" {
+		participantActive, participantErr := a.Valkey.IsLeaseParticipantActive(r.Context(), lease, senderID)
+		if participantErr != nil {
+			writeError(w, r, http.StatusServiceUnavailable, "LEASE_UNAVAILABLE", participantErr)
+			return
+		}
+		if !directInputLeaseAuthorized(senderPermission, policy, lease, senderID, participantActive) {
+			writeError(w, r, http.StatusForbidden, "CONTROL_NOT_GRANTED", store.ErrDenied)
+			return
+		}
+		// The shared participant TTL is the cross-instance online authority for
+		// Direct INPUT. Do not require a process-local Relay subscription here:
+		// a healthy committed Direct path must survive a transient Relay socket
+		// disconnect while the exact lease fence and control policy remain valid.
+		// This response is consumed by the authoritative Windows Agent before
+		// a Direct INPUT_EVENT reaches SessionHost. Binding the decision to the
+		// exact sender and policy snapshot preserves the Relay's control-policy
+		// check even though the encrypted Envelope bypasses Relay routing.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_id": lease.SessionID, "holder_device_id": lease.HolderDeviceID,
+			"lease_id": lease.ID, "version": lease.Version, "expires_at": lease.ExpiresAt,
+			"authorized_sender_device_id": senderID,
+			"control_mode":                policy.Mode, "policy_version": policy.PolicyVersion,
+		})
+		return
+	}
 	writeJSON(w, 200, lease)
 }
+
+func directInputLeaseAuthorized(permission string, policy store.SessionControlPolicy, lease kv.Lease, senderID uuid.UUID, participantActive bool) bool {
+	if senderID == uuid.Nil || lease.ID == uuid.Nil || lease.Version < 1 || !time.Now().Before(lease.ExpiresAt) ||
+		(permission != "CONTROL" && permission != "MANAGE") || !policy.Valid() || !participantActive {
+		return false
+	}
+	if policy.Mode == store.ControlModeCollaborative {
+		return true
+	}
+	return lease.HolderDeviceID == senderID
+}
+
 func (a *API) forceReleaseLease(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	sessionID, err := uuid.Parse(r.PathValue("id"))

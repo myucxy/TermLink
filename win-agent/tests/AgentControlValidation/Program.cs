@@ -138,6 +138,29 @@ catch (InvalidDataException)
 }
 Require(!browserAuthorizationAcceptedByV10,
     "Pipe V10 accepted the V11 browser account authorization command.");
+var configureServerRequest = RoundTripRequest(new RegistryRequest
+{
+    Command = RegistryCommand.ConfigureServer,
+    ServerUrl = "https://term.example.test:8910"
+});
+Require(configureServerRequest.Command == RegistryCommand.ConfigureServer &&
+    configureServerRequest.ServerUrl == "https://term.example.test:8910",
+    "Server URL configuration request changed.");
+var configureServerAcceptedByV11 = false;
+try
+{
+    using var legacyConfigureServerStream = new MemoryStream();
+    RegistryControlCodec.WriteRequest(
+        legacyConfigureServerStream,
+        new RegistryRequest { Command = RegistryCommand.ConfigureServer, ServerUrl = "https://term.example.test" },
+        11);
+    configureServerAcceptedByV11 = true;
+}
+catch (InvalidDataException)
+{
+}
+Require(!configureServerAcceptedByV11,
+    "Pipe V11 accepted the V12 server URL configuration command.");
 var commandSettingsRequest = RoundTripRequest(new RegistryRequest
 {
     Command = RegistryCommand.SaveTerminalCommands,
@@ -210,7 +233,8 @@ var response = new RegistryResponse
                 SessionId = sessionId,
                 ViewerCount = 2,
                 ControllerDeviceId = deviceId,
-                LeaseExpiresAtUtc = now.AddMinutes(1)
+                LeaseExpiresAtUtc = now.AddMinutes(1),
+                Carrier = ProductionSessionCarrier.LanDirect
             }
         },
         TerminalCommands = new List<ProductionTerminalCommandSummary>
@@ -261,7 +285,10 @@ Require(decoded.Production.TerminalCommands.Count == 1 &&
     decoded.Production.TerminalCommands[0].RunAsAdministrator,
     "V9 terminal-command settings changed.");
 Require(decoded.Production.Devices.Count == 1 && decoded.Production.Devices[0].DeviceId == deviceId, "Device summary changed.");
-Require(decoded.Production.Sessions.Count == 1 && decoded.Production.Sessions[0].ControllerDeviceId == deviceId, "Production session changed.");
+Require(decoded.Production.Sessions.Count == 1 &&
+    decoded.Production.Sessions[0].ControllerDeviceId == deviceId &&
+    decoded.Production.Sessions[0].Carrier == ProductionSessionCarrier.LanDirect,
+    "Production session or its authoritative carrier changed.");
 Require(decoded.Production.PairingChallenge != null &&
     decoded.Production.PairingChallenge.Code == "123456" &&
     decoded.Production.PairingChallenge.Permission == "CONTROL" &&
@@ -277,6 +304,10 @@ Require(defaultProduction.Production.RelayState == ProductionRelayState.NotConfi
 Require(defaultProduction.Production.Devices.Count == 0 && defaultProduction.Production.Sessions.Count == 0, "Default production collections changed.");
 Require(string.IsNullOrEmpty(defaultProduction.Production.ServerOrigin), "Default production status exposed a Server origin.");
 Require(!defaultProduction.Production.TerminalSnapshotEnabled, "Default production status enabled Terminal Snapshot.");
+Require(ProductionSessionCarrier.Normalize("nat_direct") == ProductionSessionCarrier.NatDirect &&
+    ProductionSessionCarrier.Normalize("unexpected") == ProductionSessionCarrier.Relay &&
+    ProductionSessionCarrier.Normalize(null) == ProductionSessionCarrier.Relay,
+    "Unknown carrier values did not fail closed to Relay.");
 
 using (var legacyRequestStream = new MemoryStream())
 {
@@ -360,7 +391,7 @@ using (var legacyV9ResponseStream = new MemoryStream())
         "Pipe V9 response synthesized an account nickname.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V11 browser authorization, V10 account identity, and V9/V8/V7/V6/V5 compatibility validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V12 carrier status, V11 browser authorization, V10 account identity, and V9/V8/V7/V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {

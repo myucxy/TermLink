@@ -479,6 +479,7 @@ namespace TermLink.Agent
         private const string ConfigFileName = "production-config.json";
         private const string CredentialsFileName = "production-credentials.dpapi";
         private const string IdentityStoreFileName = "production-identities.dpapi";
+        private const string ServerUrlFileName = "server-url.txt";
 
         internal static string ConfigPath
         {
@@ -493,6 +494,42 @@ namespace TermLink.Agent
         internal static string IdentityStorePath
         {
             get { return GetKnownFilePath(ResolveLocalApplicationDataRoot(), IdentityStoreFileName); }
+        }
+
+        internal static string ServerUrlPath
+        {
+            get { return GetKnownFilePath(ResolveLocalApplicationDataRoot(), ServerUrlFileName); }
+        }
+
+        internal static string LoadServerUrl()
+        {
+            try
+            {
+                var value = File.Exists(ServerUrlPath)
+                    ? File.ReadAllText(ServerUrlPath, Encoding.UTF8)
+                    : null;
+                return string.IsNullOrWhiteSpace(value)
+                    ? ProductionEnrollment.PublicServerUrl
+                    : ProductionEnrollment.NormalizeServerOrigin(value);
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException ||
+                error is InvalidDataException || error is ArgumentException || error is UriFormatException)
+            {
+                return ProductionEnrollment.PublicServerUrl;
+            }
+        }
+
+        internal static void SaveServerUrl(string value)
+        {
+            var normalized = ProductionEnrollment.NormalizeServerOrigin(value);
+            var bytes = Encoding.UTF8.GetBytes(normalized + Environment.NewLine);
+            try
+            {
+                var path = ServerUrlPath;
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                InputDeduplicator.AtomicWrite(path, bytes);
+            }
+            finally { CryptographicOperations.ZeroMemory(bytes); }
         }
 
         internal static void ForgetLocalAccount()

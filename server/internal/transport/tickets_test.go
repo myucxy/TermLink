@@ -29,6 +29,9 @@ type memoryDevicePair struct{ account, first, second uuid.UUID }
 
 func (r *memoryDeviceResolver) GetDevice(_ context.Context, accountID, deviceID uuid.UUID) (store.DeviceRecord, error) {
 	if item, ok := r.devices[accountID][deviceID]; ok {
+		if item.KeyID == "" {
+			item.KeyID = "pair-key"
+		}
 		return item, nil
 	}
 	return store.DeviceRecord{}, store.ErrNotFound
@@ -38,7 +41,7 @@ func (r *memoryDeviceResolver) AllocateDirectTransportEpoch(
 	ctx context.Context,
 	accountID, sourceDeviceID, targetDeviceID uuid.UUID,
 ) (uint64, error) {
-	if err := r.AuthorizeDirectTransportPair(ctx, accountID, sourceDeviceID, targetDeviceID); err != nil {
+	if _, err := r.AuthorizeDirectTransportSignal(ctx, accountID, sourceDeviceID, targetDeviceID, targetDeviceID); err != nil {
 		return 0, err
 	}
 	first, second := sourceDeviceID, targetDeviceID
@@ -55,19 +58,25 @@ func (r *memoryDeviceResolver) AllocateDirectTransportEpoch(
 	return r.epochs[pair], nil
 }
 
-func (r *memoryDeviceResolver) AuthorizeDirectTransportPair(
+func (r *memoryDeviceResolver) AuthorizeDirectTransportSignal(
 	ctx context.Context,
-	accountID, sourceDeviceID, targetDeviceID uuid.UUID,
-) error {
+	accountID, sourceDeviceID, targetDeviceID, responderDeviceID uuid.UUID,
+) (string, error) {
 	source, sourceErr := r.GetDevice(ctx, accountID, sourceDeviceID)
 	target, targetErr := r.GetDevice(ctx, accountID, targetDeviceID)
 	if sourceErr != nil || targetErr != nil || sourceDeviceID == targetDeviceID ||
 		source.TrustState != "TRUSTED" || source.RevokedAt != nil ||
 		target.TrustState != "TRUSTED" || target.RevokedAt != nil ||
 		!complementaryDeviceTypes(source.Type, target.Type) {
-		return store.ErrDenied
+		return "", store.ErrDenied
 	}
-	return nil
+	if responderDeviceID == sourceDeviceID {
+		return source.KeyID, nil
+	}
+	if responderDeviceID == targetDeviceID {
+		return target.KeyID, nil
+	}
+	return "", store.ErrDenied
 }
 
 func TestTicketIssueBindsPairAndRejectsReplayCrossAccountAndRevocation(t *testing.T) {
@@ -272,6 +281,115 @@ func TestSignalAuthorizationEnforcesExpirySequenceAndCandidateEventBudget(t *tes
 	}
 }
 
+func TestSignalAuthorizationBindsBothDirectionsToCurrentResponderKeyID(t *testing.T) {
+	account, pc, android := uuid.New(), uuid.New(), uuid.New()
+	const pcKey = "pc-current-key"
+	const androidKey = "android-current-key"
+	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{account: {
+		pc:      {ID: pc, Type: "PC_AGENT", TrustState: "TRUSTED", KeyID: pcKey},
+		android: {ID: android, Type: "ANDROID", TrustState: "TRUSTED", KeyID: androidKey},
+	}}}
+	service := testTicketService(t, resolver)
+	connection := uuid.New()
+	pcPrincipal := testPrincipal(account, pc, "PC_AGENT")
+	androidPrincipal := testPrincipal(account, android, "ANDROID")
+	if _, err := service.Issue(context.Background(), pcPrincipal, android, connection); err != nil {
+		t.Fatal(err)
+	}
+	epoch := service.connections[connectionKey{accountID: account, connection: connection}].pathEpoch
+
+	pcToAndroid, err := UnmarshalSignal(testSignalFrame(connection, pc, android, epoch, 1, SignalPathOffer, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pcToAndroid.KeyID = []byte(pcKey)
+	if err := service.AuthorizeSignal(context.Background(), pcPrincipal, pcToAndroid); !errors.Is(err, ErrTransportDenied) {
+		t.Fatalf("initiator key error=%v, want responder-key denial", err)
+	}
+	pcToAndroid.KeyID = []byte(androidKey)
+	if err := service.AuthorizeSignal(context.Background(), pcPrincipal, pcToAndroid); err != nil {
+		t.Fatalf("responder key after rejected same sequence: %v", err)
+	}
+
+	androidToPC, err := UnmarshalSignal(testSignalFrame(connection, android, pc, epoch, 1, SignalPathAnswer, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	androidToPC.KeyID = []byte(pcKey)
+	if err := service.AuthorizeSignal(context.Background(), androidPrincipal, androidToPC); !errors.Is(err, ErrTransportDenied) {
+		t.Fatalf("reverse direction recipient key error=%v, want original responder-key denial", err)
+	}
+	androidToPC.KeyID = []byte(androidKey)
+	if err := service.AuthorizeSignal(context.Background(), androidPrincipal, androidToPC); err != nil {
+		t.Fatalf("reverse direction responder key: %v", err)
+	}
+
+	rotated := resolver.devices[account][android]
+	rotated.KeyID = "android-rotated-key"
+	resolver.devices[account][android] = rotated
+	next, err := UnmarshalSignal(testSignalFrame(connection, pc, android, epoch, 2, SignalCandidateUpdate, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.KeyID = []byte(androidKey)
+	if err := service.AuthorizeSignal(context.Background(), pcPrincipal, next); !errors.Is(err, ErrTransportDenied) {
+		t.Fatalf("stale responder key error=%v, want denial", err)
+	}
+	next.KeyID = []byte(rotated.KeyID)
+	if err := service.AuthorizeSignal(context.Background(), pcPrincipal, next); err != nil {
+		t.Fatalf("rotated responder key after rejected same sequence: %v", err)
+	}
+}
+
+func TestSignalAuthorizationRequiresProductionGateForCutoverControl(t *testing.T) {
+	account, pc, android := uuid.New(), uuid.New(), uuid.New()
+	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{account: {
+		pc: {ID: pc, Type: "PC_AGENT", TrustState: "TRUSTED"}, android: {ID: android, Type: "ANDROID", TrustState: "TRUSTED"},
+	}}}
+	principal := testPrincipal(account, pc, "PC_AGENT")
+
+	for _, permitted := range []bool{false, true} {
+		name := "disabled"
+		if permitted {
+			name = "enabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			service, err := NewRouteTicketServiceWithRouting(
+				resolver, make([]byte, ed25519.SeedSize), permitted,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection := uuid.New()
+			if _, err := service.Issue(context.Background(), principal, android, connection); err != nil {
+				t.Fatal(err)
+			}
+			epoch := service.connections[connectionKey{accountID: account, connection: connection}].pathEpoch
+			for index, signalType := range []SignalType{
+				SignalCutoverProposal, SignalCutoverAccept, SignalCutoverCommit, SignalFallback,
+			} {
+				sequence := uint64(index + 1)
+				if !permitted {
+					sequence = 1
+				}
+				envelope, parseErr := UnmarshalSignal(
+					testSignalFrame(connection, pc, android, epoch, sequence, signalType, 32),
+				)
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				authorizeErr := service.AuthorizeSignal(context.Background(), principal, envelope)
+				if permitted && authorizeErr != nil {
+					t.Fatalf("signal %d rejected with gate enabled: %v", signalType, authorizeErr)
+				}
+				if !permitted && !errors.Is(authorizeErr, ErrTransportDenied) {
+					t.Fatalf("signal %d error=%v, want gate denial", signalType, authorizeErr)
+				}
+			}
+		})
+	}
+}
+
 func TestIsNextSignalSequenceBoundaries(t *testing.T) {
 	maximum := uint64(math.MaxInt64)
 	for _, test := range []struct {
@@ -321,6 +439,25 @@ func TestEnabledConfigUsesOnlyPinnedConfiguredSTUNServers(t *testing.T) {
 	}
 }
 
+func TestEnabledConfigAdvertisesProductionDataOnlyWhenExplicitlyPermitted(t *testing.T) {
+	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{}}
+	service, err := NewRouteTicketServiceWithRouting(
+		resolver, make([]byte, ed25519.SeedSize), true, "stun:one.test:3478",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := service.EnabledConfig(service.stunServers)
+	if !config.DirectRoutingPermitted || !service.DirectRoutingPermitted() {
+		t.Fatal("explicit production routing gate was not advertised")
+	}
+	if len(config.Capabilities) != 5 ||
+		config.Capabilities[3] != "direct_transport_data_v1" ||
+		config.Capabilities[4] != "direct_session_cutover_v1" {
+		t.Fatalf("production direct capabilities=%v", config.Capabilities)
+	}
+}
+
 func TestConfigHandlerReturnsConfiguredSTUNAllowlist(t *testing.T) {
 	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{}}
 	service, err := NewRouteTicketService(resolver, make([]byte, ed25519.SeedSize), "stun:one.test:3478")
@@ -364,8 +501,14 @@ func TestSignalAuthorizationRechecksBothDeviceTrustStates(t *testing.T) {
 }
 
 func testTicketService(t *testing.T, resolver TransportAuthority) *RouteTicketService {
+	return testTicketServiceWithRouting(t, resolver, false)
+}
+
+func testTicketServiceWithRouting(t *testing.T, resolver TransportAuthority, directRoutingPermitted bool) *RouteTicketService {
 	t.Helper()
-	service, err := NewRouteTicketService(resolver, make([]byte, ed25519.SeedSize))
+	service, err := NewRouteTicketServiceWithRouting(
+		resolver, make([]byte, ed25519.SeedSize), directRoutingPermitted,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

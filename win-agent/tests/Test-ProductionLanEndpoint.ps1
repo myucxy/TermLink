@@ -423,23 +423,34 @@ try {
         $controller.Dispose()
     }
 
-    $trayProgramText = Get-Content -Raw -LiteralPath $trayProgramSource
-    Assert-True ($trayProgramText.Contains(
-        'ProductionEnrollment.LoginDirect(options.ServerUrl,',
-        [StringComparison]::Ordinal)) 'Tray login does not use the selected Server URL.'
-    Assert-True ($trayProgramText.Contains(
-        'ProductionEnrollment.RegisterDirect(options.ServerUrl,',
-        [StringComparison]::Ordinal)) 'Tray registration does not use the selected Server URL.'
-    Assert-True ($trayProgramText.Contains(
-        'ProductionEnrollment.LinkAccount(options.ServerUrl, normalizedPcName);',
-        [StringComparison]::Ordinal)) 'Tray browser linking is not hosted in the UI process.'
+    $trayApplicationText = Get-Content -Raw -LiteralPath $trayApplicationSource
+    Assert-True ($trayApplicationText.Contains(
+        'controller.LoginAccount(dialog.Username, dialog.Password, dialog.PcName)',
+        [StringComparison]::Ordinal)) 'Tray login is not routed through Agent Control.'
+    Assert-True ($trayApplicationText.Contains(
+        'controller.RegisterAccount(dialog.Username, dialog.Email, dialog.Password, dialog.Confirm, dialog.PcName)',
+        [StringComparison]::Ordinal)) 'Tray registration is not routed through Agent Control.'
     $productionRuntimeText = Get-Content -Raw -LiteralPath $productionRuntimeSource
     $sessionRegistryText = Get-Content -Raw -LiteralPath $sessionRegistrySource
-    Assert-True ($productionRuntimeText.Contains(
-        'reconnectSignal.WaitAsync(slice, token)',
+    Assert-True ($sessionRegistryText.Contains(
+        'ProductionEnrollment.LoginDirect(',
         [StringComparison]::Ordinal) -and
         $sessionRegistryText.Contains(
-            'productionRuntime.RequestReconnect();',
+            'ProductionEnrollment.ConfiguredServerUrl()',
+            [StringComparison]::Ordinal)) `
+        'Agent login does not use the configured Server URL.'
+    Assert-True ($sessionRegistryText.Contains(
+        'ProductionEnrollment.RegisterDirect(',
+        [StringComparison]::Ordinal) -and
+        $sessionRegistryText.Contains(
+            'ProductionEnrollment.ConfiguredServerUrl()',
+            [StringComparison]::Ordinal)) `
+        'Agent registration does not use the configured Server URL.'
+    Assert-True ($productionRuntimeText.Contains(
+        'connectionSupervisor.WaitForRetryOrResumeAsync(',
+        [StringComparison]::Ordinal) -and
+        $sessionRegistryText.Contains(
+            'retryRuntime.RequestReconnect();',
             [StringComparison]::Ordinal)) `
         'Immediate reconnect no longer interrupts the bounded retry delay.'
 
@@ -481,7 +492,7 @@ try {
         HostnameMismatchRejected = $true
         InvalidOriginsRejected = $true
         LinkAccountOriginPassed = $true
-        LoginAndRegistrationUseOverride = $true
+        LoginAndRegistrationUseConfiguredAgentUrl = $true
         DialogsDisplayOverride = $true
     } | Format-List
     Write-Output 'Production LAN HTTPS endpoint and Tray propagation validation passed.'

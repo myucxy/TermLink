@@ -60,6 +60,50 @@ that read-only volume. Relay remains the authoritative connection and startup
 path, and Direct still cannot carry terminal input, output, ACK, History,
 Snapshot, or Session lifecycle traffic.
 
+After both clients have been built with their separate Direct-acceptance gates,
+the disposable environment can advertise the data-plane capability with an
+additional explicit switch:
+
+```powershell
+.\server\ops\Start-ProductionAcceptance.ps1 `
+  -SingleNode `
+  -EnableDirectDataPlane
+```
+
+`-EnableDirectDataPlane` is rejected unless Direct transport is already part of
+the selected acceptance topology. Omitting it forcibly resets both supported
+acceptance routing variables to `false`, even if the invoking shell contains a
+stale value. This switch is for the isolated cross-device fault matrix only; it
+does not change the production deployment default.
+
+The same explicit switch adds the server's Direct product acceptance metadata
+route at `GET /v1/acceptance/direct-metadata`. The route is absent (HTTP 404)
+from normal production and ordinary acceptance runs; enabling Direct transport
+or Direct routing by itself does not expose it. Its bounded, non-cacheable JSON
+contains only the schema/kind, the exact acceptance public origin, the running
+server image's content-addressed SHA-256, the two effective Direct gates, and
+the corresponding capability names. The start script obtains that SHA-256
+from Docker's inspected image ID and verifies the running container still uses
+the same image. It never hashes the executable, checkout, or source directory.
+Invalid origin or digest input fails server startup while this isolated route
+is enabled.
+
+For a source-built embedded-identity run, Compose must resolve its file-backed
+secret declarations before it can execute that image-only prebuild. The start
+script therefore exports the managed secret *paths* immediately after deriving
+them; those path strings contain no secret material and the referenced files
+need not exist for the build. Reset validation still runs before any managed
+secret directory is removed, and secret generation plus permission hardening
+remain in the later initialization phase.
+
+`TERMLINK_DIRECT_PRODUCT_E2E_METADATA_ENABLED` and
+`TERMLINK_DIRECT_PRODUCT_E2E_BUILD_SHA256` are wired only by the
+`acceptance.direct-product-e2e-metadata.compose.yml` overlay selected by this
+switch. They are not supported production deployment settings. The endpoint
+must be requested without a query string and is intended only as the
+`ServerAcceptanceMetadataUri` identity/feature proof for the real Direct
+product E2E harness; it is not a health or readiness endpoint.
+
 1. register a Windows PC device and an Android device with access tokens carrying the same OIDC subject;
 2. let Android discover the PC and its managed session immediately, without pairing, self-trust confirmation, or a per-PC Grant;
 3. open both Realtime roles, route opaque production Protobuf Envelopes, and acquire a short-lived control lease before sending input;
@@ -206,6 +250,26 @@ the LAN injection and use the public origin `https://termlink.kget.cc:8910`.
 公网 Origin。配置好测试设备的 CA 信任后，安装生成的
 `android/app/build/outputs/apk/debug/app-debug.apk`；after configuring CA trust
 on the test device, install that generated APK.
+
+When the single-node acceptance server remains behind the existing public TLS
+ingress, an isolated Direct data-plane Debug build must repeat the exact public
+origin as an explicit acknowledgement. Release builds still ignore every one
+of these inputs and keep Direct disabled:
+
+```powershell
+cd android
+.\gradlew.bat :app:assembleDebug `
+  -PtermlinkServerUrl=https://termlink.kget.cc:8910 `
+  -PtermlinkPublicDirectAcceptanceOrigin=https://termlink.kget.cc:8910 `
+  -PtermlinkEnableDirectTransportShadow=true `
+  -PtermlinkEnableDirectTransportDataPlane=true `
+  -PtermlinkDebugApplicationIdSuffix=directtest
+cd ..
+```
+
+当单机验收服务继续使用现有公网 TLS 入口时，Direct 数据面 Debug 包必须再次提供完全
+相同的公网 Origin 作为显式确认，并使用独立包名。Release 构建会忽略这些输入，Direct
+仍保持关闭。
 
 ### 4. Point Windows at the LAN origin / 配置 Windows LAN Origin
 

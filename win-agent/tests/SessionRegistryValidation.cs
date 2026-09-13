@@ -43,6 +43,7 @@ namespace TermLink.Agent
                 ValidateLocalIpcCapabilities();
                 ValidateBoundedLargeBuffer(Path.Combine(bufferRoot, "bounded-large-buffer"));
                 ValidateRemoteControlDispatch();
+                ValidateRemoteInputReplayDurability(Path.Combine(bufferRoot, "remote-input-replay"));
                 ValidateActiveCapacityAccounting();
                 ValidateCompletedHistoryCapacity(
                     hostExecutable,
@@ -505,6 +506,10 @@ namespace TermLink.Agent
                 Require(session.RemoteInputId == inputId && session.RemoteInputEpoch == 17 &&
                     session.RemoteInputBytes.SequenceEqual(inputBytes),
                     "Registry changed the remote input request.");
+                Require(registry.DispatchRemoteInput(sessionId, inputId, 17, inputBytes) ==
+                        RemoteInputDispatchOutcome.Duplicate &&
+                    session.RemoteInputDispatchCount == 1,
+                    "A byte-identical Direct/Relay input duplicate was dispatched twice.");
                 Require(registry.TrySendRemoteInputRejection(
                         sessionId,
                         inputId,
@@ -514,6 +519,74 @@ namespace TermLink.Agent
                     session.RejectedInputResult == LocalRemoteInputResult.ControlLeaseRejected,
                     "Registry changed the ordered remote input rejection.");
             }
+        }
+
+        private static void ValidateRemoteInputReplayDurability(string directory)
+        {
+            Directory.CreateDirectory(directory);
+            var sessionId = Guid.NewGuid();
+            var senderDeviceId = Guid.NewGuid();
+            var inputId = Guid.NewGuid();
+            var digest = new byte[32];
+            for (var index = 0; index < digest.Length; index++) digest[index] = checked((byte)(index + 1));
+            using (var dedupe = new InputDeduplicator(directory, sessionId))
+            {
+                Require(dedupe.TryAccept(inputId, senderDeviceId, digest),
+                    "Remote input replay fixture did not persist the first authenticated fence.");
+                Require(!dedupe.TryAccept(inputId, senderDeviceId, digest),
+                    "A pending duplicate input fence was accepted twice.");
+                Guid loadedSender;
+                byte[] loadedDigest;
+                Require(dedupe.TryGetIdentity(inputId, out loadedSender, out loadedDigest) &&
+                    loadedSender == senderDeviceId && loadedDigest != null &&
+                    loadedDigest.SequenceEqual(digest),
+                    "The pending input fence did not retain its authenticated sender and digest.");
+                if (loadedDigest != null) Array.Clear(loadedDigest, 0, loadedDigest.Length);
+            }
+
+            var resultFrame = new LocalFrame(
+                LocalFrameType.RemoteInputResult,
+                sessionId,
+                37,
+                LocalPayloadCodec.RemoteInputResult(
+                    inputId,
+                    LocalRemoteInputResult.Accepted));
+            using (var buffer = new EncryptedEventBuffer(directory, sessionId, 4 * 1024 * 1024))
+            {
+                buffer.Append(resultFrame);
+                LocalFrame recovered;
+                Require(buffer.TryFindRemoteInputResult(inputId, out recovered) &&
+                    recovered != null && recovered.Sequence == resultFrame.Sequence,
+                    "The durable input result sequence was not recovered from the event buffer.");
+                if (recovered != null && recovered.Payload != null)
+                    Array.Clear(recovered.Payload, 0, recovered.Payload.Length);
+            }
+
+            using (var completed = new InputDeduplicator(directory, sessionId))
+            {
+                completed.MarkCompleted(inputId);
+                Guid loadedSender;
+                byte[] loadedDigest;
+                Require(completed.TryGetIdentity(inputId, out loadedSender, out loadedDigest) &&
+                    loadedSender == senderDeviceId && loadedDigest != null &&
+                    loadedDigest.SequenceEqual(digest),
+                    "The completed fence lost its authenticated identity after marking the result durable.");
+                if (loadedDigest != null) Array.Clear(loadedDigest, 0, loadedDigest.Length);
+            }
+
+            using (var restarted = new InputDeduplicator(directory, sessionId))
+            {
+                Guid loadedSender;
+                byte[] loadedDigest;
+                Require(restarted.TryGetIdentity(inputId, out loadedSender, out loadedDigest) &&
+                    loadedSender == senderDeviceId && loadedDigest != null &&
+                    loadedDigest.SequenceEqual(digest),
+                    "The completed input fence did not survive Agent/runtime reconstruction.");
+                if (loadedDigest != null) Array.Clear(loadedDigest, 0, loadedDigest.Length);
+                Require(!restarted.TryAccept(inputId, Guid.NewGuid(), digest),
+                    "A conflicting device reused a completed input ID.");
+            }
+            Array.Clear(digest, 0, digest.Length);
         }
 
         private static void ValidateActiveCapacityAccounting()
@@ -1379,12 +1452,13 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class FakeManagedSession : IRegistryManagedSession, IRemoteControllableSession,
+    internal sealed class FakeManagedSession : IRegistryManagedSession, IIdempotentRemoteControllableSession,
         IRecoveryRegistrationSession
     {
         private readonly Action<IRegistryManagedSession> completion;
         private int waitCalls;
         private int completionSent;
+        private readonly HashSet<Guid> remoteInputIds = new HashSet<Guid>();
 
         public FakeManagedSession(
             SessionRegistration registration,
@@ -1404,6 +1478,7 @@ namespace TermLink.Agent
         public Guid RemoteInputId { get; private set; }
         public ulong RemoteInputEpoch { get; private set; }
         public byte[] RemoteInputBytes { get; private set; }
+        public int RemoteInputDispatchCount { get; private set; }
         public Guid RejectedInputId { get; private set; }
         public LocalRemoteInputResult RejectedInputResult { get; private set; }
 
@@ -1431,11 +1506,23 @@ namespace TermLink.Agent
 
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
-            if (inputId == Guid.Empty || bytes == null || bytes.Length == 0) return false;
+            return DispatchRemoteInput(inputId, expectedLocalInputEpoch, bytes) ==
+                RemoteInputDispatchOutcome.Enqueued;
+        }
+
+        public RemoteInputDispatchOutcome DispatchRemoteInput(
+            Guid inputId,
+            ulong expectedLocalInputEpoch,
+            byte[] bytes)
+        {
+            if (inputId == Guid.Empty || bytes == null || bytes.Length == 0)
+                return RemoteInputDispatchOutcome.Unavailable;
+            if (!remoteInputIds.Add(inputId)) return RemoteInputDispatchOutcome.Duplicate;
             RemoteInputId = inputId;
             RemoteInputEpoch = expectedLocalInputEpoch;
             RemoteInputBytes = (byte[])bytes.Clone();
-            return true;
+            RemoteInputDispatchCount++;
+            return RemoteInputDispatchOutcome.Enqueued;
         }
 
         public bool TrySendRemoteInputRejection(Guid inputId, LocalRemoteInputResult result)

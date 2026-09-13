@@ -101,11 +101,22 @@ try {
         'TERMLINK_HTTP_BIND_IP=127.0.0.1'
         'TERMLINK_HTTP_PORT=18080'
         'TERMLINK_BACKUP_RECIPIENT='
+        'TERMLINK_DIRECT_ROUTING_PERMITTED=false'
     )
     [IO.File]::WriteAllLines($envPath, $environment, [Text.UTF8Encoding]::new($false))
 
     & $policyPath -EnvFile $envPath -ComposeFile (Join-Path $runtimePath 'compose.yml')
     Assert-Test ($LASTEXITCODE -eq 0) 'Single-node production policy validation failed.'
+
+    $directRoutingEnvPath = Join-Path $fixturePath 'config-direct-routing.env'
+    $directRoutingEnvironment = $environment | ForEach-Object {
+        if ($_ -ceq 'TERMLINK_DIRECT_ROUTING_PERMITTED=false') {
+            'TERMLINK_DIRECT_ROUTING_PERMITTED=true'
+        } else { $_ }
+    }
+    [IO.File]::WriteAllLines($directRoutingEnvPath, $directRoutingEnvironment, [Text.UTF8Encoding]::new($false))
+    & $policyPath -EnvFile $directRoutingEnvPath -ComposeFile (Join-Path $runtimePath 'compose.yml')
+    Assert-Test ($LASTEXITCODE -eq 0) 'Explicit single-node Direct routing policy validation failed.'
 
     $releaseInstaller = Join-Path $fixturePath 'termlink-deploy-release'
     & (Join-Path $packagePath 'Build-Installer.ps1') -ServerImage $image -OutputPath $releaseInstaller

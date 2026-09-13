@@ -58,6 +58,10 @@ namespace TermLink.Agent
         public int Attempt { get; init; }
         public long Generation { get; init; }
         public bool WillRetry { get; init; }
+        public bool DirectDataV1Negotiated { get; init; }
+        public bool DirectSessionCutoverV1Negotiated { get; init; }
+        public bool DirectDataPlaneV1Negotiated =>
+            DirectDataV1Negotiated && DirectSessionCutoverV1Negotiated;
     }
 
     internal enum ProductionDirectSignalingCallStatus
@@ -303,6 +307,8 @@ namespace TermLink.Agent
         internal const string DirectShadowCapability = "direct_transport_shadow_v1";
         internal const string DirectMultipairShadowCapability =
             "direct_transport_shadow_multipair_v2";
+        internal const string DirectDataCapability = "direct_transport_data_v1";
+        internal const string DirectSessionCutoverCapability = "direct_session_cutover_v1";
         internal const int MaximumSignalFrameBytes = 64 * 1024;
         internal const int MaximumQueuedSignalFrames = 32;
         internal const long MaximumQueuedSignalBytes = 512 * 1024;
@@ -351,6 +357,7 @@ namespace TermLink.Agent
         private readonly Func<CancellationToken, Task<string>> accessTokenProvider;
         private readonly bool enabled;
         private readonly bool multipairV2Enabled;
+        private readonly bool directDataV1Enabled;
         private readonly HttpClient http;
         private readonly IProductionDirectSignalSocketFactory socketFactory;
         private readonly Func<long> clockMilliseconds;
@@ -386,7 +393,8 @@ namespace TermLink.Agent
             Func<TimeSpan, CancellationToken, Task> retryDelay = null,
             Func<byte[]> nonceFactory = null,
             bool allowInsecureForTests = false,
-            bool multipairV2Enabled = false)
+            bool multipairV2Enabled = false,
+            bool directDataV1Enabled = false)
         {
             root = NormalizeRoot(serverRoot, allowInsecureForTests);
             signalEndpoint = BuildEndpoint(root, SignalPath, websocket: true);
@@ -398,6 +406,7 @@ namespace TermLink.Agent
                 throw new ArgumentNullException(nameof(accessTokenProvider));
             this.enabled = enabled;
             this.multipairV2Enabled = multipairV2Enabled;
+            this.directDataV1Enabled = directDataV1Enabled;
             this.socketFactory = socketFactory ?? new ProductionClientWebSocketFactory();
             this.clockMilliseconds = clockMilliseconds ??
                 (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -504,7 +513,7 @@ namespace TermLink.Agent
             if (targetDeviceId == Guid.Empty || targetDeviceId == deviceId ||
                 !IsVersion4(connectionId) || config == null ||
                 config.ProtocolVersion != ProtocolVersion ||
-                !HasNegotiatedCapabilities(config) || config.DirectRoutingPermitted)
+                !HasNegotiatedCapabilities(config))
                 return ProductionDirectSignalingCallResult<ProductionValidatedDirectPathTicket>.Failed(
                     ProductionDirectSignalingFaultCode.TicketRejected);
             var body = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object>
@@ -588,6 +597,17 @@ namespace TermLink.Agent
             }
             lock (sync)
             {
+                var requiredDirectDataGeneration = 0L;
+                if (IsDirectDataControlSignal(envelope.SignalType))
+                {
+                    if (!HasCurrentGenerationDirectDataLocked())
+                    {
+                        CryptographicOperations.ZeroMemory(wire);
+                        PublishFault(ProductionDirectSignalingFaultCode.SignalFrameRejected, willRetry: false);
+                        return false;
+                    }
+                    requiredDirectDataGeneration = snapshot.Generation;
+                }
                 var cursor = SignalCursor.From(envelope);
                 var nonce = SignalNonce.From(envelope);
                 if (outgoingCursors.IsReplay(cursor, envelope.SignalSeq) || outgoingNonces.Contains(nonce))
@@ -597,7 +617,10 @@ namespace TermLink.Agent
                     return false;
                 }
                 var reserved = TryReserve(ref outgoingBytes, wire.Length, MaximumQueuedSignalBytes);
-                if (!reserved || !outgoing.Writer.TryWrite(new QueuedSignal(envelope, wire)))
+                if (!reserved || !outgoing.Writer.TryWrite(new QueuedSignal(
+                    envelope,
+                    wire,
+                    requiredDirectDataGeneration)))
                 {
                     if (reserved) Interlocked.Add(ref outgoingBytes, -wire.Length);
                     CryptographicOperations.ZeroMemory(wire);
@@ -618,8 +641,10 @@ namespace TermLink.Agent
                 while (incoming.Reader.TryRead(out var item))
                 {
                     Interlocked.Add(ref incomingBytes, -item.Wire.Length);
+                    var deliver = item.RequiredDirectDataGeneration == 0 ||
+                        HasCurrentGenerationDirectData(item.RequiredDirectDataGeneration);
                     CryptographicOperations.ZeroMemory(item.Wire);
-                    yield return item.Envelope;
+                    if (deliver) yield return item.Envelope;
                 }
             }
         }
@@ -768,14 +793,23 @@ namespace TermLink.Agent
                         headers,
                         connectTimeout.Token).ConfigureAwait(false);
                 }
+                var helloCapabilities = new List<string>
+                {
+                    DirectCapability
+                };
+                if (multipairV2Enabled)
+                    helloCapabilities.Add(DirectMultipairShadowCapability);
+                if (directDataV1Enabled)
+                {
+                    helloCapabilities.Add(DirectDataCapability);
+                    helloCapabilities.Add(DirectSessionCutoverCapability);
+                }
                 var hello = JsonSerializer.SerializeToUtf8Bytes(new
                 {
                     type = "CLIENT_HELLO",
                     role = "pc",
                     protocol_versions = new[] { ProtocolVersion },
-                    capabilities = multipairV2Enabled
-                        ? new[] { DirectCapability, DirectMultipairShadowCapability }
-                        : new[] { DirectCapability }
+                    capabilities = helloCapabilities
                 });
                 if (hello.Length > MaximumHelloBytes)
                     throw new ProductionDirectSignalingLaneException(
@@ -794,10 +828,15 @@ namespace TermLink.Agent
                     welcome = await socket.ReceiveAsync(MaximumHelloBytes, handshakeTimeout.Token)
                         .ConfigureAwait(false);
                 }
+                var directDataV1Negotiated = false;
+                var directSessionCutoverV1Negotiated = false;
                 try
                 {
                     if (welcome.MessageType != WebSocketMessageType.Text ||
-                        !ValidateWelcome(welcome.Payload))
+                        !ValidateWelcome(
+                            welcome.Payload,
+                            out directDataV1Negotiated,
+                            out directSessionCutoverV1Negotiated))
                         throw new ProductionDirectSignalingLaneException(
                             ProductionDirectSignalingFaultCode.SignalProtocolRejected,
                             retryable: false);
@@ -805,10 +844,16 @@ namespace TermLink.Agent
                 finally { CryptographicOperations.ZeroMemory(welcome.Payload); }
                 welcomed();
                 Publish(ProductionDirectSignalingLaneState.Connected,
-                    ProductionDirectSignalingFaultCode.None, 0, generationValue);
+                    ProductionDirectSignalingFaultCode.None, 0, generationValue,
+                    directDataV1Negotiated: directDataV1Negotiated,
+                    directSessionCutoverV1Negotiated: directSessionCutoverV1Negotiated);
+                var directDataPlaneV1Negotiated =
+                    directDataV1Negotiated && directSessionCutoverV1Negotiated;
                 using var lane = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                var receive = ReceiveLoopAsync(socket, lane.Token);
-                var send = SendLoopAsync(socket, lane.Token);
+                var receive = ReceiveLoopAsync(
+                    socket, generationValue, directDataPlaneV1Negotiated, lane.Token);
+                var send = SendLoopAsync(
+                    socket, generationValue, directDataPlaneV1Negotiated, lane.Token);
                 var completed = await Task.WhenAny(receive, send).ConfigureAwait(false);
                 try { await completed.ConfigureAwait(false); }
                 finally
@@ -832,6 +877,8 @@ namespace TermLink.Agent
 
         private async Task SendLoopAsync(
             IProductionDirectSignalSocket socket,
+            long generationValue,
+            bool directDataV1Negotiated,
             CancellationToken cancellationToken)
         {
             while (await outgoing.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
@@ -839,6 +886,13 @@ namespace TermLink.Agent
                 while (outgoing.Reader.TryRead(out var item))
                 {
                     Interlocked.Add(ref outgoingBytes, -item.Wire.Length);
+                    if (item.RequiredDirectDataGeneration != 0 &&
+                        (item.RequiredDirectDataGeneration != generationValue ||
+                            !directDataV1Negotiated))
+                    {
+                        CryptographicOperations.ZeroMemory(item.Wire);
+                        continue;
+                    }
                     try
                     {
                         await socket.SendAsync(
@@ -853,6 +907,8 @@ namespace TermLink.Agent
 
         private async Task ReceiveLoopAsync(
             IProductionDirectSignalSocket socket,
+            long generationValue,
+            bool directDataV1Negotiated,
             CancellationToken cancellationToken)
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -876,6 +932,10 @@ namespace TermLink.Agent
                 {
                     envelope = TransportSignalEnvelopeV1.Parser.ParseFrom(message.Payload);
                     ValidateSignal(envelope, message.Payload, outbound: false);
+                    if (IsDirectDataControlSignal(envelope.SignalType) &&
+                        !directDataV1Negotiated)
+                        throw new InvalidDataException(
+                            "Direct-data control was not negotiated for this generation.");
                 }
                 catch (Exception error) when (
                     error is InvalidDataException or InvalidProtocolBufferException or OverflowException)
@@ -901,8 +961,14 @@ namespace TermLink.Agent
                         ref incomingBytes,
                         message.Payload.Length,
                         MaximumQueuedSignalBytes);
+                    var requiredDirectDataGeneration = IsDirectDataControlSignal(envelope.SignalType)
+                        ? generationValue
+                        : 0;
                     if (!reserved ||
-                        !incoming.Writer.TryWrite(new QueuedSignal(envelope, message.Payload)))
+                        !incoming.Writer.TryWrite(new QueuedSignal(
+                            envelope,
+                            message.Payload,
+                            requiredDirectDataGeneration)))
                     {
                         if (reserved) Interlocked.Add(ref incomingBytes, -message.Payload.Length);
                         CryptographicOperations.ZeroMemory(message.Payload);
@@ -1000,7 +1066,14 @@ namespace TermLink.Agent
                 rootElement, "capabilities", 1, MaximumConfigCapabilities,
                 value => CapabilityPattern.IsMatch(value));
             var expectedCapabilityCount = multipairV2Enabled ? 3 : 2;
-            if (capabilities.Count != expectedCapabilityCount ||
+            var hasDirectDataCapability = capabilities.Contains(
+                DirectDataCapability, StringComparer.Ordinal);
+            var hasSessionCutoverCapability = capabilities.Contains(
+                DirectSessionCutoverCapability, StringComparer.Ordinal);
+            if (hasSessionCutoverCapability && !hasDirectDataCapability ||
+                capabilities.Count != expectedCapabilityCount +
+                    (hasDirectDataCapability ? 1 : 0) +
+                    (hasSessionCutoverCapability ? 1 : 0) ||
                 !capabilities.Contains(DirectSignalingCapability, StringComparer.Ordinal) ||
                 !capabilities.Contains(DirectShadowCapability, StringComparer.Ordinal) ||
                 (multipairV2Enabled != capabilities.Contains(
@@ -1008,8 +1081,8 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Direct shadow config capabilities are invalid.");
             var directRoutingPermitted = ReadExactBoolean(
                 rootElement, "direct_routing_permitted");
-            if (directRoutingPermitted)
-                throw new InvalidDataException("Direct routing is forbidden in shadow mode.");
+            if (directRoutingPermitted != hasDirectDataCapability)
+                throw new InvalidDataException("Direct routing capability and permission are inconsistent.");
             var keysElement = rootElement.GetProperty("ticket_signing_keys");
             if (keysElement.ValueKind != JsonValueKind.Array ||
                 keysElement.GetArrayLength() is < 1 or > MaximumTicketSigningKeys)
@@ -1151,14 +1224,15 @@ namespace TermLink.Agent
             }
             finally { CryptographicOperations.ZeroMemory(canonical); }
             var own = GuidBytes(deviceId);
+            var signalType = (int)envelope.SignalType;
             var authorityMatches = outbound
                 ? envelope.SenderDeviceId.Span.SequenceEqual(own) &&
                     !envelope.RecipientDeviceId.Span.SequenceEqual(own)
                 : envelope.RecipientDeviceId.Span.SequenceEqual(own) &&
                     !envelope.SenderDeviceId.Span.SequenceEqual(own);
             if (envelope.ProtocolVersion != ProtocolVersion ||
-                (int)envelope.SignalType < 1 ||
-                (int)envelope.SignalType > (multipairV2Enabled ? 14 : 10) ||
+                signalType < 1 ||
+                signalType > (multipairV2Enabled ? 14 : 10) ||
                 !NonZeroIdentifier(envelope.ConnectionId) ||
                 envelope.SenderDeviceId.Length != IdentifierBytes ||
                 envelope.RecipientDeviceId.Length != IdentifierBytes ||
@@ -1212,8 +1286,13 @@ namespace TermLink.Agent
                 Ciphertext = value.Ciphertext
             };
 
-        private bool ValidateWelcome(byte[] raw)
+        private bool ValidateWelcome(
+            byte[] raw,
+            out bool directDataV1Negotiated,
+            out bool directSessionCutoverV1Negotiated)
         {
+            directDataV1Negotiated = false;
+            directSessionCutoverV1Negotiated = false;
             try
             {
                 using var document = JsonDocument.Parse(raw, new JsonDocumentOptions
@@ -1232,10 +1311,22 @@ namespace TermLink.Agent
                 var capabilities = ReadUniqueStrings(
                     value, "capabilities", 1, MaximumConfigCapabilities,
                     capability => CapabilityPattern.IsMatch(capability));
-                return capabilities.Count == (multipairV2Enabled ? 2 : 1) &&
+                var hasDirectDataCapability = capabilities.Contains(
+                    DirectDataCapability, StringComparer.Ordinal);
+                var hasSessionCutoverCapability = capabilities.Contains(
+                    DirectSessionCutoverCapability, StringComparer.Ordinal);
+                var expectedCount = (multipairV2Enabled ? 2 : 1) +
+                    (hasDirectDataCapability ? 1 : 0) +
+                    (hasSessionCutoverCapability ? 1 : 0);
+                var valid = !hasSessionCutoverCapability || hasDirectDataCapability;
+                valid = valid && capabilities.Count == expectedCount &&
                     capabilities.Contains(DirectShadowCapability, StringComparer.Ordinal) &&
                     (multipairV2Enabled == capabilities.Contains(
-                        DirectMultipairShadowCapability, StringComparer.Ordinal));
+                        DirectMultipairShadowCapability, StringComparer.Ordinal)) &&
+                    (!hasDirectDataCapability || directDataV1Enabled);
+                directDataV1Negotiated = valid && hasDirectDataCapability;
+                directSessionCutoverV1Negotiated = valid && hasSessionCutoverCapability;
+                return valid;
             }
             catch (Exception error) when (
                 error is JsonException or InvalidDataException or InvalidOperationException or FormatException)
@@ -1243,6 +1334,23 @@ namespace TermLink.Agent
                 return false;
             }
         }
+
+        private bool HasCurrentGenerationDirectData(long requiredGeneration = 0)
+        {
+            lock (sync)
+            {
+                return HasCurrentGenerationDirectDataLocked() &&
+                    (requiredGeneration == 0 || snapshot.Generation == requiredGeneration);
+            }
+        }
+
+        private bool HasCurrentGenerationDirectDataLocked() =>
+            snapshot.State == ProductionDirectSignalingLaneState.Connected &&
+            snapshot.Generation == Volatile.Read(ref generation) &&
+            snapshot.DirectDataPlaneV1Negotiated;
+
+        private static bool IsDirectDataControlSignal(TransportSignalTypeV1 signalType) =>
+            (int)signalType is >= 6 and <= 9;
 
         private static async Task<byte[]> ReadBoundedResponseAsync(
             HttpResponseMessage response,
@@ -1428,19 +1536,34 @@ namespace TermLink.Agent
         internal static bool HasCurrentShadowCapabilities(
             ProductionDirectTransportServerConfig config) =>
             config != null && config.ProtocolVersion == ProtocolVersion &&
-            !config.DirectRoutingPermitted && config.Capabilities != null &&
-            config.Capabilities.Count == 2 &&
+            config.Capabilities != null &&
+            config.Capabilities.Count is >= 2 and <= 4 &&
             config.Capabilities.Contains(DirectSignalingCapability, StringComparer.Ordinal) &&
-            config.Capabilities.Contains(DirectShadowCapability, StringComparer.Ordinal);
+            config.Capabilities.Contains(DirectShadowCapability, StringComparer.Ordinal) &&
+            (!config.Capabilities.Contains(
+                    DirectSessionCutoverCapability, StringComparer.Ordinal) ||
+                config.Capabilities.Contains(DirectDataCapability, StringComparer.Ordinal));
 
         internal static bool HasMultipairShadowCapabilities(
             ProductionDirectTransportServerConfig config) =>
             config != null && config.ProtocolVersion == ProtocolVersion &&
-            !config.DirectRoutingPermitted && config.Capabilities != null &&
-            config.Capabilities.Count == 3 &&
+            config.Capabilities != null &&
+            config.Capabilities.Count is >= 3 and <= 5 &&
             config.Capabilities.Contains(DirectSignalingCapability, StringComparer.Ordinal) &&
             config.Capabilities.Contains(DirectShadowCapability, StringComparer.Ordinal) &&
-            config.Capabilities.Contains(DirectMultipairShadowCapability, StringComparer.Ordinal);
+            config.Capabilities.Contains(DirectMultipairShadowCapability, StringComparer.Ordinal) &&
+            (!config.Capabilities.Contains(
+                DirectSessionCutoverCapability, StringComparer.Ordinal) ||
+                config.Capabilities.Contains(DirectDataCapability, StringComparer.Ordinal));
+
+        internal static bool HasDirectDataCapabilities(
+            ProductionDirectTransportServerConfig config) =>
+            config != null && config.ProtocolVersion == ProtocolVersion &&
+            config.DirectRoutingPermitted && config.Capabilities != null &&
+            config.Capabilities.Contains(DirectDataCapability, StringComparer.Ordinal) &&
+            config.Capabilities.Contains(
+                DirectSessionCutoverCapability, StringComparer.Ordinal) &&
+            (HasCurrentShadowCapabilities(config) || HasMultipairShadowCapabilities(config));
 
         private bool HasNegotiatedCapabilities(ProductionDirectTransportServerConfig config) =>
             multipairV2Enabled ? HasMultipairShadowCapabilities(config) :
@@ -1559,7 +1682,9 @@ namespace TermLink.Agent
             int attempt = 0,
             long generationValue = 0,
             bool willRetry = false,
-            int? httpStatus = null)
+            int? httpStatus = null,
+            bool directDataV1Negotiated = false,
+            bool directSessionCutoverV1Negotiated = false)
         {
             var next = new ProductionDirectSignalingSnapshot
             {
@@ -1568,7 +1693,9 @@ namespace TermLink.Agent
                 Attempt = attempt,
                 Generation = generationValue,
                 WillRetry = willRetry,
-                HttpStatus = httpStatus
+                HttpStatus = httpStatus,
+                DirectDataV1Negotiated = directDataV1Negotiated,
+                DirectSessionCutoverV1Negotiated = directSessionCutoverV1Negotiated
             };
             lock (sync) snapshot = next;
             try { StateChanged?.Invoke(next); }
@@ -1577,14 +1704,19 @@ namespace TermLink.Agent
 
         private sealed class QueuedSignal
         {
-            public QueuedSignal(TransportSignalEnvelopeV1 envelope, byte[] wire)
+            public QueuedSignal(
+                TransportSignalEnvelopeV1 envelope,
+                byte[] wire,
+                long requiredDirectDataGeneration = 0)
             {
                 Envelope = envelope;
                 Wire = wire;
+                RequiredDirectDataGeneration = requiredDirectDataGeneration;
             }
 
             public TransportSignalEnvelopeV1 Envelope { get; }
             public byte[] Wire { get; }
+            public long RequiredDirectDataGeneration { get; }
         }
 
         private readonly struct SignalCursor : IEquatable<SignalCursor>

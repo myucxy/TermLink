@@ -23,8 +23,8 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 - Git 只提交和推送源码、测试、脚本与文档。`artifacts/`、`.appship/`、APK、EXE、截图和本地状态文件
   不进入 Git；发布前后都要运行 `git status -sb` 和 `git diff --check`。
 - 不通过卸载 Android App 解决签名不一致，否则会删除登录、设备身份和 Android Keystore 数据。
-- 不使用 `Start-ProductionAcceptance.ps1 -Reset` 做版本升级；`-Reset` 会删除 volumes，只能用于明确授权的
-  一次性重建。
+- 不使用旧 `Start-ProductionAcceptance.ps1` 或它的 `-Reset` 路径做版本升级；当前
+  `termlink-deploy` 不暴露 reset，禁止用 `docker compose down --volumes` 自行模拟。
 - 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交，也不发布 `latest` Docker 标签。
 - 密码、Token、PFX/keystore 密码只能从 Credential Manager、`SecureString` 或受保护的进程环境读取，
   不进入命令参数、日志、manifest 或文档。
@@ -41,7 +41,8 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 5. 通过 AppShip 仓库包装器发布 Android 与 Windows，并保留两个幂等状态文件。
 6. 发布并验证 Docker Hub 多架构镜像；记录 OCI index digest，部署时使用 `tag@digest`。
 7. 覆盖升级模拟器和 Windows 本机客户端；禁止为求省事清数据或改变安装根。
-8. 无损升级 Compose，验证 7 个常驻服务、数据库 migration、公网 `/readyz` 和 named volumes。
+8. 通过单节点部署入口无损升级，验证 `server`、`postgres`、数据库 migration、公网 `/readyz` 和
+   三个持久卷；`secrets-init` 只是一次性初始化任务，不计入常驻服务。
 9. 调用 AppShip 公开更新 API，验证上一 build 得到 `optional`、当前 build 得到 `no_update`。
 
 ## 3. Android 发布与模拟器升级
@@ -258,40 +259,76 @@ Windows hosts、系统 DNS 或 Docker Desktop 全局代理。
 Registry API 读取 index、manifest、config blob 和 attestation descriptor。该校验不需要向容器注入 Docker Hub
 写凭据，容器退出后不保留状态。
 
-## 8. Compose 无损升级
+## 8. 单节点无损升级（Server + PostgreSQL）
 
-部署参数必须同时带可读 tag 和不可变 index digest；仅 tag 或仅 digest 都会被脚本拒绝：
+当前生产入口是 `server/deploy/single-node-production/termlink-deploy`。它生成并管理单节点 Compose：
+常驻服务只有一个 TermLink `server` 和一个 PostgreSQL；身份服务、migration、短期协调状态以及
+Direct/NAT signalling 均由 `server` 内嵌处理。`secrets-init` 只在启动前复制受保护的 secret，成功退出是
+预期状态。不要再使用旧 acceptance 栈，也不要把 Keycloak、Valkey、MinIO 或 Lucky 当成当前生产依赖。
 
-```powershell
-& .\server\ops\Start-ProductionAcceptance.ps1 `
-  -ServerImage 'docker.io/myucxy/termlink:<version>@sha256:<64-hex-index-digest>'
+镜像参数必须同时包含可读 tag 和不可变 OCI index digest；仅 tag、仅 digest 或 `latest` 都会被入口拒绝。
+从源码目录首次安装时在 Linux 主机运行：
+
+```bash
+sudo ./server/deploy/single-node-production/termlink-deploy install \
+  --domain termlink.example.com \
+  --image docker.io/myucxy/termlink:<version>@sha256:<64-hex-index-digest> \
+  --disable-direct-routing
 ```
 
-不要传 `-Reset`，不要执行 `docker compose down --volumes`。脚本会拉取固定镜像、运行 migration、重建
-server，并复用 PostgreSQL、Valkey、Keycloak 和 secret volumes。历史 MinIO named volume 不参与当前
-运行时，也不要在无损升级过程中顺带删除。
+正式发布的自包含安装器会内嵌不可变镜像，正常安装可省略 `--image`；源码 checkout 仍必须显式提供。
+安装结果默认位于 `/opt/termlink`，后续统一使用该目录内被管理的入口：
 
-当发布要求明确限定为本机构建、禁止 Git 流水线和 Registry push 时，先使用固定版本、revision、created
-与 `SOURCE_DATE_EPOCH` 构建 `linux/amd64` 镜像，再通过独立参数执行同一套迁移、健康检查和生产探针：
-
-```powershell
-& .\server\ops\Start-ProductionAcceptance.ps1 `
-  -LocalServerImage 'myucxy/termlink:<version>-local-production'
+```bash
+sudo /opt/termlink/termlink-deploy upgrade \
+  --image docker.io/myucxy/termlink:<version>@sha256:<64-hex-index-digest>
+sudo /opt/termlink/termlink-deploy doctor
 ```
 
-`-LocalServerImage` 不会 pull 或 push；它只接受 `myucxy/termlink:x.y.z-local-production`，并要求镜像已经
-存在、平台为 `linux/amd64`、标签版本与 OCI version 完全一致，且 revision/source/created 元数据通过与
-远端生产镜像相同的门禁。它与 `-ServerImage` 互斥，也不能配合 `-Reset` 绕过无损升级边界。
+`upgrade` 会重写受管理的 Compose 资产并执行 `docker compose up --remove-orphans`，不会删除数据卷；配置了
+age recipient 时会先创建加密备份。禁止为了升级执行 `docker compose down --volumes`，也不要顺带清理
+`postgres-data`、`postgres-secrets` 或 `server-secrets`。初始管理员密码只显示一次；非交互安装后使用
+`sudo /opt/termlink/termlink-deploy credentials` 领取。
+
+Direct probing/signalling 与 Direct 数据路由是两个门禁。部署文件始终允许前者，但
+`TERMLINK_DIRECT_ROUTING_PERMITTED` 默认且发布时必须保持 `false`。确定性前置测试可以运行：
+
+```powershell
+pwsh -NoProfile -File .\technical-validation\direct-e2e\Test-DirectFaultMatrix.ps1
+```
+
+该模型测试不能代替真实网络。只有安装后的 Android、Windows、Server 已完成真实故障矩阵，确认
+Relay→LAN→Relay、Relay→NAT→Relay、Direct socket/protocol/queue 故障、Relay 暂断、网络切换、锁屏恢复、
+长输出与 resize burst、两台 Android 并行均无重复、无 History Gap、无 Relay generation 非预期变化后，
+才具备启用资格。停止所有旧 Server 实例或确认其 Direct capability 不再刷新后，还必须从最后一次旧
+presence 刷新起等待至少 60 秒，让旧 presence 完全过期；等待期间新栈继续以 Relay-only 运行。两个条件
+缺一不可，不能因为确定性 16/16 通过就提前启用。
+
+验收构建打开 routing gate 后，Server config、Realtime Welcome、Transport Signalling Welcome 以及
+Android/Windows 两端必须同时包含 `direct_transport_data_v1` 和 `direct_session_cutover_v1`。只出现
+前者属于 legacy data-only 协商，必须验证仍停留在 Relay，不能计为 Direct 验收通过。
+
+全部门禁通过后才执行：
+
+```bash
+sudo /opt/termlink/termlink-deploy config --enable-direct-routing
+sudo /opt/termlink/termlink-deploy doctor
+```
+
+若任一真实场景失败，立即执行 `config --disable-direct-routing`；这只关闭 Direct 数据路由，不应关闭
+Relay、重启 Agent/SessionHost 或终止现有会话。
 
 升级后必须独立确认：
 
-- `server`、`lucky-upstream`、`keycloak`、`valkey`、`postgres` 均为 `running`，其中声明了
-  healthcheck 的服务必须为 `healthy`；
+- `server` 和 `postgres` 各恰好一个实例处于 `running`，两者 healthcheck 均为 `healthy`；
+- `secrets-init` 成功退出，且渲染后的 Compose 不包含 secret 明文；
 - server 的 `Config.Image` 是 `<tag>@<digest>`，OCI revision 是计划发布提交；
 - `SELECT MAX(version) FROM schema_migrations` 等于当前最高 migration；
-- 升级前后的 named volume 名称和数量一致；
-- `https://termlink.kget.cc:8910/readyz` 返回 `{"status":"ready"}`；
-- 脚本内置的 Production OIDC/TLS/API/Realtime probe 通过。
+- 升级前后的 `postgres-data`、`postgres-secrets`、`server-secrets` 卷保持不变；
+- 本机 loopback `/healthz`、`/readyz` 及 OIDC discovery 通过，外部 HTTPS 代理保持 Host、
+  `X-Forwarded-Proto` 和 WebSocket upgrade，配置的公网 URL `/readyz` 返回 `{"status":"ready"}`；
+- Android 与 Windows 客户端仍能通过 Relay 登录、读取目录、打开会话并恢复历史；Direct 未通过上述门禁时
+  仍显示 Relay，不得因 shadow signalling 已启用而显示 LAN/NAT Direct。
 
 ## 9. 最终交付记录
 

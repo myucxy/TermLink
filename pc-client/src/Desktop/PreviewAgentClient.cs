@@ -32,6 +32,9 @@ public sealed class PreviewAgentClient : IAgentClient
         return ValueTask.CompletedTask;
     }
 
+    public ValueTask ConfigureServerAsync(string serverUrl, CancellationToken cancellationToken) =>
+        Unsupported(cancellationToken);
+
     public ValueTask RetryConnectionAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();

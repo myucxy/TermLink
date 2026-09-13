@@ -64,6 +64,7 @@ internal class DirectNativeHandleV4(
     private var totalPairs = 0
     private var planComplete = false
     private var nominationCommitted = false
+    private var promoted = false
     private val submittedPairs = LinkedHashMap<String, DirectNativeCandidatePairV4>()
     private val validatedPairs = LinkedHashSet<String>()
     private val pendingSignatures = LinkedHashSet<Long>()
@@ -72,7 +73,9 @@ internal class DirectNativeHandleV4(
 
     fun gather(request: DirectNativeGatherRequestV4): DirectNativeResultV4<Unit> =
         synchronized(lock) {
-            if (closed) return@synchronized closedFailure(request.epoch, request.attemptId)
+            if (closed || promoted) {
+                return@synchronized closedFailure(request.epoch, request.attemptId)
+            }
             if (request.epoch <= authoritativeEpoch) {
                 return@synchronized staleFailure(request.epoch, request.attemptId)
             }
@@ -190,15 +193,11 @@ internal class DirectNativeHandleV4(
 
     fun commitNomination(request: DirectNativeCommitNominationRequestV4):
         DirectNativeResultV4<Unit> = synchronized(lock) {
-        if (closed) return@synchronized closedFailure(request.epoch, request.attemptId)
+        if (closed || promoted) return@synchronized closedFailure(request.epoch, request.attemptId)
         if (!isCurrent(request.epoch, request.attemptId)) {
             return@synchronized staleFailure(request.epoch, request.attemptId)
         }
-        val winnerKey = request.winningPair.identityKey()
-        if (!checksStarted || nominationCommitted || !planComplete ||
-            !request.checkRoundId.contentEquals(checkRoundId) ||
-            winnerKey !in submittedPairs || winnerKey !in validatedPairs
-        ) {
+        if (!canCommitNomination(request)) {
             return@synchronized nativeFailureV4(
                 DirectNativeSyntheticReasonV4.NOMINATION_NOT_VALIDATED,
                 request.epoch,
@@ -223,6 +222,48 @@ internal class DirectNativeHandleV4(
         }
         if (result is DirectNativeResultV4.Success) nominationCommitted = true
         result
+    }
+
+    /**
+     * Runs the one-shot V4 -> V5 native promotion while this Kotlin V4 owner
+     * is locked. [operation] receives only the opaque JNI registry token, not
+     * a native pointer. A successful transfer permanently disables all normal
+     * V4 operations; [close] remains responsible for destroying the consumed
+     * V4 bridge wrapper.
+     */
+    internal fun promoteNomination(
+        request: DirectNativeCommitNominationRequestV4,
+        operation: (Long) -> Int,
+    ): DirectNativeResultV4<Unit> = synchronized(lock) {
+        if (closed || promoted) return@synchronized closedFailure(request.epoch, request.attemptId)
+        if (!isCurrent(request.epoch, request.attemptId)) {
+            return@synchronized staleFailure(request.epoch, request.attemptId)
+        }
+        if (!canCommitNomination(request)) {
+            return@synchronized nativeFailureV4(
+                DirectNativeSyntheticReasonV4.NOMINATION_NOT_VALIDATED,
+                request.epoch,
+                request.attemptId,
+            )
+        }
+        val status = runCatching { operation(token) }.getOrElse {
+            return@synchronized retireFailure(
+                DirectNativeSyntheticReasonV4.FFI_CALL_FAILED,
+                request.epoch,
+                request.attemptId,
+            )
+        }
+        if (status != 0) {
+            return@synchronized retireFailure(
+                DirectNativeSyntheticReasonV4.FFI_CALL_FAILED,
+                request.epoch,
+                request.attemptId,
+                status,
+            )
+        }
+        nominationCommitted = true
+        promoted = true
+        DirectNativeResultV4.Success(Unit)
     }
 
     fun cancel(epoch: Long, attemptId: ByteArray): DirectNativeResultV4<Unit> =
@@ -256,7 +297,7 @@ internal class DirectNativeHandleV4(
     }
 
     fun poll(): DirectNativeResultV4<DirectNativeEventV4?> = synchronized(lock) {
-        if (closed) return@synchronized closedFailure()
+        if (closed || promoted) return@synchronized closedFailure()
         val metadata = LongArray(POLL_METADATA_VALUES)
         val attempt = ByteArray(16)
         val endpointIp = ByteArray(16)
@@ -284,7 +325,7 @@ internal class DirectNativeHandleV4(
         operation: (ByteArray) -> Int,
     ): DirectNativeResultV4<Unit> = synchronized(lock) {
         val ownedAttempt = attemptId.copyOf()
-        if (closed) return@synchronized closedFailure(epoch, ownedAttempt)
+        if (closed || promoted) return@synchronized closedFailure(epoch, ownedAttempt)
         if (!isCurrent(epoch, ownedAttempt)) return@synchronized staleFailure(epoch, ownedAttempt)
         val status = runCatching { operation(ownedAttempt.copyOf()) }.getOrElse {
             retireLocked()
@@ -496,6 +537,13 @@ internal class DirectNativeHandleV4(
     private fun DirectNativeCandidatePairV4.identityKey(): String =
         identityKey(rank, initiator.candidateId, responder.candidateId)
 
+    private fun canCommitNomination(request: DirectNativeCommitNominationRequestV4): Boolean {
+        val winnerKey = request.winningPair.identityKey()
+        return checksStarted && !nominationCommitted && !promoted && planComplete &&
+            request.checkRoundId.contentEquals(checkRoundId) &&
+            winnerKey in submittedPairs && winnerKey in validatedPairs
+    }
+
     private fun identityKey(rank: Int, first: ByteArray, second: ByteArray): String =
         buildString(72) {
             append(rank).append(':')
@@ -517,13 +565,14 @@ internal class DirectNativeHandleV4(
         totalPairs = 0
         planComplete = false
         nominationCommitted = false
+        promoted = false
         submittedPairs.clear()
         validatedPairs.clear()
         pendingSignatures.clear()
     }
 
     private fun isCurrent(epoch: Long, attemptId: ByteArray): Boolean =
-        epoch == authoritativeEpoch && attemptId.contentEquals(authoritativeAttempt)
+        !promoted && epoch == authoritativeEpoch && attemptId.contentEquals(authoritativeAttempt)
 
     private fun planFailure(epoch: Long, attemptId: ByteArray): DirectNativeResultV4<Unit> =
         nativeFailureV4(DirectNativeSyntheticReasonV4.INVALID_PLAN, epoch, attemptId)

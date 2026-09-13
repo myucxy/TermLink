@@ -108,7 +108,8 @@ $deploymentEnvironment = Get-EnvironmentMap -Path $envPath
 
 $expectedEnvironmentNames = @(
     'COMPOSE_PROJECT_NAME', 'TERMLINK_BACKUP_RECIPIENT',
-    'TERMLINK_CONFIG_VERSION', 'TERMLINK_HTTP_BIND_IP', 'TERMLINK_HTTP_PORT',
+    'TERMLINK_CONFIG_VERSION', 'TERMLINK_DIRECT_ROUTING_PERMITTED',
+    'TERMLINK_HTTP_BIND_IP', 'TERMLINK_HTTP_PORT',
     'TERMLINK_IMAGE', 'TERMLINK_PUBLIC_PORT',
     'TERMLINK_PUBLIC_HOST', 'TERMLINK_PUBLIC_URL', 'TERMLINK_RUNTIME_DIR',
     'TERMLINK_SECRETS_DIR'
@@ -119,6 +120,8 @@ Assert-SingleNode ($deploymentEnvironment.TERMLINK_CONFIG_VERSION -ceq '2') 'Uns
 Assert-SingleNode ($deploymentEnvironment.COMPOSE_PROJECT_NAME -ceq 'termlink') 'Production project name must be termlink.'
 Assert-SingleNode ($deploymentEnvironment.TERMLINK_HTTP_BIND_IP -ceq '127.0.0.1') `
     'Server HTTP must bind only to loopback.'
+Assert-SingleNode ($deploymentEnvironment.TERMLINK_DIRECT_ROUTING_PERMITTED -cin @('true', 'false')) `
+    'TERMLINK_DIRECT_ROUTING_PERMITTED must be an explicit boolean.'
 
 $publicUri = $null
 Assert-SingleNode ([Uri]::TryCreate($deploymentEnvironment.TERMLINK_PUBLIC_URL, [UriKind]::Absolute, [ref]$publicUri) -and
@@ -224,6 +227,9 @@ Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_INITIAL_ADMIN
     '/run/secrets/initial_admin_password') 'Server must bootstrap the initial administrator from a file-backed secret.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_DIRECT_TRANSPORT_ENABLED') -ceq 'true') `
     'Single-node Direct/NAT signalling must be enabled.'
+Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_DIRECT_ROUTING_PERMITTED') -ceq
+    $deploymentEnvironment.TERMLINK_DIRECT_ROUTING_PERMITTED) `
+    'Single-node Direct routing permission must exactly match managed configuration.'
 foreach ($name in @(
     'TERMLINK_DIRECT_REDIS_URL_FILE', 'TERMLINK_KEYCLOAK_ADMIN_BASE_URL',
     'TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID', 'TERMLINK_KEYCLOAK_ADMIN_CLIENT_SECRET_FILE',

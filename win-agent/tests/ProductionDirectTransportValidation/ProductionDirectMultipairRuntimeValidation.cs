@@ -46,8 +46,10 @@ namespace TermLink.ProductionDirectTransport.Validation
                 "TermLink-direct-runtime-diagnostics-" + Guid.NewGuid().ToString("N"));
             using var diagnostics = ProductionDirectTransportDiagnostics.CreateForValidation(
                 "1", diagnosticRoot, () => now.UtcDateTime);
+            var signalingFactoryCalls = 0;
             await using var runtime = new ProductionDirectMultipairShadowRuntime(
-                true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, directSupervisor, () => signaling,
+                true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, directSupervisor,
+                () => { signalingFactoryCalls++; return signaling; },
                 _ => Task.FromResult<IReadOnlyList<ProductionDirectPeerAuthorization>>(new[]
                 {
                     new ProductionDirectPeerAuthorization(android, pairwise,
@@ -58,7 +60,9 @@ namespace TermLink.ProductionDirectTransport.Validation
                 delay: ShortDelay,
                 clockMilliseconds: () => now.ToUnixTimeMilliseconds(),
                 nativeCapability: () => true,
-                diagnostics: diagnostics);
+                diagnostics: diagnostics,
+                sharedSignaling: signaling);
+            signaling.Dispatcher = runtime.TryDispatchPrePromotionSignal;
             Require(runtime.Start(), "The ABI v4 multipair runtime did not start.");
             runtime.ObserveRelayConnected(true, relayGeneration);
             var drive = DriveAndroidAsync(runtime, signaling, native, ticket, android, pc, pairwise,
@@ -111,6 +115,9 @@ namespace TermLink.ProductionDirectTransport.Validation
                 "NONE",
                 "NETWORK_CHANGED");
             await runtime.DisposeAsync().ConfigureAwait(false);
+            Require(signalingFactoryCalls == 0 && signaling.StartCalls == 0 && signaling.ReadCalls == 0 &&
+                    signaling.DisposeCalls == 0 && signaling.DispatchCalls > 0,
+                "The shared-signalling multipair runtime created, started, read, disposed, or bypassed its process-wide dispatcher.");
             diagnostics.Dispose();
             Require(diagnostics.WaitForCompletionForValidation(TimeSpan.FromSeconds(5)),
                 "The runtime diagnostic writer did not finish before cleanup.");
@@ -124,6 +131,82 @@ namespace TermLink.ProductionDirectTransport.Validation
             await ValidateBlockingDiagnosticsCannotBlockRuntimeAsync(pc, pcIdentity).ConfigureAwait(false);
             await ValidateUnsupportedCapabilityFailsClosedAsync(pc, pcIdentity, android,
                 androidIdentity, serverIdentity, now).ConfigureAwait(false);
+            await ValidatePromotionNetworkRaceAndLateCallbacksAsync().ConfigureAwait(false);
+        }
+
+        private static async Task ValidatePromotionNetworkRaceAndLateCallbacksAsync()
+        {
+            var now = new DateTimeOffset(2026, 9, 2, 11, 0, 0, TimeSpan.Zero);
+            var pc = Guid.NewGuid(); var android = Guid.NewGuid();
+            var connection = Guid.NewGuid();
+            var pairwise = Enumerable.Range(0, 32).Select(value => (byte)(0x20 + value)).ToArray();
+            using var pcIdentity = DeviceIdentity.Generate();
+            using var androidIdentity = DeviceIdentity.Generate();
+            using var serverIdentity = DeviceIdentity.Generate();
+            var config = Config(serverIdentity.SigningPublicKey);
+            var ticket = Ticket(now, serverIdentity, Guid.NewGuid(), android, pc, connection);
+            var signaling = new FakeSignaling(pc, pcIdentity, config, now.ToUnixTimeMilliseconds());
+            var native = new FakeNativeV4(pcIdentity.SigningPublicKey, pairwise);
+            var supervisor = new ProductionDirectTransportSupervisor(() => now.UtcDateTime);
+            supervisor.ObserveRelayConnected(true);
+            var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Action<byte[]> ready = null;
+            Action<string> failed = null;
+            await using var runtime = new ProductionDirectMultipairShadowRuntime(
+                true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, supervisor,
+                () => throw new InvalidOperationException("Shared signaling must not use its factory."),
+                _ => Task.FromResult<IReadOnlyList<ProductionDirectPeerAuthorization>>(new[]
+                {
+                    new ProductionDirectPeerAuthorization(
+                        android, pairwise, androidIdentity.SigningPublicKey, 1)
+                }),
+                nativeFactory: () => native,
+                platform: new FakePlatform(),
+                delay: ShortDelay,
+                clockMilliseconds: () => now.ToUnixTimeMilliseconds(),
+                nativeCapability: () => true,
+                sharedSignaling: signaling,
+                promoteToDataRuntimeAsync: async (handoff, _) =>
+                {
+                    ready = handoff.NominationCompleted;
+                    failed = handoff.NominationFailed;
+                    entered.TrySetResult(true);
+                    await release.Task.ConfigureAwait(false);
+                    return true;
+                });
+            signaling.Dispatcher = runtime.TryDispatchPrePromotionSignal;
+            Require(runtime.Start(), "The promotion-race runtime did not start.");
+            runtime.ObserveRelayConnected(true, 12);
+            var drive = DriveAndroidAsync(runtime, signaling, native, ticket, android, pc,
+                pairwise, now.ToUnixTimeMilliseconds());
+            try
+            {
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(8)).ConfigureAwait(false);
+                runtime.NotifyNetworkChanged();
+                release.TrySetResult(true);
+                await WaitUntilAsync(() => runtime.Snapshot.ReasonCode == "NETWORK_CHANGED",
+                    TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                var before = runtime.Snapshot;
+                var binding = FakeNativeV4.Binding();
+                try { ready?.Invoke(binding); }
+                finally { CryptographicOperations.ZeroMemory(binding); }
+                failed?.Invoke("DIRECT_LATE_FAILURE");
+                await Task.Delay(25).ConfigureAwait(false);
+                var after = runtime.Snapshot;
+                Require(before.State == after.State && before.ReasonCode == after.ReasonCode &&
+                        after.ReasonCode == "NETWORK_CHANGED",
+                    "A late callback from a network-retired promotion changed current shadow state.");
+            }
+            finally
+            {
+                release.TrySetResult(true);
+                await runtime.DisposeAsync().ConfigureAwait(false);
+                await signaling.DisposeAsync().ConfigureAwait(false);
+                try { await drive.ConfigureAwait(false); }
+                catch (Exception error) when (error is not OutOfMemoryException) { }
+                CryptographicOperations.ZeroMemory(pairwise);
+            }
         }
 
         private static void ValidateRuntimeDiagnostic(
@@ -665,6 +748,11 @@ namespace TermLink.ProductionDirectTransport.Validation
             private readonly Channel<TransportSignalEnvelopeV1> outgoing = Channel.CreateUnbounded<TransportSignalEnvelopeV1>();
             private readonly ProductionDirectTransportServerConfig config;
             private readonly ProductionDirectTransportSignalingClient validator;
+            public Func<TransportSignalEnvelopeV1, bool> Dispatcher { get; set; }
+            public int StartCalls { get; private set; }
+            public int ReadCalls { get; private set; }
+            public int DisposeCalls { get; private set; }
+            public int DispatchCalls { get; private set; }
             public FakeSignaling(Guid pc, DeviceIdentity identity, ProductionDirectTransportServerConfig config, long now)
             {
                 this.config = config;
@@ -682,16 +770,36 @@ namespace TermLink.ProductionDirectTransport.Validation
             public ProductionValidatedDirectPathTicket ValidateIncomingTicket(DirectPathTicketV1 ticket,
                 Guid initiatorDeviceId, Guid connectionId, ProductionDirectTransportServerConfig value) =>
                 validator.ValidateIncomingTicket(ticket, initiatorDeviceId, connectionId, value);
-            public bool Start() => true;
+            public bool Start()
+            {
+                StartCalls++;
+                return true;
+            }
             public bool TrySend(TransportSignalEnvelopeV1 envelope) => outgoing.Writer.TryWrite(envelope);
             public async IAsyncEnumerable<TransportSignalEnvelopeV1> ReadSignalsAsync(
                 [EnumeratorCancellation] CancellationToken cancellationToken = default)
-            { while (await incoming.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                ReadCalls++;
+                while (await incoming.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
                 while (incoming.Reader.TryRead(out var value)) yield return value; }
-            public void Inject(TransportSignalEnvelopeV1 value) => incoming.Writer.TryWrite(value);
+            public void Inject(TransportSignalEnvelopeV1 value)
+            {
+                if (Dispatcher != null)
+                {
+                    DispatchCalls++;
+                    if (!Dispatcher(value))
+                        throw new InvalidOperationException("The process-wide dispatcher rejected a valid pre-promotion signal.");
+                    return;
+                }
+                incoming.Writer.TryWrite(value);
+            }
             public Task<TransportSignalEnvelopeV1> ReadOutboundAsync() => outgoing.Reader.ReadAsync().AsTask();
             public async ValueTask DisposeAsync()
-            { incoming.Writer.TryComplete(); outgoing.Writer.TryComplete(); await validator.DisposeAsync().ConfigureAwait(false); }
+            {
+                DisposeCalls++;
+                incoming.Writer.TryComplete(); outgoing.Writer.TryComplete();
+                await validator.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         private sealed class StaticConfigSignaling : IProductionDirectShadowSignaling
@@ -713,7 +821,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         }
 
-        private sealed class FakeNativeV4 : IProductionDirectShadowNativeV4
+        private sealed class FakeNativeV4 : IProductionDirectPromotableNativeV4
         {
             private readonly ConcurrentQueue<ProductionDirectNativeEventV4> events = new();
             private readonly byte[] pcPublicKey; private readonly byte[] pairwise;
@@ -748,6 +856,11 @@ namespace TermLink.ProductionDirectTransport.Validation
                     batch: 1, total: 1, candidates: new[] { localHost }, complete: false));
                 return ProductionDirectNativeCommandResult.Accepted;
             }
+            public ProductionDirectNativePromotionResultV4 TryPromoteNomination(
+                ProductionDirectCommitRequestV4 request,
+                IProductionDirectNativePromotionOperationV4 operation) =>
+                ProductionDirectNativePromotionResultV4.NotInvoked(
+                    ProductionDirectNativeCommandResult.RelayFallback);
             public ProductionDirectNativeCommandResult BeginChecks(ProductionDirectBeginChecksRequestV4 request)
             {
                 BeginCalls++;

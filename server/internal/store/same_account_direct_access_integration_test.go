@@ -159,6 +159,26 @@ func TestSameAccountDirectAccess(t *testing.T) {
 		t.Fatalf("same-account batch route=%+v present=%v, want MANAGE through PC device %s without expiry", batchRoute, ok, windows.ID)
 	}
 
+	responderKeyID, err := repository.AuthorizeDirectTransportSignal(ctx, userID, windows.ID, android.ID, android.ID)
+	if err != nil || responderKeyID != android.KeyID {
+		t.Fatalf("PC-to-Android responder key=%q error=%v, want %q/nil", responderKeyID, err, android.KeyID)
+	}
+	responderKeyID, err = repository.AuthorizeDirectTransportSignal(ctx, userID, android.ID, windows.ID, android.ID)
+	if err != nil || responderKeyID != android.KeyID {
+		t.Fatalf("Android-to-PC responder key=%q error=%v, want original responder %q/nil", responderKeyID, err, android.KeyID)
+	}
+	if _, err := repository.AuthorizeDirectTransportSignal(ctx, userID, windows.ID, android.ID, uuid.New()); !errors.Is(err, ErrDenied) {
+		t.Fatalf("non-route responder error=%v, want ErrDenied", err)
+	}
+	rotatedResponderKeyID := "same-account-rotated-" + uuid.NewString()
+	if _, err := repository.Pool.Exec(ctx, `UPDATE devices SET key_id=$2 WHERE id=$1`, android.ID, rotatedResponderKeyID); err != nil {
+		t.Fatal(err)
+	}
+	responderKeyID, err = repository.AuthorizeDirectTransportSignal(ctx, userID, windows.ID, android.ID, android.ID)
+	if err != nil || responderKeyID != rotatedResponderKeyID {
+		t.Fatalf("rotated responder key=%q error=%v, want %q/nil", responderKeyID, err, rotatedResponderKeyID)
+	}
+
 	leaseID := uuid.New()
 	leaseExpiry := time.Now().UTC().Add(30 * time.Second)
 	if err := repository.SaveLease(ctx, userID, android.ID, leaseID, sessionID, android.ID, leaseExpiry, 1, "lease.acquire", "same-account-acquire"); err != nil {

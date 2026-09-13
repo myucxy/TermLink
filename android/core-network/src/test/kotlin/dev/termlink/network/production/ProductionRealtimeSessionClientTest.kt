@@ -174,6 +174,75 @@ class ProductionRealtimeSessionClientTest {
         }
     }
 
+    @Test
+    fun semanticInputOutboxRetainsExactBytesUntilApplicationResultAndZeroesOnCompletion() {
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val peerId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val inputId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val rejectedInputId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val fence = SemanticInputFence(sessionId, peerId, keyEpoch = 7, controlGeneration = 3)
+        val otherFence = fence.copy(controlGeneration = 4)
+        val bytes = byteArrayOf(0, 1, 2, 3, 4, 5)
+        val rejectedBytes = byteArrayOf(9, 8, 7)
+        val outbox = SemanticInputOutbox(maxEntries = 4, maxBytes = 64)
+        try {
+            outbox.put(inputId, fence, envelopeSequence = 11, transportGeneration = 2, bytes)
+            assertEquals(1, outbox.size)
+            assertEquals(bytes.size, outbox.byteCount)
+            assertArrayEquals(bytes, requireNotNull(outbox.copyForRelay(inputId, fence)))
+
+            // A transport receipt/success is not an application result.
+            assertArrayEquals(bytes, requireNotNull(outbox.copyForRelay(inputId, fence)))
+            assertFalse(outbox.complete(inputId, otherFence))
+            assertEquals(1, outbox.size)
+
+            // INPUT_ACCEPTED retires only the matching fenced entry.
+            assertTrue(outbox.complete(inputId, fence))
+            assertEquals(0, outbox.size)
+            assertEquals(0, outbox.byteCount)
+            assertTrue(outbox.copyForRelay(inputId, fence) == null)
+
+            // INPUT_REJECTED follows the same application-result retirement rule.
+            outbox.put(rejectedInputId, fence, envelopeSequence = 12, transportGeneration = 2, rejectedBytes)
+            assertTrue(outbox.complete(rejectedInputId, fence))
+            assertEquals(0, outbox.size)
+            assertEquals(0, outbox.byteCount)
+        } finally {
+            outbox.close()
+            bytes.fill(0)
+            rejectedBytes.fill(0)
+        }
+    }
+
+    @Test
+    fun semanticInputOutboxFailsClosedAtEntryAndByteBoundsAndClearsOnClose() {
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val peerId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val fence = SemanticInputFence(sessionId, peerId, keyEpoch = 7, controlGeneration = 0)
+        val firstId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val secondId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val firstBytes = ByteArray(8) { it.toByte() }
+        val secondBytes = ByteArray(8) { (it + 8).toByte() }
+        val outbox = SemanticInputOutbox(maxEntries = 1, maxBytes = 8)
+        try {
+            outbox.put(firstId, fence, envelopeSequence = 1, transportGeneration = 1, firstBytes)
+            assertFailsWith<SemanticInputOutboxOverflowException> {
+                outbox.put(secondId, fence, envelopeSequence = 2, transportGeneration = 1, secondBytes)
+            }
+            assertEquals(1, outbox.size)
+            assertEquals(8, outbox.byteCount)
+            assertArrayEquals(firstBytes, requireNotNull(outbox.copyForRelay(firstId, fence)))
+            outbox.close()
+            assertEquals(0, outbox.size)
+            assertEquals(0, outbox.byteCount)
+            assertTrue(outbox.copyForRelay(firstId, fence) == null)
+        } finally {
+            outbox.close()
+            firstBytes.fill(0)
+            secondBytes.fill(0)
+        }
+    }
+
     private fun testTransport(
         rootUrl: String,
         androidId: UUID,
@@ -3746,12 +3815,170 @@ class ProductionRealtimeSessionClientTest {
             client.remoteSession.onConnected()
             client.remoteSession.grantControl("lease", Long.MAX_VALUE, leaseVersion = 1)
 
-            val result = client.remoteSession.submitInput("dock-shortcut".encodeToByteArray())
+            val result = assertIs<InputSubmission.DeliveryUnknown>(
+                client.remoteSession.submitInput("dock-shortcut".encodeToByteArray()),
+            )
 
-            assertIs<InputSubmission.DeliveryUnknown>(result)
-            assertTrue(transport.sent.any { it.messageType == MessageType.INPUT_EVENT })
+            assertTrue(
+                "Expected INPUT_EVENT; sent=${transport.sent.map { it.messageType }} " +
+                    "generation=${transport.currentConnectedGeneration()} " +
+                    "outbox=${client.semanticInputOutboxSize()}",
+                transport.sent.any { it.messageType == MessageType.INPUT_EVENT },
+            )
             assertTrue(transport.disconnectReasons.isEmpty())
             assertIs<RemoteSessionState.Controlling>(client.sessionState.value)
+            assertEquals(1, client.semanticInputOutboxSize())
+            val firstEnvelope = transport.sent.last { it.messageType == MessageType.INPUT_EVENT }
+            val exactBytes = requireNotNull(client.copyPendingInputEnvelopeForRelay(result.inputId))
+            assertArrayEquals(firstEnvelope.toByteArray(), exactBytes)
+
+            // Relay fallback reuses the retained serialized Envelope. It does
+            // not allocate a new sequence or nonce and cannot retire the
+            // semantic entry without INPUT_ACCEPTED/INPUT_REJECTED.
+            assertTrue(client.resendPendingInputOverRelay(result.inputId))
+            val replayEnvelope = transport.sent.last { it.messageType == MessageType.INPUT_EVENT }
+            assertArrayEquals(exactBytes, replayEnvelope.toByteArray())
+            assertEquals(1, transport.relayExactSendCount.get())
+            assertEquals(1, client.semanticInputOutboxSize())
+            exactBytes.fill(0)
+
+            // An authoritative key epoch change is a hard replay fence. The
+            // old ciphertext must be zeroed and can no longer be emitted even
+            // though the original caller observed only an unknown result.
+            assertTrue(client.rotateKeyMaterial(8, pcIdentity.exchange.publicKey.copyOf()))
+            assertEquals(0, client.semanticInputOutboxSize())
+            assertEquals(0, client.semanticInputOutboxByteCount())
+            assertFalse(client.resendPendingInputOverRelay(result.inputId))
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun authenticatedInputAcceptedAfterCallerTimeoutRetiresSemanticOutbox(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = QueuedSessionTransport()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "http://127.0.0.1:1/",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            inputAcceptanceTimeoutMillis = 25,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        val keyId = "epoch-00000007".encodeToByteArray()
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            assertEquals(1, transport.currentConnectedGeneration())
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            client.remoteSession.grantControl("lease", Long.MAX_VALUE, leaseVersion = 1)
+            assertIs<RemoteSessionState.Controlling>(client.sessionState.value)
+            val result = assertIs<InputSubmission.DeliveryUnknown>(
+                client.remoteSession.submitInput("late-accepted".encodeToByteArray()),
+            )
+            assertTrue(transport.sent.any { it.messageType == MessageType.INPUT_EVENT })
+            assertEquals(1, client.semanticInputOutboxSize())
+
+            val payload = InputResultPayload.newBuilder()
+                .setInputId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(result.inputId)))
+                .setAccepted(true)
+                .build()
+                .toByteArray()
+            transport.deliver(
+                incomingEnvelope(
+                    sessionId = sessionId,
+                    pcId = pcId,
+                    androidId = androidId,
+                    pcIdentity = pcIdentity,
+                    androidIdentity = androidIdentity,
+                    keyId = keyId,
+                    messageType = MessageType.INPUT_ACCEPTED,
+                    payload = payload,
+                    sequence = 1,
+                ),
+                generation = 1,
+            )
+            withTimeout(2_000) {
+                while (client.semanticInputOutboxSize() != 0) kotlinx.coroutines.yield()
+            }
+            assertEquals(0, client.semanticInputOutboxByteCount())
+        } finally {
+            client.close()
+            keyId.fill(0)
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun relayReconnectReplaysPendingSemanticInputExactlyWithoutRetiringIt(): Unit = runBlocking {
+        val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
+        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
+        val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = QueuedSessionTransport()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = "http://127.0.0.1:1/",
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            inputAcceptanceTimeoutMillis = 25,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) { client.sessionState.first { it is RemoteSessionState.Live } }
+            client.remoteSession.grantControl("lease", Long.MAX_VALUE, leaseVersion = 1)
+            assertIs<InputSubmission.DeliveryUnknown>(
+                client.remoteSession.submitInput("reconnect-replay".encodeToByteArray()),
+            )
+            val initial = transport.sent.last { it.messageType == MessageType.INPUT_EVENT }.toByteArray()
+            assertEquals(1, client.semanticInputOutboxSize())
+
+            transport.emitFailed("relay interrupted")
+            transport.emitConnected()
+            withTimeout(2_000) {
+                while (transport.relayExactSendCount.get() == 0) kotlinx.coroutines.yield()
+            }
+
+            assertArrayEquals(initial, transport.relayExactBytes.single())
+            assertEquals(1, client.semanticInputOutboxSize())
+            initial.fill(0)
         } finally {
             client.close()
             androidIdentity.destroy()
@@ -4642,6 +4869,53 @@ class ProductionRealtimeSessionClientTest {
         }
     }
 
+    private fun incomingEnvelope(
+        sessionId: UUID,
+        pcId: UUID,
+        androidId: UUID,
+        pcIdentity: DeviceIdentity,
+        androidIdentity: DeviceIdentity,
+        keyId: ByteArray,
+        messageType: MessageType,
+        payload: ByteArray,
+        sequence: Long,
+    ): Envelope {
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            pcIdentity.exchange.privateKey,
+            androidIdentity.exchange.publicKey,
+            pcId,
+            androidId,
+            7,
+        )
+        val sessionKey = SessionCrypto.deriveSessionKey(
+            pairwise,
+            sessionId,
+            CryptoDirection.PC_TO_ANDROID,
+            keyId,
+        )
+        val nonce = SessionCrypto.nonce(byteArrayOf(7, 6, 5, 4), sequence.toULong())
+        return try {
+            ProductionRealtimeClient.encryptedEnvelope(
+                sessionId = sessionId,
+                senderId = pcId,
+                messageType = messageType,
+                direction = CryptoDirection.PC_TO_ANDROID,
+                sequence = sequence,
+                acknowledgement = 0,
+                keyId = keyId,
+                nonce = nonce,
+                sessionKey = sessionKey,
+                plaintext = payload,
+                recipientId = androidId,
+            )
+        } finally {
+            payload.fill(0)
+            nonce.fill(0)
+            sessionKey.fill(0)
+            pairwise.fill(0)
+        }
+    }
+
     private class GenerationRaceSessionTransport : ProductionRealtimeSessionTransport {
         data class BlockedGenerationSend(
             val messageType: MessageType,
@@ -4843,6 +5117,8 @@ class ProductionRealtimeSessionClientTest {
         private val immediateCloses = AtomicInteger(0)
         val sent = CopyOnWriteArrayList<Envelope>()
         val disconnectReasons = CopyOnWriteArrayList<String>()
+        val relayExactBytes = CopyOnWriteArrayList<ByteArray>()
+        val relayExactSendCount = AtomicInteger(0)
 
         override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incoming.receiveAsFlow()
         override val receivePressure = mutablePressure
@@ -4869,6 +5145,23 @@ class ProductionRealtimeSessionClientTest {
         override fun send(envelope: Envelope): Boolean {
             sent += envelope
             return true
+        }
+
+        override fun sendRelayExact(envelope: Envelope, exactBytes: ByteArray): Boolean {
+            assertArrayEquals(envelope.toByteArray(), exactBytes)
+            relayExactBytes += exactBytes.copyOf()
+            relayExactSendCount.incrementAndGet()
+            sent += Envelope.parseFrom(exactBytes)
+            return true
+        }
+
+        override fun sendRelayExactForConnectedGeneration(
+            envelope: Envelope,
+            exactBytes: ByteArray,
+            expectedGeneration: Int,
+        ): Boolean {
+            if (currentConnectedGeneration() != expectedGeneration) return false
+            return sendRelayExact(envelope, exactBytes)
         }
 
         override fun disconnect(reason: String) {
@@ -4944,11 +5237,19 @@ class ProductionRealtimeSessionClientTest {
         override val state = MutableSharedFlow<RealtimeState>(extraBufferCapacity = 1)
         val sent = CopyOnWriteArrayList<Envelope>()
         val disconnectReasons = CopyOnWriteArrayList<String>()
+        val relayExactSendCount = AtomicInteger(0)
 
         override fun connect() = Unit
 
         override fun send(envelope: Envelope): Boolean {
             sent += envelope
+            return sendResult
+        }
+
+        override fun sendRelayExact(envelope: Envelope, exactBytes: ByteArray): Boolean {
+            assertArrayEquals(envelope.toByteArray(), exactBytes)
+            relayExactSendCount.incrementAndGet()
+            sent += Envelope.parseFrom(exactBytes)
             return sendResult
         }
 

@@ -58,6 +58,51 @@ func TestDirectTransportFeatureFlagDefaultsDisabledAndRejectsInvalidValues(t *te
 	}
 }
 
+func TestDirectTransportEmergencySwitchIgnoresRoutingValue(t *testing.T) {
+	const transportName = "TERMLINK_DIRECT_TRANSPORT_ENABLED"
+	const routingName = "TERMLINK_DIRECT_ROUTING_PERMITTED"
+	t.Setenv(transportName, "false")
+	t.Setenv(routingName, "malformed-stale-value")
+	enabled, routing, err := directTransportFeatureFlags()
+	if err != nil || enabled || routing {
+		t.Fatalf("emergency-off flags=(%t,%t) err=%v, want false,false,nil", enabled, routing, err)
+	}
+
+	t.Setenv(transportName, "true")
+	t.Setenv(routingName, "false")
+	enabled, routing, err = directTransportFeatureFlags()
+	if err != nil || !enabled || routing {
+		t.Fatalf("shadow-only flags=(%t,%t) err=%v, want true,false,nil", enabled, routing, err)
+	}
+
+	t.Setenv(routingName, "true")
+	enabled, routing, err = directTransportFeatureFlags()
+	if err != nil || !enabled || !routing {
+		t.Fatalf("production-direct flags=(%t,%t) err=%v, want true,true,nil", enabled, routing, err)
+	}
+
+	t.Setenv(routingName, "malformed")
+	if _, _, err = directTransportFeatureFlags(); err == nil {
+		t.Fatal("enabled transport accepted malformed routing permission")
+	}
+}
+
+func TestDirectRealtimeCapabilityRequiresReadyTransportAndRoutingPermission(t *testing.T) {
+	for _, test := range []struct {
+		ready, permitted, want bool
+	}{
+		{ready: false, permitted: false, want: false},
+		{ready: false, permitted: true, want: false},
+		{ready: true, permitted: false, want: false},
+		{ready: true, permitted: true, want: true},
+	} {
+		options := directRealtimeHubOptions(test.ready, test.permitted)
+		if options.DirectTransportDataV1 != test.want {
+			t.Fatalf("ready=%t permitted=%t capability=%t, want %t", test.ready, test.permitted, options.DirectTransportDataV1, test.want)
+		}
+	}
+}
+
 func TestDirectTransportRoutesAreAbsentUntilExplicitlyRegistered(t *testing.T) {
 	mux := http.NewServeMux()
 	realtimeCalls := 0

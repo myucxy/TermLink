@@ -247,6 +247,14 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 		"device_id": android.id, "permission": "CONTROL",
 	}, "restore-control", http.StatusOK)
 	signedJSON(t, server.URL, android, http.MethodPost, "/v1/sessions/"+sessionID.String()+"/lease", map[string]any{}, "lease-after-restore", http.StatusCreated)
+	directInputLeasePath := "/v1/sessions/" + sessionID.String() + "/lease?sender_device_id=" + android.id.String()
+	assertDirectInputAuthorizationResponse(
+		t,
+		signedJSON(t, server.URL, pc, http.MethodGet, directInputLeasePath, nil, "", http.StatusOK),
+		android.id,
+		"SINGLE",
+		1,
+	)
 	pcSocket := dialRealtime(t, server.URL, pc, "pc")
 	defer pcSocket.Close()
 	androidSocket := dialRealtime(t, server.URL, android, "android")
@@ -294,6 +302,8 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	writeEnvelope(t, androidSocket, expiringSubscribe)
 	readEnvelope(t, pcSocket)
 	time.Sleep(750 * time.Millisecond)
+	expiredDirectInput := signedJSON(t, server.URL, pc, http.MethodGet, directInputLeasePath, nil, "", http.StatusForbidden)
+	assertDirectInputErrorPayload(t, expiredDirectInput, "CONTROL_NOT_GRANTED", "errors.control_not_granted")
 	drainRouteEvents(routeEvents)
 	expiredOutput := testEnvelope(pc, android, sessionID, realtimewire.OutputChunk, realtimewire.PCToAndroid, 3)
 	writeEnvelope(t, pcSocket, expiredOutput)
@@ -301,6 +311,13 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 	signedJSON(t, server.URL, pc, http.MethodPost, "/v1/pcs/"+pcID.String()+"/grants", map[string]any{
 		"device_id": android.id, "permission": "CONTROL",
 	}, "restore-expired-grant", http.StatusOK)
+	assertDirectInputAuthorizationResponse(
+		t,
+		signedJSON(t, server.URL, pc, http.MethodGet, directInputLeasePath, nil, "", http.StatusOK),
+		android.id,
+		"SINGLE",
+		1,
+	)
 	assertWebSocketClosed(t, androidSocket, websocket.ClosePolicyViolation)
 	waitAuthorityEvent(t, authorityEvents, "device-authorization-changed")
 	restoredAndroidSocket := dialRealtime(t, server.URL, android, "android")

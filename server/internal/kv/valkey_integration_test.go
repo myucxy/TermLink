@@ -167,6 +167,96 @@ func TestAcquireConcurrentContendersCreateOneLease(t *testing.T) {
 	}
 }
 
+func TestLeaseParticipantAuthorizationIsAtomicFencedAndDoesNotRenew(t *testing.T) {
+	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
+	if redisURL == "" {
+		t.Skip("TERMLINK_INTEGRATION_REDIS_URL is required for the real Valkey participant authorization test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	valkey, err := Open(ctx, redisURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID, holderID, participantID := uuid.New(), uuid.New(), uuid.New()
+	leaseKey := "lease:" + sessionID.String()
+	participantsKey := leaseKey + ":participants"
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		_ = valkey.Client.Del(cleanupContext, leaseKey, leaseKey+":version", participantsKey).Err()
+		_ = valkey.Close()
+	})
+
+	lease, err := valkey.Acquire(ctx, sessionID, holderID, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined, err := valkey.Acquire(ctx, sessionID, participantID, 20*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseTTLBefore, err := valkey.Client.PTTL(ctx, leaseKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	participantsTTLBefore, err := valkey.Client.PTTL(ctx, participantsKey).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderScoreBefore, err := valkey.Client.ZScore(ctx, participantsKey, holderID.String()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	participantScoreBefore, err := valkey.Client.ZScore(ctx, participantsKey, participantID.String()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, test := range map[string]struct {
+		lease  Lease
+		device uuid.UUID
+		want   bool
+	}{
+		"holder":              {lease: joined, device: holderID, want: true},
+		"joined participant":  {lease: joined, device: participantID, want: true},
+		"unknown participant": {lease: joined, device: uuid.New()},
+		"stale lease ID":      {lease: func() Lease { stale := joined; stale.ID = uuid.New(); return stale }(), device: holderID},
+		"stale lease version": {lease: func() Lease { stale := joined; stale.Version++; return stale }(), device: holderID},
+	} {
+		t.Run(name, func(t *testing.T) {
+			active, queryErr := valkey.IsLeaseParticipantActive(ctx, test.lease, test.device)
+			if queryErr != nil || active != test.want {
+				t.Fatalf("IsLeaseParticipantActive()=%t/%v, want %t/nil", active, queryErr, test.want)
+			}
+		})
+	}
+	leaseTTLAfter, _ := valkey.Client.PTTL(ctx, leaseKey).Result()
+	participantsTTLAfter, _ := valkey.Client.PTTL(ctx, participantsKey).Result()
+	holderScoreAfter, _ := valkey.Client.ZScore(ctx, participantsKey, holderID.String()).Result()
+	participantScoreAfter, _ := valkey.Client.ZScore(ctx, participantsKey, participantID.String()).Result()
+	if leaseTTLAfter > leaseTTLBefore || participantsTTLAfter > participantsTTLBefore {
+		t.Fatalf("authorization extended TTLs lease=%s->%s participants=%s->%s", leaseTTLBefore, leaseTTLAfter, participantsTTLBefore, participantsTTLAfter)
+	}
+	if holderScoreAfter != holderScoreBefore || participantScoreAfter != participantScoreBefore {
+		t.Fatalf("authorization changed participant expiry scores holder=%f->%f participant=%f->%f", holderScoreBefore, holderScoreAfter, participantScoreBefore, participantScoreAfter)
+	}
+
+	if _, err := valkey.Client.ZAdd(ctx, participantsKey, redis.Z{Score: float64(time.Now().Add(-time.Second).UnixMilli()), Member: participantID.String()}).Result(); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := valkey.IsLeaseParticipantActive(ctx, lease, participantID); err != nil || active {
+		t.Fatalf("expired participant active/error=%t/%v, want false/nil", active, err)
+	}
+	if _, err := valkey.Client.ZScore(ctx, participantsKey, participantID.String()).Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("expired participant was not atomically pruned: %v", err)
+	}
+	accepted, released, err := valkey.ReleaseForDevice(ctx, lease, holderID)
+	if err != nil || !accepted || !released {
+		t.Fatalf("holder release accepted/released/error=%t/%t/%v", accepted, released, err)
+	}
+}
+
 func TestReleaseForDeviceRetainsSharedLeaseUntilLastParticipant(t *testing.T) {
 	redisURL := strings.TrimSpace(os.Getenv("TERMLINK_INTEGRATION_REDIS_URL"))
 	if redisURL == "" {

@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "termlink_direct_ffi_v4.h"
+#include "termlink_direct_jni_v4_registry.h"
 
 namespace {
 
@@ -50,6 +51,7 @@ struct BridgeHolderV4 {
     }
     std::mutex mutex;
     void* bridge;
+    bool promoted = false;
 };
 
 std::mutex g_v4_registry_mutex;
@@ -87,7 +89,7 @@ jint with_v4_bridge(jlong token, Operation&& operation) {
     auto holder = find_v4_holder(token);
     if (!holder) return kInvalid;
     std::lock_guard lock(holder->mutex);
-    if (holder->bridge == nullptr) return kInvalid;
+    if (holder->bridge == nullptr || holder->promoted) return kInvalid;
     return static_cast<jint>(operation(holder->bridge));
 }
 
@@ -102,6 +104,22 @@ void secure_zero(std::uint8_t* bytes, std::size_t size) {
     volatile std::uint8_t* output = bytes;
     for (std::size_t index = 0; index < size; ++index) output[index] = 0;
 }
+
+class SecureZeroGuard final {
+public:
+    SecureZeroGuard(std::uint8_t* bytes, std::size_t size) noexcept
+        : bytes_(bytes), size_(size) {}
+    ~SecureZeroGuard() noexcept {
+        if (bytes_ != nullptr && size_ != 0) secure_zero(bytes_, size_);
+    }
+
+    SecureZeroGuard(const SecureZeroGuard&) = delete;
+    SecureZeroGuard& operator=(const SecureZeroGuard&) = delete;
+
+private:
+    std::uint8_t* bytes_;
+    std::size_t size_;
+};
 
 bool nonzero_id(const std::uint8_t* bytes) { return !all_zero(bytes, 16); }
 
@@ -401,6 +419,26 @@ bool event_valid(const TermLinkDirectEventV4& event) {
 
 }  // namespace
 
+std::int32_t termlink_direct_jni_promote_v4_token(
+    std::int64_t v4_token, void* v5_bridge,
+    const TermLinkDirectPromoteV5* promote) {
+    if (v4_token <= 0 || v5_bridge == nullptr || promote == nullptr) {
+        return TERMLINK_DIRECT_V5_ERR_INVALID_ARGUMENT;
+    }
+    auto holder = find_v4_holder(static_cast<jlong>(v4_token));
+    if (!holder) return TERMLINK_DIRECT_V5_ERR_INVALID_HANDLE;
+    std::lock_guard lock(holder->mutex);
+    if (holder->bridge == nullptr || holder->promoted) {
+        return TERMLINK_DIRECT_V5_ERR_INVALID_HANDLE;
+    }
+    const auto status = termlink_direct_promote_v5(v5_bridge, holder->bridge, promote);
+    // ABI v5 makes promotion one-shot from the caller's perspective even when
+    // activation, timeout, or queueing later fails. Keep destroy available for
+    // the consumed V4 wrapper, but never expose ordinary V4 operations again.
+    holder->promoted = true;
+    return status;
+}
+
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV4_abiContractV4(
     JNIEnv* env, jobject) {
@@ -522,6 +560,10 @@ Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV4_beginChec
         scalars[7] < 0 || scalars[7] > 1 || scalars[8] < 1 || scalars[8] > 8) return kInvalid;
     if (scalars[6] != scalars[8]) return kInvalid;
     TermLinkDirectBeginChecksV4 input{};
+    SecureZeroGuard local_send_probe_hmac_key_guard(
+        input.local_send_probe_hmac_key, sizeof(input.local_send_probe_hmac_key));
+    SecureZeroGuard peer_receive_probe_hmac_key_guard(
+        input.peer_receive_probe_hmac_key, sizeof(input.peer_receive_probe_hmac_key));
     input.abi_version = TERMLINK_DIRECT_ABI_VERSION_V4;
     input.struct_size = static_cast<std::uint32_t>(sizeof(input));
     input.epoch = static_cast<std::uint64_t>(scalars[0]);
@@ -557,8 +599,6 @@ Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV4_beginChec
     const jint result = with_v4_bridge(token, [&input](void* bridge) {
         return termlink_direct_begin_checks_v4(bridge, &input);
     });
-    secure_zero(input.local_send_probe_hmac_key, sizeof(input.local_send_probe_hmac_key));
-    secure_zero(input.peer_receive_probe_hmac_key, sizeof(input.peer_receive_probe_hmac_key));
     return result;
 }
 

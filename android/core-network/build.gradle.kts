@@ -39,6 +39,36 @@ val directReadelfExecutable = directExecutableFromEnvironment(
     "TERMLINK_LLVM_READELF",
     directAndroidNdkRoot.resolve("toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-readelf.exe"),
 )
+val directV5JniExportPrefix =
+    "Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV5_"
+val expectedDirectV5JniExports = setOf(
+    "abiContractV5",
+    "createV5",
+    "pathUsageV5",
+    "attachV5",
+    "promoteV5",
+    "submitSignatureV5",
+    "receiveSigningPayloadV5",
+    "pathInfoV5",
+    "receiveEnvelopeV5",
+    "startProposalV5",
+    "receiveProposalV5",
+    "receiveAcceptV5",
+    "receiveCommitV5",
+    "commitEchoSentV5",
+    "receiveFallbackV5",
+    "tickV5",
+    "updateAppliedCursorV5",
+    "deregisterSessionV5",
+    "routeEnvelopeV5",
+    "pollRouteActionV5",
+    "arbitrateIngressV5",
+    "tickIngressV5",
+    "pollEventV5",
+    "cancelV5",
+    "networkChangedV5",
+    "destroyV5",
+).mapTo(sortedSetOf()) { directV5JniExportPrefix + it }
 
 val buildTermlinkDirectNative by tasks.registering {
     group = "build"
@@ -68,6 +98,9 @@ val buildTermlinkDirectNative by tasks.registering {
         }
         check(directCoreRoot.resolve("include/termlink_direct_ffi_v4.h").isFile) {
             "network-core/include/termlink_direct_ffi_v4.h must be provided by the shared network core"
+        }
+        check(directCoreRoot.resolve("include/termlink_direct_ffi_v5.h").isFile) {
+            "network-core/include/termlink_direct_ffi_v5.h must be provided by the shared network core"
         }
         for (abi in abis) {
             val buildDir = directNativeBuildRoot.get().dir(abi).asFile
@@ -134,6 +167,41 @@ val verifyTermlinkDirectNativeAlignment by tasks.registering {
     }
 }
 
+val verifyTermlinkDirectNativeExports by tasks.registering {
+    group = "verification"
+    description = "Verifies every requested Direct JNI library exports the complete frozen V5 bridge."
+    dependsOn(buildTermlinkDirectNative)
+
+    doLast {
+        check(directReadelfExecutable.isFile) {
+            "Pinned Android NDK llvm-readelf is missing: $directReadelfExecutable"
+        }
+        for (abi in requestedDirectAbis.get()) {
+            val library = generatedDirectNativeRoot.get().dir(abi)
+                .file("libtermlink_direct_jni.so").asFile
+            check(library.isFile) { "Direct JNI output is missing for $abi: $library" }
+            val dynamicSymbols = providers.exec {
+                commandLine(
+                    directReadelfExecutable.absolutePath,
+                    "--dyn-syms",
+                    "--wide",
+                    library.absolutePath,
+                )
+            }.standardOutput.asText.get()
+            val actual = dynamicSymbols.lineSequence()
+                .map(String::trim)
+                .filter { it.contains(directV5JniExportPrefix) }
+                .map { it.substringAfterLast(' ') }
+                .toCollection(sortedSetOf())
+            check(actual == expectedDirectV5JniExports) {
+                val missing = expectedDirectV5JniExports - actual
+                val unexpected = actual - expectedDirectV5JniExports
+                "Direct JNI $abi V5 exports drifted; missing=$missing unexpected=$unexpected"
+            }
+        }
+    }
+}
+
 android {
     namespace = "dev.termlink.network.testrelay"
     compileSdk = 36
@@ -182,5 +250,9 @@ dependencies {
 }
 
 tasks.named("preBuild").configure {
-    dependsOn(buildTermlinkDirectNative)
+    dependsOn(
+        buildTermlinkDirectNative,
+        verifyTermlinkDirectNativeAlignment,
+        verifyTermlinkDirectNativeExports,
+    )
 }

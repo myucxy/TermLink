@@ -3,6 +3,8 @@ package dev.termlink.product
 import android.content.res.Configuration
 import dev.termlink.model.DeviceTrustState
 import dev.termlink.model.PcSummary
+import dev.termlink.model.SessionState
+import dev.termlink.model.SessionSummary
 import dev.termlink.harness.BuildConfig
 import java.time.Instant
 import java.util.UUID
@@ -175,6 +177,79 @@ class ProductStateTest {
         assertFalse(ProductSnapshot(signedIn = true).isConnected())
         assertTrue(ProductSnapshot(connectionState = ProductConnectionState.CONNECTED).isConnected())
     }
+
+    @Test
+    fun sessionCarrierMappingUsesExactSessionIdAndFailsClosed() {
+        val pcId = UUID.fromString("30000000-0000-0000-0000-000000000001")
+        val deviceId = UUID.fromString("20000000-0000-0000-0000-000000000001")
+        val session = testSession(pcId)
+        val pc = testPc(pcId, deviceId)
+        val snapshot = ProductSnapshot(
+            pcs = listOf(pc),
+            pcCarrierStates = mapOf(deviceId to PcCarrierState.LAN_DIRECT),
+            sessionCarrierStates = mapOf(session.id to PcCarrierState.LAN_DIRECT),
+        )
+
+        assertEquals(PcCarrierState.LAN_DIRECT, snapshot.carrierForSession(session))
+        assertEquals(
+            PcCarrierState.RELAY,
+            snapshot.copy(sessionCarrierStates = mapOf(pcId to PcCarrierState.NAT_DIRECT))
+                .carrierForSession(session),
+        )
+        assertEquals(
+            PcCarrierState.RELAY,
+            snapshot.copy(sessionCarrierStates = emptyMap()).carrierForSession(session),
+        )
+        assertEquals(
+            PcCarrierState.LAN_DIRECT,
+            snapshot.copy(pcs = emptyList()).carrierForSession(session),
+        )
+    }
+
+    @Test
+    fun removingSessionDoesNotRemovePcCarrierState() {
+        val pcId = UUID.fromString("30000000-0000-0000-0000-000000000002")
+        val deviceId = UUID.fromString("20000000-0000-0000-0000-000000000002")
+        val session = testSession(pcId)
+        val carrierStates = mapOf(deviceId to PcCarrierState.NAT_DIRECT)
+        val snapshot = ProductSnapshot(
+            pcs = listOf(testPc(pcId, deviceId)),
+            sessions = listOf(session),
+            pcCarrierStates = carrierStates,
+            sessionCarrierStates = mapOf(session.id to PcCarrierState.NAT_DIRECT),
+        )
+
+        val removed = snapshot.withoutSession(session.id)
+
+        assertTrue(removed.sessions.isEmpty())
+        assertEquals(carrierStates, removed.pcCarrierStates)
+        assertEquals(PcCarrierState.NAT_DIRECT, removed.pcCarrierStates[deviceId])
+        assertTrue(removed.sessionCarrierStates.isEmpty())
+    }
+
+    private fun testPc(id: UUID, deviceId: UUID): PcSummary = PcSummary(
+        id = id,
+        deviceId = deviceId,
+        name = "test-pc",
+        agentVersion = "test",
+        remoteRoutingEnabled = true,
+        online = true,
+        lastSeenAt = Instant.EPOCH,
+    )
+
+    private fun testSession(pcId: UUID): SessionSummary = SessionSummary(
+        id = UUID.nameUUIDFromBytes(pcId.toString().toByteArray()),
+        pcId = pcId,
+        shellType = "powershell",
+        encryptedTitle = null,
+        state = SessionState.RUNNING,
+        columns = 80,
+        rows = 24,
+        lastOutputSequence = 0u,
+        createdAt = Instant.EPOCH,
+        endedAt = null,
+        online = true,
+    )
 
     @Test
     fun agentUpdateCancellationStopsAtInstallBoundary() {

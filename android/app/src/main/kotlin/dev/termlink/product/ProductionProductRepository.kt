@@ -42,7 +42,9 @@ import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.network.direct.ProductionDirectAuthorizedPeer
-import dev.termlink.network.direct.ProductionDirectShadowRuntime
+import dev.termlink.network.direct.ProductionDirectCarrier
+import dev.termlink.network.direct.ProductionDirectDeviceCoordinator
+import dev.termlink.network.direct.ProductionDirectLiveSessionRegistration
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.ControlRequestSupersededException
 import dev.termlink.network.production.InputSequenceProvider
@@ -80,6 +82,7 @@ import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.nativecore.NativeTerminalEngine
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.io.IOException
+import java.io.Closeable
 import java.time.Instant
 import java.net.URI
 import java.net.URLEncoder
@@ -173,9 +176,15 @@ internal class RealtimeAccessTokenSource {
  * and remote-session ownership.  TermLink therefore owns this boundary; Termux's
  * generation checks are only a lifecycle-behaviour reference, not reusable code.
  */
-internal class AuthenticationLifecycleFence {
+internal class AuthenticationLifecycleFence(
+    initialGeneration: Long = 0L,
+) {
+    init {
+        require(initialGeneration >= 0L) { "authentication generation cannot be negative" }
+    }
+
     private val lock = Any()
-    private var generation = 0L
+    private var generation = initialGeneration
 
     fun capture(): Long = synchronized(lock) { generation }
 
@@ -284,7 +293,90 @@ internal fun authenticationExpiredSnapshot(
     authenticationState = ProductAuthenticationState.SIGNED_OUT,
     connectionState = ProductConnectionState.ERROR,
     connectionError = message,
+    pcCarrierStates = emptyMap(),
+    sessionCarrierStates = emptyMap(),
 )
+
+/** Exact runtime identity fence used by asynchronous Direct carrier projection. */
+internal fun directRuntimeProjectionClaimMatches(
+    currentOwner: Any?,
+    currentMultiplexer: Any?,
+    currentCoordinator: Any?,
+    expectedOwner: Any,
+    expectedMultiplexer: Any,
+    expectedCoordinator: Any,
+): Boolean = currentOwner === expectedOwner &&
+    currentMultiplexer === expectedMultiplexer &&
+    currentCoordinator === expectedCoordinator
+
+/**
+ * Keeps only non-Relay carriers backed by the current trusted, online PC
+ * directory. Missing entries deliberately project as Relay in [ProductSnapshot].
+ */
+internal fun retainAuthoritativePcCarrierStates(
+    carrierStates: Map<UUID, PcCarrierState>,
+    devices: List<DeviceSummary>,
+    pcs: List<PcSummary>,
+): Map<UUID, PcCarrierState> {
+    val trustedPcDeviceIds = devices.asSequence()
+        .filter { it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED }
+        .mapTo(hashSetOf(), DeviceSummary::id)
+    val admitted = pcs.asSequence()
+        .filter(PcSummary::online)
+        .map(PcSummary::deviceId)
+        .filterTo(hashSetOf(), trustedPcDeviceIds::contains)
+    return carrierStates.filter { (deviceId, carrier) ->
+        deviceId in admitted && carrier != PcCarrierState.RELAY
+    }
+}
+
+/**
+ * Keeps only exact live-session carriers whose owning PC is still trusted and
+ * online. A device-level Direct state is never expanded to unlisted sessions.
+ */
+internal fun retainAuthoritativeSessionCarrierStates(
+    carrierStates: Map<UUID, PcCarrierState>,
+    devices: List<DeviceSummary>,
+    pcs: List<PcSummary>,
+    sessions: List<SessionSummary>,
+): Map<UUID, PcCarrierState> {
+    val trustedPcDeviceIds = devices.asSequence()
+        .filter { it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED }
+        .mapTo(hashSetOf(), DeviceSummary::id)
+    val admittedPcIds = pcs.asSequence()
+        .filter { it.online && it.deviceId in trustedPcDeviceIds }
+        .mapTo(hashSetOf(), PcSummary::id)
+    val admittedSessionIds = sessions.asSequence()
+        .filter { it.online && it.pcId in admittedPcIds }
+        .mapTo(hashSetOf(), SessionSummary::id)
+    return carrierStates.filter { (sessionId, carrier) ->
+        sessionId in admittedSessionIds && carrier != PcCarrierState.RELAY
+    }
+}
+
+internal fun ProductionDirectCarrier.toPcCarrierState(): PcCarrierState = when (this) {
+    ProductionDirectCarrier.RELAY -> PcCarrierState.RELAY
+    ProductionDirectCarrier.NEGOTIATING -> PcCarrierState.NEGOTIATING_DIRECT
+    ProductionDirectCarrier.LAN_DIRECT -> PcCarrierState.LAN_DIRECT
+    ProductionDirectCarrier.NAT_DIRECT -> PcCarrierState.NAT_DIRECT
+}
+
+private const val DIRECT_SESSION_CUTOVER_CAPABILITY = "direct_session_cutover_v1"
+private const val DIRECT_TRANSPORT_DATA_CAPABILITY = "direct_transport_data_v1"
+
+/**
+ * Data-plane Hello capabilities are an optional advertisement. They must not
+ * enter the required Welcome set because Relay-only servers remain supported.
+ */
+internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set<String> =
+    if (dataPlaneEnabled) {
+        setOf(
+            DIRECT_SESSION_CUTOVER_CAPABILITY,
+            DIRECT_TRANSPORT_DATA_CAPABILITY,
+        )
+    } else {
+        emptySet()
+    }
 
 /** Only a rejected refresh credential terminates an established sign-in. */
 internal fun isAuthenticationRefreshRejection(error: Throwable): Boolean =
@@ -523,6 +615,10 @@ internal data class ProductRealtimeDiagnostics(
     val flowControlSendCount: Long,
     val lastReceivedSequence: Long,
     val lastHandledSequence: Long,
+    val contiguousAppliedSequence: Long = 0,
+    val duplicateEventCount: Long = 0,
+    val historyGapCount: Long = 0,
+    val durableAck: Long = 0,
     val networkAvailableCount: Int,
     val networkLostCount: Int,
     val networkReconnectCount: Int,
@@ -711,7 +807,7 @@ internal class ProductionProductRepository(
     private val remoteFilePreflightHttp = http.newBuilder()
         .callTimeout(20, TimeUnit.SECONDS)
         .build()
-    // Direct is an optional shadow path. Give its blocking REST calls and
+    // Direct is an optional sibling path. Give its blocking REST calls and
     // signalling WebSocket an independent dispatcher/connection pool so a
     // black-holed STUN/signalling attempt cannot consume Relay's HTTP budget.
     private val directShadowHttp = createIsolatedDirectShadowHttpClient(http)
@@ -740,8 +836,8 @@ internal class ProductionProductRepository(
     )
     // Direct performs bounded but blocking control-plane and native work. It
     // must never occupy the single Relay/router permit above.
-    private val directShadowRuntimeScope = CoroutineScope(
-        SupervisorJob() + Dispatchers.IO.limitedParallelism(1),
+    private val directCoordinatorRuntimeScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO,
     )
     private val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
     private val realtimeNetworkLock = Any()
@@ -795,7 +891,7 @@ internal class ProductionProductRepository(
                 realtimeMultiplexer?.onNetworkAvailable()
             }
         }
-        observeDirectShadowNetwork(network)
+        observeDirectCoordinatorNetwork(network)
     }
     private val realtimeNetworkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -823,15 +919,15 @@ internal class ProductionProductRepository(
                     false
                 }
             }
-            if (removed) observeDirectShadowNetwork(null)
+            if (removed) observeDirectCoordinatorNetwork(null)
         }
     }
 
-    private fun observeDirectShadowNetwork(network: Network?) {
+    private fun observeDirectCoordinatorNetwork(network: Network?) {
         val owned = synchronized(liveSessionLock) {
             val owner = realtimeMultiplexerOwner
-            val runtime = directShadowRuntime
-            if (owner == null || runtime == null) null else owner.authenticationGeneration to runtime
+            val coordinator = directCoordinator
+            if (owner == null || coordinator == null) null else owner.authenticationGeneration to coordinator
         } ?: return
         owned.second.observeNetwork(owned.first, network)
     }
@@ -846,7 +942,8 @@ internal class ProductionProductRepository(
     private val sessionAuthorityTransitionFences = ConcurrentHashMap.newKeySet<UUID>()
     @Volatile private var realtimeMultiplexer: ProductionRealtimeMultiplexer? = null
     @Volatile private var realtimeMultiplexerOwner: RealtimeAuthenticationOwner? = null
-    @Volatile private var directShadowRuntime: ProductionDirectShadowRuntime? = null
+    @Volatile private var directCoordinator: ProductionDirectDeviceCoordinator? = null
+    @Volatile private var directCarrierProjectionJob: Job? = null
     private val historyEngines = ConcurrentHashMap<UUID, TermuxTerminalEngine>()
     private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val transcriptLoads = ConcurrentHashMap<TranscriptLoadKey, Deferred<Unit>>()
@@ -870,16 +967,25 @@ internal class ProductionProductRepository(
     // -> liveSessionLock. No code holding liveSessionLock may enter the fence.
     private val authenticationRetirementBarrier = AuthenticationRetirementBarrier()
     private val realtimeAccessToken = RealtimeAccessTokenSource()
-    private val authenticationLifecycle = AuthenticationLifecycleFence()
+    // Runtime owners require a positive generation. Start this repository at
+    // generation one so persisted authentication can restore a session before
+    // the first interactive auth transition advances the fence.
+    private val authenticationLifecycle = AuthenticationLifecycleFence(initialGeneration = 1L)
     private var pendingInteractiveAuthenticationGeneration: Long? = null
     private val tokenRefresh = TokenRefreshCoordinator { force ->
         requestFreshAccessToken(force, expectedRuntimeOwner = null)
     }
-    // The first production client is intentionally pinned to the public service.
-    // Migrate older installs that may still have a locally edited endpoint.
-    private val initialServerUrl = PRODUCT_PUBLIC_SERVER_URL.also {
-        if (sessionStore.serverUrl != it) sessionStore.serverUrl = it
+    // The build default is only the first-run value. A selected endpoint is
+    // persisted and is the root for every TermLink request in this runtime.
+    private val initialServerUrl = run {
+        val stored = sessionStore.serverUrl
+        val normalized = stored?.let { runCatching { normalizeProductServerUrl(it) }.getOrNull() }
+            ?: PRODUCT_PUBLIC_SERVER_URL
+        if (sessionStore.serverUrl != normalized) sessionStore.serverUrl = normalized
+        normalized
     }
+
+    private fun currentServerUrl(): String = sessionStore.serverUrl ?: initialServerUrl
     private val billing = BillingCoordinator(
         adapter = PlayBillingAdapter(context, activityProvider),
         gateway = object : BillingServerGateway {
@@ -905,6 +1011,7 @@ internal class ProductionProductRepository(
     @Volatile private var accountScope: String? = sessionStore.accountScope
     private var oidcConfiguration: NativeOidcConfiguration? = null
     @Volatile private var closed = false
+    private var directProductE2EBridgeRegistration: Closeable? = null
     private val updateArchitecture = Build.SUPPORTED_ABIS.firstOrNull()?.takeIf { it.isNotBlank() } ?: "universal"
     private val updateRequestKey = "$PRODUCT_APPSHIP_SLUG|android|$updateArchitecture|stable|${BuildConfig.VERSION_CODE}"
     private val updateDownloader = ProductUpdateDownloader(
@@ -981,6 +1088,11 @@ internal class ProductionProductRepository(
             realtimeMultiplexer?.onAppForegrounded(backgroundDurationMillis, networkUsable = true)
         }
     }
+
+    /** Content-free lifecycle observation used only by the isolated Debug acceptance bridge. */
+    internal fun debugDirectProductE2ELifecycle(): RealtimeAppLifecycleState =
+        synchronized(realtimeLifecycleLock) { realtimeLifecycleState }
+
     private val billingStateJob = scope.launch {
         billing.snapshot.collect { state ->
             mutableSnapshot.value = mutableSnapshot.value.copy(billing = state)
@@ -1008,14 +1120,38 @@ internal class ProductionProductRepository(
             connectivityManager.registerDefaultNetworkCallback(realtimeNetworkCallback)
             true
         }.getOrDefault(false)
+        if (BuildConfig.TERMLINK_DIRECT_TRANSPORT_SHADOW &&
+            BuildConfig.TERMLINK_DIRECT_TRANSPORT_DATA_PLANE
+        ) {
+            val bridge = ProductionDirectProductE2EBridge(
+                repository = this,
+                captureAuthenticationGeneration = authenticationLifecycle::capture,
+                isAuthenticationGenerationCurrent = authenticationLifecycle::isCurrent,
+                moveProductToBackground = { activityProvider()?.moveTaskToBack(true) == true },
+                moveProductToForeground = {
+                    val activity = activityProvider()
+                    if (activity == null) {
+                        false
+                    } else {
+                        activity.startActivity(
+                            Intent(activity, ProductActivity::class.java).addFlags(
+                                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                            ),
+                        )
+                        true
+                    }
+                },
+            )
+            directProductE2EBridgeRegistration = ProductionDirectProductE2EBridgeRegistry.attach(bridge)
+        }
         if (authState?.isAuthorized == true) {
             scope.launch { runCatching { refresh() } }
         }
     }
 
     override suspend fun configureServer(url: String) {
-        val normalized = PRODUCT_PUBLIC_SERVER_URL
-        val changed = normalized != sessionStore.serverUrl
+        val normalized = normalizeProductServerUrl(url)
+        val changed = normalized != currentServerUrl()
         var authenticationGeneration = authenticationLifecycle.capture()
         if (changed) {
             cancelRemoteDownloadsAndJoin(clearMetadata = true)
@@ -1281,7 +1417,7 @@ internal class ProductionProductRepository(
             val request = requestBuilder.build()
             val registrationFlow = flow == EmbeddedAuthFlow.REGISTRATION
             val initialUri = if (registrationFlow) {
-                EmbeddedOidcContract.registrationUri(PRODUCT_PUBLIC_SERVER_URL)
+                EmbeddedOidcContract.registrationUri(currentServerUrl())
             } else {
                 request.toUri()
             }
@@ -1441,7 +1577,7 @@ internal class ProductionProductRepository(
                         authenticationState = ProductAuthenticationState.SIGNED_OUT,
                         connectionState = ProductConnectionState.CONFIGURED,
                         enrollmentState = ProductEnrollmentState.UNKNOWN,
-                        serverUrl = PRODUCT_PUBLIC_SERVER_URL,
+                        serverUrl = currentServerUrl(),
                     )
                 }
             }
@@ -1470,6 +1606,8 @@ internal class ProductionProductRepository(
                         snapshot.copy(
                             signedIn = false,
                             accountLabel = null,
+                            pcCarrierStates = emptyMap(),
+                            sessionCarrierStates = emptyMap(),
                             sessionStates = emptyMap(),
                             sessionOpenFailures = emptyMap(),
                             sessionTitles = emptyMap(),
@@ -1695,6 +1833,15 @@ internal class ProductionProductRepository(
             // of presenting TL-N003 or rebuilding the transport.
             clearSessionOpenFailure(sessionId)
         } catch (error: Throwable) {
+            if (BuildConfig.DEBUG) {
+                Log.w(
+                    SESSION_OPEN_LOG_TAG,
+                        "control_request_failed type=${error::class.java.simpleName} " +
+                        "cause=${error.cause?.javaClass?.simpleName.orEmpty()} " +
+                        "api=${(error as? TermLinkApiException)?.status ?: 0}:" +
+                        "${(error as? TermLinkApiException)?.code.orEmpty()}",
+                )
+            }
             val classified = classifySessionOpenException(error, SessionFailureStage.CONTROL)
             observeSessionOpenFailure(
                 sessionId = sessionId,
@@ -1840,7 +1987,7 @@ internal class ProductionProductRepository(
             }
         }
         check(bootstrapStarted) { "Authentication lifecycle changed" }
-        val root = PRODUCT_PUBLIC_SERVER_URL
+        val root = currentServerUrl()
         val stored = authenticationLifecycle.capture { currentGeneration ->
             check(
                 !closed &&
@@ -1889,9 +2036,23 @@ internal class ProductionProductRepository(
                 )
             }
         } catch (error: CancellationException) {
+            withContext(NonCancellable) {
+                try {
+                    hostHistoryClient?.closeGracefully()
+                } catch (_: Throwable) {
+                    // Preserve the cancellation and dispose the renderer below.
+                }
+            }
             engine.dispose()
             throw error
         } catch (error: Throwable) {
+            withContext(NonCancellable) {
+                try {
+                    hostHistoryClient?.closeGracefully()
+                } catch (_: Throwable) {
+                    // Preserve the bootstrap failure and dispose the renderer below.
+                }
+            }
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
             if (!observeBootstrapFailureIfCurrent(
@@ -1912,7 +2073,7 @@ internal class ProductionProductRepository(
         }
         val transport = try {
             check(isCurrentRealtimeOwner(realtime.owner)) { "Authentication lifecycle changed" }
-            realtime.multiplexer.register(sessionId)
+            realtime.multiplexer.register(sessionId, pc.deviceId)
         } catch (error: CancellationException) {
             engine.dispose()
             throw error
@@ -1931,6 +2092,7 @@ internal class ProductionProductRepository(
             }
             throw classified
         }
+        val directAppliedCursor = AtomicReference(restoredHistory.durableAcknowledgement)
         val liveReference = AtomicReference<LiveProductSession?>(null)
         val client = try {
             ProductionRealtimeSessionClient(
@@ -1969,6 +2131,13 @@ internal class ProductionProductRepository(
                             sequence.toULong(),
                         )
                         observeLiveAcknowledgement(sessionId, persisted)
+                        directAppliedCursor.updateAndGet { current -> maxOf(current, persisted) }
+                        updateDirectAppliedCursorIfCurrent(
+                            realtime,
+                            pc.deviceId,
+                            sessionId,
+                            persisted.toLong(),
+                        )
                         DurableAckCommit(persisted.toLong(), expectedGeneration)
                     }
                 },
@@ -1993,6 +2162,13 @@ internal class ProductionProductRepository(
                             expectedGeneration,
                         )
                         observeLiveAcknowledgement(sessionId, reset.sequence)
+                        directAppliedCursor.updateAndGet { current -> maxOf(current, reset.sequence) }
+                        updateDirectAppliedCursorIfCurrent(
+                            realtime,
+                            pc.deviceId,
+                            sessionId,
+                            reset.sequence.toLong(),
+                        )
                         DurableAckCommit(reset.sequence.toLong(), reset.rendererGeneration)
                     }
                 },
@@ -2028,11 +2204,42 @@ internal class ProductionProductRepository(
             }
             throw classified
         }
+        val directRegistration = try {
+            realtime.directCoordinator.registerLiveSession(pc.deviceId, sessionId, client)
+        } catch (error: CancellationException) {
+            client.close()
+            engine.dispose()
+            throw error
+        } catch (error: Throwable) {
+            client.close()
+            engine.dispose()
+            val classified = classifySessionOpenException(error, SessionFailureStage.REALTIME)
+            if (!observeBootstrapFailureIfCurrent(
+                    sessionId,
+                    classified.failure,
+                    authenticationGeneration,
+                    realtime,
+                    stored,
+                )
+            ) {
+                throw IllegalStateException("Authentication lifecycle changed", error)
+            }
+            throw classified
+        }
         val live = LiveProductSession(
             engine = engine,
             client = client,
             parentScope = scope,
             authenticationOwner = realtime.owner,
+            directRegistration = directRegistration,
+            directActivationObserver = {
+                updateDirectAppliedCursorIfCurrent(
+                    realtime,
+                    pc.deviceId,
+                    sessionId,
+                    directAppliedCursor.get().toLong(),
+                )
+            },
             inheritedRendererFatalSequence = inheritedRendererFatalSequence,
         )
         check(liveReference.compareAndSet(null, live)) { "Live session incarnation was already installed" }
@@ -2059,6 +2266,7 @@ internal class ProductionProductRepository(
                             !closed &&
                                 realtimeMultiplexerOwner === realtime.owner &&
                                 realtimeMultiplexer === realtime.multiplexer &&
+                                directCoordinator === realtime.directCoordinator &&
                                 storedIdentity === stored &&
                                 liveSessions[sessionId] === live
                         },
@@ -2122,7 +2330,8 @@ internal class ProductionProductRepository(
             installed = synchronized(liveSessionLock) {
                 when {
                     realtimeMultiplexerOwner !== realtime.owner ||
-                        realtimeMultiplexer !== realtime.multiplexer -> {
+                        realtimeMultiplexer !== realtime.multiplexer ||
+                        directCoordinator !== realtime.directCoordinator -> {
                         exactRuntime = false
                         false
                     }
@@ -2151,6 +2360,7 @@ internal class ProductionProductRepository(
                 !closed &&
                     realtimeMultiplexerOwner === realtime.owner &&
                     realtimeMultiplexer === realtime.multiplexer &&
+                    directCoordinator === realtime.directCoordinator &&
                     storedIdentity === stored &&
                     liveSessions[sessionId] === live
             },
@@ -2268,9 +2478,23 @@ internal class ProductionProductRepository(
                 )
             }
         } catch (error: CancellationException) {
+            withContext(NonCancellable) {
+                try {
+                    historyClient?.closeGracefully()
+                } catch (_: Throwable) {
+                    // Preserve the cancellation and dispose the renderer below.
+                }
+            }
             engine.dispose()
             throw error
         } catch (error: Throwable) {
+            withContext(NonCancellable) {
+                try {
+                    historyClient?.closeGracefully()
+                } catch (_: Throwable) {
+                    // Preserve the bootstrap failure and dispose the renderer below.
+                }
+            }
             engine.dispose()
             val classified = classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
             if (!observeBootstrapFailureIfCurrent(
@@ -2299,6 +2523,7 @@ internal class ProductionProductRepository(
                 !closed &&
                     realtimeMultiplexerOwner === realtime.owner &&
                     realtimeMultiplexer === realtime.multiplexer &&
+                    directCoordinator === realtime.directCoordinator &&
                     storedIdentity === stored &&
                     mutableSnapshot.value.sessions.any {
                         it.id == session.id && it.state == SessionState.EXITED
@@ -2325,6 +2550,7 @@ internal class ProductionProductRepository(
                 !closed &&
                     realtimeMultiplexerOwner === realtime.owner &&
                     realtimeMultiplexer === realtime.multiplexer &&
+                    directCoordinator === realtime.directCoordinator &&
                     storedIdentity === stored &&
                     readOnlySessionEngines[session.id] === engine
             },
@@ -2360,12 +2586,14 @@ internal class ProductionProductRepository(
         disposeEngineOnClose: Boolean = false,
         sessionDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     ): ProductionRealtimeSessionClient {
+        // Bootstrap history is a bounded Relay-only consumer. Registering a peer
+        // here would admit temporary history frames into the Direct data gateway.
         val transport = realtime.multiplexer.register(session.id)
         return try {
             ProductionRealtimeSessionClient(
                 engine = engine,
                 config = ProductionRealtimeSessionConfig(
-                    rootUrl = PRODUCT_PUBLIC_SERVER_URL,
+                    rootUrl = currentServerUrl(),
                     tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(realtime.owner) },
                     androidDeviceId = stored.deviceId,
                     pcDeviceId = pc.deviceId,
@@ -2487,6 +2715,10 @@ internal class ProductionProductRepository(
             flowControlSendCount = realtime.flowControlSendCount,
             lastReceivedSequence = realtime.lastReceivedSequence,
             lastHandledSequence = realtime.lastHandledSequence,
+            contiguousAppliedSequence = realtime.contiguousAppliedSequence,
+            duplicateEventCount = realtime.duplicateEventCount,
+            historyGapCount = realtime.historyGapCount,
+            durableAck = realtime.durableAck,
             networkAvailableCount = realtimeNetworkAvailableCount.get(),
             networkLostCount = realtimeNetworkLostCount.get(),
             networkReconnectCount = realtimeNetworkReconnectCount.get(),
@@ -3071,7 +3303,7 @@ internal class ProductionProductRepository(
             val stored = identity()
             logRemoteDownloadStage(recordId, transferId, "peer_key_lookup", "completed")
             val transferClient = ProductionFileTransferClient(
-                rootUrl = PRODUCT_PUBLIC_SERVER_URL,
+                rootUrl = currentServerUrl(),
                 accessToken = realtimeAccessToken::requireCurrent,
                 localDeviceId = stored.deviceId,
                 identity = stored.identity,
@@ -3546,6 +3778,17 @@ internal class ProductionProductRepository(
                     accountLabel = accountDisplayLabel(),
                     devices = devices,
                     pcs = pcs,
+                    pcCarrierStates = retainAuthoritativePcCarrierStates(
+                        current.pcCarrierStates,
+                        devices,
+                        pcs,
+                    ),
+                    sessionCarrierStates = retainAuthoritativeSessionCarrierStates(
+                        current.sessionCarrierStates,
+                        devices,
+                        pcs,
+                        runtimeSessions,
+                    ),
                     sessions = runtimeSessions,
                     sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
                     sessionOpenFailures = current.sessionOpenFailures.filterKeys(retainedSessionIds::contains),
@@ -3644,6 +3887,17 @@ internal class ProductionProductRepository(
                     deletedSessionIds = deletedSessionIds,
                 )
                 reconciled.copy(
+                    pcCarrierStates = retainAuthoritativePcCarrierStates(
+                        reconciled.pcCarrierStates,
+                        devices,
+                        pcs,
+                    ),
+                    sessionCarrierStates = retainAuthoritativeSessionCarrierStates(
+                        reconciled.sessionCarrierStates,
+                        devices,
+                        pcs,
+                        runtimeSessions,
+                    ),
                     sessionTitles = reconcileSessionDirectoryTitles(
                         reconciled.sessionTitles,
                         runtimeSessions,
@@ -3672,7 +3926,7 @@ internal class ProductionProductRepository(
         diagnostic: ((String) -> Unit)? = null,
         block: suspend (ProductionApiClient, Long) -> T,
     ): T = withContext(Dispatchers.IO) {
-        val root = PRODUCT_PUBLIC_SERVER_URL
+        val root = currentServerUrl()
         val initial = captureAuthenticationState(expectedGeneration = expectedGeneration)
         diagnostic?.invoke("access_token_started")
         val token = freshAccessToken(expectedGeneration = initial.authenticationGeneration)
@@ -3968,7 +4222,7 @@ internal class ProductionProductRepository(
 
     private suspend fun ensureOidcConfiguration(): NativeOidcConfiguration {
         oidcConfiguration?.let { return it }
-        val root = PRODUCT_PUBLIC_SERVER_URL
+        val root = currentServerUrl()
         val client = fetchClientConfiguration(root)
         return withContext(Dispatchers.IO) {
             nativeOidc.discover(client.issuer.toString(), client.clientId, client.redirectUri)
@@ -4157,6 +4411,8 @@ internal class ProductionProductRepository(
                 accountLabel = accountDisplayLabel(),
                 devices = listOf(self),
                 pcs = emptyList(),
+                pcCarrierStates = emptyMap(),
+                sessionCarrierStates = emptyMap(),
                 sessions = emptyList(),
                 sessionStates = emptyMap(),
                 sessionOpenFailures = emptyMap(),
@@ -4415,7 +4671,7 @@ internal class ProductionProductRepository(
     }
 
     /**
-     * Publishes only trusted, online PC metadata to the optional Direct sibling. Pairwise secrets
+     * Publishes only trusted, online PC metadata to the device Direct coordinator. Pairwise secrets
      * are freshly derived, copied by the runtime, and zeroed here before returning.
      */
     private fun refreshDirectAuthorizedPeers(
@@ -4424,9 +4680,9 @@ internal class ProductionProductRepository(
         devices: List<DeviceSummary>,
         pcs: List<PcSummary>,
     ) {
-        val runtime = synchronized(liveSessionLock) {
+        val coordinator = synchronized(liveSessionLock) {
             val owner = realtimeMultiplexerOwner
-            directShadowRuntime.takeIf {
+            directCoordinator.takeIf {
                 owner?.authenticationGeneration == authenticationGeneration &&
                     owner.storedIdentity === stored
             }
@@ -4463,7 +4719,7 @@ internal class ProductionProductRepository(
             }
             .toList()
         try {
-            runtime.replaceAuthorizedPeers(authenticationGeneration, replacements)
+            coordinator.replaceAuthorizedPeers(authenticationGeneration, replacements)
         } finally {
             replacements.forEach(ProductionDirectAuthorizedPeer::close)
         }
@@ -4475,7 +4731,8 @@ internal class ProductionProductRepository(
      * unavailable history object store cannot block an epoch transition.
      */
     private suspend fun refreshLiveKeyMetadata(): Unit = keyMetadataRefreshLock.withLock {
-        withApi { api ->
+        withAuthenticatedApi { api, authenticationGeneration ->
+            val stored = identity()
             val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
             val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
             val sessions = mutableSnapshot.value.sessions
@@ -4501,6 +4758,7 @@ internal class ProductionProductRepository(
                 closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds))
                 closeLiveSessionsExcept(retainedLiveSessionIds(sessions, trustedPcIds))
             }
+            refreshDirectAuthorizedPeers(authenticationGeneration, stored, devices, pcs)
         }
     }
 
@@ -4544,6 +4802,29 @@ internal class ProductionProductRepository(
                 liveAcknowledgements = product.liveAcknowledgements + (sessionId to sequence),
             )
         }
+    }
+
+    private fun updateDirectAppliedCursorIfCurrent(
+        realtime: RealtimeRuntimeClaim,
+        peerDeviceId: UUID,
+        sessionId: UUID,
+        sequence: Long,
+    ): Boolean {
+        val exactRuntime = synchronized(liveSessionLock) {
+            directRuntimeProjectionClaimMatches(
+                currentOwner = realtimeMultiplexerOwner,
+                currentMultiplexer = realtimeMultiplexer,
+                currentCoordinator = directCoordinator,
+                expectedOwner = realtime.owner,
+                expectedMultiplexer = realtime.multiplexer,
+                expectedCoordinator = realtime.directCoordinator,
+            )
+        }
+        return exactRuntime && realtime.directCoordinator.updateAppliedCursor(
+            peerDeviceId,
+            sessionId,
+            sequence,
+        )
     }
 
     private fun clearSessionOpenFailure(sessionId: UUID) {
@@ -4594,6 +4875,7 @@ internal class ProductionProductRepository(
             !closed &&
                 realtimeMultiplexerOwner === realtime.owner &&
                 realtimeMultiplexer === realtime.multiplexer &&
+                directCoordinator === realtime.directCoordinator &&
                 storedIdentity === stored
         },
     ) {
@@ -5185,6 +5467,8 @@ internal class ProductionProductRepository(
             detachRealtimeRuntimeLocked()
         }
         mutableSnapshot.value = mutableSnapshot.value.copy(
+            pcCarrierStates = emptyMap(),
+            sessionCarrierStates = emptyMap(),
             sessionStates = emptyMap(),
             sessionOpenFailures = emptyMap(),
             sessionTitles = emptyMap(),
@@ -5198,13 +5482,15 @@ internal class ProductionProductRepository(
         return RetiredRealtimeRuntime(
             sessions = liveSessions.values.toList().also { liveSessions.clear() },
             readOnlyEngines = readOnlySessionEngines.values.toList().also { readOnlySessionEngines.clear() },
-            directShadow = directShadowRuntime.also { directShadowRuntime = null },
+            directCoordinator = directCoordinator.also { directCoordinator = null },
+            directCarrierProjectionJob = directCarrierProjectionJob.also { directCarrierProjectionJob = null },
             multiplexer = realtimeMultiplexer.also { realtimeMultiplexer = null },
         )
     }
 
     private fun closeRetiredRealtimeRuntime(retired: RetiredRealtimeRuntime) {
-        retired.directShadow?.close()
+        retired.directCarrierProjectionJob?.cancel()
+        retired.directCoordinator?.close()
         retired.sessions.forEach(LiveProductSession::close)
         retired.readOnlyEngines.forEach(NativeTerminalEngine::dispose)
         retired.multiplexer?.close()
@@ -5217,7 +5503,8 @@ internal class ProductionProductRepository(
             // A black-holed Direct control-plane request must not delay Relay
             // socket closure or keep live sessions attached during auth switch.
             try {
-                retired.directShadow?.close()
+                retired.directCarrierProjectionJob?.cancel()
+                retired.directCoordinator?.close()
             } catch (error: Throwable) {
                 firstFailure = firstFailure ?: error
             }
@@ -5241,7 +5528,12 @@ internal class ProductionProductRepository(
                 firstFailure = firstFailure ?: error
             }
             try {
-                retired.directShadow?.closeAndJoin()
+                retired.directCoordinator?.closeAndJoin()
+            } catch (error: Throwable) {
+                firstFailure = firstFailure ?: error
+            }
+            try {
+                retired.directCarrierProjectionJob?.join()
             } catch (error: Throwable) {
                 firstFailure = firstFailure ?: error
             }
@@ -5271,6 +5563,7 @@ internal class ProductionProductRepository(
                     accountScope == owner.accountScope &&
                     storedIdentity === owner.storedIdentity &&
                     realtimeMultiplexer != null &&
+                    directCoordinator != null &&
                     authenticationRuntimeClaimMatches(
                         currentOwner = realtimeMultiplexerOwner,
                         currentOwnerGeneration = realtimeMultiplexerOwner?.authenticationGeneration,
@@ -5290,6 +5583,7 @@ internal class ProductionProductRepository(
                     accountScope == owner.accountScope &&
                     storedIdentity === owner.storedIdentity &&
                     realtimeMultiplexer != null &&
+                    directCoordinator != null &&
                     authenticationRuntimeClaimMatches(
                         currentOwner = realtimeMultiplexerOwner,
                         currentOwnerGeneration = realtimeMultiplexerOwner?.authenticationGeneration,
@@ -5318,17 +5612,20 @@ internal class ProductionProductRepository(
             }
             var selectedOwner: RealtimeAuthenticationOwner? = null
             var selectedRuntime: ProductionRealtimeMultiplexer? = null
+            var selectedCoordinator: ProductionDirectDeviceCoordinator? = null
             val retired = synchronized(liveSessionLock) {
                 val existing = realtimeMultiplexer
+                val existingCoordinator = directCoordinator
                 val owner = realtimeMultiplexerOwner
                 when {
-                    existing == null -> null
-                    owner != null &&
+                    existing == null && existingCoordinator == null -> null
+                    existing != null && existingCoordinator != null && owner != null &&
                         owner.authenticationGeneration == authentication.authenticationGeneration &&
                         owner.accountScope == expectedAccountScope &&
                         owner.storedIdentity === stored -> {
                         selectedOwner = owner
                         selectedRuntime = existing
+                        selectedCoordinator = existingCoordinator
                         null
                     }
                     else -> detachRealtimeRuntimeLocked()
@@ -5340,7 +5637,8 @@ internal class ProductionProductRepository(
             }
             selectedRuntime?.let { existing ->
                 val owner = requireNotNull(selectedOwner)
-                if (isCurrentRealtimeOwner(owner)) return RealtimeRuntimeClaim(owner, existing)
+                val coordinator = requireNotNull(selectedCoordinator)
+                if (isCurrentRealtimeOwner(owner)) return RealtimeRuntimeClaim(owner, existing, coordinator)
                 detachRealtimeRuntimeIfOwner(owner)?.let { closeRetiredRealtimeRuntimeAndJoin(it) }
                 throw IllegalStateException("Authentication lifecycle changed")
             }
@@ -5351,7 +5649,7 @@ internal class ProductionProductRepository(
                 storedIdentity = stored,
             )
             val candidate = ProductionRealtimeMultiplexer(
-                rootUrl = PRODUCT_PUBLIC_SERVER_URL,
+                rootUrl = currentServerUrl(),
                 tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(owner) },
                 deviceId = stored.deviceId,
                 identity = stored.identity,
@@ -5361,6 +5659,9 @@ internal class ProductionProductRepository(
                 } else {
                     emptySet()
                 },
+                optionalAdvertisedCapabilities = productRealtimeOptionalCapabilities(
+                    BuildConfig.TERMLINK_DIRECT_TRANSPORT_DATA_PLANE,
+                ),
                 httpClient = http,
                 allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
                 authenticationRefresher = dev.termlink.network.production.RealtimeAuthenticationRefresher {
@@ -5374,22 +5675,59 @@ internal class ProductionProductRepository(
                     )
                 },
             )
-            val directCandidate = if (BuildConfig.TERMLINK_DIRECT_TRANSPORT_SHADOW) {
-                ProductionDirectShadowRuntime(
-                    enabled = true,
-                    authenticationGeneration = owner.authenticationGeneration,
-                    rootUrl = PRODUCT_PUBLIC_SERVER_URL,
-                    tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(owner) },
-                    localDeviceId = stored.deviceId,
-                    identity = stored.identity,
-                    relayEvents = candidate.directRelayConnectionEvents,
-                    connectivityManager = connectivityManager,
-                    parentScope = directShadowRuntimeScope,
-                    httpClient = directShadowHttp,
-                    allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
-                )
-            } else {
-                null
+            val directCandidate = ProductionDirectDeviceCoordinator(
+                authenticationGeneration = owner.authenticationGeneration,
+                rootUrl = currentServerUrl(),
+                tokenProvider = AccessTokenProvider { requireRealtimeAccessToken(owner) },
+                localDeviceId = stored.deviceId,
+                identity = stored.identity,
+                multiplexer = candidate,
+                connectivityManager = connectivityManager,
+                parentScope = directCoordinatorRuntimeScope,
+                httpClient = directShadowHttp,
+                allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+                shadowDiscoveryEnabled = BuildConfig.TERMLINK_DIRECT_TRANSPORT_SHADOW,
+                // Release is hard-disabled. Only an isolated private-network
+                // Debug acceptance build can enable this independent gate.
+                dataPlaneEnabled = BuildConfig.TERMLINK_DIRECT_TRANSPORT_DATA_PLANE,
+            )
+            val carrierProjectionCandidate = directCoordinatorRuntimeScope.launch(start = CoroutineStart.LAZY) {
+                combine(directCandidate.carriers, directCandidate.sessionCarriers) {
+                        pcCarriers, sessionCarriers ->
+                    pcCarriers to sessionCarriers
+                }.collect { (pcCarriers, sessionCarriers) ->
+                    authenticationLifecycle.runIfCurrent(
+                        owner.authenticationGeneration,
+                        predicate = {
+                            !closed &&
+                                storedIdentity === stored &&
+                                directRuntimeProjectionClaimMatches(
+                                    currentOwner = realtimeMultiplexerOwner,
+                                    currentMultiplexer = realtimeMultiplexer,
+                                    currentCoordinator = directCoordinator,
+                                    expectedOwner = owner,
+                                    expectedMultiplexer = candidate,
+                                    expectedCoordinator = directCandidate,
+                                )
+                        },
+                    ) {
+                        mutableSnapshot.update { snapshot ->
+                            snapshot.copy(
+                                pcCarrierStates = retainAuthoritativePcCarrierStates(
+                                    pcCarriers.mapValues { (_, carrier) -> carrier.toPcCarrierState() },
+                                    snapshot.devices,
+                                    snapshot.pcs,
+                                ),
+                                sessionCarrierStates = retainAuthoritativeSessionCarrierStates(
+                                    sessionCarriers.mapValues { (_, carrier) -> carrier.toPcCarrierState() },
+                                    snapshot.devices,
+                                    snapshot.pcs,
+                                    snapshot.sessions,
+                                ),
+                            )
+                        }
+                    }
+                }
             }
             var installed = false
             val installationCurrent = authenticationLifecycle.runIfCurrent(
@@ -5402,35 +5740,38 @@ internal class ProductionProductRepository(
                 },
             ) {
                 installed = synchronized(liveSessionLock) {
-                    if (realtimeMultiplexer != null || directShadowRuntime != null) {
+                    if (realtimeMultiplexer != null || directCoordinator != null || directCarrierProjectionJob != null) {
                         false
                     } else {
                         realtimeMultiplexerOwner = owner
                         realtimeMultiplexer = candidate
-                        directShadowRuntime = directCandidate
+                        directCoordinator = directCandidate
+                        directCarrierProjectionJob = carrierProjectionCandidate
                         true
                     }
                 }
             }
             if (!installationCurrent || !installed) {
-                directCandidate?.close()
+                carrierProjectionCandidate.cancel()
+                directCandidate.close()
                 candidate.close()
                 if (!installationCurrent) throw IllegalStateException("Authentication lifecycle changed")
                 continue
             }
             if (isCurrentRealtimeOwner(owner)) {
-                directCandidate?.let { direct ->
-                    refreshDirectAuthorizedPeers(
-                        authenticationGeneration = owner.authenticationGeneration,
-                        stored = stored,
-                        devices = mutableSnapshot.value.devices,
-                        pcs = mutableSnapshot.value.pcs,
-                    )
-                    synchronized(realtimeNetworkLock) { realtimeNetwork }
-                        ?.let { network -> direct.observeNetwork(owner.authenticationGeneration, network) }
-                    direct.start()
-                }
-                return RealtimeRuntimeClaim(owner, candidate)
+                carrierProjectionCandidate.start()
+                refreshDirectAuthorizedPeers(
+                    authenticationGeneration = owner.authenticationGeneration,
+                    stored = stored,
+                    devices = mutableSnapshot.value.devices,
+                    pcs = mutableSnapshot.value.pcs,
+                )
+                directCandidate.observeNetwork(
+                    owner.authenticationGeneration,
+                    synchronized(realtimeNetworkLock) { realtimeNetwork },
+                )
+                directCandidate.start()
+                return RealtimeRuntimeClaim(owner, candidate, directCandidate)
             }
             detachRealtimeRuntimeIfOwner(owner)?.let { closeRetiredRealtimeRuntimeAndJoin(it) }
             throw IllegalStateException("Authentication lifecycle changed")
@@ -5517,6 +5858,8 @@ internal class ProductionProductRepository(
     override fun close() {
         if (closed) return
         closed = true
+        directProductE2EBridgeRegistration?.close()
+        directProductE2EBridgeRegistration = null
         authenticationLifecycle.invalidate()
         realtimeAccessToken.clear()
         if (realtimeNetworkCallbackRegistered) {
@@ -5525,7 +5868,7 @@ internal class ProductionProductRepository(
         }
         closeLiveSessions()
         realtimeRuntimeScope.cancel()
-        directShadowRuntimeScope.cancel()
+        directCoordinatorRuntimeScope.cancel()
         closeHistoryEngines()
         val closingDownloadJobs = remoteDownloadJobs.values.toList()
         closingDownloadJobs.forEach(Job::cancel)
@@ -5611,6 +5954,8 @@ internal class ProductionProductRepository(
         val client: ProductionRealtimeSessionClient,
         private val parentScope: CoroutineScope,
         val authenticationOwner: RealtimeAuthenticationOwner,
+        private val directRegistration: ProductionDirectLiveSessionRegistration,
+        private val directActivationObserver: () -> Unit,
         /** Fatal sequence inherited only from the incarnation rebuilt after it. */
         val inheritedRendererFatalSequence: Long? = null,
     ) : AutoCloseable {
@@ -5653,6 +5998,10 @@ internal class ProductionProductRepository(
             if (!admitted) return false
             try {
                 client.start()
+                check(directRegistration.activate()) {
+                    "Direct live-session registration was retired during startup"
+                }
+                directActivationObserver()
                 return synchronized(lifecycleLock) {
                     if (lifecycle != Lifecycle.STARTING) {
                         false
@@ -5707,6 +6056,7 @@ internal class ProductionProductRepository(
                     closingJobs.forEach(Job::cancel)
                 }
             }
+            directRegistration.close()
             if (waitForStart) startCompleted.await()
             client.closeGracefully()
             jobs.filterNot { it === caller }.forEach { it.join() }
@@ -5724,6 +6074,7 @@ internal class ProductionProductRepository(
                 lifecycle = Lifecycle.CLOSING
                 listOfNotNull(stateJob, tokenRefreshJob, recoveryJob).forEach(Job::cancel)
             }
+            directRegistration.close()
             client.close()
         }
     }
@@ -5731,7 +6082,8 @@ internal class ProductionProductRepository(
     private data class RetiredRealtimeRuntime(
         val sessions: List<LiveProductSession>,
         val readOnlyEngines: List<NativeTerminalEngine>,
-        val directShadow: ProductionDirectShadowRuntime?,
+        val directCoordinator: ProductionDirectDeviceCoordinator?,
+        val directCarrierProjectionJob: Job?,
         val multiplexer: ProductionRealtimeMultiplexer?,
     )
 
@@ -5744,6 +6096,7 @@ internal class ProductionProductRepository(
     private data class RealtimeRuntimeClaim(
         val owner: RealtimeAuthenticationOwner,
         val multiplexer: ProductionRealtimeMultiplexer,
+        val directCoordinator: ProductionDirectDeviceCoordinator,
     )
 
     private data class AuthenticationStateCapture(
@@ -8258,6 +8611,7 @@ internal class ProductionProductRepository(
     )
 
     private companion object {
+        private const val SESSION_OPEN_LOG_TAG = "TermLinkSessionOpen"
         private const val HISTORY_REPLAY_LOG_TAG = "TermLinkHistoryReplay"
         private const val HOST_HISTORY_RESTORE_LOG_TAG = "TermLinkHostRestore"
         private const val REMOTE_DOWNLOAD_LOG_TAG = "TermLinkFileTransfer"

@@ -119,6 +119,12 @@ internal class DirectNativeCandidateV4(
         expiresAtMillis,
     )
 
+    internal fun destroy() {
+        candidateId.fill(0)
+        relatedCandidateId.fill(0)
+        endpoint.ipAddress.fill(0)
+    }
+
     companion object {
         internal const val CANDIDATE_WIRE_BYTES = 80
     }
@@ -153,6 +159,11 @@ internal class DirectNativeCandidatePairV4(
         .array()
 
     internal fun ownedCopy() = DirectNativeCandidatePairV4(rank, initiator, responder)
+
+    internal fun destroy() {
+        initiator.destroy()
+        responder.destroy()
+    }
 
     companion object {
         internal const val PAIR_WIRE_BYTES = 164
@@ -304,6 +315,16 @@ internal class DirectNativeCommitNominationRequestV4(
         require(this.peerCertificateSha256.size == 32 &&
             this.peerDeviceSigningPublicKey.size == 32)
         require(this.localProofNonce.size in 16..32)
+    }
+
+    internal fun destroy() {
+        attemptId.fill(0)
+        checkRoundId.fill(0)
+        nominationId.fill(0)
+        winningPair.destroy()
+        peerCertificateSha256.fill(0)
+        peerDeviceSigningPublicKey.fill(0)
+        localProofNonce.fill(0)
     }
 }
 
