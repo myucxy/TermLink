@@ -146,9 +146,9 @@ func TestSameAccountDirectAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("same-account control policy: %v", err)
 	}
-	if policy.Mode != ControlModeSingle || !policy.LocalPriority || policy.PolicyVersion != 1 ||
+	if policy.Mode != ControlModeCollaborative || !policy.LocalPriority || policy.PolicyVersion != 1 ||
 		policy.PCID != pcID || policy.PCDeviceID != windows.ID || policy.GrantExpiresAt != nil {
-		t.Fatalf("same-account control policy=%+v, want default SINGLE policy for PC %s", policy, pcID)
+		t.Fatalf("same-account control policy=%+v, want default COLLABORATIVE policy for PC %s", policy, pcID)
 	}
 	routes, err := repository.SessionRoutes(ctx, userID, android.ID, []uuid.UUID{sessionID})
 	if err != nil {

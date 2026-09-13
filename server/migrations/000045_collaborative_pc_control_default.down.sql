@@ -1,0 +1,2 @@
+ALTER TABLE pcs
+    ALTER COLUMN control_mode SET DEFAULT 'SINGLE';
