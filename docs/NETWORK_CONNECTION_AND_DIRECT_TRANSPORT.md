@@ -419,3 +419,33 @@ IPv4/IPv6、VPN 开关、Windows 防火墙拒绝 UDP、Android 锁屏/唤醒、�
 probe/认证/cutover 时延、fallback reason、重发字节数、seq gap 和 queue depth。禁止记录候选
 地址、ticket、key/nonce、Envelope bytes、终端文本或完整异常；UI 的绿色在线点只由 Realtime
 Relay 的已认证心跳决定，直连状态另列“局域网直连/公网直连/Relay”。
+
+
+## 票据续期（V1.x 规划，未实施）
+
+### 动机
+
+V1 票据 120 秒硬上限使活跃直连被周期性拆除（数据面在 `ticket_expires_at_ms` 强制退役，
+随后重走 gather→probe→QUIC→proof→cutover，叠加 30s 同对间隔/连败冷却）。
+"可直连则优先直连"因此实际退化为"每 2 分钟内优先直连"。
+
+### 设计草案
+
+1. **信令消息**：`transport.v1` 信令通道新增 `RENEWAL_REQUEST` / `RENEWAL_ISSUED`
+   （复用现有设备认证 + nonce + 限流框架）。
+2. **请求时机**：数据面 cutover 完成且 liveness 正常后，发起方每 60~90 秒请求一次续期。
+3. **服务端校验**：pair 当前 path_epoch 活跃、双端设备仍 TRUSTED 且未撤销、限流未超。
+   通过后签发续期票据：绑定同一 `connection_id`、`path_epoch+1`、新过期时间。
+   续期票据不用于建立（Reserve/Finalize 建立防重放不受影响），仅用于延长现有连接寿命。
+4. **FFI 接口**：新增 `termlink_direct_refresh_ticket_v5(handle, path_id, ticket, len)`：
+   验签 + 校验 pair/connection_id/epoch 连续性 + 新过期时间在未来，原子替换数据循环的
+   `ticket_expires_at_ms`（数据循环从共享状态读取而非固定值）。
+5. **撤销语义**：续期请求本身即周期性服务端接触点——被撤销设备的续期被拒，
+   数据面在 ≤旧 TTL 内自然退役；信令/Relay 层撤销仍立即生效。
+6. **协议版本**：wire 层 `MAX_DIRECT_TICKET_LIFETIME_MS` 对续期票据放宽为
+   `max(120s, 续期窗)`；需要 wire/FFI/C#/Kotlin/服务端五处同步与测试向量更新。
+
+### 实施前置
+
+- direct-e2e 真实网络适配器（见审计 #3）先行，续期行为进入故障矩阵；
+- 五端变更需同一协议版本号递增并冻结测试向量。

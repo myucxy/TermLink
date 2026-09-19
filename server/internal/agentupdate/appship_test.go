@@ -38,6 +38,47 @@ const validOfferJSON = `{
   }
 }`
 
+// The signer anchor is an operator trust identity: with it configured, an
+// offer without the pinned artifact signer (or with a different one) must be
+// rejected before it can trigger any agent upgrade decision.
+func TestParseOfferSignerAnchorEnforcement(t *testing.T) {
+	anchor := "0123456789abcdef0123456789abcdef01234567"
+	// parseOffer via the exported seam has no anchor; exercise the anchor by
+	// normalizing the JSON with a mutated signer per case.
+	signerKey := `"signerFingerprint":"0123456789abcdef0123456789abcdef01234567"`
+	mutate := func(signerValue string) []byte {
+		if signerValue == "" {
+			return []byte(strings.Replace(validOfferJSON, signerKey+",", "", 1))
+		}
+		return []byte(strings.Replace(validOfferJSON, signerKey,
+			`"signerFingerprint":"`+signerValue+`"`, 1))
+	}
+
+	cases := []struct {
+		name        string
+		signer      string
+		wantErrText string
+	}{
+		{name: "matching signer is accepted", signer: anchor, wantErrText: ""},
+		{name: "missing signer is rejected", signer: "", wantErrText: "required by policy"},
+		{name: "foreign signer is rejected", signer: "ffffffffffffffffffffffffffffffffffffffff", wantErrText: "not the pinned publisher"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			offer, err := parseOffer(mutate(tc.signer), 37, nil, anchor)
+			if tc.wantErrText == "" {
+				if err != nil || !offer.Available {
+					t.Fatalf("pinned offer rejected: err=%v offer=%+v", err, offer)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Fatalf("anchor policy error = %v, want containing %q", err, tc.wantErrText)
+			}
+		})
+	}
+}
+
 func TestParseOfferAcceptsPinnedWindowsSetupContract(t *testing.T) {
 	offer, err := ParseOffer([]byte(validOfferJSON), 37)
 	if err != nil {

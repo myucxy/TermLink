@@ -282,6 +282,14 @@ namespace TermLink.Tray
                     {
                         decision = WindowsUpdateDecision.NoUpdate;
                     }
+                    // Fail closed like the MSIX and Android update paths: a
+                    // decision without a build number cannot be proven to be an
+                    // upgrade, so it must never reach the verified-launch stage.
+                    if ((decision == WindowsUpdateDecision.Optional || decision == WindowsUpdateDecision.Required) &&
+                        !buildNumber.HasValue)
+                    {
+                        return Error("Update service response did not include a build number; refusing to update.");
+                    }
                     if (decision == WindowsUpdateDecision.NoUpdate)
                     {
                         return new WindowsUpdateResult

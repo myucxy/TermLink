@@ -54,6 +54,12 @@ type Catalog interface {
 type AppShipCatalog struct {
 	baseURL *url.URL
 	client  *http.Client
+	// signerFingerprintAnchor is an optional operator trust anchor (SHA-1
+	// Authenticode thumbprint, 40 lowercase hex chars). When set, every update
+	// offer must carry the matching artifact signer fingerprint; offers
+	// without it, or with a different signer, are rejected before they can
+	// reach agents (including REQUIRED/forced upgrade decisions).
+	signerFingerprintAnchor string
 }
 
 type appShipResolver interface {
@@ -87,6 +93,24 @@ func NewAppShipCatalogWithAllowedPrivateIPs(baseURL string, client *http.Client,
 		return nil, fmt.Errorf("%w: AppShip private IP allowlist is invalid", ErrUnavailable)
 	}
 	return newAppShipCatalog(baseURL, client, appShipNetworkOptions{allowedPrivateIPs: allowed})
+}
+
+// NewAppShipCatalogWithSignerAnchor behaves like
+// NewAppShipCatalogWithAllowedPrivateIPs and additionally pins the artifact
+// signer identity. An empty anchor keeps the historical pass-through behavior.
+func NewAppShipCatalogWithSignerAnchor(baseURL string, client *http.Client, allowedPrivateIPsValue string, signerFingerprint string) (*AppShipCatalog, error) {
+	catalog, err := NewAppShipCatalogWithAllowedPrivateIPs(baseURL, client, allowedPrivateIPsValue)
+	if err != nil {
+		return nil, err
+	}
+	if trimmed := strings.TrimSpace(signerFingerprint); trimmed != "" {
+		normalized := normalizeHex(trimmed)
+		if len(normalized) != 40 || !isLowerHex(normalized) {
+			return nil, fmt.Errorf("%w: AppShip signer fingerprint anchor must be a 40-char SHA-1 hex thumbprint", ErrUnavailable)
+		}
+		catalog.signerFingerprintAnchor = normalized
+	}
+	return catalog, nil
 }
 
 func newAppShipCatalog(baseURL string, client *http.Client, network appShipNetworkOptions) (*AppShipCatalog, error) {
@@ -194,7 +218,7 @@ func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild i
 	if len(body) == 0 || len(body) > maximumResponseBytes {
 		return Offer{}, fmt.Errorf("%w: response size is invalid", ErrUnavailable)
 	}
-	return parseOffer(body, currentBuild, c.baseURL)
+	return parseOffer(body, currentBuild, c.baseURL, c.signerFingerprintAnchor)
 }
 
 func appShipDialContext(resolver appShipResolver, dial appShipDialFunc, allowedPrivateIPs ...net.IP) appShipDialFunc {
@@ -328,10 +352,10 @@ var appShipDeniedNetworks = func() []*net.IPNet {
 }()
 
 func ParseOffer(body []byte, currentBuild int64) (Offer, error) {
-	return parseOffer(body, currentBuild, nil)
+	return parseOffer(body, currentBuild, nil, "")
 }
 
-func parseOffer(body []byte, currentBuild int64, trustedOrigin *url.URL) (Offer, error) {
+func parseOffer(body []byte, currentBuild int64, trustedOrigin *url.URL, signerFingerprintAnchor string) (Offer, error) {
 	var root map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.UseNumber()
@@ -397,6 +421,17 @@ func parseOffer(body []byte, currentBuild int64, trustedOrigin *url.URL) (Offer,
 			return Offer{}, fmt.Errorf("%w: signer fingerprint is invalid", ErrInvalidArtifact)
 		}
 		signerPointer = &signer
+	}
+	if signerFingerprintAnchor != "" {
+		// Operator-pinned publisher identity: without a matching artifact
+		// signer the offer must not reach agents, and a forced (REQUIRED)
+		// upgrade decision must never originate from an unverified source.
+		if signerPointer == nil {
+			return Offer{}, fmt.Errorf("%w: artifact signer fingerprint is required by policy", ErrInvalidArtifact)
+		}
+		if signer != signerFingerprintAnchor {
+			return Offer{}, fmt.Errorf("%w: artifact signer fingerprint is not the pinned publisher", ErrInvalidArtifact)
+		}
 	}
 	if !matchesOptional(artifact, "platform", "windows") ||
 		!matchesOptional(artifact, "fileKind", "exe") ||
