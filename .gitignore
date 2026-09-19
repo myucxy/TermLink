@@ -31,3 +31,5 @@ Thumbs.db
 .DS_Store
 # Local build artifacts not covered by generic rules
 server/termlink-server.exe
+# local packaging output
+win-agent/publish/

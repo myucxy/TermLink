@@ -211,30 +211,6 @@ try {
                 "-p:Version=$Version"
             )
         }
-        # Keep the WinForms implementation as an isolated single-file rollback
-        # and update surface for one Preview cycle. Its dependency graph must not
-        # overwrite Avalonia assemblies in the primary payload.
-        Invoke-Tool -FilePath $candidate -Arguments @(
-            'publish', (Join-Path $PSScriptRoot '..\src\Tray\TermLink.Tray.csproj'),
-            '--configuration', 'Release',
-            '--runtime', 'win-x64',
-            '--self-contained', 'true',
-            '--output', $legacyPublish,
-            '--artifacts-path', $dotnetArtifacts,
-            '--nologo',
-            '-p:RestoreLockedMode=true',
-            '-p:PackageVersion=1.0.0',
-            '-p:DebugSymbols=false',
-            '-p:DebugType=None',
-            '-p:PublishSingleFile=true',
-            '-p:IncludeNativeLibrariesForSelfExtract=true',
-            '-p:EnableCompressionInSingleFile=true',
-            "-p:TermLinkUpdateApplicationSlug=$updateApplicationSlug",
-            "-p:TermLinkUpdateChannel=$appShipUpdateChannel",
-            "-p:Version=$Version"
-        )
-        Copy-Item -LiteralPath (Join-Path $legacyPublish 'TermLink.exe') `
-            -Destination (Join-Path $layout 'TermLink.Legacy.exe')
         Invoke-Tool -FilePath $candidate -Arguments @(
             'publish', (Join-Path $PSScriptRoot '..\src\Updater\TermLink.Updater.csproj'),
             '--configuration', 'Release',
@@ -258,7 +234,6 @@ try {
         $expectedProductExecutables = @(
             'TermLink.Agent.exe',
             'TermLink.exe',
-            'TermLink.Legacy.exe',
             'TermLink.SessionHost.exe',
             'TermLink.Updater.exe'
         )

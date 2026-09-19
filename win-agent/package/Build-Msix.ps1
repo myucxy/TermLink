@@ -181,8 +181,7 @@ try {
         $projects = @(
             'src\Agent\TermLink.Agent.csproj',
             'src\SessionHost\TermLink.SessionHost.csproj',
-            'src\Tray\TermLink.Tray.csproj'
-        )
+                    )
         foreach ($project in $projects) {
             Invoke-Tool -FilePath $candidate -Arguments @(
                 'publish', (Join-Path $PSScriptRoot "..\$project"),
