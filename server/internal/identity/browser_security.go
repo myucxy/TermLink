@@ -12,6 +12,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/termlink/termlink/server/internal/localnet"
+
 )
 
 const identityFormCSRFLifetime = 10 * time.Minute
@@ -125,8 +128,8 @@ func (p *Provider) passwordResetPage(w http.ResponseWriter, r *http.Request) {
 			p.renderPasswordReset(w, r, token, "", "链接无效或已过期，或者新密码不符合要求。 / The link is invalid or expired, or the new password does not meet the requirements.", false, http.StatusBadRequest)
 			return
 		}
-		p.clearBrowserSession(w)
-		p.clearIdentityFormCSRF(w)
+		p.clearBrowserSession(r, w)
+		p.clearIdentityFormCSRF(r, w)
 		p.renderPasswordReset(w, r, "", "密码已更新，请重新登录。 / Your password was updated. Sign in again.", "", true, http.StatusOK)
 		return
 	}
@@ -170,7 +173,7 @@ func waitForPasswordResetResponseFloor(ctx context.Context, startedAt time.Time)
 }
 
 func (p *Provider) renderPasswordReset(w http.ResponseWriter, r *http.Request, token, message, formError string, completed bool, status int) {
-	csrf, err := p.issueIdentityFormCSRF(w)
+	csrf, err := p.issueIdentityFormCSRF(r, w)
 	if err != nil {
 		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusServiceUnavailable)
 		return
@@ -194,8 +197,8 @@ func (p *Provider) changePassword(w http.ResponseWriter, r *http.Request) {
 		p.renderAccountPage(w, r, "", "当前密码、验证码或新密码无效。 / The current password, verification code, or new password is invalid.", http.StatusBadRequest)
 		return
 	}
-	p.clearBrowserSession(w)
-	p.clearIdentityFormCSRF(w)
+	p.clearBrowserSession(r, w)
+	p.clearIdentityFormCSRF(r, w)
 	p.renderIdentityOutcome(w, "密码已修改 / Password changed", "所有现有登录令牌已撤销，请重新登录。 / All existing sign-in tokens were revoked. Sign in again.", "/login", "重新登录 / Sign in again")
 }
 
@@ -209,7 +212,7 @@ func (p *Provider) beginMFAEnrollment(w http.ResponseWriter, r *http.Request) {
 		p.renderAccountPage(w, r, "", "当前密码无效，或动态验证码已经启用。 / The current password is invalid, or an authenticator is already enabled.", http.StatusBadRequest)
 		return
 	}
-	csrf, err := p.issueIdentityFormCSRF(w)
+	csrf, err := p.issueIdentityFormCSRF(r, w)
 	if err != nil {
 		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusServiceUnavailable)
 		return
@@ -268,7 +271,7 @@ func (p *Provider) authorizeIdentityForm(w http.ResponseWriter, r *http.Request)
 	}
 	session, account, err := p.authenticatedBrowserAccount(r)
 	if err != nil {
-		p.clearBrowserSession(w)
+		p.clearBrowserSession(r, w)
 		http.Redirect(w, r, "/login?return_to=/account/identity", http.StatusSeeOther)
 		return browserSession{}, Account{}, false
 	}
@@ -294,11 +297,11 @@ func (p *Provider) authenticatedBrowserAccount(r *http.Request) (browserSession,
 func (p *Provider) renderAccountPage(w http.ResponseWriter, r *http.Request, message, formError string, status int) {
 	session, account, err := p.authenticatedBrowserAccount(r)
 	if err != nil {
-		p.clearBrowserSession(w)
+		p.clearBrowserSession(r, w)
 		http.Redirect(w, r, "/login?return_to=/account/identity", http.StatusSeeOther)
 		return
 	}
-	csrf, err := p.issueIdentityFormCSRF(w)
+	csrf, err := p.issueIdentityFormCSRF(r, w)
 	if err != nil {
 		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusServiceUnavailable)
 		return
@@ -325,7 +328,7 @@ func (p *Provider) renderAccountPage(w http.ResponseWriter, r *http.Request, mes
 func (p *Provider) refreshBrowserSession(w http.ResponseWriter, r *http.Request, previous browserSession, mfa bool) {
 	account, err := p.accounts.LoadAccount(r.Context(), previous.Subject)
 	if err != nil {
-		p.clearBrowserSession(w)
+		p.clearBrowserSession(r, w)
 		return
 	}
 	methods := []string{"pwd"}
@@ -333,7 +336,7 @@ func (p *Provider) refreshBrowserSession(w http.ResponseWriter, r *http.Request,
 		methods = []string{"pwd", "otp", "mfa"}
 	}
 	now := p.clock().UTC()
-	p.setBrowserSession(w, browserSession{
+	p.setBrowserSession(r, w, browserSession{
 		Subject: previous.Subject, AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(), Methods: methods,
 		ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix(),
 	})
@@ -351,7 +354,7 @@ func (p *Provider) renderIdentityOutcome(w http.ResponseWriter, title, message, 
 	_ = identityOutcomeTemplate.Execute(w, outcomePageData{Title: title, Message: message, LinkURL: linkURL, Link: link})
 }
 
-func (p *Provider) issueIdentityFormCSRF(w http.ResponseWriter) (string, error) {
+func (p *Provider) issueIdentityFormCSRF(r *http.Request, w http.ResponseWriter) (string, error) {
 	token, err := randomIdentityText(24)
 	if err != nil {
 		return "", err
@@ -362,7 +365,7 @@ func (p *Provider) issueIdentityFormCSRF(w http.ResponseWriter) (string, error) 
 		return "", err
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: browserFormCSRFCookie, Value: sealed, Path: "/", Secure: true, HttpOnly: true,
+		Name: localnet.CookieName(r.Host, browserFormCSRFCookie), Value: sealed, Path: "/", Secure: localnet.CookieSecure(r.Host), HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Expires: now.Add(identityFormCSRFLifetime), MaxAge: int(identityFormCSRFLifetime.Seconds()),
 	})
 	return token, nil
@@ -372,7 +375,7 @@ func (p *Provider) validateIdentityForm(r *http.Request) error {
 	if !p.trustedIdentityFormOrigin(r) || r.ParseForm() != nil {
 		return errors.New("identity form origin or payload is invalid")
 	}
-	cookie, err := r.Cookie(browserFormCSRFCookie)
+	cookie, err := r.Cookie(localnet.CookieName(r.Host, browserFormCSRFCookie))
 	if err != nil {
 		return err
 	}
@@ -475,9 +478,9 @@ func forwardedRequestHost(r *http.Request) (string, bool) {
 	return host, true
 }
 
-func (p *Provider) clearIdentityFormCSRF(w http.ResponseWriter) {
+func (p *Provider) clearIdentityFormCSRF(r *http.Request, w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
-		Name: browserFormCSRFCookie, Value: "", Path: "/", Secure: true, HttpOnly: true,
+		Name: localnet.CookieName(r.Host, browserFormCSRFCookie), Value: "", Path: "/", Secure: localnet.CookieSecure(r.Host), HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0),
 	})
 }

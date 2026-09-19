@@ -37,7 +37,7 @@ namespace TermLink.Agent
             var path = DefaultPath;
             if (!File.Exists(path)) return null;
             var config = JsonSerializer.Deserialize<ProductionAgentConfig>(File.ReadAllText(path, Encoding.UTF8));
-            if (config == null || !Uri.TryCreate(config.ServerUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
+            if (config == null || !Uri.TryCreate(config.ServerUrl, UriKind.Absolute, out var uri) || !ProductionServerOriginPolicy.IsAllowedOrigin(uri) ||
                 config.PcId == Guid.Empty || string.IsNullOrWhiteSpace(config.PcName) || string.IsNullOrWhiteSpace(config.AgentVersion) || config.KeyEpoch < 1)
             {
                 throw new InvalidDataException("Production Agent configuration is invalid.");
@@ -46,7 +46,7 @@ namespace TermLink.Agent
             if (!string.IsNullOrWhiteSpace(config.OIDCIssuer) || !string.IsNullOrWhiteSpace(config.OIDCClientId))
             {
                 if (!Uri.TryCreate(config.OIDCIssuer, UriKind.Absolute, out var issuer) ||
-                    issuer.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(config.OIDCClientId))
+                    !ProductionServerOriginPolicy.IsAllowedOrigin(issuer) || string.IsNullOrWhiteSpace(config.OIDCClientId))
                 {
                     throw new InvalidDataException("Production Agent OIDC configuration is invalid.");
                 }
@@ -84,8 +84,8 @@ namespace TermLink.Agent
         public static void Save(ProductionAgentConfig config)
         {
             if (config == null) throw new ArgumentNullException(nameof(config));
-            if (!Uri.TryCreate(config.ServerUrl, UriKind.Absolute, out var server) || server.Scheme != Uri.UriSchemeHttps ||
-                !Uri.TryCreate(config.OIDCIssuer, UriKind.Absolute, out var issuer) || issuer.Scheme != Uri.UriSchemeHttps ||
+            if (!Uri.TryCreate(config.ServerUrl, UriKind.Absolute, out var server) || !ProductionServerOriginPolicy.IsAllowedOrigin(server) ||
+                !Uri.TryCreate(config.OIDCIssuer, UriKind.Absolute, out var issuer) || !ProductionServerOriginPolicy.IsAllowedOrigin(issuer) ||
                 config.PcId == Guid.Empty || string.IsNullOrWhiteSpace(config.PcName) ||
                 string.IsNullOrWhiteSpace(config.AgentVersion) || config.KeyEpoch < 1 ||
                 string.IsNullOrWhiteSpace(config.OIDCClientId) ||
@@ -294,7 +294,7 @@ namespace TermLink.Agent
         {
             value = (value ?? string.Empty).Trim().TrimEnd('/');
             if (!Uri.TryCreate(value, UriKind.Absolute, out var issuer) ||
-                issuer.Scheme != Uri.UriSchemeHttps || !string.IsNullOrEmpty(issuer.Fragment) ||
+                !ProductionServerOriginPolicy.IsAllowedOrigin(issuer) || !string.IsNullOrEmpty(issuer.Fragment) ||
                 !string.IsNullOrEmpty(issuer.Query) || !string.IsNullOrEmpty(issuer.UserInfo))
             {
                 return null;

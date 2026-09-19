@@ -382,7 +382,7 @@ func runProduction() error {
 	if directTransportEnabled {
 		if cfg.RuntimeMode == config.RuntimeModeSingleNode {
 			directTickets, err = transport.NewRouteTicketServiceWithRouting(
-				repository, directTransportKey, false, directSTUNServers...,
+				repository, directTransportKey, true, directSTUNServers...,
 			)
 			if err == nil {
 				directTickets.SetRoutingPermittedOverride(routingPermitted)
@@ -410,7 +410,7 @@ func runProduction() error {
 					directState, err = kv.NewDirectTransportState(directValkey.Client, "")
 					if err == nil {
 						directTickets, err = transport.NewSharedRouteTicketServiceWithRouting(
-							directRepository, directState, directTransportKey, false, directSTUNServers...,
+							directRepository, directState, directTransportKey, true, directSTUNServers...,
 						)
 						if err == nil {
 							directTickets.SetRoutingPermittedOverride(routingPermitted)

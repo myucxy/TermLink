@@ -7989,7 +7989,7 @@ namespace TermLink.Agent
                     using var document = JsonDocument.Parse(
                         await discovery.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
                     var endpoint = document.RootElement.GetProperty("token_endpoint").GetString();
-                    if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) || endpointUri.Scheme != Uri.UriSchemeHttps)
+                    if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri) || !ProductionServerOriginPolicy.IsAllowedOrigin(endpointUri))
                         throw new InvalidDataException("OIDC token endpoint is invalid.");
                     tokenEndpoint = endpoint;
                 }

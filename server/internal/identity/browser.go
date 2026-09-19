@@ -20,6 +20,8 @@ import (
 	"github.com/ory/fosite"
 	"github.com/termlink/termlink/server/internal/clientaddress"
 	"github.com/termlink/termlink/server/internal/humanverification"
+	"github.com/termlink/termlink/server/internal/localnet"
+
 )
 
 const (
@@ -317,14 +319,14 @@ func (p *Provider) completeAuthorizeLogin(w http.ResponseWriter, r *http.Request
 					}
 					methods := appendUnique(existing.Methods, method, "mfa")
 					now := p.clock().UTC()
-					p.setBrowserSession(w, browserSession{Subject: existing.Subject, AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(), Methods: methods, ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix()})
+					p.setBrowserSession(r, w, browserSession{Subject: existing.Subject, AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(), Methods: methods, ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix()})
 					p.issueAuthorization(w, r, request, account, methods, now)
 					return
 				}
 				p.renderLogin(w, r, request, "验证码无效或已使用。 / The authenticator code is invalid or was already used.", account.Username, true, account.Username)
 				return
 			}
-			p.clearBrowserSession(w)
+			p.clearBrowserSession(r, w)
 		}
 	}
 	if csrfState.PendingSubject != "" {
@@ -347,7 +349,7 @@ func (p *Provider) completeAuthorizeLogin(w http.ResponseWriter, r *http.Request
 		}
 		authenticatedAt := time.Unix(csrfState.PasswordAuthenticatedAt, 0).UTC()
 		methods := []string{"pwd", method, "mfa"}
-		p.setBrowserSession(w, browserSession{Subject: account.Subject.String(), AuthEpoch: account.AuthEpoch, AuthenticatedAt: authenticatedAt.Unix(), Methods: methods, ExpiresAt: p.clock().UTC().Add(embeddedBrowserSessionLifetime).Unix()})
+		p.setBrowserSession(r, w, browserSession{Subject: account.Subject.String(), AuthEpoch: account.AuthEpoch, AuthenticatedAt: authenticatedAt.Unix(), Methods: methods, ExpiresAt: p.clock().UTC().Add(embeddedBrowserSessionLifetime).Unix()})
 		p.issueAuthorization(w, r, request, account, methods, authenticatedAt)
 		return
 	}
@@ -367,7 +369,7 @@ func (p *Provider) completeAuthorizeLogin(w http.ResponseWriter, r *http.Request
 	}
 	if account.PasswordResetRequired {
 		now := p.clock().UTC()
-		p.setBrowserSession(w, browserSession{
+		p.setBrowserSession(r, w, browserSession{
 			Subject: account.Subject.String(), AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(),
 			Methods: []string{"pwd"}, ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix(), SetupRequired: true,
 		})
@@ -391,7 +393,7 @@ func (p *Provider) completeAuthorizeLogin(w http.ResponseWriter, r *http.Request
 		methods = append(methods, method, "mfa")
 	}
 	now := p.clock().UTC()
-	p.setBrowserSession(w, browserSession{Subject: subject, AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(), Methods: methods, ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix()})
+	p.setBrowserSession(r, w, browserSession{Subject: subject, AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(), Methods: methods, ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix()})
 	p.issueAuthorization(w, r, request, account, methods, now)
 }
 
@@ -418,7 +420,7 @@ func (p *Provider) issueAuthorization(w http.ResponseWriter, r *http.Request, re
 		p.oauth.WriteAuthorizeError(r.Context(), w, request, err)
 		return
 	}
-	p.clearBrowserCSRF(w)
+	p.clearBrowserCSRF(r, w)
 	p.oauth.WriteAuthorizeResponse(r.Context(), w, request, response)
 }
 
@@ -455,7 +457,7 @@ func (p *Provider) renderLoginWithState(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusInternalServerError)
 		return
 	}
-	cookieName := browserCSRFCookie + "-" + cookieSuffix
+	cookieName := localnet.CookieName(r.Host, browserCSRFCookie) + "-" + cookieSuffix
 	state.CookieName = cookieName
 	state.Token = csrf
 	state.QueryHash = base64.RawURLEncoding.EncodeToString(queryHash[:])
@@ -465,7 +467,7 @@ func (p *Provider) renderLoginWithState(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: sealed, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: now.Add(10 * time.Minute), MaxAge: 600})
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: sealed, Path: "/", Secure: localnet.CookieSecure(r.Host), HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: now.Add(10 * time.Minute), MaxAge: 600})
 	action := r.URL.Path
 	if r.URL.RawQuery != "" {
 		action += "?" + r.URL.RawQuery
@@ -509,7 +511,9 @@ func (p *Provider) verifyLoginHuman(w http.ResponseWriter, r *http.Request, requ
 
 func (p *Provider) validateBrowserCSRF(r *http.Request) (browserCSRF, error) {
 	cookieName := strings.TrimSpace(r.FormValue("termlink_csrf_cookie"))
-	if !strings.HasPrefix(cookieName, browserCSRFCookie+"-") || strings.ContainsAny(cookieName, " \t\r\n;=") {
+	if (!strings.HasPrefix(cookieName, browserCSRFCookie+"-") &&
+		!strings.HasPrefix(cookieName, strings.TrimPrefix(browserCSRFCookie, "__Host-")+"-")) ||
+		strings.ContainsAny(cookieName, " \t\r\n;=") {
 		return browserCSRF{}, errors.New("identity csrf cookie is invalid")
 	}
 	cookie, err := r.Cookie(cookieName)
@@ -529,19 +533,19 @@ func (p *Provider) validateBrowserCSRF(r *http.Request) (browserCSRF, error) {
 	return state, nil
 }
 
-func (p *Provider) clearBrowserCSRF(w http.ResponseWriter, states ...browserCSRF) {
+func (p *Provider) clearBrowserCSRF(r *http.Request, w http.ResponseWriter, states ...browserCSRF) {
 	var state browserCSRF
 	if len(states) > 0 {
 		state = states[0]
 	}
 	name := state.CookieName
 	if name == "" {
-		name = browserCSRFCookie
+		name = localnet.CookieName(r.Host, browserCSRFCookie)
 	}
 	http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
 }
 
-func (p *Provider) setBrowserSession(w http.ResponseWriter, session browserSession) {
+func (p *Provider) setBrowserSession(r *http.Request, w http.ResponseWriter, session browserSession) {
 	sealed, err := p.browserCookies.seal(session, "session")
 	if err != nil {
 		return
@@ -551,11 +555,11 @@ func (p *Provider) setBrowserSession(w http.ResponseWriter, session browserSessi
 	if maxAge < 1 {
 		maxAge = 1
 	}
-	http.SetCookie(w, &http.Cookie{Name: browserSessionCookie, Value: sealed, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: expires, MaxAge: maxAge})
+	http.SetCookie(w, &http.Cookie{Name: localnet.CookieName(r.Host, browserSessionCookie), Value: sealed, Path: "/", Secure: localnet.CookieSecure(r.Host), HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: expires, MaxAge: maxAge})
 }
 
 func (p *Provider) readBrowserSession(r *http.Request) (browserSession, error) {
-	cookie, err := r.Cookie(browserSessionCookie)
+	cookie, err := r.Cookie(localnet.CookieName(r.Host, browserSessionCookie))
 	if err != nil {
 		return browserSession{}, err
 	}
@@ -566,8 +570,8 @@ func (p *Provider) readBrowserSession(r *http.Request) (browserSession, error) {
 	return session, nil
 }
 
-func (p *Provider) clearBrowserSession(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: browserSessionCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
+func (p *Provider) clearBrowserSession(r *http.Request, w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: localnet.CookieName(r.Host, browserSessionCookie), Value: "", Path: "/", Secure: localnet.CookieSecure(r.Host), HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
 }
 
 func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
@@ -675,8 +679,8 @@ func removeCredentialFields(values url.Values) {
 }
 
 func (p *Provider) logout(w http.ResponseWriter, r *http.Request) {
-	p.clearBrowserSession(w)
-	p.clearBrowserCSRF(w)
+	p.clearBrowserSession(r, w)
+	p.clearBrowserCSRF(r, w)
 	target := "/"
 	requested := strings.TrimSpace(r.FormValue("post_logout_redirect_uri"))
 	if requested != "" {

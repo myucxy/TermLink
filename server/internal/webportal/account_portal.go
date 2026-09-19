@@ -219,7 +219,7 @@ func userPortalNotice(value string) string {
 func (p *Portal) requireAccount(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
 	session, err := p.readSession(r)
 	if err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		http.Redirect(w, r, "/login?return_to=/account", http.StatusSeeOther)
 		return webSession{}, store.PortalAccount{}, false
 	}

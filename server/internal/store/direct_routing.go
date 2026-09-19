@@ -8,9 +8,9 @@ import (
 )
 
 // The direct transport data-plane routing policy is a runtime switch owned by
-// the management portal. A missing row means routing is not permitted, so a
-// fresh deployment starts with direct transport in shadow-only mode until a
-// SUPER_ADMIN explicitly enables it.
+// the management portal. A missing row means routing is PERMITTED (the
+// product default: prefer direct when it works, Relay always as the
+// fallback); SUPER_ADMIN can disable it from the portal at runtime.
 func (s *Postgres) GetDirectRoutingPolicy(ctx context.Context) (bool, error) {
 	if s == nil || s.Pool == nil {
 		return false, ErrDenied
@@ -20,7 +20,7 @@ func (s *Postgres) GetDirectRoutingPolicy(ctx context.Context) (bool, error) {
 		`SELECT routing_permitted FROM direct_routing_policy WHERE singleton`).Scan(&permitted)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
+			return true, nil
 		}
 		return false, err
 	}

@@ -25,7 +25,7 @@ type sensitiveStepUpStatusResponse struct {
 func (p *Portal) sensitiveStepUp(w http.ResponseWriter, r *http.Request) {
 	session, err := p.readSession(r)
 	if err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		p.renderSensitiveStepUpResult(w, http.StatusUnauthorized, "failed", "", "登录已失效", "请关闭验证窗口，重新登录后再执行该操作。")
 		return
 	}
@@ -59,7 +59,7 @@ func (p *Portal) sensitiveStepUpStatus(w http.ResponseWriter, r *http.Request) {
 	verified := false
 	status := http.StatusOK
 	if session, err := p.readSession(r); err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		status = http.StatusUnauthorized
 	} else {
 		verified = recentSensitiveVerification(session, p.now())
@@ -101,7 +101,7 @@ func (p *Portal) completeSensitiveStepUp(w http.ResponseWriter, r *http.Request,
 	session.MFA = identity.MFA
 	session.SensitiveVerifiedAtMS = verifiedAtMS
 	session.SensitiveMethod = method
-	if err := p.refreshSessionCookie(w, session); err != nil {
+	if err := p.refreshSessionCookie(r, w, session); err != nil {
 		p.internalError(w, err)
 		return
 	}

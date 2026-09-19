@@ -42,7 +42,7 @@ func (p *Portal) accountUpdateNickname(w http.ResponseWriter, r *http.Request) {
 			"account_identity_profile_sync_failed", uuid.NewString(), profileErr,
 			slog.String("account_id", account.ID.String()))
 	}
-	if err := p.refreshSessionCookie(w, session); err != nil {
+	if err := p.refreshSessionCookie(r, w, session); err != nil {
 		p.internalError(w, err)
 		return
 	}
@@ -120,19 +120,19 @@ func (p *Portal) accountConfirmEmail(w http.ResponseWriter, r *http.Request) {
 			"account_identity_profile_sync_failed", uuid.NewString(), profileErr,
 			slog.String("account_id", account.ID.String()))
 	}
-	if err = p.refreshSessionCookie(w, session); err != nil {
+	if err = p.refreshSessionCookie(r, w, session); err != nil {
 		p.internalError(w, err)
 		return
 	}
 	http.Redirect(w, r, "/account?section=settings&notice=email-updated", http.StatusSeeOther)
 }
 
-func (p *Portal) refreshSessionCookie(w http.ResponseWriter, session webSession) error {
+func (p *Portal) refreshSessionCookie(r *http.Request, w http.ResponseWriter, session webSession) error {
 	encoded, err := p.sessionCodec.seal(session)
 	if err != nil {
 		return err
 	}
-	p.setCookie(w, sessionCookieName, encoded, time.UnixMilli(session.ExpiresAtMS))
+	p.setCookie(r, w, sessionCookieName, encoded, time.UnixMilli(session.ExpiresAtMS))
 	return nil
 }
 

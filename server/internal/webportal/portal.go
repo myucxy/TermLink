@@ -808,10 +808,10 @@ func (p *Portal) beginOIDC(w http.ResponseWriter, r *http.Request, returnTo, the
 		p.internalError(w, err)
 		return
 	}
-	p.setCookie(w, pending.CookieName, stateCookie, p.now().Add(oauthStateTTL))
+	p.setCookie(r, w, pending.CookieName, stateCookie, p.now().Add(oauthStateTTL))
 	// Keep the legacy slot for older embedded pages and clients; callbacks prefer
 	// the per-flow cookie above, so parallel windows no longer overwrite state.
-	p.setCookie(w, oauthCookieName, stateCookie, p.now().Add(oauthStateTTL))
+	p.setCookie(r, w, oauthCookieName, stateCookie, p.now().Add(oauthStateTTL))
 	location := p.flow.AuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme)
 	if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
 		location = dynamic.AuthorizationURLForRedirect(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme, redirectURI)
@@ -835,8 +835,8 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		cookieName = oauthCookieName
 		cookie, err = r.Cookie(cookieName)
 	}
-	p.clearCookie(w, cookieName)
-	p.clearCookie(w, oauthCookieName)
+	p.clearCookie(r, w, cookieName)
+	p.clearCookie(r, w, oauthCookieName)
 	if err != nil {
 		p.renderError(w, http.StatusBadRequest, "登录已过期", "授权状态已失效，请返回首页重新登录。")
 		return
@@ -949,8 +949,8 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		p.internalError(w, err)
 		return
 	}
-	p.setCookie(w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
-	p.clearCookie(w, legacySessionCookie)
+	p.setCookie(r, w, sessionCookieName, sessionCookie, p.now().Add(webSessionTTL))
+	p.clearCookie(r, w, legacySessionCookie)
 	returnTo := "/"
 	switch normalizePortalReturnTo(pending.ReturnTo) {
 	case "/account":
@@ -1002,13 +1002,13 @@ func (p *Portal) account(w http.ResponseWriter, r *http.Request) {
 	}
 	session, err := p.readSession(r)
 	if err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		http.Redirect(w, r, "/login?return_to=/account", http.StatusSeeOther)
 		return
 	}
 	portalAccount, err := p.currentAccount(r.Context(), session)
 	if err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		p.renderError(w, http.StatusForbidden, "账号不可用", "账号已被停用或浏览器会话需要重新登录。")
 		return
 	}
@@ -1330,7 +1330,7 @@ func (p *Portal) adminUpdateStatus(w http.ResponseWriter, r *http.Request) {
 func (p *Portal) logout(w http.ResponseWriter, r *http.Request) {
 	session, err := p.readSession(r)
 	if err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -1342,8 +1342,8 @@ func (p *Portal) logout(w http.ResponseWriter, r *http.Request) {
 		p.renderError(w, http.StatusForbidden, "退出请求被拒绝", "安全校验失败，请刷新个人页后重试。")
 		return
 	}
-	p.clearCookie(w, sessionCookieName)
-	p.clearCookie(w, legacySessionCookie)
+	p.clearCookie(r, w, sessionCookieName)
+	p.clearCookie(r, w, legacySessionCookie)
 	target := p.flow.LogoutURL()
 	if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
 		if origin, originOK := requestOrigin(r); originOK {
@@ -1358,7 +1358,7 @@ func (p *Portal) notFound(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (p *Portal) readSession(r *http.Request) (webSession, error) {
-	cookie, err := r.Cookie(sessionCookieName)
+	cookie, err := r.Cookie(localnet.CookieName(r.Host, sessionCookieName))
 	if err != nil {
 		return webSession{}, err
 	}
@@ -1473,27 +1473,27 @@ func (p *Portal) humanVerificationRuntime(ctx context.Context) (humanverificatio
 	}, nil
 }
 
-func (p *Portal) setCookie(w http.ResponseWriter, name, value string, expires time.Time) {
+func (p *Portal) setCookie(r *http.Request, w http.ResponseWriter, name, value string, expires time.Time) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     name,
+		Name:     localnet.CookieName(r.Host, name),
 		Value:    value,
 		Path:     "/",
 		Expires:  expires.UTC(),
 		MaxAge:   int(expires.Sub(p.now()).Seconds()),
-		Secure:   true,
+		Secure:   localnet.CookieSecure(r.Host),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
-func (p *Portal) clearCookie(w http.ResponseWriter, name string) {
+func (p *Portal) clearCookie(r *http.Request, w http.ResponseWriter, name string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     name,
+		Name:     localnet.CookieName(r.Host, name),
 		Value:    "",
 		Path:     "/",
 		Expires:  time.Unix(1, 0).UTC(),
 		MaxAge:   -1,
-		Secure:   true,
+		Secure:   localnet.CookieSecure(r.Host),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
@@ -2016,7 +2016,7 @@ func (p *Portal) currentAccount(ctx context.Context, session webSession) (store.
 func (p *Portal) requireConsole(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
 	session, err := p.readSession(r)
 	if err != nil {
-		p.clearCookie(w, sessionCookieName)
+		p.clearCookie(r, w, sessionCookieName)
 		http.Redirect(w, r, "/login?return_to=/admin", http.StatusSeeOther)
 		return webSession{}, store.PortalAccount{}, false
 	}

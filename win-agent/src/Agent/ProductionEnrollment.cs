@@ -134,8 +134,10 @@ namespace TermLink.Agent
 
         internal static string NormalizeServerOrigin(string value)
         {
+            // Plain HTTP is accepted for loopback/private-network origins so a
+            // local development server can be exercised end to end.
             if (!Uri.TryCreate(value, UriKind.Absolute, out var server) ||
-                server.Scheme != Uri.UriSchemeHttps ||
+                !ProductionServerOriginPolicy.IsAllowedOrigin(server) ||
                 string.IsNullOrEmpty(server.Query) == false ||
                 string.IsNullOrEmpty(server.Fragment) == false ||
                 !string.IsNullOrEmpty(server.UserInfo) ||
@@ -143,7 +145,7 @@ namespace TermLink.Agent
             {
                 throw new ArgumentException("The TermLink server origin must be an HTTPS origin.");
             }
-            return new UriBuilder(Uri.UriSchemeHttps, server.IdnHost, server.IsDefaultPort ? -1 : server.Port)
+            return new UriBuilder(server.Scheme, server.IdnHost, server.IsDefaultPort ? -1 : server.Port)
                 .Uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped).TrimEnd('/');
         }
 
