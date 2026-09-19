@@ -36,6 +36,7 @@ import (
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/observability"
 	"github.com/termlink/termlink/server/internal/outbox"
+	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/realtime"
 	"github.com/termlink/termlink/server/internal/registrationrecovery"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
@@ -60,12 +61,10 @@ func main() {
 		os.Exit(runHealthcheck())
 	case "admin-route-reset":
 		err = runAdminRouteReset()
-	case "identity-import-keycloak":
-		err = runKeycloakIdentityImport()
 	case "identity-reset-initial-admin":
 		err = runEmbeddedInitialAdminReset()
 	default:
-		err = fmt.Errorf("unknown command %q (use serve, migrate, healthcheck, admin-route-reset, identity-import-keycloak, or identity-reset-initial-admin)", command)
+		err = fmt.Errorf("unknown command %q (use serve, migrate, healthcheck, admin-route-reset, or identity-reset-initial-admin)", command)
 	}
 	if err != nil {
 		logProcessFailure(slog.Default(), command, err)
@@ -73,7 +72,7 @@ func main() {
 	}
 }
 
-func logProcessFailure(logger *slog.Logger, command string, _ error) {
+func logProcessFailure(logger *slog.Logger, command string, err error) {
 	errorClass := "invalid_command"
 	switch command {
 	case "serve":
@@ -84,12 +83,26 @@ func logProcessFailure(logger *slog.Logger, command string, _ error) {
 		errorClass = "healthcheck_failed"
 	case "admin-route-reset":
 		errorClass = "admin_route_offline_reset_failed"
-	case "identity-import-keycloak":
-		errorClass = "keycloak_identity_import_failed"
 	case "identity-reset-initial-admin":
 		errorClass = "embedded_initial_admin_reset_failed"
 	}
+	// Reason text is opt-in diagnostics (TERMLINK_LOG_FAILURE_REASON): error
+	// chains may carry operator-sensitive context, so the default log keeps
+	// the stable class only.
+	if logFailureReason() {
+		logger.Error("server stopped", "error_class", errorClass, "reason", err.Error())
+		return
+	}
 	logger.Error("server stopped", "error_class", errorClass)
+}
+
+func logFailureReason() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TERMLINK_LOG_FAILURE_REASON"))) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func runProduction() error {
@@ -97,6 +110,12 @@ func runProduction() error {
 	defer stop()
 	cfg, err := config.Load()
 	if err != nil {
+		if errors.Is(err, config.ErrInvalid) || errors.Is(err, config.ErrMissing) {
+			// These classes name the offending variable only; surfacing the
+			// class keeps a misconfigured deployment diagnosable without
+			// risking secret material that other error paths may carry.
+			slog.Error("production config rejected", "reason", err.Error())
+		}
 		return fmt.Errorf("load production config: %w", err)
 	}
 	directAcceptanceMetadataConfig, err := loadDirectAcceptanceMetadataConfig(cfg.PublicURL)
@@ -113,6 +132,9 @@ func runProduction() error {
 		return err
 	}
 	defer repository.Close()
+	// Online state is process-local and expires with the authenticated socket;
+	// durable device identity and revocation remain in PostgreSQL.
+	onlinePresence := presence.New(presence.DefaultTTL)
 	if cfg.RuntimeMode == config.RuntimeModeSingleNode {
 		migrationCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		err = migrate.UpPool(migrationCtx, repository.Pool)
@@ -127,6 +149,15 @@ func runProduction() error {
 	repository.AutoTrustDevices = true
 	if err := repository.VerifySchema(ctx); err != nil {
 		return err
+	}
+	keyMaster := cfg.TokenSigningKey.Value()
+	if strings.TrimSpace(keyMaster) == "" && cfg.RuntimeMode == config.RuntimeModeSingleNode && cfg.IdentityProvider == config.IdentityProviderEmbedded {
+		master, secretErr := repository.EnsureRuntimeSecret(ctx, "token-signing-master", 32)
+		if secretErr != nil {
+			return fmt.Errorf("initialize database-backed server secret: %w", secretErr)
+		}
+		keyMaster = string(master)
+		clear(master)
 	}
 	var coordinator kv.Coordinator
 	if cfg.RuntimeMode == config.RuntimeModeSingleNode {
@@ -147,7 +178,6 @@ func runProduction() error {
 		return err
 	}
 	defer coordinator.Close()
-	keyMaster := cfg.TokenSigningKey.Value()
 	subjectKey := deriveServerKey(keyMaster, "oidc-subject-hash")
 	tokenKey := deriveServerKey(keyMaster, "capability-token-signing")
 	cookieKey := deriveServerKey(keyMaster, "web-cookie-master")
@@ -244,10 +274,11 @@ func runProduction() error {
 		}
 	}
 	appShipBaseURL := os.Getenv("TERMLINK_APPSHIP_BASE_URL")
-	updateCatalog, err := agentupdate.NewAppShipCatalogWithAllowedPrivateIPs(
+	updateCatalog, err := agentupdate.NewAppShipCatalogWithSignerAnchor(
 		appShipBaseURL,
 		nil,
 		os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
+		os.Getenv("TERMLINK_APPSHIP_SIGNER_FINGERPRINT"),
 	)
 	if err != nil {
 		return fmt.Errorf("initialize Agent update catalog: %w", err)
@@ -256,6 +287,10 @@ func runProduction() error {
 	var accountDeletionRunner *accountdeletion.Runner
 	if cfg.AccountDeletionEnabled {
 		identityKeys, keyErr := cfg.AccountDeletionIdentityKeys()
+		if keyErr != nil && cfg.AccountDeletionIdentityKey.Empty() && keyMaster != "" {
+			identityKeys = map[int16][]byte{cfg.AccountDeletionIdentityKeyVersion: deriveServerKey(keyMaster, "account-deletion-identity")}
+			keyErr = nil
+		}
 		if keyErr != nil {
 			return fmt.Errorf("load account deletion identity keys: %w", keyErr)
 		}
@@ -286,7 +321,7 @@ func runProduction() error {
 		accountDeletionRunner = accountdeletion.NewRunner(deletionService, accountdeletion.RunnerOptions{Logger: slog.Default()})
 	}
 	productionAPI := &api.API{
-		Store: repository, Valkey: coordinator, Tokens: verifier, Auth: authentication,
+		Store: repository, Valkey: coordinator, Presence: onlinePresence, Tokens: verifier, Auth: authentication,
 		ServiceEmail:      serviceEmail,
 		HumanVerification: humanVerificationManager,
 		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey,
@@ -321,14 +356,19 @@ func runProduction() error {
 		defer cancel()
 		_ = fileTransferHub.Close(shutdown)
 	}()
-	directTransportEnabled, directRoutingPermitted, err := directTransportFeatureFlags()
+	directTransportEnabled, err := directTransportFeatureFlags()
 	if err != nil {
 		return err
 	}
-	if !directTransportEnabled && strings.TrimSpace(os.Getenv("TERMLINK_DIRECT_ROUTING_PERMITTED")) != "" {
-		// The transport switch is the emergency fail-safe. A stale or invalid
-		// routing value must never prevent the independent Relay from starting.
-		slog.Warn("direct routing setting ignored while direct transport is disabled")
+	// The direct data-plane routing permission is portal-owned: SUPER_ADMIN
+	// toggles it at runtime from the management portal and it is stored in
+	// PostgreSQL (direct_routing_policy). Reads are bounded to ticket issuance
+	// and capability negotiation, both low-frequency events.
+	routingPermitted := func() bool {
+		policyCtx, policyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer policyCancel()
+		permitted, policyErr := repository.GetDirectRoutingPolicy(policyCtx)
+		return policyErr == nil && permitted
 	}
 	directSTUNServers, err := parseDirectSTUNServers(os.Getenv("TERMLINK_DIRECT_STUN_SERVERS"))
 	if err != nil {
@@ -342,9 +382,10 @@ func runProduction() error {
 	if directTransportEnabled {
 		if cfg.RuntimeMode == config.RuntimeModeSingleNode {
 			directTickets, err = transport.NewRouteTicketServiceWithRouting(
-				repository, directTransportKey, directRoutingPermitted, directSTUNServers...,
+				repository, directTransportKey, false, directSTUNServers...,
 			)
 			if err == nil {
+				directTickets.SetRoutingPermittedOverride(routingPermitted)
 				directHub = transport.NewHub(directTickets)
 				directAuthentication = auth.Middleware{Tokens: verifier, Devices: repository, Nonces: coordinator, SubjectKey: subjectKey}
 			}
@@ -369,8 +410,11 @@ func runProduction() error {
 					directState, err = kv.NewDirectTransportState(directValkey.Client, "")
 					if err == nil {
 						directTickets, err = transport.NewSharedRouteTicketServiceWithRouting(
-							directRepository, directState, directTransportKey, directRoutingPermitted, directSTUNServers...,
+							directRepository, directState, directTransportKey, false, directSTUNServers...,
 						)
+						if err == nil {
+							directTickets.SetRoutingPermittedOverride(routingPermitted)
+						}
 					}
 					if err == nil {
 						directHub, err = transport.NewSharedHub(directTickets, directState)
@@ -403,6 +447,7 @@ func runProduction() error {
 		}
 	}
 	if directHub != nil {
+		directHub.SetPresence(onlinePresence)
 		if directRepository != nil {
 			defer directRepository.Close()
 		}
@@ -420,8 +465,12 @@ func runProduction() error {
 		coordinator,
 		slog.Default(),
 		observer,
-		directRealtimeHubOptions(directHub != nil, directRoutingPermitted),
+		realtime.HubOptions{
+			DirectTransportDataV1:         directHub != nil,
+			DirectTransportDataV1Override: func() bool { return directHub != nil && routingPermitted() },
+		},
 	)
+	hub.SetPresence(onlinePresence)
 	defer func() {
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -472,6 +521,7 @@ func runProduction() error {
 		OIDCDiscovery:             localDiscovery,
 		OIDCHTTPClient:            localOIDCHTTPClient,
 		Repository:                repository,
+		Presence:                  onlinePresence,
 		AccountStatusChanged: func(ctx context.Context, accountID uuid.UUID, status string) error {
 			return coordinator.Publish(ctx, "account-status-changed", accountID)
 		},
@@ -487,7 +537,7 @@ func runProduction() error {
 		mux,
 		directAcceptanceMetadataConfig,
 		directHub != nil,
-		directRoutingPermitted,
+		routingPermitted,
 	); err != nil {
 		return err
 	}
@@ -530,7 +580,7 @@ func runProduction() error {
 		go accountDeletionRunner.Run(ctx)
 	}
 	go fileoperationcleanup.New(repository, fileoperationcleanup.Options{Logger: slog.Default()}).Run(ctx)
-	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil, "direct_routing_permitted", directHub != nil && directRoutingPermitted)
+	slog.Info("TermLink production server starting", "address", cfg.ListenAddr, "public_url", cfg.PublicURL, "metrics_enabled", cfg.MetricsListenAddr != "", "direct_transport_enabled", directHub != nil, "direct_routing_permitted_dynamic", routingPermitted != nil)
 	applicationHandler := hideDirectAcceptanceMetadataWhenDisabled(directAcceptanceMetadataConfig, mux)
 	if metrics != nil {
 		applicationHandler = metrics.HTTPMiddleware(applicationHandler)
@@ -617,20 +667,12 @@ func optionalFeatureFlag(name string) (bool, error) {
 	}
 }
 
-func directTransportFeatureFlags() (transportEnabled, routingPermitted bool, err error) {
-	transportEnabled, err = optionalFeatureFlag("TERMLINK_DIRECT_TRANSPORT_ENABLED")
-	if err != nil || !transportEnabled {
-		// DIRECT_TRANSPORT_ENABLED is the emergency fail-safe. When it is off,
-		// even a stale or malformed routing value is deliberately ignored so the
-		// unrelated Relay can always start.
-		return transportEnabled, false, err
-	}
-	routingPermitted, err = optionalFeatureFlag("TERMLINK_DIRECT_ROUTING_PERMITTED")
-	return transportEnabled, routingPermitted, err
-}
-
-func directRealtimeHubOptions(directTransportReady, routingPermitted bool) realtime.HubOptions {
-	return realtime.HubOptions{DirectTransportDataV1: directTransportReady && routingPermitted}
+func directTransportFeatureFlags() (transportEnabled bool, err error) {
+	// TERMLINK_DIRECT_TRANSPORT_ENABLED remains the deployment-level emergency
+	// fail-safe for whether the transport subsystem starts at all. Whether the
+	// direct data plane may carry traffic is the portal-owned routing policy
+	// (direct_routing_policy), toggled by SUPER_ADMIN at runtime.
+	return optionalFeatureFlag("TERMLINK_DIRECT_TRANSPORT_ENABLED")
 }
 
 func readOptionalSecretFile(name string) (string, error) {
@@ -777,49 +819,6 @@ func runEmbeddedInitialAdminReset() error {
 		return err
 	}
 	return accounts.ResetInitialAdministratorPassword(ctx, cfg.InitialAdminPassword.Value())
-}
-
-func runKeycloakIdentityImport() error {
-	if len(os.Args) < 3 || len(os.Args) > 4 {
-		return errors.New("usage: termlink-server identity-import-keycloak <realm-export.json> [--dry-run]")
-	}
-	dryRun := false
-	if len(os.Args) == 4 {
-		if os.Args[3] != "--dry-run" {
-			return errors.New("identity import accepts only the optional --dry-run flag")
-		}
-		dryRun = true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("load production config: %w", err)
-	}
-	repository, err := store.OpenWithOptions(ctx, cfg.DatabaseURL.Value(), store.OpenOptions{MinConns: 0, MaxConns: 2})
-	if err != nil {
-		return err
-	}
-	defer repository.Close()
-	if err = repository.VerifySchema(ctx); err != nil {
-		return err
-	}
-	source, err := os.Open(os.Args[2])
-	if err != nil {
-		return errors.New("open Keycloak realm export failed")
-	}
-	defer source.Close()
-	result, err := identity.ImportKeycloakRealm(ctx, repository.Pool, source, dryRun)
-	if err != nil {
-		return err
-	}
-	zhMode, enMode := "已完成", "completed"
-	if result.DryRun {
-		zhMode, enMode = "演练通过（未写入）", "dry run passed (no changes committed)"
-	}
-	fmt.Printf("Keycloak 用户迁移%s：用户 %d，跳过服务账号 %d。\nKeycloak identity migration %s: users %d, service accounts skipped %d.\n",
-		zhMode, result.Imported, result.SkippedServiceAccounts, enMode, result.Imported, result.SkippedServiceAccounts)
-	return nil
 }
 
 func readinessHandler(repository *store.Postgres, coordinator kv.Coordinator) http.HandlerFunc {

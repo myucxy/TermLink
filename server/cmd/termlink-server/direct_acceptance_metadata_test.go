@@ -29,7 +29,7 @@ func TestDirectAcceptanceMetadataDisabledIsNotRegistered(t *testing.T) {
 				t.Fatalf("disabled config = %#v, %v; want nil, nil", config, err)
 			}
 			mux := http.NewServeMux()
-			if err := registerDirectAcceptanceMetadataRoute(mux, config, true, true); err != nil {
+			if err := registerDirectAcceptanceMetadataRoute(mux, config, true, func() bool { return true }); err != nil {
 				t.Fatal(err)
 			}
 			fallback := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -95,7 +95,7 @@ func TestDirectAcceptanceMetadataExactResponseAndRouteContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	if err = registerDirectAcceptanceMetadataRoute(mux, config, true, true); err != nil {
+	if err = registerDirectAcceptanceMetadataRoute(mux, config, true, func() bool { return true }); err != nil {
 		t.Fatal(err)
 	}
 
@@ -172,7 +172,7 @@ func TestDirectAcceptanceMetadataCapabilitiesTrackActualGates(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			mux := http.NewServeMux()
 			config := &directAcceptanceMetadataConfig{origin: "https://acceptance.example.invalid", buildSHA256: testDirectAcceptanceBuildSHA}
-			if err := registerDirectAcceptanceMetadataRoute(mux, config, test.transport, test.routing); err != nil {
+			if err := registerDirectAcceptanceMetadataRoute(mux, config, test.transport, func() bool { return test.routing }); err != nil {
 				t.Fatal(err)
 			}
 			response := serveMetadataRequest(mux, http.MethodGet, directAcceptanceMetadataPath)
