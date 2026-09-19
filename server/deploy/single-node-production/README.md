@@ -13,9 +13,10 @@ This package installs the supported single-server topology:
 TermLink Server embeds OAuth 2.0/OpenID Connect, account management, database
 migrations, realtime coordination, and Direct/NAT signalling. PostgreSQL is the
 only required long-running companion service. Keycloak, Valkey, MinIO, and
-separate migration services are not used. A network-isolated one-shot container
+separate migration services are not used. A network-isolated startup helper
 copies host secrets into owner-only Docker volumes before PostgreSQL and Server
-start; it does not remain running.
+start; the installer removes its exited container after startup, so the steady
+state contains only Server and PostgreSQL.
 
 The public identity contract remains unchanged. Web, Android, and Windows use
 the same `/realms/termlink` issuer, client IDs, redirect URIs, claims, and Web
@@ -118,11 +119,10 @@ Release maintainers generate the downloadable one-file installer with:
   -OutputPath '.\out\termlink-deploy'
 ```
 
-An older installation that still runs Keycloak must not be upgraded in place
-without first exporting and importing its identities. For a reset deployment,
-install into a clean data directory instead. The offline
-`identity-import-keycloak` command remains available for deliberate migration;
-it is not part of the production runtime.
+The single-node release uses TermLink's embedded identity provider. Deploy a
+new release into a clean data directory when replacing an older Keycloak-based
+installation; identity migration is intentionally outside the supported
+runtime.
 
 ## Encrypted backup and restore
 

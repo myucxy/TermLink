@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -297,6 +298,162 @@ func (s *Postgres) RevokeUserPortalDevice(ctx context.Context, accountID, device
 	}
 	if err := completeUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, result); err != nil {
 		return UserPortalActionResult{}, err
+	}
+	return result, tx.Commit(ctx)
+}
+
+// DisableUserPortalDevice blocks authentication while retaining the device row.
+func (s *Postgres) DisableUserPortalDevice(ctx context.Context, accountID, deviceID uuid.UUID, idempotencyKey, traceID string) (UserPortalActionResult, error) {
+	if deviceID == uuid.Nil || validateUserPortalActionInput(accountID, idempotencyKey, traceID) != nil {
+		return UserPortalActionResult{}, ErrDenied
+	}
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return UserPortalActionResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := requireUserPortalActionAccount(ctx, tx, accountID); err != nil {
+		return UserPortalActionResult{}, err
+	}
+	hash := userPortalActionHash("user-portal-device-disable-v1", []uuid.UUID{accountID, deviceID})
+	var result UserPortalActionResult
+	replayed, err := claimUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, &result)
+	if err != nil {
+		return result, err
+	}
+	if replayed {
+		return result, tx.Commit(ctx)
+	}
+	var disabledAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT disabled_at FROM devices WHERE id=$1 AND user_id=$2 FOR UPDATE`, deviceID, accountID).Scan(&disabledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return result, ErrNotFound
+	}
+	if err != nil {
+		return result, err
+	}
+	result.Changed = disabledAt == nil
+	if result.Changed {
+		if _, err = tx.Exec(ctx, `UPDATE devices SET disabled_at=now(),disabled_reason='user_portal' WHERE id=$1 AND user_id=$2`, deviceID, accountID); err != nil {
+			return result, err
+		}
+		if _, err = tx.Exec(ctx, userPortalRevokeDevicePCsSQL, deviceID, accountID, false); err != nil {
+			return result, err
+		}
+		if _, err = tx.Exec(ctx, userPortalDeleteDeviceGrantsSQL, deviceID, accountID); err != nil {
+			return result, err
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id) VALUES($1,'user_portal.device.disable','device',$2,'SUCCEEDED',$3)`, accountID, deviceID, traceID); err != nil {
+			return result, err
+		}
+	}
+	if err = completeUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, result); err != nil {
+		return result, err
+	}
+	return result, tx.Commit(ctx)
+}
+
+// DeleteUserPortalDevice removes a device and its dependent PC/session data.
+func (s *Postgres) DeleteUserPortalDevice(ctx context.Context, accountID, deviceID uuid.UUID, idempotencyKey, traceID string) (UserPortalActionResult, error) {
+	if deviceID == uuid.Nil || validateUserPortalActionInput(accountID, idempotencyKey, traceID) != nil {
+		return UserPortalActionResult{}, ErrDenied
+	}
+	var result UserPortalActionResult
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		result, err = s.deleteUserPortalDeviceOnce(ctx, accountID, deviceID, idempotencyKey, traceID)
+		if !isPostgresRetryableTransactionError(err) {
+			return result, err
+		}
+		if ctx.Err() != nil {
+			return UserPortalActionResult{}, ctx.Err()
+		}
+	}
+	return result, err
+}
+
+func (s *Postgres) deleteUserPortalDeviceOnce(ctx context.Context, accountID, deviceID uuid.UUID, idempotencyKey, traceID string) (UserPortalActionResult, error) {
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return UserPortalActionResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := requireUserPortalActionAccount(ctx, tx, accountID); err != nil {
+		return UserPortalActionResult{}, err
+	}
+	hash := userPortalActionHash("user-portal-device-delete-v1", []uuid.UUID{accountID, deviceID})
+	var result UserPortalActionResult
+	replayed, err := claimUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, &result)
+	if err != nil {
+		return result, err
+	}
+	if replayed {
+		return result, tx.Commit(ctx)
+	}
+	var exists uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT id FROM devices WHERE id=$1 AND user_id=$2 FOR UPDATE`, deviceID, accountID).Scan(&exists)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return result, ErrNotFound
+	}
+	if err != nil {
+		return result, err
+	}
+	// Release the target's bootstrap slot first. Dependent devices are then
+	// attached to the existing bootstrap PC, or one dependent PC is promoted
+	// when the deleted device was the only bootstrap. This preserves trust while
+	// avoiding the partial unique index on trusted nil-approved PCs.
+	if _, err = tx.Exec(ctx, `
+		UPDATE devices
+		SET trust_state='REVOKED', revoked_at=COALESCE(revoked_at,now()),
+		    approved_by=NULL, approved_at=COALESCE(approved_at,now())
+		WHERE id=$1 AND user_id=$2`, deviceID, accountID); err != nil {
+		return result, err
+	}
+	if _, err = tx.Exec(ctx, `
+		WITH existing_anchor AS (
+			SELECT id
+			FROM devices
+			WHERE user_id=$2 AND id<>$1
+			  AND device_type IN ('WINDOWS_PC','PC_AGENT')
+			  AND trust_state='TRUSTED' AND approved_by IS NULL
+			ORDER BY created_at,id
+			LIMIT 1
+		), dependent_anchor AS (
+			SELECT id
+			FROM devices
+			WHERE user_id=$2 AND approved_by=$1
+			  AND device_type IN ('WINDOWS_PC','PC_AGENT')
+			  AND trust_state='TRUSTED'
+			ORDER BY created_at,id
+			LIMIT 1
+		), anchor AS (
+			SELECT id FROM existing_anchor
+			UNION ALL
+			SELECT id FROM dependent_anchor
+			WHERE NOT EXISTS (SELECT 1 FROM existing_anchor)
+			LIMIT 1
+		)
+		UPDATE devices d
+		SET approved_by=CASE
+				WHEN d.id=(SELECT id FROM anchor) THEN NULL
+				ELSE (SELECT id FROM anchor)
+			END,
+			approved_at=COALESCE(d.approved_at,now())
+		WHERE d.user_id=$2 AND d.approved_by=$1`, deviceID, accountID); err != nil {
+		return result, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM device_grants WHERE approved_by=$1`, deviceID); err != nil {
+		return result, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM devices WHERE id=$1 AND user_id=$2`, deviceID, accountID); err != nil {
+		return result, err
+	}
+	result.Changed = true
+	if _, err = tx.Exec(ctx, `INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id) VALUES($1,'user_portal.device.delete','device',$2,'SUCCEEDED',$3)`, accountID, deviceID, traceID); err != nil {
+		return result, err
+	}
+	if err = completeUserPortalAction(ctx, tx, accountID, idempotencyKey, hash, result); err != nil {
+		return result, err
 	}
 	return result, tx.Commit(ctx)
 }

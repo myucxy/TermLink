@@ -344,7 +344,6 @@ services:
       TERMLINK_IDENTITY_PROVIDER: embedded
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
       TERMLINK_OIDC_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
-      TERMLINK_OIDC_BACKCHANNEL_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
       TERMLINK_OIDC_CLIENT_ID: termlink-server
       TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows
       TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
@@ -533,6 +532,10 @@ start_stack() {
   docker pull "$IMAGE"
   log 'starting PostgreSQL and TermLink Server with embedded identity'
   "${COMPOSE[@]}" up -d --wait --wait-timeout 300 --scale server=1 --remove-orphans
+  # secrets-init only copies file-backed secrets with the correct container
+  # ownership. Remove its exited container so the steady-state deployment has
+  # exactly the two intended services: PostgreSQL and TermLink Server.
+  "${COMPOSE[@]}" rm --force secrets-init >/dev/null
 }
 
 assert_running_service() {

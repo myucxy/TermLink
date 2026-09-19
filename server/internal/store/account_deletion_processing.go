@@ -29,31 +29,8 @@ const userPortalAccountDeletionLockOutboxSQL = `
 	VALUES('account.status.changed',$1,
 	       jsonb_build_object('account_id',$1::uuid,'status','LOCKED'))`
 
-// These statements are a retirement-only privacy boundary. They scrub or
-// remove account-linked rows left by releases that supported commercial
-// features; they do not expose or reactivate any commercial behavior.
-var userPortalAccountDeletionRedactLegacyCommercialStatements = []string{
-	`UPDATE orders SET idempotency_key='deleted-' || id::text,updated_at=now() WHERE account_id=$1`,
-	`UPDATE payment_transactions payment
-	 SET payment_payload='{}'::jsonb,updated_at=now()
-	 FROM orders account_order
-	 WHERE account_order.id=payment.order_id AND account_order.account_id=$1`,
-	`UPDATE payment_notifications notification
-	 SET payload_ciphertext=NULL
-	 WHERE notification.order_no IN (SELECT order_no FROM orders WHERE account_id=$1)`,
-	`UPDATE refunds refund
-	 SET reason='ACCOUNT_DELETED',updated_at=now()
-	 FROM orders account_order
-	 WHERE account_order.id=refund.order_id AND account_order.account_id=$1`,
-}
-
 var userPortalAccountDeletionPurgePrivateStatements = []string{
 	`DELETE FROM account_identity_profiles WHERE user_id=$1`,
-	`DELETE FROM redemption_claims WHERE account_id=$1`,
-	`DELETE FROM entitlement_grants WHERE account_id=$1`,
-	`DELETE FROM subscriptions WHERE account_id=$1`,
-	`DELETE FROM entitlements WHERE account_id=$1`,
-	`DELETE FROM quota_selections WHERE account_id=$1`,
 	`DELETE FROM invitation_redemptions WHERE user_id=$1`,
 	`DELETE FROM idempotency_keys WHERE user_id=$1`,
 	`DELETE FROM account_deletion_requests WHERE account_id=$1 AND id<>$2`,
@@ -149,11 +126,6 @@ func (s *Postgres) FinalizeUserPortalAccountDeletion(ctx context.Context, proces
 	}
 	if status != "LOCKED" || role != "USER" || isAdmin {
 		return ErrDenied
-	}
-	for _, statement := range userPortalAccountDeletionRedactLegacyCommercialStatements {
-		if _, err := tx.Exec(ctx, statement, accountID); err != nil {
-			return err
-		}
 	}
 	for _, statement := range userPortalAccountDeletionPurgePrivateStatements {
 		arguments := []any{accountID}

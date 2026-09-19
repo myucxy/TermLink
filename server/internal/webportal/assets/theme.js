@@ -133,6 +133,21 @@
     button.addEventListener("click", toggleTheme);
   });
 
+  document.querySelectorAll("[data-password-toggle]").forEach((button) => {
+    const input = document.getElementById(button.getAttribute("aria-controls"));
+    if (!(input instanceof HTMLInputElement)) return;
+    button.addEventListener("click", () => {
+      const visible = input.type === "password";
+      input.type = visible ? "text" : "password";
+      const label = visible ? button.dataset.labelHide : button.dataset.labelShow;
+      if (label) {
+        button.setAttribute("aria-label", label);
+        button.setAttribute("title", label);
+      }
+      button.dataset.visible = visible ? "true" : "false";
+    });
+  });
+
   document.querySelectorAll("form[data-confirm-action]").forEach((form) => {
     form.addEventListener("submit", (event) => {
       const account = form.dataset.account || (isChineseUI ? "该账号" : "this account");
@@ -186,11 +201,22 @@
     const actionCopy = isChineseUI ? {
       password: "修改密码由身份服务验证当前凭据后完成。",
       mfa: "绑定或管理 Google 身份验证器，Secret 仅由身份服务处理。",
-      sessions: "查看并撤销其他浏览器登录会话。",
     } : {
       password: "The identity service verifies the current credentials before changing the password.",
       mfa: "Set up or manage an authenticator. The identity service handles the secret.",
-      sessions: "Review and revoke other browser sign-in sessions.",
+    };
+    const applyIdentitySection = () => {
+      const section = frame instanceof HTMLIFrameElement ? frame.dataset.identitySection : "";
+      if (section !== "password" && section !== "mfa" || !(frame instanceof HTMLIFrameElement)) return;
+      try {
+        [...frame.contentDocument.querySelectorAll("main > section")].forEach((item) => {
+          const passwordSection = item.querySelector('form[action*="/password/change"]');
+          const mfaSection = item.querySelector('form[action*="/account/mfa/"]');
+          item.hidden = section === "password" ? !passwordSection : !mfaSection;
+        });
+      } catch (_) {
+        // External identity providers may deny iframe DOM access.
+      }
     };
     let loadedURL = "";
     document.querySelectorAll("[data-identity-dialog]").forEach((button) => {
@@ -199,10 +225,13 @@
         const actionBaseURL = `${baseURL.replace(/\/$/, "")}/${action}`;
         const actionURL = themedURL(actionBaseURL, currentPreference()) || actionBaseURL;
         if (description) description.textContent = actionCopy[action];
+        if (frame instanceof HTMLIFrameElement) frame.dataset.identitySection = action;
         if (loadedURL !== actionURL && frame instanceof HTMLIFrameElement) {
           if (pending) pending.hidden = false;
           frame.src = actionURL;
           loadedURL = actionURL;
+        } else {
+          applyIdentitySection();
         }
         if (fallback instanceof HTMLAnchorElement) fallback.href = actionURL;
         identityDialog.showModal();
@@ -211,6 +240,7 @@
     if (frame instanceof HTMLIFrameElement) {
       frame.addEventListener("load", () => {
         if (pending) pending.hidden = true;
+        applyIdentitySection();
         sendThemeToFrame(frame, currentPreference());
       });
     }

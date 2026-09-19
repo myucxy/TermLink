@@ -27,6 +27,19 @@ import (
 
 const testPublicHost = "termlink.example:8910"
 
+func TestDynamicOIDCOriginAndOAuthStateCookie(t *testing.T) {
+	endpoint := oidcEndpointForRedirect(oauth2.Endpoint{AuthURL: "https://identity.example/realms/termlink/protocol/openid-connect/auth"}, "https://alias.example:9443/auth/callback")
+	if endpoint.AuthURL != "https://alias.example:9443/realms/termlink/protocol/openid-connect/auth" {
+		t.Fatalf("dynamic authorization endpoint = %q", endpoint.AuthURL)
+	}
+	if oauthCookieForState("short") != oauthCookieName {
+		t.Fatal("short state must use the legacy cookie slot")
+	}
+	if got := oauthCookieForState("state_1234567890123456"); got == oauthCookieName || !strings.HasPrefix(got, oauthCookieName+"-") {
+		t.Fatalf("per-flow OAuth cookie = %q", got)
+	}
+}
+
 type testOIDCFlow struct {
 	state         string
 	nonce         string
@@ -890,13 +903,13 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 		strings.Contains(adminCSS, `var(--text-1)`) ||
 		!strings.Contains(portalCSS, `.account-menu-panel`) ||
 		!strings.Contains(portalCSS, `background: var(--surface);`) ||
-		!strings.Contains(portalDashboardHTML, `/assets/portal-dashboard.css?v=registration-v2`) ||
+		!strings.Contains(portalDashboardHTML, `/assets/portal-dashboard.css?v=account-shell-v5`) ||
 		!strings.Contains(registrationAdminHTML, `/assets/admin.css?v=01b-v17`) ||
-		!strings.Contains(registrationAdminHTML, `/assets/portal-dashboard.css?v=registration-v2`) {
+		!strings.Contains(registrationAdminHTML, `/assets/portal-dashboard.css?v=account-shell-v5`) {
 		t.Error("account menus must use defined theme surfaces and versioned opaque panel styles")
 	}
 	for _, contract := range []string{
-		`data-identity-dialog="password"`, `data-identity-dialog="mfa"`, `data-identity-dialog="sessions"`,
+		`data-identity-dialog="password"`, `data-identity-dialog="mfa"`,
 		`<dialog class="identity-security-dialog"`, `data-identity-dialog-frame`, `data-identity-dialog-fallback`,
 		`data-theme-sync`, `referrerpolicy="strict-origin"`,
 	} {
@@ -907,7 +920,8 @@ func TestPortalAccountResponsiveAndSVGControlContract(t *testing.T) {
 	if !strings.Contains(portalCSS, `.identity-security-dialog::backdrop`) ||
 		!strings.Contains(portalCSS, `.identity-security-dialog iframe`) ||
 		!strings.Contains(readAsset("theme.js"), "const actionBaseURL = `${baseURL.replace(/\\/$/, \"\")}/${action}`;") ||
-		!strings.Contains(readAsset("theme.js"), "themedURL(actionBaseURL, currentPreference())") {
+		!strings.Contains(readAsset("theme.js"), "themedURL(actionBaseURL, currentPreference())") ||
+		!strings.Contains(readAsset("theme.js"), "frame.dataset.identitySection = action") {
 		t.Error("identity security actions must open their allowlisted Keycloak section in the same-page dialog")
 	}
 	if !strings.Contains(adminCSS, `overflow-x: clip;`) ||

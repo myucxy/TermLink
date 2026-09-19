@@ -1,3 +1,14 @@
+﻿<#
+.SYNOPSIS
+    DEPRECATED for the current single-node deployment: this toolchain targets the
+    retired multi-container stack (compose/core.compose.yml with Caddy/Valkey).
+
+    For the current production form use the encrypted backup built into the
+    single-node deployment tooling instead:
+        server/deploy/single-node-production/termlink-deploy backup [options]
+    (age-encrypted archive, SHA-256 manifest, guarded restore path).
+    See server/deploy/single-node-production/README.md, section "backup".
+#>
 [CmdletBinding()]
 param(
     [string[]]$ComposeFile = @((Join-Path $PSScriptRoot '..\compose\core.compose.yml')),

@@ -364,6 +364,8 @@ internal fun ProductionDirectCarrier.toPcCarrierState(): PcCarrierState = when (
 private const val DIRECT_SESSION_CUTOVER_CAPABILITY = "direct_session_cutover_v1"
 private const val DIRECT_TRANSPORT_DATA_CAPABILITY = "direct_transport_data_v1"
 
+private class RevokedDeviceIdentityException : Exception()
+
 /**
  * Data-plane Hello capabilities are an optional advertisement. They must not
  * enter the required Welcome set because Relay-only servers remain supported.
@@ -4064,10 +4066,23 @@ internal class ProductionProductRepository(
             // Read the server-authoritative self association and reject any
             // mismatch rather than blindly continuing after a 409.
             val current = runCatching { ProductResponseParser.self(api.get("/v1/devices/self").jsonObject) }
-                .getOrElse { throw IllegalStateException("Device registration conflict could not be verified") }
+                .getOrElse { error ->
+                    if (error is TermLinkApiException && error.code == "DEVICE_REVOKED") {
+                        throw RevokedDeviceIdentityException()
+                    }
+                    throw IllegalStateException("Device registration conflict could not be verified")
+                }
             check(current.id == identity.deviceId) { "Device registration conflict could not be verified" }
         }
     }
+
+    private suspend fun resetRevokedDeviceIdentity(scope: String) =
+        authenticationStateMutationLock.withLock {
+            val retired = storedIdentity
+            storedIdentity = null
+            keyVault.clear(scope)
+            retired?.identity?.destroy()
+        }
 
     private fun identity(expectedScope: String? = null): DeviceKeyVault.StoredIdentity {
         val scope = accountScope ?: error("OIDC account scope is unavailable")
@@ -4292,11 +4307,23 @@ internal class ProductionProductRepository(
             }
         }
         establishAccountScope(nextScope, authenticationGeneration)
-        withAuthenticatedApi(expectedGeneration = authenticationGeneration) { api, generation ->
-            // withApi registers this account-scoped key first. Continue directly
-            // into the authoritative refresh; no enrollment confirmation step is
-            // part of the same-account Android flow.
-            refreshWithApi(api, generation)
+        try {
+            withAuthenticatedApi(expectedGeneration = authenticationGeneration) { api, generation ->
+                // withApi registers this account-scoped key first. Continue directly
+                // into the authoritative refresh; no enrollment confirmation step is
+                // part of the same-account Android flow.
+                refreshWithApi(api, generation)
+            }
+        } catch (_: RevokedDeviceIdentityException) {
+            // Re-authentication is the explicit user action that allows an
+            // installation whose device key was revoked to enroll a fresh key.
+            closeHistoryEngines()
+            clearRoomCache()
+            billing.reset()
+            resetRevokedDeviceIdentity(nextScope)
+            withAuthenticatedApi(expectedGeneration = authenticationGeneration) { api, generation ->
+                refreshWithApi(api, generation)
+            }
         }
     }
 
@@ -4373,7 +4400,8 @@ internal class ProductionProductRepository(
     /**
      * A revoked server response closes access-bearing runtime state and erases
      * local encrypted session/history rows. The account-scoped identity remains
-     * in Android Keystore so a later sign-in does not manufacture a new device.
+     * while this authenticated runtime is marked revoked; a later explicit
+     * sign-in rotates it only when the server rejects its registration.
      */
     private suspend fun clearAccessControlledState(
         self: DeviceSummary,

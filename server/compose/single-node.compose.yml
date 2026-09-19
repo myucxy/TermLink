@@ -1,7 +1,7 @@
-# Explicit one-Server production overlay. Keep PostgreSQL and the separately
-# operated Keycloak durable service, while embedding short-lived coordination,
-# Direct/NAT signalling, migrations, and public Keycloak route forwarding in
-# TermLink Server. Do not scale server beyond one replica with this overlay.
+# Explicit one-Server production overlay. PostgreSQL is the only external
+# stateful service; identity, migrations, coordination, Relay and Direct/NAT
+# signalling run inside TermLink Server. Do not scale the server beyond one
+# replica with this overlay.
 services:
   migrate:
     profiles: ["distributed-runtime"]
@@ -12,18 +12,13 @@ services:
   server:
     environment:
       TERMLINK_RUNTIME_MODE: single-node
-      TERMLINK_OIDC_BACKCHANNEL_ISSUER: ${TERMLINK_OIDC_BACKCHANNEL_ISSUER:?private Keycloak realm URL is required}
+      TERMLINK_IDENTITY_PROVIDER: embedded
       TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
       TERMLINK_DIRECT_ROUTING_PERMITTED: ${TERMLINK_DIRECT_ROUTING_PERMITTED:-false}
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
       TERMLINK_REDIS_URL_FILE: !reset null
       TERMLINK_DIRECT_REDIS_URL_FILE: !reset null
     secrets: !override
-      - source: oidc_client_secret
-        target: oidc_client_secret
-        uid: "65532"
-        gid: "65532"
-        mode: 0400
       - source: database_url
         target: database_url
         uid: "65532"

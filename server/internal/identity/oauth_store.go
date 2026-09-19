@@ -19,11 +19,15 @@ import (
 const maximumOAuthSessionBytes = 256 << 10
 
 type oauthStore struct {
-	pool     *pgxpool.Pool
-	accounts *AccountStore
-	clients  map[string]fosite.Client
-	clock    func() time.Time
+	pool           *pgxpool.Pool
+	accounts       *AccountStore
+	clients        map[string]fosite.Client
+	webClientID    string
+	stepUpClientID string
+	clock          func() time.Time
 }
+
+type dynamicWebOriginKey struct{}
 
 type oauthTransactionKey struct{}
 
@@ -92,10 +96,21 @@ type persistedAuthorize struct {
 	DefaultResponseMode  fosite.ResponseModeType `json:"default_response_mode"`
 }
 
-func (s *oauthStore) GetClient(_ context.Context, id string) (fosite.Client, error) {
+func (s *oauthStore) GetClient(ctx context.Context, id string) (fosite.Client, error) {
 	client, ok := s.clients[id]
 	if !ok {
 		return nil, fosite.ErrNotFound
+	}
+	if id == s.webClientID || id == s.stepUpClientID {
+		if origin, ok := ctx.Value(dynamicWebOriginKey{}).(string); ok && origin != "" {
+			if base, ok := client.(*fosite.DefaultOpenIDConnectClient); ok {
+				clone := *base
+				defaultClient := *base.DefaultClient
+				defaultClient.RedirectURIs = []string{origin + "/auth/callback"}
+				clone.DefaultClient = &defaultClient
+				return &clone, nil
+			}
+		}
 	}
 	return client, nil
 }

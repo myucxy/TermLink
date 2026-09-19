@@ -172,6 +172,12 @@
 
 ## 五、修复路线图
 
+> **进度（2026-09-19 第二轮）**：新增完成——#17 Relay 内存上限、#16 签名锚点（opt-in）、
+> #32 email-code、#8 服务端 LIMIT 200、#19 Tray 降级防护、直连路由开关移入管理页
+> （迁移 000049 + DB 策略 + 传输/Relay 动态读取 + SUPER_ADMIN 页面开关，
+> env 的 DIRECT_ROUTING_PERMITTED 已移除）、管理员密码随机化、localnet 统一放宽包、
+> 失败原因日志开关。三端构建部署完成，模拟器已登录本机 Docker server。
+
 > **进度（2026-09-19）**：第一周 6 项中 5 项完成——#1/#30 部署资产已提交（含 PUBLIC_URL
 > 占位符与管理员密码文件接线）、#4 管理员密码随机化（config/identity/测试/README）、
 > #7 FLAG_SECURE（编译通过）、#13 runbook latest 边界修订、#14 EDGE_GATEWAY.md、

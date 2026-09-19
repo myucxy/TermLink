@@ -41,32 +41,20 @@ func TestAccountDeletionClaimsRequireOpaqueIdentityHandle(t *testing.T) {
 	}
 }
 
-func TestAccountDeletionFinalizationRedactsLegacyCommercialAndPurgesPrivateRecords(t *testing.T) {
+func TestAccountDeletionFinalizationPurgesPrivateRecords(t *testing.T) {
 	t.Parallel()
-	redaction := normalizePrivacySQL(strings.Join(userPortalAccountDeletionRedactLegacyCommercialStatements, " "))
-	for _, required := range []string{
-		"update orders", "idempotency_key='deleted-'", "update payment_transactions",
-		"payment_payload='{}'::jsonb", "update payment_notifications",
-		"payload_ciphertext=null", "update refunds", "reason='account_deleted'",
-	} {
-		if !strings.Contains(redaction, required) {
-			t.Fatalf("legacy commercial redaction lacks %q: %s", required, redaction)
-		}
-	}
 	purge := normalizePrivacySQL(strings.Join(userPortalAccountDeletionPurgePrivateStatements, " "))
 	for _, required := range []string{
-		"delete from redemption_claims", "delete from entitlement_grants",
-		"delete from subscriptions", "delete from entitlements", "delete from quota_selections",
-		"delete from invitation_redemptions", "delete from idempotency_keys",
+		"delete from account_identity_profiles", "delete from invitation_redemptions", "delete from idempotency_keys",
 		"delete from pcs", "delete from devices",
 	} {
 		if !strings.Contains(purge, required) {
 			t.Fatalf("private-row purge lacks %q: %s", required, purge)
 		}
 	}
-	for _, retained := range []string{"delete from orders", "delete from payment_transactions", "delete from refunds", "delete from audit_events"} {
-		if strings.Contains(purge, retained) {
-			t.Fatalf("retained legal record is destructively removed by %q", retained)
+	for _, removed := range []string{"orders", "payment_transactions", "payment_notifications", "refunds", "redemption_claims", "entitlement_grants", "subscriptions", "entitlements", "quota_selections"} {
+		if strings.Contains(purge, removed) {
+			t.Fatalf("retired commercial table is still referenced by %q", removed)
 		}
 	}
 	anonymize := normalizePrivacySQL(userPortalAccountDeletionAnonymizeUserSQL)

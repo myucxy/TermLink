@@ -154,6 +154,8 @@ type DeviceRecord struct {
 	ApprovedAt        *time.Time `json:"approved_at,omitempty"`
 	RevokedAt         *time.Time `json:"revoked_at,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
+	Online            bool       `json:"online"`
+	LastSeenAt        *time.Time `json:"last_seen_at,omitempty"`
 }
 
 // RegisterDevice creates the user on first OIDC login. Production enables
@@ -254,6 +256,17 @@ func (s *Postgres) registerDeviceOnce(ctx context.Context, subjectHash [32]byte,
 			return uuid.Nil, DeviceRecord{}, false, ErrConflict
 		}
 	}
+	if IsPCAgentDeviceType(input.Type) {
+		// A deleted PC can later register again with the same stable device ID.
+		// The deterministic PC-upsert key must not replay a prior success without
+		// recreating the deleted pcs row.
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM idempotency_keys
+			WHERE user_id=$1
+			  AND idempotency_key LIKE 'pc-upsert-v3-%-' || replace($2::text, '-', '') || '-%'`, userID, input.ID); err != nil {
+			return uuid.Nil, DeviceRecord{}, false, err
+		}
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata) VALUES($1,$2,'device.register','device',$2,'SUCCEEDED',$3,jsonb_build_object('trust_state',$4::text,'bootstrap',$5::boolean))`, userID, record.ID, traceID, trustState, bootstrap); err != nil {
 		return uuid.Nil, DeviceRecord{}, false, err
 	}
@@ -280,16 +293,20 @@ func ensureUser(ctx context.Context, tx pgx.Tx, subjectHash [32]byte) (uuid.UUID
 func (s *Postgres) LoadDeviceForSubject(ctx context.Context, subjectHash [32]byte, deviceID uuid.UUID) (auth.Device, error) {
 	var result auth.Device
 	var key []byte
+	var disabledAt *time.Time
 	err := s.Pool.QueryRow(ctx, `
-		SELECT d.id,d.user_id,d.device_type,d.signing_public_key,d.trust_state
+		SELECT d.id,d.user_id,d.device_type,d.signing_public_key,d.trust_state,d.disabled_at
 		FROM devices d JOIN users u ON u.id=d.user_id
 		WHERE d.id=$1 AND u.oidc_subject_hash=$2 AND u.status='ACTIVE'`, deviceID, subjectHash[:],
-	).Scan(&result.ID, &result.UserID, &result.Type, &key, &result.TrustState)
+	).Scan(&result.ID, &result.UserID, &result.Type, &key, &result.TrustState, &disabledAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return auth.Device{}, ErrNotFound
 	}
 	if err != nil {
 		return auth.Device{}, err
+	}
+	if disabledAt != nil {
+		return auth.Device{}, auth.ErrDeviceDisabled
 	}
 	if len(key) != ed25519.PublicKeySize {
 		return auth.Device{}, fmt.Errorf("invalid stored signing key")
@@ -887,7 +904,9 @@ func (s *Postgres) upsertPCResolvedOnce(
 		ON CONFLICT(id) DO UPDATE SET device_id=excluded.device_id,name=excluded.name,agent_version=excluded.agent_version,
 		key_epoch=CASE WHEN pcs.device_id<>excluded.device_id
 			THEN pcs.key_epoch+1
-			ELSE GREATEST(pcs.key_epoch,excluded.key_epoch) END,last_seen_at=now(),
+			ELSE GREATEST(pcs.key_epoch,excluded.key_epoch) END,
+		last_seen_at=CASE WHEN pcs.last_seen_at IS NULL OR pcs.last_seen_at < now()-interval '30 seconds'
+			THEN now() ELSE pcs.last_seen_at END,
 		session_heartbeat_capable=pcs.session_heartbeat_capable OR excluded.session_heartbeat_capable,
 		session_heartbeat_enabled_at=COALESCE(pcs.session_heartbeat_enabled_at,excluded.session_heartbeat_enabled_at),
 		supported_shells=excluded.supported_shells,
@@ -997,6 +1016,7 @@ func (s *Postgres) ListPCs(ctx context.Context, userID, deviceID uuid.UUID) ([]P
 type SessionRecord struct {
 	ID                      uuid.UUID  `json:"id"`
 	PCID                    uuid.UUID  `json:"pc_id"`
+	PCDeviceID              uuid.UUID  `json:"-"`
 	ShellType               string     `json:"shell_type"`
 	TitleCipher             []byte     `json:"title_cipher,omitempty"`
 	State                   string     `json:"state"`
@@ -1143,9 +1163,28 @@ func (s *Postgres) ListSessionsIncludingEnded(ctx context.Context, userID, devic
 	return s.listSessions(ctx, userID, deviceID, pcID, true)
 }
 
+// ListSessionsUsingPresence keeps the same durable authorization predicate but
+// lets the API apply the process-local connection registry for online status.
+// The database remains the source of session identity and permissions.
+func (s *Postgres) ListSessionsUsingPresence(ctx context.Context, userID, deviceID, pcID uuid.UUID, includeEnded bool) ([]SessionRecord, error) {
+	return s.listSessionsUsingPresence(ctx, userID, deviceID, pcID, includeEnded)
+}
+
 func (s *Postgres) listSessions(ctx context.Context, userID, deviceID, pcID uuid.UUID, includeEnded bool) ([]SessionRecord, error) {
-	rows, err := s.Pool.Query(ctx, `
-		SELECT s.id,s.pc_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,
+	return s.listSessionsWithOnlineFilter(ctx, userID, deviceID, pcID, includeEnded, true)
+}
+
+func (s *Postgres) listSessionsUsingPresence(ctx context.Context, userID, deviceID, pcID uuid.UUID, includeEnded bool) ([]SessionRecord, error) {
+	return s.listSessionsWithOnlineFilter(ctx, userID, deviceID, pcID, includeEnded, false)
+}
+
+func (s *Postgres) listSessionsWithOnlineFilter(ctx context.Context, userID, deviceID, pcID uuid.UUID, includeEnded, filterOnline bool) ([]SessionRecord, error) {
+	// The ended-session catalog is unbounded by design (CleanupSessions is a
+	// no-op), so the history view is capped to the most recent window per PC
+	// until the full cursor pagination lands with the client lazy-loading half.
+	const maxHistorySessionsPerPC = 200
+	query := `
+		SELECT s.id,s.pc_id,p.device_id,s.shell_type,s.title_cipher,s.state,s.columns,s.rows,s.last_output_seq,
 		       s.snapshot_status,s.snapshot_reason_code,s.created_at,s.last_seen_at,s.ended_at,presence.online
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id
@@ -1162,15 +1201,21 @@ func (s *Postgres) listSessions(ctx context.Context, userID, deviceID, pcID uuid
 			) AS online
 		) presence
 		WHERE p.id=$1 AND p.owner_user_id=$2 AND s.deleted_at IS NULL
-		  AND ($5 OR presence.online) AND (
+		  AND ($5 OR $7 OR presence.online) AND (
 			$4 OR p.device_id=actor.id OR EXISTS(
 				SELECT 1 FROM device_grants g
 				WHERE g.pc_id=p.id AND g.device_id=actor.id
 				  AND (g.expires_at IS NULL OR g.expires_at>now())
 			)
 		)
-		ORDER BY s.created_at DESC,s.id`,
-		pcID, userID, deviceID, s.AutoTrustDevices, includeEnded, int(sessionOnlineWindow/time.Second))
+		ORDER BY s.created_at DESC,s.id`
+	args := []any{pcID, userID, deviceID, s.AutoTrustDevices, includeEnded,
+		int(sessionOnlineWindow / time.Second), !filterOnline}
+	if includeEnded {
+		query += ` LIMIT $8`
+		args = append(args, maxHistorySessionsPerPC)
+	}
+	rows, err := s.Pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1179,7 +1224,7 @@ func (s *Postgres) listSessions(ctx context.Context, userID, deviceID, pcID uuid
 	for rows.Next() {
 		var i SessionRecord
 		var seq int64
-		if err := rows.Scan(&i.ID, &i.PCID, &i.ShellType, &i.TitleCipher, &i.State, &i.Columns,
+		if err := rows.Scan(&i.ID, &i.PCID, &i.PCDeviceID, &i.ShellType, &i.TitleCipher, &i.State, &i.Columns,
 			&i.Rows, &seq, &i.SnapshotStatus, &i.SnapshotReasonCode,
 			&i.CreatedAt, &i.LastSeenAt, &i.EndedAt, &i.Online); err != nil {
 			return nil, err

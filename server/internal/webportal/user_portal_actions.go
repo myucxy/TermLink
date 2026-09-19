@@ -34,13 +34,63 @@ type userPortalActionRepository interface {
 	CancelUserPortalAccountDeletion(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalAccountDeletion, error)
 }
 
+func (p *Portal) userPortalDisableDevice(w http.ResponseWriter, r *http.Request) {
+	_, account, repository, ok := p.requireUserPortalAction(w, r)
+	if !ok {
+		return
+	}
+	deviceID, err := parseCanonicalPortalUUID(r.PathValue("id"))
+	if err != nil {
+		p.renderError(w, http.StatusBadRequest, "设备标识无效 / Invalid device", "请刷新设备页面后重试。 / Refresh and try again.")
+		return
+	}
+	traceID, _ := randomText(12)
+	action, ok := repository.(interface {
+		DisableUserPortalDevice(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalActionResult, error)
+	})
+	if !ok {
+		p.renderError(w, http.StatusServiceUnavailable, "设备操作暂不可用", "服务端尚未支持设备禁用。 / Device disable is unavailable.")
+		return
+	}
+	if _, err = action.DisableUserPortalDevice(r.Context(), account.ID, deviceID, strings.TrimSpace(r.Form.Get("idempotency_key")), traceID); err != nil {
+		p.handleUserPortalActionError(w, err)
+		return
+	}
+	p.redirectUserPortal(w, r, "devices", "device-disabled", url.Values{})
+}
+
+func (p *Portal) userPortalDeleteDevice(w http.ResponseWriter, r *http.Request) {
+	_, account, repository, ok := p.requireUserPortalAction(w, r)
+	if !ok {
+		return
+	}
+	deviceID, err := parseCanonicalPortalUUID(r.PathValue("id"))
+	if err != nil {
+		p.renderError(w, http.StatusBadRequest, "设备标识无效 / Invalid device", "请刷新设备页面后重试。 / Refresh and try again.")
+		return
+	}
+	traceID, _ := randomText(12)
+	action, ok := repository.(interface {
+		DeleteUserPortalDevice(context.Context, uuid.UUID, uuid.UUID, string, string) (store.UserPortalActionResult, error)
+	})
+	if !ok {
+		p.renderError(w, http.StatusServiceUnavailable, "设备操作暂不可用", "服务端尚未支持设备删除。 / Device deletion is unavailable.")
+		return
+	}
+	if _, err = action.DeleteUserPortalDevice(r.Context(), account.ID, deviceID, strings.TrimSpace(r.Form.Get("idempotency_key")), traceID); err != nil {
+		p.handleUserPortalActionError(w, err)
+		return
+	}
+	p.redirectUserPortal(w, r, "devices", "device-deleted", url.Values{})
+}
+
 type portalAuditRepository interface {
 	Audit(context.Context, uuid.UUID, uuid.UUID, string, string, uuid.UUID, string, string, string) error
 }
 
 func (p *Portal) loadUserPortalPrivacySelection(ctx context.Context, repository userPortalActionRepository, accountID uuid.UUID, values url.Values, data *userPortalPageData) error {
 	allowed := map[string]bool{"section": true, "notice": true, "deletion_id": true}
-	if data == nil || values.Get("section") != "privacy" || validatePortalFormValues(values, allowed) != nil {
+	if data == nil || (values.Get("section") != "privacy" && values.Get("section") != "settings") || validatePortalFormValues(values, allowed) != nil {
 		return errUserPortalRequest
 	}
 	if deletionText := strings.TrimSpace(values.Get("deletion_id")); deletionText != "" {
@@ -108,6 +158,42 @@ func (p *Portal) userPortalUpdatePCControlPolicy(w http.ResponseWriter, r *http.
 	p.redirectUserPortal(w, r, "pcs", "pc-policy-updated", url.Values{})
 }
 
+func (p *Portal) userPortalBatchUpdatePCControlPolicy(w http.ResponseWriter, r *http.Request) {
+	_, account, repository, ok := p.requireUserPortalAction(w, r)
+	if !ok {
+		return
+	}
+	remoteRouting, remoteErr := strconv.ParseBool(strings.TrimSpace(r.Form.Get("remote_routing_enabled")))
+	localPriority, localErr := strconv.ParseBool(strings.TrimSpace(r.Form.Get("local_priority")))
+	mode := store.ControlMode(strings.ToUpper(strings.TrimSpace(r.Form.Get("mode"))))
+	if remoteErr != nil || localErr != nil || (mode != store.ControlModeSingle && mode != store.ControlModeTakeover && mode != store.ControlModeCollaborative) {
+		p.renderError(w, http.StatusBadRequest, "批量控制策略无效", "请选择有效的路由和控制策略。 / Choose valid routing and control values.")
+		return
+	}
+	policies, err := repository.ListUserPortalPCControlPolicies(r.Context(), account.ID, 100)
+	if err != nil {
+		p.handleUserPortalActionError(w, err)
+		return
+	}
+	for _, policy := range policies {
+		key, keyErr := randomText(18)
+		if keyErr != nil {
+			p.internalError(w, keyErr)
+			return
+		}
+		traceID, traceErr := randomText(12)
+		if traceErr != nil {
+			p.internalError(w, traceErr)
+			return
+		}
+		if _, err = repository.SetUserPortalPCControlPolicy(r.Context(), account.ID, policy.PCID, store.UserPortalPCControlPolicyInput{RemoteRoutingEnabled: remoteRouting, Mode: mode, LocalPriority: localPriority, ExpectedVersion: policy.PolicyVersion}, key, traceID); err != nil {
+			p.handleUserPortalActionError(w, err)
+			return
+		}
+	}
+	p.redirectUserPortal(w, r, "pcs", "pc-policy-updated", url.Values{})
+}
+
 func (p *Portal) userPortalRequestAccountDeletion(w http.ResponseWriter, r *http.Request) {
 	session, account, _, ok := p.requireUserPortalAction(w, r)
 	if !ok {
@@ -139,7 +225,7 @@ func (p *Portal) userPortalRequestAccountDeletion(w http.ResponseWriter, r *http
 		return
 	}
 	p.auditUserPortalActionSuccess(r, account.ID, "web.user.account_deletion.request.context", "account_deletion", item.ID)
-	p.redirectUserPortal(w, r, "privacy", "deletion-requested", url.Values{"deletion_id": {item.ID.String()}})
+	p.redirectUserPortal(w, r, "settings", "deletion-requested", url.Values{"deletion_id": {item.ID.String()}})
 }
 
 func (p *Portal) userPortalConfirmAccountDeletion(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +261,7 @@ func (p *Portal) userPortalConfirmAccountDeletion(w http.ResponseWriter, r *http
 		return
 	}
 	p.auditUserPortalActionSuccess(r, account.ID, "web.user.account_deletion.confirm.context", "account_deletion", requestID)
-	p.redirectUserPortal(w, r, "privacy", "deletion-confirmed", url.Values{"deletion_id": {requestID.String()}})
+	p.redirectUserPortal(w, r, "settings", "deletion-confirmed", url.Values{"deletion_id": {requestID.String()}})
 }
 
 func (p *Portal) userPortalCancelAccountDeletion(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +285,7 @@ func (p *Portal) userPortalCancelAccountDeletion(w http.ResponseWriter, r *http.
 		return
 	}
 	p.auditUserPortalActionSuccess(r, account.ID, "web.user.account_deletion.cancel.context", "account_deletion", requestID)
-	p.redirectUserPortal(w, r, "privacy", "deletion-cancelled", url.Values{"deletion_id": {requestID.String()}})
+	p.redirectUserPortal(w, r, "settings", "deletion-cancelled", url.Values{"deletion_id": {requestID.String()}})
 }
 
 func (p *Portal) requireUserPortalAction(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, userPortalActionRepository, bool) {

@@ -88,12 +88,12 @@ func registerDirectAcceptanceMetadataRoute(
 	mux *http.ServeMux,
 	config *directAcceptanceMetadataConfig,
 	directTransportReady bool,
-	directRoutingPermitted bool,
+	directRoutingPermitted func() bool,
 ) error {
 	if config == nil {
 		return nil
 	}
-	routingReady := directTransportReady && directRoutingPermitted
+	routingReady := directTransportReady && directRoutingPermitted()
 	capabilities := make([]string, 0, 4)
 	if directTransportReady {
 		capabilities = append(capabilities,

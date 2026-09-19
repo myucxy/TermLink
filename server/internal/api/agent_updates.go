@@ -152,6 +152,15 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusConflict, "AGENT_VERSION_UNSUPPORTED", store.ErrConflict)
 		return
 	}
+	// Presence is the normal liveness source. Refresh the durable timestamp
+	// once for this rare write operation so the store keeps its final defense
+	// without bringing heartbeat traffic back to PostgreSQL.
+	if a.Presence != nil && a.Store != nil {
+		if err := a.Store.TouchPCPresence(r.Context(), p.UserID, pc.DeviceID); err != nil {
+			writeStoreError(w, r, err)
+			return
+		}
+	}
 	if a.AgentUpdateCatalog == nil {
 		writeError(w, r, http.StatusServiceUnavailable, "AGENT_UPDATE_CATALOG_UNAVAILABLE", agentupdate.ErrUnavailable)
 		return
@@ -471,6 +480,14 @@ func (a *API) agentUpdatePCContext(
 	if pc == nil {
 		writeError(w, r, http.StatusForbidden, "FORBIDDEN", store.ErrDenied)
 		return store.PCRecord{}, 0, false
+	}
+	if a.Presence != nil {
+		seen, online := a.Presence.Online(p.UserID, pc.DeviceID)
+		pc.Online = online
+		if online {
+			seen = seen.UTC()
+			pc.LastSeenAt = &seen
+		}
 	}
 	sessions, err := a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID)
 	if err != nil {

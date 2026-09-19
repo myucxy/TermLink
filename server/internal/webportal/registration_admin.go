@@ -54,6 +54,7 @@ type invitationUseView struct {
 
 type registrationAdminPageData struct {
 	Username               string
+	Nickname               string
 	Role                   store.Role
 	RoleLabel              string
 	CSRF                   string
@@ -96,7 +97,7 @@ func (p *Portal) adminRegistrationDashboard(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	data := registrationAdminPageData{
-		Username: session.Username, Role: account.Role, RoleLabel: roleLabel(account.Role), CSRF: session.CSRF,
+		Username: session.Username, Nickname: firstNonEmpty(session.Nickname, session.Username), Role: account.Role, RoleLabel: roleLabel(account.Role), CSRF: session.CSRF,
 		AdminBasePath: adminBasePath,
 		Section:       "registration", SectionTitle: "注册与邀请码",
 		CanOperate:         account.Role == store.RoleAdmin || account.Role == store.RoleSuperAdmin,
@@ -373,7 +374,7 @@ func (p *Portal) renderGeneratedInvitationCodes(w http.ResponseWriter, r *http.R
 		return
 	}
 	p.render(w, http.StatusCreated, "registration-admin.html", registrationAdminPageData{
-		Username: session.Username, Role: account.Role, RoleLabel: roleLabel(account.Role), CSRF: session.CSRF,
+		Username: session.Username, Nickname: firstNonEmpty(session.Nickname, session.Username), Role: account.Role, RoleLabel: roleLabel(account.Role), CSRF: session.CSRF,
 		AdminBasePath: adminBasePath,
 		Section:       "registration", SectionTitle: "注册与邀请码",
 		CanOperate:         account.Role == store.RoleAdmin || account.Role == store.RoleSuperAdmin,

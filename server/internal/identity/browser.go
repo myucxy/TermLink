@@ -37,10 +37,12 @@ type browserSession struct {
 	AuthenticatedAt int64    `json:"auth_time"`
 	Methods         []string `json:"amr"`
 	ExpiresAt       int64    `json:"exp"`
+	SetupRequired   bool     `json:"setup_required,omitempty"`
 }
 
 type browserCSRF struct {
 	Token                   string `json:"token"`
+	CookieName              string `json:"cookie_name"`
 	QueryHash               string `json:"query_hash"`
 	ExpiresAt               int64  `json:"exp"`
 	PendingSubject          string `json:"pending_subject,omitempty"`
@@ -51,6 +53,7 @@ type browserCSRF struct {
 type loginPageData struct {
 	Action                    string
 	CSRF                      string
+	CSRFCookie                string
 	Error                     string
 	Username                  string
 	OTPOnly                   bool
@@ -61,15 +64,17 @@ type loginPageData struct {
 }
 
 type accountPageData struct {
-	Username  string
-	Nickname  string
-	Email     string
-	MFA       bool
-	ReturnURL string
-	LogoutURL string
-	CSRF      string
-	Error     string
-	Message   string
+	Username               string
+	Nickname               string
+	Email                  string
+	MFA                    bool
+	Section                string
+	ReturnURL              string
+	LogoutURL              string
+	CSRF                   string
+	Error                  string
+	Message                string
+	PasswordChangeRequired bool
 }
 
 var loginTemplate = template.Must(template.New("embedded-login").Parse(`<!doctype html>
@@ -83,7 +88,7 @@ var loginTemplate = template.Must(template.New("embedded-login").Parse(`<!doctyp
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
   <script src="/assets/theme-init.js?v=theme-sync-v1"></script>
   <link rel="stylesheet" href="/assets/identity.css?v=identity-v2">
-  <script src="/assets/theme.js?v=theme-sync-v1" defer></script>
+  <script src="/assets/theme.js?v=theme-sync-v2" defer></script>
   {{if .HumanVerificationRequired}}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{{end}}
 </head>
 <body class="tl-page" data-page-id="login-login">
@@ -138,8 +143,9 @@ var loginTemplate = template.Must(template.New("embedded-login").Parse(`<!doctyp
           <a href="{{.RegisterURL}}" data-theme-transfer role="tab" aria-selected="false">创建账号</a>
         </div>
         {{end}}
-        <form id="kc-form-login" class="tl-form" method="post" action="{{.Action}}" autocomplete="on">
-          <input type="hidden" name="termlink_csrf" value="{{.CSRF}}">
+		<form id="kc-form-login" class="tl-form" method="post" action="{{.Action}}" autocomplete="on">
+		  <input type="hidden" name="termlink_csrf" value="{{.CSRF}}">
+		  <input type="hidden" name="termlink_csrf_cookie" value="{{.CSRFCookie}}">
           {{if not .OTPOnly}}
           <div class="tl-form-group">
             <label for="username" class="tl-label">邮箱或用户名</label>
@@ -179,10 +185,10 @@ var accountTemplate = template.Must(template.New("embedded-account").Parse(`<!do
 <meta name="color-scheme" content="light dark"><title>TermLink 身份设置 / Identity settings</title><script src="/assets/theme-init.js?v=theme-sync-v1"></script><link rel="stylesheet" href="/realms/termlink/resources/identity.css?v=theme-sync-v1"><script src="/assets/theme.js?v=theme-sync-v1" defer></script></head>
 <body><main class="identity-card wide"><div class="brand">TL</div><h1>身份与安全</h1><p class="subtitle">Identity and security</p>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}{{if .Message}}<div class="success" role="status">{{.Message}}</div>{{end}}
-<dl><dt>用户名 / Username</dt><dd>{{.Username}}</dd><dt>昵称 / Nickname</dt><dd>{{.Nickname}}</dd><dt>邮箱 / Email</dt><dd>{{.Email}}</dd><dt>动态验证码 / Authenticator</dt><dd>{{if .MFA}}已启用 / Enabled{{else}}未启用 / Not enabled{{end}}</dd></dl>
-<section><h2>修改密码 / Change password</h2><form method="post" action="/realms/termlink/account/password/change"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><label>新密码 / New password<input type="password" name="password" minlength="8" maxlength="1024" autocomplete="new-password" required></label><label>确认新密码 / Confirm new password<input type="password" name="password_confirm" minlength="8" maxlength="1024" autocomplete="new-password" required></label>{{if .MFA}}<label>动态验证码或恢复码 / Authenticator or recovery code<input name="second_factor" maxlength="32" autocomplete="one-time-code" required></label>{{end}}<button type="submit">修改密码 / Change password</button></form></section>
-<section><h2>多因素认证 / Multi-factor authentication</h2>{{if .MFA}}<p class="hint">恢复码只会在绑定或重新生成后显示一次。<br>Recovery codes are shown only once after enrollment or regeneration.</p><form method="post" action="/realms/termlink/account/recovery-codes/regenerate"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><label>动态验证码或现有恢复码 / Authenticator or existing recovery code<input name="second_factor" maxlength="32" autocomplete="one-time-code" required></label><button type="submit">重新生成恢复码 / Regenerate recovery codes</button></form><form method="post" action="/realms/termlink/account/mfa/disable" class="danger-zone"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><label>动态验证码或恢复码 / Authenticator or recovery code<input name="second_factor" maxlength="32" autocomplete="one-time-code" required></label><button class="danger" type="submit">停用动态验证码 / Disable authenticator</button></form>{{else}}<form method="post" action="/realms/termlink/account/mfa/begin"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><button type="submit">绑定动态验证码 / Set up authenticator</button></form>{{end}}</section>
-<div class="actions">{{if .ReturnURL}}<a class="button" href="{{.ReturnURL}}">返回 TermLink / Back</a>{{end}}<a class="secondary" href="{{.LogoutURL}}">退出身份会话 / Sign out</a></div>
+{{if .PasswordChangeRequired}}<div class="error" role="alert">这是首次登录，请先修改初始密码。<br>This is the first sign-in. Change the initial password before continuing.</div>{{else}}<dl><dt>用户名 / Username</dt><dd>{{.Username}}</dd><dt>昵称 / Nickname</dt><dd>{{.Nickname}}</dd><dt>邮箱 / Email</dt><dd>{{.Email}}</dd><dt>动态验证码 / Authenticator</dt><dd>{{if .MFA}}已启用 / Enabled{{else}}未启用 / Not enabled{{end}}</dd></dl>{{end}}
+{{if or (eq .Section "") (eq .Section "password")}}<section id="security-password"><h2>修改密码 / Change password</h2><form method="post" action="/realms/termlink/account/password/change"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><label>新密码 / New password<input type="password" name="password" minlength="8" maxlength="1024" autocomplete="new-password" required></label><label>确认新密码 / Confirm new password<input type="password" name="password_confirm" minlength="8" maxlength="1024" autocomplete="new-password" required></label>{{if .MFA}}<label>动态验证码或恢复码 / Authenticator or recovery code<input name="second_factor" maxlength="32" autocomplete="one-time-code" required></label>{{end}}<button type="submit">修改密码 / Change password</button></form></section>{{end}}
+{{if and (not .PasswordChangeRequired) (or (eq .Section "") (eq .Section "mfa"))}}<section id="security-mfa"><h2>多因素认证 / Multi-factor authentication</h2>{{if .MFA}}<p class="hint">恢复码只会在绑定或重新生成后显示一次。<br>Recovery codes are shown only once after enrollment or regeneration.</p><form method="post" action="/realms/termlink/account/recovery-codes/regenerate"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><label>动态验证码或现有恢复码 / Authenticator or existing recovery code<input name="second_factor" maxlength="32" autocomplete="one-time-code" required></label><button type="submit">重新生成恢复码 / Regenerate recovery codes</button></form><form method="post" action="/realms/termlink/account/mfa/disable" class="danger-zone"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><label>动态验证码或恢复码 / Authenticator or recovery code<input name="second_factor" maxlength="32" autocomplete="one-time-code" required></label><button class="danger" type="submit">停用动态验证码 / Disable authenticator</button></form>{{else}}<form method="post" action="/realms/termlink/account/mfa/begin"><input type="hidden" name="termlink_form_csrf" value="{{.CSRF}}"><label>当前密码 / Current password<input type="password" name="current_password" maxlength="1024" autocomplete="current-password" required></label><button type="submit">绑定动态验证码 / Set up authenticator</button></form>{{end}}</section>{{end}}
+<div class="actions">{{if .ReturnURL}}<a class="button" href="{{.ReturnURL}}" target="_top">返回 TermLink / Back</a>{{end}}<a class="secondary" href="{{.LogoutURL}}" target="_top">退出身份会话 / Sign out</a></div>
 </main></body></html>`))
 
 const identityCSS = `:root{color-scheme:light;font-family:Inter,"Segoe UI",system-ui,sans-serif;--bg:#f7f8fc;--bg-accent:#e6e9f2;--card:#fff;--surface:#f0f2f8;--text:#171a24;--muted:#4e5668;--border:#737b8e;--border-soft:#d5d9e3;--accent:#4659a8;--accent-on:#fff;--danger:#b3261e;--danger-bg:#fde8e7;--danger-on:#8a1c16;--success-bg:#e3f4eb;--success-on:#176b45;--code-bg:#edf0f7;--code-on:#273a74;--shadow:rgba(23,26,36,.16)}html[data-theme="dark"]{color-scheme:dark;--bg:#0b0f14;--bg-accent:#1b2430;--card:#121820;--surface:#222c39;--text:#e9eef5;--muted:#aab5c5;--border:#465363;--border-soft:#2c3745;--accent:#9cb2ff;--accent-on:#14203d;--danger:#ff8c91;--danger-bg:#451d24;--danger-on:#ffd9df;--success-bg:#123d31;--success-on:#c8ffe9;--code-bg:#071119;--code-on:#b8f4da;--shadow:rgba(0,0,0,.5)}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:radial-gradient(circle at top,var(--bg-accent),var(--bg) 55%);color:var(--text)}.identity-card{width:min(100%,420px);padding:28px;border:1px solid var(--border-soft);border-radius:18px;background:var(--card);box-shadow:0 20px 60px var(--shadow)}.identity-card.wide{width:min(100%,680px)}.brand{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;background:var(--accent);color:var(--accent-on);font-weight:800}h1{margin:18px 0 2px;font-size:1.55rem}h2{margin:0 0 8px;font-size:1.12rem}.subtitle,.hint{color:var(--muted)}.error,.success{margin:18px 0;padding:12px;border-radius:10px}.error{background:var(--danger-bg);color:var(--danger-on)}.success{background:var(--success-bg);color:var(--success-on)}label{display:grid;gap:7px;margin:16px 0;font-size:.92rem}input{width:100%;min-height:46px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:inherit;font:inherit}input:focus{outline:2px solid var(--accent);outline-offset:2px}button,.button{display:block;width:100%;min-height:46px;padding:12px;border:0;border-radius:10px;background:var(--accent);color:var(--accent-on);font-weight:750;text-align:center;text-decoration:none;cursor:pointer}button.danger{background:var(--danger);color:var(--accent-on)}.secondary{display:block;margin-top:15px;color:var(--accent);text-align:center}.account-label{padding:10px 0;color:var(--text)}dl{display:grid;grid-template-columns:minmax(120px,1fr) 2fr;gap:12px;margin:22px 0}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}section{margin:22px 0;padding:18px;border:1px solid var(--border-soft);border-radius:12px}.danger-zone{margin-top:28px;padding-top:12px;border-top:1px solid var(--border-soft)}.actions{display:grid;gap:8px;margin-top:20px}code{display:block;padding:12px;border-radius:8px;background:var(--code-bg);color:var(--code-on);overflow-wrap:anywhere}.recovery-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:0;list-style:none}.recovery-list code{text-align:center}@media(max-width:500px){body{padding:12px}.identity-card{padding:22px 18px}dl{grid-template-columns:1fr;gap:3px}dd{margin-bottom:10px}.recovery-list{grid-template-columns:1fr}}`
@@ -244,7 +250,12 @@ func (p *Provider) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, maximumIdentityForm)
 	}
-	authorizeRequest, err := p.oauth.NewAuthorizeRequest(r.Context(), r)
+	ctx := r.Context()
+	if origin, ok := requestHTTPSOrigin(r); ok {
+		ctx = context.WithValue(ctx, dynamicWebOriginKey{}, origin)
+		r = r.WithContext(ctx)
+	}
+	authorizeRequest, err := p.oauth.NewAuthorizeRequest(ctx, r)
 	if err != nil {
 		p.oauth.WriteAuthorizeError(r.Context(), w, authorizeRequest, err)
 		return
@@ -344,14 +355,23 @@ func (p *Provider) completeAuthorizeLogin(w http.ResponseWriter, r *http.Request
 	if !p.verifyLoginHuman(w, r, request, username) {
 		return
 	}
-	subject, err := p.accounts.Authenticate(r.Context(), username, r.Form.Get("password"))
+	subject, err := p.accounts.AuthenticateForBrowserSetup(r.Context(), username, r.Form.Get("password"))
 	if err != nil {
 		p.renderLogin(w, r, request, "登录失败。请检查凭据；迁移账号请先通过“忘记密码”设置新密码。 / Sign-in failed. Check your credentials; migrated accounts must first set a new password through ‘Forgot password’.", username, false, "")
 		return
 	}
 	account, err := p.accounts.LoadAccount(r.Context(), subject)
-	if err != nil || !account.Enabled || account.PasswordResetRequired {
+	if err != nil || !account.Enabled {
 		p.renderLogin(w, r, request, "账号需要先完成安全设置。 / Complete the account security setup before signing in.", username, false, "")
+		return
+	}
+	if account.PasswordResetRequired {
+		now := p.clock().UTC()
+		p.setBrowserSession(w, browserSession{
+			Subject: account.Subject.String(), AuthEpoch: account.AuthEpoch, AuthenticatedAt: now.Unix(),
+			Methods: []string{"pwd"}, ExpiresAt: now.Add(embeddedBrowserSessionLifetime).Unix(), SetupRequired: true,
+		})
+		http.Redirect(w, r, "/realms/termlink/account/password", http.StatusSeeOther)
 		return
 	}
 	methods := []string{"pwd"}
@@ -430,6 +450,13 @@ func (p *Provider) renderLoginWithState(w http.ResponseWriter, r *http.Request, 
 	}
 	queryHash := sha256.Sum256([]byte(r.URL.RawQuery))
 	now := p.clock().UTC()
+	cookieSuffix, err := randomIdentityText(9)
+	if err != nil {
+		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusInternalServerError)
+		return
+	}
+	cookieName := browserCSRFCookie + "-" + cookieSuffix
+	state.CookieName = cookieName
 	state.Token = csrf
 	state.QueryHash = base64.RawURLEncoding.EncodeToString(queryHash[:])
 	state.ExpiresAt = now.Add(10 * time.Minute).Unix()
@@ -438,12 +465,16 @@ func (p *Provider) renderLoginWithState(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "身份服务暂不可用 / Identity service unavailable", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: browserCSRFCookie, Value: sealed, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: now.Add(10 * time.Minute), MaxAge: 600})
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: sealed, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: now.Add(10 * time.Minute), MaxAge: 600})
 	action := r.URL.Path
 	if r.URL.RawQuery != "" {
 		action += "?" + r.URL.RawQuery
 	}
-	registerURL := "/register?continue=" + url.QueryEscape(p.issuer+"/protocol/openid-connect/auth?"+r.URL.RawQuery)
+	continueURL := p.issuer + "/protocol/openid-connect/auth?" + r.URL.RawQuery
+	if origin, ok := requestHTTPSOrigin(r); ok {
+		continueURL = origin + "/realms/termlink/protocol/openid-connect/auth?" + r.URL.RawQuery
+	}
+	registerURL := "/register?continue=" + url.QueryEscape(continueURL)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	if humanRuntime.Enabled {
@@ -451,7 +482,7 @@ func (p *Provider) renderLoginWithState(w http.ResponseWriter, r *http.Request, 
 	}
 	w.WriteHeader(http.StatusOK)
 	_ = loginTemplate.Execute(w, loginPageData{
-		Action: action, CSRF: csrf, Error: message, Username: username, OTPOnly: otpOnly,
+		Action: action, CSRF: csrf, CSRFCookie: cookieName, Error: message, Username: username, OTPOnly: otpOnly,
 		RegisterURL: registerURL, AccountLabel: accountLabel,
 		HumanVerificationRequired: humanRuntime.Enabled, HumanVerificationSiteKey: humanRuntime.SiteKey,
 	})
@@ -477,7 +508,11 @@ func (p *Provider) verifyLoginHuman(w http.ResponseWriter, r *http.Request, requ
 }
 
 func (p *Provider) validateBrowserCSRF(r *http.Request) (browserCSRF, error) {
-	cookie, err := r.Cookie(browserCSRFCookie)
+	cookieName := strings.TrimSpace(r.FormValue("termlink_csrf_cookie"))
+	if !strings.HasPrefix(cookieName, browserCSRFCookie+"-") || strings.ContainsAny(cookieName, " \t\r\n;=") {
+		return browserCSRF{}, errors.New("identity csrf cookie is invalid")
+	}
+	cookie, err := r.Cookie(cookieName)
 	if err != nil {
 		return browserCSRF{}, err
 	}
@@ -494,8 +529,16 @@ func (p *Provider) validateBrowserCSRF(r *http.Request) (browserCSRF, error) {
 	return state, nil
 }
 
-func (p *Provider) clearBrowserCSRF(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: browserCSRFCookie, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
+func (p *Provider) clearBrowserCSRF(w http.ResponseWriter, states ...browserCSRF) {
+	var state browserCSRF
+	if len(states) > 0 {
+		state = states[0]
+	}
+	name := state.CookieName
+	if name == "" {
+		name = browserCSRFCookie
+	}
+	http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
 }
 
 func (p *Provider) setBrowserSession(w http.ResponseWriter, session browserSession) {
@@ -529,7 +572,13 @@ func (p *Provider) clearBrowserSession(w http.ResponseWriter) {
 
 func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maximumIdentityForm)
-	request, err := p.oauth.NewAccessRequest(r.Context(), r, newSession())
+	_ = r.ParseForm()
+	ctx := r.Context()
+	if redirectOrigin, ok := callbackOrigin(r.FormValue("redirect_uri")); ok {
+		ctx = context.WithValue(ctx, dynamicWebOriginKey{}, redirectOrigin)
+		r = r.WithContext(ctx)
+	}
+	request, err := p.oauth.NewAccessRequest(ctx, r, newSession())
 	if err != nil {
 		p.oauth.WriteAccessError(r.Context(), w, request, err)
 		return
@@ -631,7 +680,7 @@ func (p *Provider) logout(w http.ResponseWriter, r *http.Request) {
 	target := "/"
 	requested := strings.TrimSpace(r.FormValue("post_logout_redirect_uri"))
 	if requested != "" {
-		if parsed, err := url.Parse(requested); err == nil && sameIdentityOrigin(parsed, p.publicOrigin) && parsed.User == nil && parsed.Fragment == "" {
+		if parsed, err := url.Parse(requested); err == nil && (sameIdentityOrigin(parsed, p.publicOrigin) || originUsesRequestHost(parsed.String(), r)) && parsed.User == nil && parsed.Fragment == "" {
 			target = parsed.String()
 		}
 	}
@@ -645,6 +694,21 @@ func sameIdentityOrigin(candidate *url.URL, expected string) bool {
 
 func (p *Provider) accountPage(w http.ResponseWriter, r *http.Request) {
 	p.renderAccountPage(w, r, "", "", http.StatusOK)
+}
+
+func identityAccountSection(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	path := strings.TrimRight(r.URL.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/account/password") || strings.HasSuffix(path, "/account/password/change"):
+		return "password"
+	case strings.HasSuffix(path, "/account/mfa") || strings.HasSuffix(path, "/account/mfa/begin") || strings.HasSuffix(path, "/account/mfa/confirm") || strings.HasSuffix(path, "/account/mfa/disable") || strings.HasSuffix(path, "/account/recovery-codes/regenerate"):
+		return "mfa"
+	default:
+		return ""
+	}
 }
 
 func randomIdentityText(bytes int) (string, error) {

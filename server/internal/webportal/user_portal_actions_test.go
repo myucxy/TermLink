@@ -58,10 +58,6 @@ func (r *testAccountPortalRepository) ListUserPortalSessions(context.Context, uu
 	return nil, nil
 }
 
-func (r *testAccountPortalRepository) ListUserPortalSecurityActivity(context.Context, uuid.UUID, store.UserPortalAuditPageRequest) ([]store.UserPortalSecurityActivity, error) {
-	return nil, nil
-}
-
 type userPortalAuditCall struct {
 	action, targetType, result, traceID, metadata string
 	accountID, targetID                           uuid.UUID

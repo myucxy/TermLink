@@ -220,9 +220,8 @@ Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_RUNTIME_MODE'
     'Server must use single-node runtime mode.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_IDENTITY_PROVIDER') -ceq 'embedded') `
     'Server must own the embedded identity provider.'
-Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_OIDC_BACKCHANNEL_ISSUER') -ceq
-    "$($deploymentEnvironment.TERMLINK_PUBLIC_URL)/realms/termlink") `
-    'Embedded OIDC backchannel issuer must preserve the public issuer.'
+Assert-SingleNode ($null -eq (Get-Value $serverEnvironment 'TERMLINK_OIDC_BACKCHANNEL_ISSUER')) `
+    'Embedded identity must not require a separate OIDC backchannel issuer.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_INITIAL_ADMIN_PASSWORD_FILE') -ceq
     '/run/secrets/initial_admin_password') 'Server must bootstrap the initial administrator from a file-backed secret.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_DIRECT_TRANSPORT_ENABLED') -ceq 'true') `

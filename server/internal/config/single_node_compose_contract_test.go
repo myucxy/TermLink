@@ -16,7 +16,7 @@ func TestProductionSingleNodeComposeDisablesExternalCoordination(t *testing.T) {
 		"migrate:\n    profiles: [\"distributed-runtime\"]",
 		"valkey:\n    profiles: [\"distributed-runtime\"]",
 		"TERMLINK_RUNTIME_MODE: single-node",
-		"TERMLINK_OIDC_BACKCHANNEL_ISSUER:",
+		"TERMLINK_IDENTITY_PROVIDER: embedded",
 		"TERMLINK_DIRECT_TRANSPORT_ENABLED: \"true\"",
 		"TERMLINK_REDIS_URL_FILE: !reset null",
 		"TERMLINK_DIRECT_REDIS_URL_FILE: !reset null",

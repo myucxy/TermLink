@@ -17,7 +17,6 @@ type userPortalRepository interface {
 	ListUserPortalDevices(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalDevice, error)
 	ListUserPortalPCs(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalPC, error)
 	ListUserPortalSessions(context.Context, uuid.UUID, store.UserPortalPageRequest) ([]store.UserPortalSession, error)
-	ListUserPortalSecurityActivity(context.Context, uuid.UUID, store.UserPortalAuditPageRequest) ([]store.UserPortalSecurityActivity, error)
 }
 
 type userPortalPageData struct {
@@ -37,11 +36,11 @@ type userPortalPageData struct {
 	Devices                   []store.UserPortalDevice
 	PCs                       []store.UserPortalPC
 	Sessions                  []store.UserPortalSession
-	SecurityActivities        []store.UserPortalSecurityActivity
 	IdempotencyKey            string
 	Notice                    string
 	SensitiveActionsAvailable bool
 	PCPolicies                []store.UserPortalPCControlPolicy
+	PCRows                    []userPortalPCRow
 	PrivacyPreflight          store.UserPortalAccountDeletionPreflight
 	AccountDeletion           *store.UserPortalAccountDeletion
 	ProfileChangeAvailable    bool
@@ -49,6 +48,12 @@ type userPortalPageData struct {
 	PendingEmail              string
 	EmailChallengeID          uuid.UUID
 	EmailChallengeExpiresAt   time.Time
+}
+
+type userPortalPCRow struct {
+	PC              store.UserPortalPC
+	Policy          store.UserPortalPCControlPolicy
+	PolicyAvailable bool
 }
 
 func (p *Portal) accountDashboard(w http.ResponseWriter, r *http.Request) {
@@ -62,12 +67,15 @@ func (p *Portal) accountDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	section := normalizeUserPortalSection(r.URL.Query().Get("section"))
+	if section == "privacy" {
+		section = "settings"
+	}
 	data, err := p.loadUserPortalPage(r.Context(), repository, session, account, section, userPortalNotice(r.URL.Query().Get("notice")))
 	if err != nil {
 		p.internalError(w, err)
 		return
 	}
-	if section == "privacy" && data.SensitiveActionsAvailable {
+	if (section == "privacy" || section == "settings") && data.SensitiveActionsAvailable {
 		actionRepository := p.config.Repository.(userPortalActionRepository)
 		if err := p.loadUserPortalPrivacySelection(r.Context(), actionRepository, account.ID, r.URL.Query(), &data); err != nil {
 			if errors.Is(err, errUserPortalRequest) {
@@ -119,24 +127,68 @@ func (p *Portal) loadUserPortalPage(ctx context.Context, repository userPortalRe
 		data.Devices, err = repository.ListUserPortalDevices(ctx, account.ID, request)
 	case "pcs":
 		data.PCs, err = repository.ListUserPortalPCs(ctx, account.ID, request)
-		if err == nil && actionsAvailable {
-			data.PCPolicies, err = actionRepository.ListUserPortalPCControlPolicies(ctx, account.ID, 50)
+		if err == nil {
+			data.PCRows = make([]userPortalPCRow, 0, len(data.PCs))
+			for _, pc := range data.PCs {
+				data.PCRows = append(data.PCRows, userPortalPCRow{PC: pc, Policy: store.UserPortalPCControlPolicy{PCID: pc.ID, Name: pc.Name}})
+			}
+			if actionsAvailable {
+				data.PCPolicies, err = actionRepository.ListUserPortalPCControlPolicies(ctx, account.ID, 50)
+				if err == nil {
+					byID := make(map[uuid.UUID]store.UserPortalPCControlPolicy, len(data.PCPolicies))
+					for _, policy := range data.PCPolicies {
+						byID[policy.PCID] = policy
+					}
+					for index := range data.PCRows {
+						if policy, ok := byID[data.PCRows[index].PC.ID]; ok {
+							data.PCRows[index].Policy = policy
+							data.PCRows[index].PolicyAvailable = true
+						}
+					}
+				}
+			}
 		}
 	case "sessions":
 		data.Sessions, err = repository.ListUserPortalSessions(ctx, account.ID, request)
-	case "security":
-		data.SecurityActivities, err = repository.ListUserPortalSecurityActivity(ctx, account.ID, store.UserPortalAuditPageRequest{Limit: 50})
-	case "privacy":
+	case "privacy", "settings":
 		if actionsAvailable {
 			data.PrivacyPreflight, err = actionRepository.GetUserPortalAccountDeletionPreflight(ctx, account.ID)
 		}
 	}
+	if err == nil && p.config.Presence != nil {
+		p.applyCachedPortalPresence(account.ID, &data)
+	}
 	return data, err
+}
+
+func (p *Portal) applyCachedPortalPresence(accountID uuid.UUID, data *userPortalPageData) {
+	if p == nil || p.config.Presence == nil || data == nil {
+		return
+	}
+	if data.Section == "overview" {
+		data.Overview.OnlinePCs = p.config.Presence.OnlineDeviceCount(accountID, "pc")
+	}
+	for index := range data.Devices {
+		seen, online := p.config.Presence.Online(accountID, data.Devices[index].ID)
+		data.Devices[index].Online = online
+		if online {
+			seen = seen.UTC()
+			data.Devices[index].LastSeenAt = &seen
+		}
+	}
+	for index := range data.PCs {
+		seen, online := p.config.Presence.Online(accountID, data.PCs[index].DeviceID)
+		data.PCs[index].Online = online
+		if online {
+			seen = seen.UTC()
+			data.PCs[index].LastSeenAt = &seen
+		}
+	}
 }
 
 func normalizeUserPortalSection(section string) string {
 	switch strings.ToLower(strings.TrimSpace(section)) {
-	case "overview", "devices", "pcs", "sessions", "security", "privacy", "settings":
+	case "overview", "devices", "pcs", "sessions", "privacy", "settings":
 		return strings.ToLower(strings.TrimSpace(section))
 	default:
 		return "overview"
@@ -146,13 +198,15 @@ func normalizeUserPortalSection(section string) string {
 func userPortalSectionTitle(section string) string {
 	return map[string]string{
 		"overview": "账号概览", "devices": "设备", "pcs": "Windows PC", "sessions": "会话元数据",
-		"security": "安全活动", "privacy": "数据隐私", "settings": "个人设置与登录安全",
+		"privacy": "数据隐私", "settings": "个人设置与登录安全",
 	}[normalizeUserPortalSection(section)]
 }
 
 func userPortalNotice(value string) string {
 	return map[string]string{
 		"device-revoked":     bilingualPortalNotice("设备已撤销；相关授权、控制租约和后续密钥分发已停止。", "The device was revoked. Its grants, control leases, and future key distribution were stopped."),
+		"device-disabled":    bilingualPortalNotice("设备已禁用；该设备将无法继续登录。", "The device was disabled and can no longer sign in."),
+		"device-deleted":     bilingualPortalNotice("设备已删除；使用该设备重新登录后会重新注册。", "The device was deleted and will register again on its next sign-in."),
 		"pc-policy-updated":  bilingualPortalNotice("PC 远程路由和控制策略已更新。", "The PC remote route and control policy were updated."),
 		"deletion-requested": bilingualPortalNotice("账号注销申请已创建，仍需在确认时限内完成二次确认。", "The account deletion request was created and still requires confirmation before the deadline."),
 		"deletion-confirmed": bilingualPortalNotice("账号注销已确认并进入 7 天冷静期；当前仍未删除，可在允许状态下取消。", "Account deletion was confirmed and entered the 7-day cooling-off period. Nothing has been deleted yet, and cancellation remains available when permitted."),

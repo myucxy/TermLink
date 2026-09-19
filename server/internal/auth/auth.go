@@ -32,6 +32,7 @@ var (
 	ErrUnauthenticated = errors.New("authentication failed")
 	ErrDevicePending   = errors.New("device approval required")
 	ErrDeviceRevoked   = errors.New("device revoked")
+	ErrDeviceDisabled  = errors.New("device disabled")
 )
 
 type Identity struct {
@@ -226,6 +227,8 @@ func authenticationFailureClass(err error) string {
 		return "DEVICE_PENDING"
 	case errors.Is(err, ErrDeviceRevoked):
 		return "DEVICE_REVOKED"
+	case errors.Is(err, ErrDeviceDisabled):
+		return "DEVICE_DISABLED"
 	case errors.Is(err, ErrUnauthenticated):
 		return "UNAUTHENTICATED"
 	default:
@@ -251,6 +254,9 @@ func (m Middleware) VerifyRequest(r *http.Request) (Principal, error) {
 	}
 	device, err := m.Devices.LoadDeviceForSubject(r.Context(), SubjectHash(m.SubjectKey, identity), deviceID)
 	if err != nil {
+		if errors.Is(err, ErrDeviceDisabled) {
+			return Principal{}, ErrDeviceDisabled
+		}
 		return Principal{}, fmt.Errorf("%w: unknown device", ErrUnauthenticated)
 	}
 	switch device.TrustState {
@@ -353,6 +359,8 @@ func writeAuthError(w http.ResponseWriter, status int, err error) {
 		code = "DEVICE_PENDING"
 	} else if errors.Is(err, ErrDeviceRevoked) {
 		code = "DEVICE_REVOKED"
+	} else if errors.Is(err, ErrDeviceDisabled) {
+		code = "DEVICE_DISABLED"
 	}
 	_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message_key":%q}}`, code, "auth."+strings.ToLower(code))
 }

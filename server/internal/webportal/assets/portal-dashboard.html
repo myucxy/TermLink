@@ -9,46 +9,39 @@
   <link rel="icon" href="/assets/termlink-favicon.svg" type="image/svg+xml">
   <script src="/assets/theme-init.js?v=01b-v11"></script>
   <link rel="stylesheet" href="/assets/site.css?v=step-up-v2">
-  <link rel="stylesheet" href="/assets/portal-dashboard.css?v=registration-v2">
+  <link rel="stylesheet" href="/assets/admin.css?v=01b-v17">
+  <link rel="stylesheet" href="/assets/portal-dashboard.css?v=account-shell-v5">
   <script src="/assets/theme.js?v=theme-sync-v1" defer></script>
 </head>
-<body class="portal-body">
-  <header class="site-header">
-    <a class="brand" href="/" aria-label="TermLink 首页"><img class="brand-mark" src="/assets/termlink-app-icon.svg" alt=""><span><strong>TermLink</strong><small>Account Center</small></span></a>
-    <div class="site-header-actions">
-      <button class="button button-quiet theme-toggle" type="button" data-theme-toggle aria-label="切换主题" title="切换主题"><span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span><span class="theme-toggle-label">主题</span></button>
-      <details class="account-menu">
-        <summary class="account-menu-trigger" aria-label="打开账号菜单"><span class="account-menu-avatar">{{printf "%.1s" .Nickname}}</span><span>{{.Nickname}}</span></summary>
-        <div class="account-menu-panel">
-          <strong>{{.Nickname}}</strong><small>@{{.Username}}</small>
-          <a href="/account?section=settings">个人设置</a>
-          <a href="/account?section=settings#login-security">登录与安全</a>
-          {{if .CanOpenConsole}}<a href="{{.ConsoleURL}}">进入管理中心</a>{{end}}
-          <form action="/logout" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">退出登录</button></form>
-        </div>
-      </details>
-    </div>
-  </header>
-
-  <main class="portal-user-shell">
-    <aside class="portal-user-sidebar">
-      <div class="portal-user-identity"><span class="status-dot" aria-hidden="true"></span><span><small>当前账号</small><strong>{{.Username}}</strong></span></div>
-      <nav class="portal-user-nav" aria-label="用户中心">
+<body class="admin-body portal-body">
+  <div class="admin-shell portal-account-shell">
+    <aside class="admin-sidebar portal-user-sidebar">
+      <a class="brand admin-brand" href="/" aria-label="TermLink 首页"><img class="brand-mark" src="/assets/termlink-app-icon.svg" alt=""><span><strong>TermLink</strong><small>Account Center</small></span></a>
+      <nav class="admin-nav portal-user-nav" aria-label="用户中心">
         <a href="/account?section=overview"{{if eq .Section "overview"}} aria-current="page"{{end}}>仪表盘</a>
         <a href="/account?section=devices"{{if eq .Section "devices"}} aria-current="page"{{end}}>设备</a>
         <a href="/account?section=pcs"{{if eq .Section "pcs"}} aria-current="page"{{end}}>PC Agent</a>
         <a href="/account?section=sessions"{{if eq .Section "sessions"}} aria-current="page"{{end}}>会话记录</a>
-        <a href="/account?section=security"{{if eq .Section "security"}} aria-current="page"{{end}}>安全活动</a>
-        <a href="/account?section=privacy"{{if eq .Section "privacy"}} aria-current="page"{{end}}>账号注销</a>
+        <a href="/account?section=settings"{{if eq .Section "settings"}} aria-current="page"{{end}}>个人设置</a>
       </nav>
-      <p class="portal-sidebar-note">本页面只读取账号与连接元数据。终端内容始终保持端到端加密。</p>
     </aside>
 
-    <div class="portal-user-content">
-      <section class="portal-hero portal-user-hero">
-        <div><p class="eyebrow">ACCOUNT · CONTENT BLIND</p><h1>{{.SectionTitle}}</h1><p>你好，{{.Nickname}}。所有查询都限定为当前登录账号。</p></div>
-      </section>
-
+    <main class="admin-main portal-user-content">
+      <header class="admin-topbar">
+        <div><p class="eyebrow">ACCOUNT · CONTENT BLIND</p><h1>{{.SectionTitle}}</h1></div>
+        <div class="admin-top-actions">
+          <button class="button button-quiet theme-toggle admin-theme-toggle" type="button" data-theme-toggle aria-label="切换深浅主题" title="切换主题"><span class="theme-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path class="theme-icon-moon" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/><g class="theme-icon-sun"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></g></svg></span><span class="theme-toggle-label">主题</span></button>
+          <details class="account-menu admin-account-menu">
+            <summary class="account-menu-trigger admin-account-trigger" aria-label="打开账号菜单"><span class="admin-avatar" aria-hidden="true">{{printf "%.1s" .Nickname}}</span><span class="admin-account-name">{{.Nickname}}</span></summary>
+            <div class="account-menu-panel admin-account-panel">
+              <strong>{{.Nickname}}</strong><small>@{{.Username}}</small>
+              <a href="/account?section=settings">个人设置</a><a href="/account?section=settings#login-security">登录与安全</a>
+              {{if .CanOpenConsole}}<a href="{{.ConsoleURL}}">进入管理中心</a>{{end}}
+              <form action="/logout" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">退出登录</button></form>
+            </div>
+          </details>
+        </div>
+      </header>
       {{if .Notice}}<div class="portal-notice" role="status">{{.Notice}}</div>{{end}}
 
       {{if eq .Section "overview"}}
@@ -62,36 +55,22 @@
       {{end}}
 
       {{if eq .Section "devices"}}
-      <section class="portal-card"><div class="portal-card-heading"><div><p class="eyebrow">OWNED DEVICES</p><h2>账号设备</h2><p>撤销会立即停止新密钥分发，并清除相关授权和控制租约；这与退出登录不同。</p></div><span class="count-pill">最近 {{len .Devices}} 个</span></div><div class="portal-table-wrap"><table class="portal-table account-action-table"><thead><tr><th>设备</th><th>类型</th><th>信任</th><th>在线</th><th>最后活动</th><th>登记时间</th><th>安全操作</th></tr></thead><tbody>{{range .Devices}}<tr><td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td>{{.Type}}</td><td><span class="portal-state state-{{.TrustState}}">{{.TrustState}}</span></td><td>{{if .Online}}在线{{else}}离线{{end}}</td><td>{{if .LastSeenAt}}{{formatTime .LastSeenAt}}{{else}}尚未上报{{end}}</td><td>{{formatTime .CreatedAt}}</td><td>{{if and $.SensitiveActionsAvailable (ne .TrustState "REVOKED")}}<form class="table-sensitive-form" action="/account/devices/{{.ID}}/revoke" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.IdempotencyKey (printf "device-revoke:%s" .ID)}}"><input type="hidden" name="reason" value="系统自动记录"><button class="danger-outline" type="submit">撤销设备</button></form>{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="7" class="empty-cell">当前账号没有已登记设备。</td></tr>{{end}}</tbody></table></div></section>
+      <section class="portal-card"><div class="portal-card-heading"><div><p class="eyebrow">OWNED DEVICES</p><h2>账号设备</h2><p>禁用会阻止设备登录；删除会清理设备记录，之后该设备重新登录即可重新注册。历史“撤销设备”操作仍由禁用流程覆盖。</p></div><span class="count-pill">最近 {{len .Devices}} 个</span></div><div class="portal-table-wrap"><table class="portal-table account-action-table"><thead><tr><th>设备</th><th>类型</th><th>信任</th><th>在线</th><th>最后活动</th><th>登记时间</th><th>安全操作</th></tr></thead><tbody>{{range .Devices}}<tr><td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td>{{.Type}}</td><td>{{if eq .TrustState "DISABLED"}}<span class="portal-state state-DISABLED">已禁用 / Disabled</span>{{else}}<span class="portal-state state-{{.TrustState}}">{{.TrustState}}</span>{{end}}</td><td>{{if .Online}}在线{{else}}离线{{end}}</td><td>{{if .LastSeenAt}}{{formatTime .LastSeenAt}}{{else}}尚未上报{{end}}</td><td>{{formatTime .CreatedAt}}</td><td>{{if $.SensitiveActionsAvailable}}<div class="table-actions">{{if ne .TrustState "DISABLED"}}<form action="/account/devices/{{.ID}}/disable" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.IdempotencyKey (printf "device-disable:%s" .ID)}}"><input type="hidden" name="reason" value="系统自动记录"><button type="submit">禁用</button></form>{{end}}<form action="/account/devices/{{.ID}}/delete" method="post" onsubmit="return confirm('确认删除此设备？删除后可重新注册。 / Delete this device? It can register again later.');"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.IdempotencyKey (printf "device-delete:%s" .ID)}}"><input type="hidden" name="reason" value="系统自动记录"><button class="danger-outline" type="submit">删除</button></form></div>{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="7" class="empty-cell">当前账号没有已登记设备。</td></tr>{{end}}</tbody></table></div></section>
       {{end}}
 
       {{if eq .Section "pcs"}}
-      <section class="portal-card"><div class="portal-card-heading"><div><p class="eyebrow">WINDOWS AGENTS</p><h2>Windows PC</h2><p>平台、Agent 版本和路由状态来自当前账号自己的 PC。</p></div><span class="count-pill">最近 {{len .PCs}} 台</span></div><div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>PC</th><th>平台</th><th>Agent</th><th>远程路由</th><th>在线</th><th>最后活动</th></tr></thead><tbody>{{range .PCs}}<tr><td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td>{{.Platform}} · {{.Architecture}}{{if .PlatformVersion}} · {{.PlatformVersion}}{{end}}</td><td>{{.AgentVersion}}</td><td>{{if .RemoteRoutingEnabled}}已允许{{else}}已关闭{{end}}</td><td>{{if .Online}}在线{{else}}离线{{end}}</td><td>{{if .LastSeenAt}}{{formatTime .LastSeenAt}}{{else}}尚未上报{{end}}</td></tr>{{else}}<tr><td colspan="6" class="empty-cell">当前账号没有已登记 PC。</td></tr>{{end}}</tbody></table></div></section>
-      {{if .SensitiveActionsAvailable}}<section class="portal-card"><div class="portal-card-heading"><div><p class="eyebrow">VERSIONED CONTROL POLICY</p><h2>远程与控制策略</h2><p>单人控制是默认；申请接管会安全撤销旧租约；协同控制只应在明确协作时开启。更新采用乐观版本，避免覆盖其他设备刚完成的修改。</p></div></div><div class="policy-grid">{{range .PCPolicies}}<article class="policy-card"><div class="policy-card-heading"><div><strong>{{.Name}}</strong><small>{{shortID .PCID}} · 策略 v{{.PolicyVersion}}</small></div><span class="portal-state state-{{.Mode}}">{{userPortalControlModeLabel .Mode}}</span></div><form class="portal-form" action="/account/pcs/{{.PCID}}/control-policy" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.IdempotencyKey (printf "pc-policy:%s:%d" .PCID .PolicyVersion)}}"><input type="hidden" name="expected_version" value="{{.PolicyVersion}}"><label><span>远程路由</span><select name="remote_routing_enabled"><option value="true"{{if .RemoteRoutingEnabled}} selected{{end}}>允许通过 TermLink 远程连接</option><option value="false"{{if not .RemoteRoutingEnabled}} selected{{end}}>关闭远程路由</option></select></label><label><span>控制策略</span><select name="mode"><option value="SINGLE"{{if eq .Mode "SINGLE"}} selected{{end}}>单人控制（默认）</option><option value="TAKEOVER"{{if eq .Mode "TAKEOVER"}} selected{{end}}>申请接管</option><option value="COLLABORATIVE"{{if eq .Mode "COLLABORATIVE"}} selected{{end}}>协同控制</option></select></label><label><span>本地优先</span><select name="local_priority"><option value="true"{{if .LocalPriority}} selected{{end}}>本地输入优先</option><option value="false"{{if not .LocalPriority}} selected{{end}}>按租约策略处理</option></select></label><input type="hidden" name="reason" value="系统自动记录"><button class="button button-primary" type="submit">保存控制策略</button></form></article>{{else}}<div class="portal-empty-state"><strong>没有可配置的 PC</strong><span>PC 注册后会在这里显示版本化控制策略。</span></div>{{end}}</div></section>{{end}}
+      <section class="portal-card">
+        <div class="portal-card-heading"><div><p class="eyebrow">WINDOWS AGENTS</p><h2>PC Agent 与控制策略</h2><p>平台、Agent、在线状态、远程路由和控制策略统一管理。单人控制（默认）、申请接管、协同控制和本地输入优先均可调整。</p></div><span class="count-pill">最近 {{len .PCRows}} 台</span></div>
+        {{if .SensitiveActionsAvailable}}<form class="batch-policy-form" action="/account/pcs/control-policy/batch" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey "pc-policy-batch"}}"><input type="hidden" name="reason" value="系统自动记录"><label>批量远程路由 <select name="remote_routing_enabled"><option value="true">允许</option><option value="false">关闭</option></select></label><label>批量控制 <select name="mode"><option value="SINGLE">单人</option><option value="TAKEOVER">申请接管</option><option value="COLLABORATIVE">协同</option></select></label><label>批量本地优先 <select name="local_priority"><option value="true">本地优先</option><option value="false">按租约</option></select></label><button class="button button-quiet" type="submit">批量保存 / Save all</button></form>{{end}}
+        <div class="portal-table-wrap"><table class="portal-table account-action-table"><thead><tr><th>PC</th><th>平台 / Agent</th><th>在线</th><th>远程路由</th><th>控制策略</th><th>操作</th></tr></thead><tbody>{{range .PCRows}}<tr><td><strong>{{.PC.Name}}</strong><small>PC {{shortID .PC.ID}} · 设备 {{shortID .PC.DeviceID}} · 策略 v{{.Policy.PolicyVersion}}</small></td><td>{{.PC.Platform}} · {{.PC.Architecture}}<small>{{.PC.AgentVersion}}</small></td><td>{{if .PC.Online}}在线{{else}}离线{{end}}</td>{{if and $.SensitiveActionsAvailable .PolicyAvailable}}<td colspan="3"><form class="pc-policy-row" action="/account/pcs/{{.Policy.PCID}}/control-policy" method="post"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey $.IdempotencyKey (printf "pc-policy:%s:%d" .Policy.PCID .Policy.PolicyVersion)}}"><input type="hidden" name="expected_version" value="{{.Policy.PolicyVersion}}"><label><span class="sr-only">远程路由</span><select name="remote_routing_enabled"><option value="true"{{if .Policy.RemoteRoutingEnabled}} selected{{end}}>允许</option><option value="false"{{if not .Policy.RemoteRoutingEnabled}} selected{{end}}>关闭</option></select></label><label><span class="sr-only">控制策略</span><select name="mode"><option value="SINGLE"{{if eq .Policy.Mode "SINGLE"}} selected{{end}}>单人</option><option value="TAKEOVER"{{if eq .Policy.Mode "TAKEOVER"}} selected{{end}}>申请接管</option><option value="COLLABORATIVE"{{if eq .Policy.Mode "COLLABORATIVE"}} selected{{end}}>协同</option></select></label><label><span class="sr-only">本地优先</span><select name="local_priority"><option value="true"{{if .Policy.LocalPriority}} selected{{end}}>本地优先</option><option value="false"{{if not .Policy.LocalPriority}} selected{{end}}>按租约</option></select></label><input type="hidden" name="reason" value="系统自动记录"><button class="button button-primary" type="submit">保存</button></form></td>{{else}}<td colspan="3"><span class="portal-state state-PENDING">{{if .PolicyAvailable}}控制策略暂不可用{{else}}等待 Agent 上报{{end}}</span></td>{{end}}</tr>{{else}}<tr><td colspan="6" class="empty-cell">当前账号没有已登记 PC。</td></tr>{{end}}</tbody></table></div>
+      </section>
       {{end}}
-
       {{if eq .Section "sessions"}}
       <section class="portal-card"><div class="portal-card-heading"><div><p class="eyebrow">LIFECYCLE METADATA ONLY</p><h2>会话元数据</h2><p>仅包含会话标识、所属 PC、状态和时间，不读取终端正文。终端历史由在线的 Windows 主机保存和提供。</p></div><span class="count-pill">最近 {{len .Sessions}} 个</span></div><div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>会话引用</th><th>PC</th><th>状态</th><th>在线</th><th>创建时间</th><th>结束时间</th></tr></thead><tbody>{{range .Sessions}}<tr><td><strong>{{shortID .ID}}</strong></td><td>{{.PCName}}<small>{{shortID .PCID}}</small></td><td><span class="portal-state state-{{.State}}">{{.State}}</span></td><td>{{if .Online}}在线{{else}}离线{{end}}</td><td>{{formatTime .CreatedAt}}</td><td>{{if .EndedAt}}{{formatTime .EndedAt}}{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="6" class="empty-cell">当前账号没有会话记录。</td></tr>{{end}}</tbody></table></div></section>
       {{end}}
 
-      {{if eq .Section "privacy"}}
-      {{if .SensitiveActionsAvailable}}
-      <section class="portal-card danger-zone"><div class="portal-card-heading"><div><p class="eyebrow">ACCOUNT DELETION</p><h2>账号注销</h2><p>注销申请需要二次确认并进入 7 天冷静期。页面只显示状态；只有后台保留/删除流程真实完成后才会标记 COMPLETED。</p></div>{{if .AccountDeletion}}<span class="portal-state state-{{.AccountDeletion.Status}}">{{.AccountDeletion.Status}}</span>{{else if .PrivacyPreflight.Ready}}<span class="portal-state state-VALIDATED">可申请</span>{{else}}<span class="portal-state state-WARNING">存在阻塞项</span>{{end}}</div>
-        <dl class="portal-detail-grid privacy-preflight"><div><dt>活动设备</dt><dd>{{.PrivacyPreflight.ActiveDevices}}</dd></div><div><dt>活动会话</dt><dd>{{.PrivacyPreflight.LiveSessions}}</dd></div><div><dt>预检结果</dt><dd>{{if .PrivacyPreflight.Ready}}允许创建申请{{else}}请先结束活动连接{{end}}</dd></div></dl>
-        {{if .AccountDeletion}}<dl class="portal-detail-grid privacy-request-state"><div><dt>申请</dt><dd>{{shortID .AccountDeletion.ID}}</dd></div><div><dt>状态</dt><dd>{{.AccountDeletion.Status}}</dd></div><div><dt>申请时间</dt><dd>{{formatTime .AccountDeletion.RequestedAt}}</dd></div><div><dt>确认有效期</dt><dd>{{formatTime .AccountDeletion.ConfirmationExpiresAt}}</dd></div><div><dt>计划执行</dt><dd>{{formatOptionalPortalTime .AccountDeletion.ScheduledFor}}</dd></div><div><dt>处理完成</dt><dd>{{formatOptionalPortalTime .AccountDeletion.CompletedAt}}</dd></div></dl><div class="privacy-status-actions"><a class="button button-quiet" href="/account?section=privacy&deletion_id={{.AccountDeletion.ID}}">刷新注销状态</a></div>
-          {{if userPortalDeletionCanConfirm .AccountDeletion}}<form class="portal-form danger-confirm-form" action="/account/privacy/deletions/{{.AccountDeletion.ID}}/confirm" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey (printf "deletion-confirm:%s:%d" .AccountDeletion.ID .AccountDeletion.Version)}}"><label><span>再次输入“删除我的账号”</span><input name="confirmation" autocomplete="off" required></label><input type="hidden" name="reason" value="系统自动记录"><button class="button button-danger" type="submit">确认并进入 7 天冷静期</button></form>{{end}}
-          {{if userPortalDeletionCanCancel .AccountDeletion}}<form class="portal-form compact-form" action="/account/privacy/deletions/{{.AccountDeletion.ID}}/cancel" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey (printf "deletion-cancel:%s:%d" .AccountDeletion.ID .AccountDeletion.Version)}}"><input type="hidden" name="reason" value="系统自动记录"><button class="button button-quiet" type="submit">取消注销申请</button></form>{{end}}
-        {{else if and .PrivacyPreflight.Ready .PrivacyPreflight.RequestSupported}}<form class="portal-form danger-confirm-form" action="/account/privacy/deletions" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey "deletion-request"}}"><label><span>输入“删除我的账号”</span><input name="confirmation" autocomplete="off" required></label><input type="hidden" name="reason" value="系统自动记录"><button class="button button-danger" type="submit">创建注销申请</button></form>{{else}}<p class="portal-muted">请先结束活动会话和连接，再重新执行注销预检。</p>{{end}}
-      </section>
-      {{else}}<section class="portal-card"><div class="portal-empty-state"><strong>账号注销暂不可用</strong><span>当前服务端没有配置账号注销处理器；页面不会提供仅前端生效的假入口。</span></div></section>{{end}}
-      {{end}}
-
-      {{if eq .Section "security"}}
-      <section class="portal-card"><div class="portal-card-heading"><div><p class="eyebrow">SANITIZED AUDIT VIEW</p><h2>安全活动</h2><p>不展示自由文本元数据、Trace 或网络摘要。</p></div><span class="count-pill">最近 {{len .SecurityActivities}} 条</span></div><div class="portal-table-wrap"><table class="portal-table"><thead><tr><th>时间</th><th>操作</th><th>目标类型</th><th>结果</th></tr></thead><tbody>{{range .SecurityActivities}}<tr><td>{{formatTime .CreatedAt}}</td><td><strong>{{.Action}}</strong></td><td>{{.TargetType}}</td><td><span class="portal-state state-{{.Result}}">{{.Result}}</span></td></tr>{{else}}<tr><td colspan="4" class="empty-cell">当前账号还没有安全活动记录。</td></tr>{{end}}</tbody></table></div></section>
-      {{end}}
-
       {{if eq .Section "settings"}}
-      <section class="portal-card" aria-labelledby="profile-settings-title">
+      <section class="portal-card settings-page" aria-labelledby="profile-settings-title">
         <div class="portal-card-heading"><div><p class="eyebrow">PROFILE</p><h2 id="profile-settings-title">个人资料</h2><p>昵称用于展示；用户名创建后永久不可修改。</p></div><span class="portal-state state-ACTIVE">{{.RoleLabel}}</span></div>
         <dl class="portal-detail-grid">
           <div><dt>昵称</dt><dd>{{.Nickname}}</dd></div>
@@ -102,7 +81,7 @@
         <p class="portal-muted">修改昵称或邮箱不会改变用户 ID；新邮箱必须完成验证后才会生效。</p>
         {{if .ProfileChangeAvailable}}
         <div class="profile-settings-grid">
-          <form class="portal-form" action="/account/profile/nickname" method="post">
+          <form class="portal-form settings-inline-form" action="/account/profile/nickname" method="post">
             <input type="hidden" name="csrf" value="{{.CSRF}}">
             <label><span>修改昵称</span><input name="nickname" value="{{.Nickname}}" minlength="1" maxlength="64" required></label>
             <button class="button button-primary" type="submit">保存昵称</button>
@@ -113,26 +92,38 @@
             <label><span>新邮箱</span><input name="new_email" type="email" maxlength="320" required autocomplete="email"></label>
             <button class="button button-quiet" type="submit">发送验证代码</button>
           </form>
-          {{else}}<div class="portal-empty-state"><strong>邮箱修改暂不可用</strong><span>管理员需要先验证并启用服务邮箱；当前邮箱不会被未验证的地址替换。</span></div>{{end}}
+          {{else}}<div class="portal-empty-state profile-settings-unavailable"><strong>邮箱修改暂不可用</strong><span>管理员需要先验证并启用服务邮箱；当前邮箱不会被未验证的地址替换。</span></div>{{end}}
         </div>
         {{else}}<div class="portal-empty-state"><strong>身份资料同步暂不可用</strong><span>当前部署未配置受限的身份管理服务账号，页面不会提供仅前端生效的修改入口。</span></div>{{end}}
         {{if .EmailChallengeID}}
         <form class="portal-form email-verification-form" action="/account/profile/email" method="post">
           <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="verification_id" value="{{.EmailChallengeID}}"><input type="hidden" name="new_email" value="{{.PendingEmail}}">
           <div><strong>验证新邮箱 {{.PendingEmail}}</strong><p>验证码有效至 {{formatTime .EmailChallengeExpiresAt}}；验证成功前仍使用原邮箱登录。</p></div>
-          <label><span>6 位验证码</span><input name="email_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label>
-          <button class="button button-primary" type="submit">验证并更新邮箱</button>
+          <div class="settings-inline-controls">
+            <label><span>6 位验证码</span><input name="email_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label>
+            <button class="button button-primary" type="submit">验证并更新邮箱</button>
+          </div>
         </form>
         {{end}}
       </section>
-      <section class="portal-card" id="login-security" aria-labelledby="login-security-title">
+      <section class="portal-card settings-page" id="login-security" aria-labelledby="login-security-title">
         <div class="portal-card-heading"><div><p class="eyebrow">WEB LOGIN SECURITY</p><h2 id="login-security-title">登录与安全</h2><p>密码、Web 身份验证器和浏览器会话由身份服务安全处理，TermLink Server 不接触凭据 Secret。</p></div></div>
-        <div class="overview-shortcuts"><button type="button" data-identity-dialog="password">修改密码</button><button type="button" data-identity-dialog="mfa">绑定 Google 身份验证器</button><button type="button" data-identity-dialog="sessions">管理浏览器会话</button></div>
+        <div class="overview-shortcuts"><button type="button" data-identity-dialog="password">修改密码</button><button type="button" data-identity-dialog="mfa">绑定 Google 身份验证器</button></div>
         <p class="portal-muted">Web MFA 仅用于网页登录和管理中心，不要求 Android 或 Windows/PC 客户端输入动态验证码。</p>
       </section>
+      {{if .SensitiveActionsAvailable}}
+      <section class="portal-card danger-zone settings-account-deletion"><div class="portal-card-heading"><div><p class="eyebrow">ACCOUNT DELETION</p><h2>账号注销</h2><p>注销申请需要二次确认并进入 7 天冷静期。页面只显示状态；只有后台保留/删除流程真实完成后才会标记 COMPLETED。</p></div>{{if .AccountDeletion}}<span class="portal-state state-{{.AccountDeletion.Status}}">{{.AccountDeletion.Status}}</span>{{else if .PrivacyPreflight.Ready}}<span class="portal-state state-VALIDATED">可申请</span>{{else}}<span class="portal-state state-WARNING">存在阻塞项</span>{{end}}</div>
+        <dl class="portal-detail-grid privacy-preflight"><div><dt>活动设备</dt><dd>{{.PrivacyPreflight.ActiveDevices}}</dd></div><div><dt>活动会话</dt><dd>{{.PrivacyPreflight.LiveSessions}}</dd></div><div><dt>预检结果</dt><dd>{{if .PrivacyPreflight.Ready}}允许创建申请{{else}}请先结束活动连接{{end}}</dd></div></dl>
+        {{if .AccountDeletion}}<dl class="portal-detail-grid privacy-request-state"><div><dt>申请</dt><dd>{{shortID .AccountDeletion.ID}}</dd></div><div><dt>状态</dt><dd>{{.AccountDeletion.Status}}</dd></div><div><dt>申请时间</dt><dd>{{formatTime .AccountDeletion.RequestedAt}}</dd></div><div><dt>确认有效期</dt><dd>{{formatTime .AccountDeletion.ConfirmationExpiresAt}}</dd></div><div><dt>计划执行</dt><dd>{{formatOptionalPortalTime .AccountDeletion.ScheduledFor}}</dd></div><div><dt>处理完成</dt><dd>{{formatOptionalPortalTime .AccountDeletion.CompletedAt}}</dd></div></dl><div class="privacy-status-actions"><a class="button button-quiet" href="/account?section=settings&deletion_id={{.AccountDeletion.ID}}">刷新注销状态</a></div>
+          {{if userPortalDeletionCanConfirm .AccountDeletion}}<form class="portal-form danger-confirm-form" action="/account/privacy/deletions/{{.AccountDeletion.ID}}/confirm" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey (printf "deletion-confirm:%s:%d" .AccountDeletion.ID .AccountDeletion.Version)}}"><label><span>再次输入“删除我的账号”</span><input name="confirmation" autocomplete="off" required></label><input type="hidden" name="reason" value="系统自动记录"><button class="button button-danger" type="submit">确认并进入 7 天冷静期</button></form>{{end}}
+          {{if userPortalDeletionCanCancel .AccountDeletion}}<form class="portal-form compact-form" action="/account/privacy/deletions/{{.AccountDeletion.ID}}/cancel" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey (printf "deletion-cancel:%s:%d" .AccountDeletion.ID .AccountDeletion.Version)}}"><input type="hidden" name="reason" value="系统自动记录"><button class="button button-quiet" type="submit">取消注销申请</button></form>{{end}}
+        {{else if and .PrivacyPreflight.Ready .PrivacyPreflight.RequestSupported}}<form class="portal-form danger-confirm-form" action="/account/privacy/deletions" method="post"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{actionKey .IdempotencyKey "deletion-request"}}"><label><span>输入“删除我的账号”</span><input name="confirmation" autocomplete="off" required></label><input type="hidden" name="reason" value="系统自动记录"><button class="button button-danger" type="submit">创建注销申请</button></form>{{else}}<p class="portal-muted">请先结束活动会话和连接，再重新执行注销预检。</p>{{end}}
+      </section>
+      {{else}}<section class="portal-card settings-account-deletion"><div class="portal-empty-state"><strong>账号注销暂不可用</strong><span>当前服务端没有配置账号注销处理器；页面不会提供仅前端生效的假入口。</span></div></section>{{end}}
       {{end}}
     </div>
-  </main>
+    </main>
+  </div>
   {{if eq .Section "settings"}}
   <dialog class="identity-security-dialog" data-identity-dialog-root data-identity-url="{{.IdentityAccountURL}}" aria-labelledby="identity-security-dialog-title">
     <div class="identity-security-dialog-header"><div><p class="eyebrow">SECURE IDENTITY</p><h2 id="identity-security-dialog-title">登录与安全</h2><p data-identity-dialog-description>身份服务将在安全窗口中处理本次操作。</p></div><button class="identity-dialog-close" type="button" data-identity-dialog-close aria-label="关闭安全对话框">×</button></div>

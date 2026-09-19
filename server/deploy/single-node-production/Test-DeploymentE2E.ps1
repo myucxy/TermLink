@@ -108,6 +108,7 @@ try {
     Invoke-Docker -Arguments ($composeArguments + @(
         'up', '-d', '--wait', '--wait-timeout', '300', '--scale', 'server=1'
     )) | Out-Null
+    Invoke-Docker -Arguments ($composeArguments + @('rm', '--force', 'secrets-init')) | Out-Null
 
     $running = (Invoke-Docker -Arguments ($composeArguments + @('ps', '--services', '--filter', 'status=running'))).Output
     foreach ($service in @('postgres', 'server')) {
@@ -118,6 +119,9 @@ try {
     if ($running -contains 'edge' -or $running -contains 'keycloak' -or $running -contains 'valkey' -or
         $running -contains 'minio' -or $running -contains 'migrate') {
         throw 'E2E topology contains a retired service.'
+    }
+    if ($running -contains 'secrets-init') {
+        throw 'E2E topology left the one-shot secrets helper running.'
     }
 
     Wait-HttpReady -Uri "http://127.0.0.1:$httpPort/healthz" | Out-Null
@@ -133,7 +137,7 @@ try {
         'exec', '-T', 'postgres', 'psql', '-U', 'termlink', '-d', 'termlink',
         '-Atqc', 'SELECT MAX(version) FROM schema_migrations'
     ))).Output[-1].ToString().Trim()
-    if ($migration -ne '43') { throw "Unexpected migration version: $migration" }
+    if ($migration -ne '45') { throw "Unexpected migration version: $migration" }
     $identityAccountQuery = "SELECT COUNT(*) FROM identity_accounts WHERE username='admin' AND enabled=true AND " +
         "'SUPER_ADMIN'=ANY(realm_roles) AND 'TERMLINK_BOOTSTRAP_MANAGED_V1'=ANY(realm_roles)"
     $identityAccountCount = (Invoke-Docker -Arguments ($composeArguments + @(

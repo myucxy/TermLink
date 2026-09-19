@@ -119,10 +119,9 @@ func TestProcessFailureLogDoesNotFormatErrorOrUnknownCommand(t *testing.T) {
 
 func TestProcessFailureClassesAreStable(t *testing.T) {
 	tests := map[string]string{
-		"serve":                    "production_server_failed",
-		"migrate":                  "database_migration_failed",
-		"healthcheck":              "healthcheck_failed",
-		"identity-import-keycloak": "keycloak_identity_import_failed",
+		"serve":       "production_server_failed",
+		"migrate":     "database_migration_failed",
+		"healthcheck": "healthcheck_failed",
 	}
 	for command, errorClass := range tests {
 		t.Run(command, func(t *testing.T) {

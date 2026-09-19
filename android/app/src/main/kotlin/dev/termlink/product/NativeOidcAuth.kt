@@ -1,5 +1,6 @@
 package dev.termlink.product
 
+import dev.termlink.harness.BuildConfig
 import android.net.Uri
 import java.io.ByteArrayOutputStream
 import java.util.Base64
@@ -136,11 +137,19 @@ internal object OidcJwtClaims {
 internal object OidcEndpointPolicy {
     fun canonicalIssuer(raw: String): String = try {
         val uri = URI(raw.trim())
-        require(uri.scheme.equals("https", ignoreCase = true))
+        // Debug builds may target a local cleartext server end to end: relax
+        // the https requirement only for loopback/private-network issuers.
+        val httpAllowed = BuildConfig.DEBUG && isExplicitLocalTestUrl(raw)
+        if (httpAllowed) {
+            require(uri.scheme.equals("https", ignoreCase = true) || uri.scheme.equals("http", ignoreCase = true))
+        } else {
+            require(uri.scheme.equals("https", ignoreCase = true))
+        }
         require(uri.rawUserInfo == null && uri.rawQuery == null && uri.rawFragment == null)
         require(!uri.host.isNullOrBlank())
         val path = uri.rawPath.orEmpty().trimEnd('/')
-        URI("https", null, uri.host.lowercase(Locale.US), uri.port, if (path.isEmpty()) null else path, null, null)
+        val scheme = if (uri.scheme.equals("https", ignoreCase = true)) "https" else "http"
+        URI(scheme, null, uri.host.lowercase(Locale.US), uri.port, if (path.isEmpty()) null else path, null, null)
             .toString()
             .trimEnd('/')
     } catch (error: Exception) {
@@ -166,7 +175,14 @@ internal object OidcEndpointPolicy {
         val actual = try { URI(endpoint.trim()) } catch (error: Exception) {
             throw IllegalArgumentException("OIDC $name endpoint is invalid", error)
         }
-        require(actual.scheme.equals("https", ignoreCase = true)) { "OIDC $name endpoint must use HTTPS" }
+        val httpAllowed = BuildConfig.DEBUG && expected.scheme.equals("http", ignoreCase = true)
+        if (httpAllowed) {
+            require(actual.scheme.equals("https", ignoreCase = true) || actual.scheme.equals("http", ignoreCase = true)) {
+                "OIDC $name endpoint must use HTTP(S)"
+            }
+        } else {
+            require(actual.scheme.equals("https", ignoreCase = true)) { "OIDC $name endpoint must use HTTPS" }
+        }
         require(actual.rawUserInfo == null && actual.rawQuery == null && actual.rawFragment == null) {
             "OIDC $name endpoint cannot contain credentials, query, or fragment"
         }

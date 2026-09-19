@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/termlink/termlink/server/internal/auth"
+	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
@@ -51,6 +52,7 @@ type Hub struct {
 	started      bool
 	closed       bool
 	ready        atomic.Bool
+	presence     *presence.Registry
 	// A shared presence registration performs network I/O before the local
 	// peer map can be updated. Serialize only equal-device replacements so two
 	// concurrent WebSocket handshakes cannot commit generations to shared state
@@ -73,6 +75,7 @@ type signalPeer struct {
 	presence   DirectPresence
 	multipair  bool
 	directData bool
+	presenceID uuid.UUID
 }
 
 type signalClientHello struct {
@@ -183,6 +186,17 @@ func (h *Hub) openSharedCycle(ctx context.Context) (DirectMailboxSubscription, e
 
 func (h *Hub) Handler() http.Handler { return http.HandlerFunc(h.serveHTTP) }
 
+// SetPresence attaches the process-local online registry shared with the
+// authenticated realtime Relay.
+func (h *Hub) SetPresence(registry *presence.Registry) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.presence = registry
+	h.mu.Unlock()
+}
+
 func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	principal, ok := signalPrincipalFromContext(r.Context())
 	if !ok || h.tickets == nil {
@@ -222,7 +236,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	peer := &signalPeer{
 		hub: h, socket: socket, principal: principal,
-		send: make(chan []byte, signalQueueFrames), done: make(chan struct{}), windowAt: time.Now(),
+		send: make(chan []byte, signalQueueFrames), done: make(chan struct{}), windowAt: time.Now(), presenceID: uuid.New(),
 		multipair: slices.Contains(hello.Capabilities, "direct_transport_shadow_multipair_v2"),
 	}
 	peer.directData = h.tickets.DirectRoutingPermitted() &&
@@ -232,7 +246,21 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		closeSignalSocket(socket, websocket.CloseTryAgainLater, "transport signalling shutting down")
 		return
 	}
-	defer h.remove(peer)
+	defer func() {
+		h.remove(peer)
+		h.mu.Lock()
+		registry := h.presence
+		h.mu.Unlock()
+		if registry != nil {
+			registry.Remove(peer.presenceID)
+		}
+	}()
+	h.mu.Lock()
+	registry := h.presence
+	h.mu.Unlock()
+	if registry != nil {
+		registry.Register(peer.principal.UserID, peer.principal.Device.ID, peer.presenceID, peer.principal.Device.Type)
+	}
 	welcomeCapabilities := []string{"direct_transport_shadow_v1"}
 	if peer.multipair {
 		welcomeCapabilities = append(welcomeCapabilities, "direct_transport_shadow_multipair_v2")
@@ -253,7 +281,18 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = socket.SetReadDeadline(time.Now().Add(signalPongTimeout))
-	socket.SetPongHandler(func(string) error { return socket.SetReadDeadline(time.Now().Add(signalPongTimeout)) })
+	socket.SetPongHandler(func(string) error {
+		if err := socket.SetReadDeadline(time.Now().Add(signalPongTimeout)); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		registry := h.presence
+		h.mu.Unlock()
+		if registry != nil {
+			registry.Touch(peer.presenceID)
+		}
+		return nil
+	})
 	go peer.writeLoop()
 	peer.readLoop()
 }

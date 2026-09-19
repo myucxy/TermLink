@@ -83,7 +83,7 @@ func TestEmbeddedLoginTemplatePreservesTermLinkIdentityShell(t *testing.T) {
 	for _, expected := range []string{
 		`class="identity-titlebar"`, `class="identity-layout"`, `class="identity-context"`,
 		`class="identity-auth-pane"`, `/assets/identity.css?v=identity-v2`,
-		`/assets/theme-init.js?v=theme-sync-v1`, `/assets/theme.js?v=theme-sync-v1`,
+		`/assets/theme-init.js?v=theme-sync-v1`, `/assets/theme.js?v=theme-sync-v2`,
 		`TermLink Server · Healthy`, `Authorization Code + PKCE`, `href="/account"`,
 		`href="/register?continue=test"`, `name="termlink_csrf" value="test-csrf"`,
 		`name="username"`, `name="password"`,
@@ -209,6 +209,41 @@ func TestEmbeddedIdentityAuxiliaryPagesLoadSharedThemeRuntime(t *testing.T) {
 	for _, contract := range []string{`html[data-theme="dark"]`, `--bg:#f7f8fc`, `--bg:#0b0f14`} {
 		if !strings.Contains(identityCSS, contract) {
 			t.Fatalf("identity auxiliary stylesheet omitted %q", contract)
+		}
+	}
+}
+
+func TestEmbeddedIdentityAccountActionRendersOnlyRequestedSection(t *testing.T) {
+	for _, test := range []struct {
+		section string
+		want    string
+		omit    string
+	}{
+		{section: "password", want: `id="security-password"`, omit: `id="security-mfa"`},
+		{section: "mfa", want: `id="security-mfa"`, omit: `id="security-password"`},
+	} {
+		t.Run(test.section, func(t *testing.T) {
+			var output bytes.Buffer
+			if err := accountTemplate.Execute(&output, accountPageData{Section: test.section}); err != nil {
+				t.Fatal(err)
+			}
+			body := output.String()
+			if !strings.Contains(body, test.want) || strings.Contains(body, test.omit) {
+				t.Fatalf("section %q rendered wrong account sections", test.section)
+			}
+		})
+	}
+}
+
+func TestEmbeddedIdentityAccountNavigationLeavesIframe(t *testing.T) {
+	var output bytes.Buffer
+	if err := accountTemplate.Execute(&output, accountPageData{ReturnURL: "/account", LogoutURL: "/logout"}); err != nil {
+		t.Fatal(err)
+	}
+	body := output.String()
+	for _, link := range []string{`href="/account" target="_top"`, `href="/logout" target="_top"`} {
+		if !strings.Contains(body, link) {
+			t.Fatalf("identity navigation missing top-level target %q", link)
 		}
 	}
 }

@@ -54,7 +54,6 @@ func TestUserPortalDTOsExposeOnlyContractFields(t *testing.T) {
 	assertFields(t, UserPortalDevice{}, "ID", "Type", "Name", "TrustState", "Online", "LastSeenAt", "CreatedAt", "RevokedAt")
 	assertFields(t, UserPortalPC{}, "ID", "DeviceID", "Name", "AgentVersion", "Platform", "Architecture", "PlatformVersion", "RemoteRoutingEnabled", "Online", "LastSeenAt", "CreatedAt")
 	assertFields(t, UserPortalSession{}, "ID", "PCID", "PCName", "State", "Online", "CreatedAt", "EndedAt")
-	assertFields(t, UserPortalSecurityActivity{}, "ID", "Action", "TargetType", "Result", "CreatedAt")
 }
 
 func TestUserPortalSQLIsAccountScopedAndOmitsSensitiveColumns(t *testing.T) {
@@ -64,7 +63,6 @@ func TestUserPortalSQLIsAccountScopedAndOmitsSensitiveColumns(t *testing.T) {
 		"devices":  userPortalDevicesSQL,
 		"pcs":      userPortalPCsSQL,
 		"sessions": userPortalSessionsSQL,
-		"activity": userPortalSecurityActivitySQL,
 	}
 	for name, query := range queries {
 		query := strings.ToLower(query)
@@ -105,10 +103,6 @@ func TestUserPortalListSQLUsesBoundedStableKeysetOrdering(t *testing.T) {
 				t.Fatalf("query is not a bounded created_at/UUID keyset query: %s", query)
 			}
 		})
-	}
-	activity := strings.ToLower(userPortalSecurityActivitySQL)
-	if !strings.Contains(activity, "audit.id<$2") || !strings.Contains(activity, "order by audit.id desc") || !strings.Contains(activity, "limit $3") {
-		t.Fatalf("activity query is not a bounded ID keyset query: %s", activity)
 	}
 }
 

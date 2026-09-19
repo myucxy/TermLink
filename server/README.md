@@ -1,107 +1,102 @@
 # TermLink Server
 
-当前 `server` 仅包含阶段 0/1 的 Docker 测试服务。它从仓库内固定、非敏感的
-Golden Stream Bundle 构造两条彼此隔离的 WebSocket 测试路径：
+TermLink Server 的生产部署只保留两个容器：
 
 ```text
-LAN Replay V1（只读） → Android → TerminalEngine
-Phase 1 Test Session V1（临时双向） ↔ Android RemoteTerminalSession → Termux View
+外部 HTTPS 反向代理
+        |
+TermLink Server
+        |
+PostgreSQL
 ```
 
-第一条路径继续使用冻结且不变的 [LAN Replay V1](../protocol/test-vectors/LAN_REPLAY_V1.md)。
-第二条路径使用独立 `TLT1` Magic，专门验证累计 ACK、断线续传、输入 accepted、测试租约、
-慢消费者 Flow Control 和 History Gap；规范见
-[Phase 1 Test Session V1](../protocol/test-vectors/PHASE1_TEST_SESSION_V1.md)。
+Server 内置以下能力：
 
-整个服务都不是生产 Relay：它使用明文 `ws://`，不连接真实 Shell，也没有账号、设备批准、
-生产租约、E2EE、可移植 Snapshot 或持久历史。Phase 1 入口只会接受 Harness 主动发送的
-测试输入，`InputAccepted` 也只表示测试服务收到了匹配的 UUID。
+- OIDC 登录、注册、邀请码、邮箱验证码和可选人机验证；
+- Android、Windows Agent、PC 和会话管理；
+- Relay 实时转发、ACK、租约和多端协同；
+- 单节点 Direct/NAT 信令；
+- 文件传输任务和 Windows Agent 升级任务；
+- 个人中心、管理后台、备份恢复和健康检查。
 
-## 启动局域网测试容器
+Server 不执行 Windows 命令，不创建 Windows ConPTY，不保存完整终端历史，
+也不保存文件对象。命令和终端历史由 Windows Agent 负责，文件字节在 Android
+与 Windows 之间通过实时链路传输。
 
-在仓库根目录执行：
+## 部署
 
-```powershell
-docker compose -f server\compose\lan-test.compose.yml up --build -d
-docker compose -f server\compose\lan-test.compose.yml ps
+直接使用仓库内的完整 Compose 文件，不需要 `.env` 文件。将部署参数
+作为本次 Docker 命令的环境变量传入：
+
+```bash
+TERMLINK_IMAGE='docker.io/myucxy/termlink:TAG@sha256:DIGEST' \
+TERMLINK_PUBLIC_URL='https://termlink.example.com' \
+TERMLINK_POSTGRES_PASSWORD='URL_SAFE_DATABASE_PASSWORD' \
+TERMLINK_HTTP_PORT=8080 \
+docker compose -f server/compose.yml up -d --wait
 ```
 
-默认配置：
+首次启动时 Server 会在数据库中生成并保存运行时主密钥，内置身份服务会创建
+`admin` 用户。初始密码在首次启动时随机生成并仅打印一次到启动日志（检索
+`generated one-time initial administrator password`）；也可通过
+`TERMLINK_INITIAL_ADMIN_PASSWORD_FILE` 显式注入，不存在公开的固定默认密码。
+首次部署的注册策略默认为关闭，管理员可在“注册与邀请码”页面按需开启或改为仅邀请码。
+数据库密码通过 `TERMLINK_POSTGRES_PASSWORD` 传入；该值只能使用 URL 安全字符，
+并应通过受保护的部署环境注入，避免提交到版本库。
 
-- HTTP/WebSocket 端口：`8080`，绑定所有本机接口；
-- 测试令牌：`termlink-lan-test`；
-- 测试用例：`smoke-powershell-v1`；
-- 健康检查：`GET /healthz`；
-- 只读 WebSocket：`GET /v1/test/replay/<case-name>`，使用 Bearer Token；
-- 临时双向 WebSocket：
-  `GET /v1/test/session/<case-name>?scenario=<scenario>`，使用相同 Bearer Token。
+TermLink 不负责安装 TLS 反向代理。需要在宿主机或云平台配置 Nginx、Traefik、
+Lucky 或其他支持 WebSocket 的 HTTPS 入口，并将请求转发到 Server。
 
-双向入口的 `scenario` 可取 `steady`、`disconnect-once`、`history-gap`、
-`slow-consumer` 或 `exited`。
+## 必需配置
 
-若要避免使用默认测试令牌，应在第一次 `up` 前设置至少 12 个字符的值，并在 Android
-Harness 输入同一个值：
+直接使用 `server/compose.yml` 时只需要在本次命令中传入：
 
-```powershell
-$env:TERMLINK_TEST_TOKEN = 'replace-with-a-local-test-token'
-docker compose -f server\compose\lan-test.compose.yml up --build -d
+```text
+TERMLINK_IMAGE
+TERMLINK_PUBLIC_URL
+TERMLINK_POSTGRES_PASSWORD
 ```
 
-## 验证
+PostgreSQL 数据目录必须使用持久化卷。Server 首次启动会自动迁移数据库，并将
+Token 签名主密钥及其派生密钥的根密钥保存到 PostgreSQL；不需要 `.env`、Secret
+文件、`secrets-init`、独立 migrate 容器、Keycloak、Valkey、MinIO 或 Caddy。
 
-先查找 PC 当前 Wi-Fi 或以太网 IPv4 地址，再从 PC 验证两个入口：
+## 备份（compose 路径最小方案）
 
-```powershell
-ipconfig
-Invoke-RestMethod http://127.0.0.1:8080/healthz
-Invoke-RestMethod http://<PC-LAN-IP>:8080/healthz
+生产/长期运行建议使用 `server/deploy/single-node-production/termlink-deploy backup`
+（age 加密归档 + SHA-256 清单 + 受保护的恢复路径）。compose 直用路径的最小等价命令：
+
+```bash
+docker compose -f server/compose.yml exec postgres   pg_dump -U termlink -d termlink > backup-$(date +%Y%m%d).sql
 ```
 
-预期响应：
+恢复：`cat backup-YYYYMMDD.sql | docker compose -f server/compose.yml exec -T postgres   psql -U termlink -d termlink`。请定期演练恢复并把备份送到非本机存储；
+`server/ops/Backup-TermLink.ps1` / `Restore-TermLink.ps1` 面向已淘汰的旧多容器栈，勿用。
 
-```json
-{"status":"ok","mode":"lan-replay-test"}
+## 健康检查
+
+```text
+GET /healthz   进程存活检查
+GET /readyz    PostgreSQL 和运行时依赖检查
 ```
 
-`mode` 是为既有 LAN Replay 自动化保留的兼容健康标识，不是当前路由能力清单。
+`/metrics` 只有在显式开启内部指标监听时才提供，不属于最小部署要求。
 
-手机需要与 PC 位于同一可互访局域网。先用手机浏览器打开
-`http://<PC-LAN-IP>:8080/healthz`；只有该地址可访问后，才继续测试 Android WebSocket。
+## 生产边界
 
-在 API 36 模拟器上验证完整 Android 双向路径：
+| 内容 | 负责方 |
+|---|---|
+| 账号和 Token | TermLink Server 内置身份服务 |
+| 设备、PC、会话元数据 | TermLink Server + PostgreSQL |
+| 命令执行和 Windows ConPTY | Windows Agent |
+| 终端历史 | 在线 Windows Agent |
+| 实时消息路由 | TermLink Server Relay |
+| 文件字节 | Android 与 Windows Agent |
+| 文件任务、租约和权限 | TermLink Server + PostgreSQL |
+| HTTPS 证书和反向代理 | 宿主机或云平台 |
 
-```powershell
-cd android
-.\Validate-Phase1RelayEmulator.ps1
-```
+## 测试和验收
 
-脚本使用 `ws://10.0.2.2:8080`，验证一次断线后从 ACK 续传、取得测试租约后的输入
-accepted、明确的 `5..6` History Gap、exit 17，以及 0 crash/ANR。机器可读证据写入
-`docs/validation/phase1-android-relay-emulator.json`。
-
-## 安全边界
-
-- `ws://` 和默认令牌只适合可信局域网内的非敏感固定测试流，禁止映射到公网；
-- LAN Replay 路由保持只读；Phase 1 路由只接收主动测试输入，不得输入密钥、真实命令或
-  其他敏感内容；Bundle 名称受限，浏览器 Origin 请求被拒绝；
-- 容器以非 root 用户运行，根文件系统只读，并丢弃全部 Linux capabilities；
-- Compose 不会修改 Windows 防火墙。如果手机访问失败，先检查当前 IP、同一 Wi-Fi、
-  访客网络或 AP 客户端隔离；需要新增防火墙规则时必须单独评估和授权。
-
-结束测试：
-
-```powershell
-docker compose -f server\compose\lan-test.compose.yml down
-```
-
-## Go 检查
-
-```powershell
-cd server
-D:\Dev\Env\Go\bin\go.exe test ./...
-D:\Dev\Env\Go\bin\go.exe vet ./...
-.\Validate-Phase1TestRelay.ps1
-```
-
-验证脚本会生成 `docs/validation/phase1-test-relay.json`，并确认现有 LAN Replay 测试仍然
-通过。当前实现没有把临时帧格式标记为生产 Protobuf，也没有改变 LAN Replay V1。
+LAN Replay、Phase 1、Keycloak 验收栈、Valkey 集成栈和监控栈属于开发验证内容，
+不属于生产部署。相关文件应从生产部署文档和发布包中排除；需要运行测试时，
+请使用仓库的 `technical-validation` 文档和 CI 流程。

@@ -272,6 +272,10 @@ func (p *Provider) authorizeIdentityForm(w http.ResponseWriter, r *http.Request)
 		http.Redirect(w, r, "/login?return_to=/account/identity", http.StatusSeeOther)
 		return browserSession{}, Account{}, false
 	}
+	if session.SetupRequired && !strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/account/password/change") {
+		http.Redirect(w, r, "/realms/termlink/account/password", http.StatusSeeOther)
+		return browserSession{}, Account{}, false
+	}
 	return session, account, true
 }
 
@@ -281,14 +285,14 @@ func (p *Provider) authenticatedBrowserAccount(r *http.Request) (browserSession,
 		return browserSession{}, Account{}, err
 	}
 	account, err := p.accounts.LoadAccount(r.Context(), session.Subject)
-	if err != nil || !account.Enabled || account.PasswordResetRequired || account.AuthEpoch != session.AuthEpoch {
+	if err != nil || !account.Enabled || account.AuthEpoch != session.AuthEpoch || (account.PasswordResetRequired && !session.SetupRequired) || (!account.PasswordResetRequired && session.SetupRequired) {
 		return browserSession{}, Account{}, ErrInvalidCredentials
 	}
 	return session, account, nil
 }
 
 func (p *Provider) renderAccountPage(w http.ResponseWriter, r *http.Request, message, formError string, status int) {
-	_, account, err := p.authenticatedBrowserAccount(r)
+	session, account, err := p.authenticatedBrowserAccount(r)
 	if err != nil {
 		p.clearBrowserSession(w)
 		http.Redirect(w, r, "/login?return_to=/account/identity", http.StatusSeeOther)
@@ -304,7 +308,7 @@ func (p *Provider) renderAccountPage(w http.ResponseWriter, r *http.Request, mes
 		message = "动态验证码已停用。 / Authenticator disabled."
 	}
 	if candidate := strings.TrimSpace(r.URL.Query().Get("referrer_uri")); candidate != "" {
-		if parsed, parseErr := url.Parse(candidate); parseErr == nil && sameIdentityOrigin(parsed, p.publicOrigin) && parsed.User == nil && parsed.Fragment == "" {
+		if parsed, parseErr := url.Parse(candidate); parseErr == nil && (sameIdentityOrigin(parsed, p.publicOrigin) || originUsesRequestHost(parsed.String(), r)) && parsed.User == nil && parsed.Fragment == "" {
 			returnURL = parsed.String()
 		}
 	}
@@ -313,6 +317,7 @@ func (p *Provider) renderAccountPage(w http.ResponseWriter, r *http.Request, mes
 	w.WriteHeader(status)
 	_ = accountTemplate.Execute(w, accountPageData{
 		Username: account.Username, Nickname: account.Nickname, Email: account.Email, MFA: account.TOTPConfigured,
+		Section: identityAccountSection(r), PasswordChangeRequired: session.SetupRequired,
 		ReturnURL: returnURL, LogoutURL: "/realms/termlink/protocol/openid-connect/logout", CSRF: csrf, Error: formError, Message: message,
 	})
 }
@@ -387,7 +392,7 @@ func (p *Provider) trustedIdentityFormOrigin(r *http.Request) bool {
 		candidate = strings.TrimSpace(r.Referer())
 	}
 	parsed, err := url.Parse(candidate)
-	if err == nil && parsed.User == nil && sameIdentityOrigin(parsed, p.publicOrigin) {
+	if err == nil && parsed.User == nil && (sameIdentityOrigin(parsed, p.publicOrigin) || originUsesRequestHost(parsed.String(), r)) {
 		return true
 	}
 	// A browser using a privacy-preserving referrer policy can serialize a
@@ -401,7 +406,73 @@ func (p *Provider) trustedIdentityFormOrigin(r *http.Request) bool {
 
 func (p *Provider) identityRequestUsesPublicHost(r *http.Request) bool {
 	expected, err := url.Parse(p.publicOrigin)
-	return err == nil && expected.Host != "" && strings.EqualFold(strings.TrimSpace(r.Host), expected.Host)
+	if err != nil || expected.Host == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Host), expected.Host) {
+		return true
+	}
+	host, ok := forwardedRequestHost(r)
+	return ok && strings.EqualFold(host, expected.Host)
+}
+
+func requestHTTPSOrigin(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	host := strings.TrimSpace(r.Host)
+	if forwarded, ok := forwardedRequestHost(r); ok {
+		host = forwarded
+	}
+	if host == "" || strings.ContainsAny(host, " /\\\t\r\n@") {
+		return "", false
+	}
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS == nil {
+			return "", false
+		}
+		proto = "https"
+	}
+	if !strings.EqualFold(proto, "https") {
+		return "", false
+	}
+	return callbackOrigin("https://" + host)
+}
+
+func callbackOrigin(raw string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		strings.ContainsAny(parsed.Host, " /\\\t\r\n@") {
+		return "", false
+	}
+	return "https://" + parsed.Host, true
+}
+
+func originUsesRequestHost(value string, r *http.Request) bool {
+	origin, err := url.Parse(value)
+	if err != nil || origin.Scheme != "https" || origin.Host == "" || origin.User != nil ||
+		(origin.Path != "" && origin.Path != "/") || origin.RawPath != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return false
+	}
+	if strings.EqualFold(origin.Host, strings.TrimSpace(r.Host)) {
+		return true
+	}
+	host, ok := forwardedRequestHost(r)
+	return ok && strings.EqualFold(origin.Host, host)
+}
+
+func forwardedRequestHost(r *http.Request) (string, bool) {
+	values := r.Header.Values("X-Forwarded-Host")
+	if len(values) != 1 || strings.Contains(values[0], ",") {
+		return "", false
+	}
+	host := strings.TrimSpace(values[0])
+	if host == "" || strings.ContainsAny(host, " /\\\t\r\n@") {
+		return "", false
+	}
+	return host, true
 }
 
 func (p *Provider) clearIdentityFormCSRF(w http.ResponseWriter) {

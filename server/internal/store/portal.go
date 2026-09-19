@@ -191,6 +191,7 @@ type PortalConnection struct {
 	RunningSessions int
 	LastOutputSeq   int64
 	LastSeenAt      *time.Time
+	Online          bool
 }
 
 type PortalAdminDashboard struct {

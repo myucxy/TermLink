@@ -65,8 +65,7 @@ loopback 回调、Android 内嵌登录、注册与邀请码、密码重置、MFA
 读取、终端会话和文件传输。Compose 展开结果应只有一次性
 `runtime-secrets-init`、`postgres` 与 `server`；初始化任务移除后只保留后两项。
 
-## 旧数据导入工具
+## 旧数据导入
 
-仓库暂时保留 `identity-import-keycloak` 作为离线兼容工具，但它不参与运行时，也
-不会在内嵌 Compose 中创建服务、卷、secret、健康检查或网络依赖。导入账号不含
-旧密码与 MFA，必须先通过密码重置完成身份接管。全新部署不需要执行该工具。
+当前版本不提供 Keycloak 账号导入。请使用全新单节点数据目录，并通过内置身份
+初始化管理员账号；旧 Keycloak 数据迁移不属于运行时支持范围。

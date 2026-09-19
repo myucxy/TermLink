@@ -383,6 +383,7 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
   margin: 28px 0 0;
   color: var(--text-2);
   font-size: 18px;
+  overflow-wrap: anywhere;
 }
 
 .hero-actions {
@@ -417,10 +418,11 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
 
 .terminal-card {
   position: absolute;
+  min-width: 0;
   z-index: 1;
   top: 118px;
-  right: -8%;
-  width: 61%;
+  right: 0;
+  width: 52%;
   overflow: hidden;
   border: 1px solid #303849;
   border-radius: 16px;
@@ -482,6 +484,7 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
 .terminal-body p {
   margin: 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .terminal-body .muted { color: #697487; }
@@ -920,6 +923,18 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
     padding-block: 14px;
   }
 
+  .home-body .site-header-actions {
+    width: auto;
+    order: initial;
+    min-width: 0;
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+
+  .home-body .site-header-actions > a {
+    flex: 0 0 auto;
+  }
+
   .brand small { display: none; }
   .site-header-actions { width: 100%; order: 3; }
   .site-header-actions > a { min-width: 0; flex: 1 1 90px; padding-inline: 10px; }
@@ -929,6 +944,7 @@ html[data-theme="dark"] .theme-icon-sun { display: inline; }
   .hero h1 { font-size: 48px; }
   .hero-kicker { font-size: 30px; }
   .hero-lead { font-size: 16px; }
+  .hero-actions .text-link { flex-basis: 100%; }
   .terminal-card {
     position: relative;
     top: auto;

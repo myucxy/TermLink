@@ -827,6 +827,12 @@ class ProductActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The terminal renders remote shell content (tokens, keys, source);
+        // keep it out of system screenshots, recents thumbnails and recordings.
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
         repositoryOwner = ViewModelProvider(
             this,
             ProductRepositoryViewModel.Factory(applicationContext),

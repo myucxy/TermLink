@@ -28,11 +28,6 @@ type UserPortalPageRequest struct {
 	Before *UserPortalUUIDCursor `json:"before,omitempty"`
 }
 
-type UserPortalAuditPageRequest struct {
-	Limit    int   `json:"limit"`
-	BeforeID int64 `json:"before_id,omitempty"`
-}
-
 type UserPortalAccountOverview struct {
 	ID             uuid.UUID `json:"id"`
 	Role           Role      `json:"role"`
@@ -83,16 +78,6 @@ type UserPortalSession struct {
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
 }
 
-// UserPortalSecurityActivity excludes free-form audit metadata, trace data,
-// network hashes, and external transaction references.
-type UserPortalSecurityActivity struct {
-	ID         int64     `json:"id"`
-	Action     string    `json:"action"`
-	TargetType string    `json:"target_type"`
-	Result     string    `json:"result"`
-	CreatedAt  time.Time `json:"created_at"`
-}
-
 const userPortalAccountOverviewSQL = `
 	SELECT account.id,account.role,account.status,account.created_at,
 	       (SELECT count(*) FROM devices d WHERE d.user_id=account.id AND d.device_type='ANDROID'),
@@ -112,7 +97,7 @@ const userPortalAccountOverviewSQL = `
 const userPortalDevicesSQL = `
 	SELECT device.id,device.device_type,device.name,device.trust_state,
 	       coalesce(device.last_seen_at>now()-($4 * interval '1 second'),false),
-	       device.last_seen_at,device.created_at,device.revoked_at
+	       device.last_seen_at,device.created_at,device.revoked_at,device.disabled_at
 	FROM devices device
 	JOIN users account ON account.id=device.user_id AND account.id=$1 AND account.status='ACTIVE'
 	WHERE device.user_id=$1 AND device.device_type IN ('ANDROID','WINDOWS_PC','PC_AGENT')
@@ -121,16 +106,18 @@ const userPortalDevicesSQL = `
 	LIMIT $5`
 
 const userPortalPCsSQL = `
-	SELECT pc.id,pc.device_id,pc.name,pc.agent_version,pc.platform,pc.architecture,
-	       pc.platform_version,pc.remote_routing_enabled,
-	       coalesce(pc.last_seen_at>now()-($4 * interval '1 second'),false),
-	       pc.last_seen_at,pc.created_at
-	FROM pcs pc
-	JOIN users account ON account.id=pc.owner_user_id AND account.id=$1 AND account.status='ACTIVE'
-	JOIN devices device ON device.id=pc.device_id AND device.user_id=$1
-	WHERE pc.owner_user_id=$1
-	  AND ($2::timestamptz IS NULL OR (pc.created_at,pc.id)<($2::timestamptz,$3::uuid))
-	ORDER BY pc.created_at DESC,pc.id DESC
+	SELECT coalesce(pc.id,device.id),device.id,coalesce(pc.name,device.name),
+	       coalesce(pc.agent_version,'未上报'),coalesce(pc.platform,'unknown'),
+	       coalesce(pc.architecture,'unknown'),coalesce(pc.platform_version,'未上报'),
+	       coalesce(pc.remote_routing_enabled,true),
+	       coalesce(coalesce(pc.last_seen_at,device.last_seen_at)>now()-($4 * interval '1 second'),false),
+	       coalesce(pc.last_seen_at,device.last_seen_at),coalesce(pc.created_at,device.created_at)
+	FROM devices device
+	JOIN users account ON account.id=device.user_id AND account.id=$1 AND account.status='ACTIVE'
+	LEFT JOIN pcs pc ON pc.device_id=device.id AND pc.owner_user_id=$1
+	WHERE device.user_id=$1 AND device.device_type IN ('WINDOWS_PC','PC_AGENT')
+	  AND ($2::timestamptz IS NULL OR (coalesce(pc.created_at,device.created_at),coalesce(pc.id,device.id))<($2::timestamptz,$3::uuid))
+	ORDER BY coalesce(pc.created_at,device.created_at) DESC,coalesce(pc.id,device.id) DESC
 	LIMIT $5`
 
 const userPortalSessionsSQL = `
@@ -147,14 +134,6 @@ const userPortalSessionsSQL = `
 	  AND ($2::timestamptz IS NULL OR (session.created_at,session.id)<($2::timestamptz,$3::uuid))
 	ORDER BY session.created_at DESC,session.id DESC
 	LIMIT $5`
-
-const userPortalSecurityActivitySQL = `
-	SELECT audit.id,audit.action,audit.target_type,audit.result,audit.created_at
-	FROM audit_events audit
-	JOIN users account ON account.id=audit.user_id AND account.id=$1 AND account.status='ACTIVE'
-	WHERE audit.user_id=$1 AND ($2::bigint=0 OR audit.id<$2)
-	ORDER BY audit.id DESC
-	LIMIT $3`
 
 func normalizeUserPortalLimit(limit int) int {
 	if limit < 1 {
@@ -225,9 +204,13 @@ func (s *Postgres) ListUserPortalDevices(ctx context.Context, accountID uuid.UUI
 	result := make([]UserPortalDevice, 0, limit)
 	for rows.Next() {
 		var item UserPortalDevice
+		var disabledAt *time.Time
 		if err := rows.Scan(&item.ID, &item.Type, &item.Name, &item.TrustState, &item.Online,
-			&item.LastSeenAt, &item.CreatedAt, &item.RevokedAt); err != nil {
+			&item.LastSeenAt, &item.CreatedAt, &item.RevokedAt, &disabledAt); err != nil {
 			return nil, err
+		}
+		if disabledAt != nil {
+			item.TrustState = "DISABLED"
 		}
 		result = append(result, item)
 	}
@@ -278,30 +261,6 @@ func (s *Postgres) ListUserPortalSessions(ctx context.Context, accountID uuid.UU
 		var item UserPortalSession
 		if err := rows.Scan(&item.ID, &item.PCID, &item.PCName, &item.State, &item.Online,
 			&item.CreatedAt, &item.EndedAt); err != nil {
-			return nil, err
-		}
-		result = append(result, item)
-	}
-	return result, rows.Err()
-}
-
-func (s *Postgres) ListUserPortalSecurityActivity(ctx context.Context, accountID uuid.UUID, request UserPortalAuditPageRequest) ([]UserPortalSecurityActivity, error) {
-	if request.BeforeID < 0 {
-		return nil, ErrInvalidUserPortalPage
-	}
-	if err := s.requireUserPortalAccount(ctx, accountID); err != nil {
-		return nil, err
-	}
-	limit := normalizeUserPortalLimit(request.Limit)
-	rows, err := s.Pool.Query(ctx, userPortalSecurityActivitySQL, accountID, request.BeforeID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make([]UserPortalSecurityActivity, 0, limit)
-	for rows.Next() {
-		var item UserPortalSecurityActivity
-		if err := rows.Scan(&item.ID, &item.Action, &item.TargetType, &item.Result, &item.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, item)

@@ -1,0 +1,2 @@
+-- The previous policy is intentionally not restored automatically. An
+-- administrator can select the desired registration mode in the admin page.

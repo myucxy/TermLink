@@ -440,96 +440,6 @@ func TestEmbeddedAccountSecurityLifecycle(t *testing.T) {
 	}
 }
 
-func TestKeycloakImportPreservesSubjectAndNeverImportsCredentials(t *testing.T) {
-	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TERMLINK_INTEGRATION_DATABASE_URL is required for embedded identity integration tests")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	pool, cleanup := newIdentityTestPool(t, ctx, databaseURL)
-	defer cleanup()
-
-	if _, err := ImportKeycloakRealm(ctx, pool, strings.NewReader(`{"realm":"termlink"}`), true); err == nil || !strings.Contains(err.Error(), "--users realm_file") {
-		t.Fatalf("realm export without embedded users = %v", err)
-	}
-	subject := uuid.New()
-	export := keycloakExportJSON(t, subject, "Imported User")
-	result, err := ImportKeycloakRealm(ctx, pool, strings.NewReader(export), true)
-	if err != nil || !result.DryRun || result.Imported != 1 || result.SkippedServiceAccounts != 1 {
-		t.Fatalf("dry-run import = %#v, %v", result, err)
-	}
-	var count int
-	if err = pool.QueryRow(ctx, `SELECT count(*) FROM identity_accounts`).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("dry-run persisted %d accounts: %v", count, err)
-	}
-	result, err = ImportKeycloakRealm(ctx, pool, strings.NewReader(export), false)
-	if err != nil || result.Imported != 1 {
-		t.Fatalf("committed import = %#v, %v", result, err)
-	}
-	store, err := NewAccountStore(pool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	account, err := store.LoadAccount(ctx, subject.String())
-	if err != nil || account.Subject != subject || account.Nickname != "Imported User" ||
-		!account.PasswordResetRequired || len(account.RealmRoles) != 2 || account.RealmRoles[0] != "ADMIN" {
-		t.Fatalf("imported account = %#v, %v", account, err)
-	}
-	provider, err := New(ctx, Config{
-		Issuer: "https://identity.example.test/realms/termlink", Pool: pool,
-		HMACSecret: make([]byte, 64), KeyEncryptionKey: bytesOf(0x62, 32),
-		AndroidClientID: "termlink-android", AndroidRedirectURI: "dev.termlink:/oauth2redirect",
-		WindowsClientID: "termlink-windows", WindowsRedirectURI: "http://127.0.0.1/oauth2/callback",
-		WebClientID: "termlink-web", WebRedirectURI: "https://identity.example.test/auth/callback",
-		StepUpClientID: "termlink-web-step-up", AllowedParties: []string{"termlink-android", "termlink-windows"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertTokenRejected(t, provider.Handler(), url.Values{
-		"grant_type": {"password"}, "client_id": {"termlink-android"},
-		"username": {"imported-user"}, "password": {"must-not-be-imported"},
-	})
-	if _, err = pool.Exec(ctx, `UPDATE identity_accounts SET email_verified=false WHERE subject=$1`, subject); err != nil {
-		t.Fatal(err)
-	}
-	resetEmail, resetToken, deliver, err := store.BeginPasswordReset(ctx, "imported-user")
-	if err != nil || !deliver || resetEmail != "Imported@example.test" || resetToken == "" {
-		t.Fatalf("migrated unverified account reset = %q, token=%t, deliver=%t, %v", resetEmail, resetToken != "", deliver, err)
-	}
-	newPassword := "New embedded password 42!"
-	if err = store.CompletePasswordReset(ctx, resetToken, newPassword, newPassword); err != nil {
-		t.Fatal(err)
-	}
-	account, err = store.LoadAccount(ctx, subject.String())
-	if err != nil || !account.EmailVerified || account.PasswordResetRequired {
-		t.Fatalf("migrated account after password reset = %#v, %v", account, err)
-	}
-	beforeProfileUpdate := requestToken(t, provider.Handler(), url.Values{
-		"grant_type": {"password"}, "client_id": {"termlink-android"},
-		"username": {"imported-user"}, "password": {newPassword},
-	})
-	updatedExport := keycloakExportJSON(t, subject, "Updated Imported User")
-	if _, err = ImportKeycloakRealm(ctx, pool, strings.NewReader(updatedExport), false); err != nil {
-		t.Fatal(err)
-	}
-	account, err = store.LoadAccount(ctx, subject.String())
-	if err != nil || account.Nickname != "Updated Imported User" || account.PasswordResetRequired {
-		t.Fatalf("re-imported account = %#v, %v", account, err)
-	}
-	if authenticated, authenticateErr := store.Authenticate(ctx, "imported-user", newPassword); authenticateErr != nil || authenticated != subject.String() {
-		t.Fatalf("preserved embedded password authentication = %q, %v", authenticated, authenticateErr)
-	}
-	if _, err = provider.TokenVerifier().Verify(ctx, beforeProfileUpdate.AccessToken); !errors.Is(err, auth.ErrUnauthenticated) {
-		t.Fatalf("access token survived imported profile update: %v", err)
-	}
-	assertTokenRejected(t, provider.Handler(), url.Values{
-		"grant_type": {"refresh_token"}, "client_id": {"termlink-android"},
-		"refresh_token": {beforeProfileUpdate.RefreshToken},
-	})
-}
-
 func TestEmbeddedSigningKeyRotationKeepsOverlapVerifiable(t *testing.T) {
 	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
 	if databaseURL == "" {
@@ -685,26 +595,6 @@ func accessTokenKeyID(t *testing.T, rawToken string) string {
 		t.Fatalf("access token header = %s, %v", header, err)
 	}
 	return value.KeyID
-}
-
-func keycloakExportJSON(t *testing.T, subject uuid.UUID, nickname string) string {
-	t.Helper()
-	encoded, err := json.Marshal(map[string]any{
-		"realm": "termlink",
-		"users": []any{
-			map[string]any{
-				"id": subject.String(), "username": "imported-user", "email": "Imported@Example.Test",
-				"emailVerified": true, "enabled": true, "attributes": map[string]any{"nickname": []string{nickname}},
-				"realmRoles":  []string{"offline_access", "ADMIN", "ADMIN"},
-				"credentials": []any{map[string]any{"type": "password", "secretData": "must-not-be-imported"}}, "totp": true,
-			},
-			map[string]any{"id": uuid.NewString(), "serviceAccountClientId": "termlink-server"},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(encoded)
 }
 
 type identityTokenResponse struct {
