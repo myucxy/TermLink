@@ -25,7 +25,10 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 - 不通过卸载 Android App 解决签名不一致，否则会删除登录、设备身份和 Android Keystore 数据。
 - 不使用旧 `Start-ProductionAcceptance.ps1` 或它的 `-Reset` 路径做版本升级；当前
   `termlink-deploy` 不暴露 reset，禁止用 `docker compose down --volumes` 自行模拟。
-- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交，也不发布 `latest` Docker 标签。
+- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。Docker `latest`
+  标签仅作为便捷入口保留（compose 默认引用它），更新 `latest` 必须与对应版本
+  tag 同时推送，并在 `docs/RELEASE_*.md` 发布记录中登记 digest；生产/共享部署
+  一律引用 `TAG@sha256:DIGEST`，不依赖 `latest`。
 - 密码、Token、PFX/keystore 密码只能从 Credential Manager、`SecureString` 或受保护的进程环境读取，
   不进入命令参数、日志、manifest 或文档。
 - AppShip 失败时保留 `.appship/` 状态；Docker/AppShip draft 或状态不因失败而删除后重新创建。
