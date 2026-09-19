@@ -54,6 +54,7 @@ type RouteTicketService struct {
 	authority              TransportAuthority
 	state                  DirectStateStore
 	directRoutingPermitted bool
+	routingPermittedOverride func() bool
 	private                ed25519.PrivateKey
 	public                 ed25519.PublicKey
 	keyID                  []byte
@@ -138,6 +139,27 @@ func NewSharedRouteTicketServiceWithRouting(authority TransportAuthority, state 
 	return newRouteTicketService(authority, state, seed, directRoutingPermitted, stunServers...)
 }
 
+// SetRoutingPermittedOverride replaces the static constructor-time routing
+// permission with a runtime lookup. It must be called before the service is
+// served; the production caller wires it to the database-backed portal policy
+// so SUPER_ADMIN can toggle direct routing at runtime.
+func (s *RouteTicketService) SetRoutingPermittedOverride(fn func() bool) {
+	if s == nil {
+		return
+	}
+	s.routingPermittedOverride = fn
+}
+
+func (s *RouteTicketService) routingPermittedNow() bool {
+	if s == nil {
+		return false
+	}
+	if s.routingPermittedOverride != nil {
+		return s.routingPermittedOverride()
+	}
+	return s.directRoutingPermitted
+}
+
 func newRouteTicketService(authority TransportAuthority, state DirectStateStore, seed []byte, directRoutingPermitted bool, stunServers ...string) (*RouteTicketService, error) {
 	if authority == nil || len(seed) < ed25519.SeedSize {
 		return nil, errors.New("transport ticket dependencies unavailable")
@@ -175,7 +197,7 @@ func (s *RouteTicketService) EnabledConfig(stunServers []string) EnabledDeviceCo
 		"direct_transport_shadow_v1",
 		"direct_transport_shadow_multipair_v2",
 	}
-	if s.directRoutingPermitted {
+	if s.routingPermittedNow() {
 		capabilities = append(
 			capabilities,
 			"direct_transport_data_v1",
@@ -185,7 +207,7 @@ func (s *RouteTicketService) EnabledConfig(stunServers []string) EnabledDeviceCo
 	return EnabledDeviceConfig{
 		ProtocolVersion:        1,
 		Capabilities:           capabilities,
-		DirectRoutingPermitted: s.directRoutingPermitted,
+		DirectRoutingPermitted: s.routingPermittedNow(),
 		TicketSigningKeys: []TicketSigningKey{{
 			KeyID: string(s.keyID), Algorithm: "Ed25519", PublicKey: base64.RawURLEncoding.EncodeToString(s.public),
 		}},
@@ -194,7 +216,7 @@ func (s *RouteTicketService) EnabledConfig(stunServers []string) EnabledDeviceCo
 }
 
 func (s *RouteTicketService) DirectRoutingPermitted() bool {
-	return s != nil && s.directRoutingPermitted
+	return s != nil && s.routingPermittedNow()
 }
 
 type ticketRequest struct {

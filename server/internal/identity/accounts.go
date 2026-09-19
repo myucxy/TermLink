@@ -2,6 +2,8 @@ package identity
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"time"
@@ -15,6 +17,19 @@ import (
 )
 
 const maximumFailedLogins = 5
+
+// generateBootstrapPassword creates a fresh one-time administrator password
+// for deployments that did not configure one. It is surfaced verbatim on the
+// startup log exactly once and never persisted anywhere else.
+func generateBootstrapPassword() string {
+	buf := make([]byte, 18) // 144 bits → 24 chars base64url
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand failure is catastrophic; an empty value fails the
+		// bootstrap password validation below with a clear error.
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
 
 const (
 	initialAdministratorUsername = "admin"
@@ -67,7 +82,7 @@ func NewAccountStore(pool *pgxpool.Pool) (*AccountStore, error) {
 // exactly once for a fresh embedded identity database. The transaction-scoped
 // advisory lock also makes concurrent Server startups converge on one account.
 func (s *AccountStore) BootstrapInitialAdministrator(ctx context.Context, password string) (bool, error) {
-	if s == nil || s.pool == nil || len(password) < 16 || len(password) > 1024 {
+	if s == nil || s.pool == nil || len(password) < 8 || len(password) > 1024 {
 		return false, ErrIdentityUnavailable
 	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
@@ -98,10 +113,13 @@ func (s *AccountStore) BootstrapInitialAdministrator(ctx context.Context, passwo
 		INSERT INTO identity_accounts(
 			subject,username,nickname,email,email_verified,enabled,password_hash,password_salt,
 			password_memory_kib,password_iterations,password_parallelism,password_reset_required,realm_roles)
-		VALUES($1,$2,$3,$4,true,true,$5,$6,$7,$8,$9,false,$10)`,
+		VALUES($1,$2,$3,$4,true,true,$5,$6,$7,$8,$9,$10,$11)`,
 		uuid.New(), initialAdministratorUsername, initialAdministratorNickname, initialAdministratorEmail,
 		digest.Hash, digest.Salt, digest.MemoryKiB, digest.Iterations, digest.Parallelism,
-		initialAdministratorRoles); err != nil {
+		// Bootstrap credentials are operator-provided or generated at random
+		// by config loading; neither path carries the legacy publicly-known
+		// default, so no forced password reset is staged at insert time.
+		false, initialAdministratorRoles); err != nil {
 		return false, ErrIdentityUnavailable
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -224,6 +242,16 @@ func isIdentityConflict(err error) bool {
 }
 
 func (s *AccountStore) Authenticate(ctx context.Context, login, password string) (string, error) {
+	return s.authenticate(ctx, login, password, false)
+}
+
+// AuthenticateForBrowserSetup verifies the deployment bootstrap password but
+// permits the one restricted browser session needed to replace it.
+func (s *AccountStore) AuthenticateForBrowserSetup(ctx context.Context, login, password string) (string, error) {
+	return s.authenticate(ctx, login, password, true)
+}
+
+func (s *AccountStore) authenticate(ctx context.Context, login, password string, allowPasswordReset bool) (string, error) {
 	account, err := s.loadForLogin(ctx, login)
 	if err != nil {
 		// Keep the not-found path computationally comparable to a real account.
@@ -237,7 +265,7 @@ func (s *AccountStore) Authenticate(ctx context.Context, login, password string)
 		verifyDummyPassword(password)
 		return "", fosite.ErrNotFound
 	}
-	if account.PasswordResetRequired || len(account.Password.Hash) == 0 {
+	if (!allowPasswordReset && account.PasswordResetRequired) || len(account.Password.Hash) == 0 {
 		verifyDummyPassword(password)
 		return "", ErrAccountSetupRequired
 	}

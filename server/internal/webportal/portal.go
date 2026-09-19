@@ -27,9 +27,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/accountdeletion"
 	"github.com/termlink/termlink/server/internal/adminroute"
+	"github.com/termlink/termlink/server/internal/localnet"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/buildinfo"
 	"github.com/termlink/termlink/server/internal/humanverification"
+	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
 	"golang.org/x/oauth2"
@@ -81,6 +83,7 @@ type Config struct {
 	IdentityProfiles          identityProfileService
 	IdentityMFAStatus         identityMFAStatusService
 	Repository                portalRepository
+	Presence                  *presence.Registry
 	AccountStatusChanged      func(context.Context, uuid.UUID, string) error
 	Clock                     func() time.Time
 }
@@ -145,6 +148,13 @@ type sectionPortalRepository interface {
 	PortalAdminSection(context.Context, uuid.UUID, string) (store.PortalAdminDashboard, error)
 }
 
+// transportRoutingRepository is implemented by stores that own the runtime
+// direct-transport data-plane policy toggled from the management portal.
+type transportRoutingRepository interface {
+	GetDirectRoutingPolicy(context.Context) (bool, error)
+	SetDirectRoutingPolicy(context.Context, bool, uuid.UUID) error
+}
+
 type oidcFlow interface {
 	AuthorizationURL(state, nonce, challenge, theme string) string
 	StepUpAuthorizationURL(state, nonce, challenge, theme, method string) string
@@ -154,15 +164,25 @@ type oidcFlow interface {
 	AccountURL() string
 }
 
+type dynamicOIDCFlow interface {
+	AuthorizationURLForRedirect(state, nonce, challenge, theme, redirectURI string) string
+	StepUpAuthorizationURLForRedirect(state, nonce, challenge, theme, method, redirectURI string) string
+	ExchangeAndVerifyForRedirect(context.Context, string, string, string, string) (accountIdentity, error)
+	ExchangeStepUpAndVerifyForRedirect(context.Context, string, string, string, string, string) (accountIdentity, error)
+	LogoutURLForOrigin(string) string
+}
+
 type oauthState struct {
-	State      string `json:"state"`
-	Nonce      string `json:"nonce"`
-	Verifier   string `json:"verifier"`
-	ReturnTo   string `json:"return_to"`
-	Theme      string `json:"theme,omitempty"`
-	Purpose    string `json:"purpose,omitempty"`
-	Method     string `json:"method,omitempty"`
-	IssuedAtMS int64  `json:"issued_at_ms"`
+	State       string `json:"state"`
+	Nonce       string `json:"nonce"`
+	Verifier    string `json:"verifier"`
+	ReturnTo    string `json:"return_to"`
+	Theme       string `json:"theme,omitempty"`
+	Purpose     string `json:"purpose,omitempty"`
+	Method      string `json:"method,omitempty"`
+	RedirectURI string `json:"redirect_uri,omitempty"`
+	CookieName  string `json:"cookie_name,omitempty"`
+	IssuedAtMS  int64  `json:"issued_at_ms"`
 }
 
 type webSession struct {
@@ -255,6 +275,7 @@ type accountPageData struct {
 
 type adminPageData struct {
 	Username               string
+	Nickname               string
 	Role                   store.Role
 	RoleLabel              string
 	CSRF                   string
@@ -274,6 +295,9 @@ type adminPageData struct {
 	AdminRoute             adminroute.View
 	CanConfigureSystem     bool
 	RegistrationNavigation bool
+
+	TransportRoutingPermitted   bool
+	TransportRoutingConfigured bool
 }
 
 type errorPageData struct {
@@ -452,17 +476,34 @@ func newPortal(config Config, publicOrigin *url.URL, flow oidcFlow) (*Portal, er
 
 func validateConfig(config Config) (*url.URL, error) {
 	publicOrigin, err := url.Parse(strings.TrimSpace(config.PublicURL))
-	if err != nil || publicOrigin.Scheme != "https" || publicOrigin.Host == "" || publicOrigin.User != nil ||
+	schemeOK := publicOrigin != nil && publicOrigin.Scheme == "https"
+	// Local-development relaxation mirrors the config-level switch: an
+	// explicit operator opt-in permits a plain-HTTP loopback/private origin.
+	if !schemeOK && publicOrigin != nil && publicOrigin.Scheme == "http" &&
+		localnet.AllowHTTP() && localnet.IsLoopbackOrPrivateHost(publicOrigin.Hostname()) {
+		schemeOK = true
+	}
+	if err != nil || !schemeOK || publicOrigin == nil || publicOrigin.Host == "" || publicOrigin.User != nil ||
 		(publicOrigin.Path != "" && publicOrigin.Path != "/") || publicOrigin.RawPath != "" ||
 		publicOrigin.RawQuery != "" || publicOrigin.Fragment != "" {
 		return nil, errors.New("web portal public URL must be an HTTPS origin")
 	}
 	issuer, err := url.Parse(strings.TrimSpace(config.Issuer))
-	if err != nil || issuer.Scheme != "https" || issuer.Host == "" || issuer.User != nil {
+	issuerSchemeOK := issuer != nil && issuer.Scheme == "https"
+	if !issuerSchemeOK && issuer != nil && issuer.Scheme == "http" &&
+		localnet.AllowHTTP() && localnet.IsLoopbackOrPrivateHost(issuer.Hostname()) {
+		issuerSchemeOK = true
+	}
+	if err != nil || !issuerSchemeOK || issuer == nil || issuer.Host == "" || issuer.User != nil {
 		return nil, errors.New("web portal issuer must use HTTPS")
 	}
 	redirect, err := url.Parse(strings.TrimSpace(config.RedirectURI))
-	if err != nil || redirect.Scheme != "https" || !strings.EqualFold(redirect.Host, publicOrigin.Host) ||
+	redirectSchemeOK := redirect != nil && redirect.Scheme == "https"
+	if !redirectSchemeOK && redirect != nil && redirect.Scheme == "http" &&
+		localnet.AllowHTTP() && localnet.IsLoopbackOrPrivateHost(redirect.Hostname()) {
+		redirectSchemeOK = true
+	}
+	if err != nil || !redirectSchemeOK || redirect.Host == "" ||
 		redirect.Path != "/auth/callback" || redirect.RawQuery != "" || redirect.Fragment != "" || redirect.User != nil {
 		return nil, errors.New("web portal redirect URI must use the public HTTPS callback")
 	}
@@ -585,7 +626,10 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /auth/step-up/result", p.sensitiveStepUpResult)
 	mux.HandleFunc("GET /account", p.account)
 	mux.HandleFunc("POST /account/devices/{id}/revoke", p.strongAccountAction("user.device.revoke", p.userPortalRevokeDevice))
+	mux.HandleFunc("POST /account/devices/{id}/disable", p.strongAccountAction("user.device.disable", p.userPortalDisableDevice))
+	mux.HandleFunc("POST /account/devices/{id}/delete", p.strongAccountAction("user.device.delete", p.userPortalDeleteDevice))
 	mux.HandleFunc("POST /account/pcs/{id}/control-policy", p.strongAccountAction("user.pc.control_policy.update", p.userPortalUpdatePCControlPolicy))
+	mux.HandleFunc("POST /account/pcs/control-policy/batch", p.strongAccountAction("user.pc.control_policy.batch_update", p.userPortalBatchUpdatePCControlPolicy))
 	mux.HandleFunc("POST /account/privacy/deletions", p.strongAccountAction("user.account_deletion.request", p.userPortalRequestAccountDeletion))
 	mux.HandleFunc("POST /account/privacy/deletions/{id}/confirm", p.strongAccountAction("user.account_deletion.confirm", p.userPortalConfirmAccountDeletion))
 	mux.HandleFunc("POST /account/privacy/deletions/{id}/cancel", p.strongAccountAction("user.account_deletion.cancel", p.userPortalCancelAccountDeletion))
@@ -596,6 +640,7 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /account/identity/{action}", p.identity)
 	mux.HandleFunc("GET /admin", p.admin)
 	mux.HandleFunc("GET /admin/registration", p.adminRegistrationDashboard)
+	mux.HandleFunc("POST /admin/transport/routing", p.sensitiveAction("transport.routing.update", p.adminUpdateTransportRouting))
 	mux.HandleFunc("POST /admin/registration/policy", p.sensitiveAction("registration.policy.update", p.adminUpdateRegistrationPolicy))
 	mux.HandleFunc("POST /admin/registration/invitations/batches", p.sensitiveAction("registration.invitation_batch.create", p.adminCreateInvitationBatch))
 	mux.HandleFunc("POST /admin/registration/invitations/batches/{id}/codes", p.sensitiveAction("registration.invitation_codes.generate", p.adminGenerateInvitationCodes))
@@ -660,7 +705,7 @@ func (p *Portal) registrationAdminJS(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (p *Portal) registerPage(w http.ResponseWriter, r *http.Request) {
-	continueURL := normalizeRegistrationContinueURL(p.config, r.URL.Query().Get("continue"))
+	continueURL := normalizeRegistrationContinueURL(p.config, r.URL.Query().Get("continue"), r)
 	repository, ok := p.config.Repository.(registrationPortalRepository)
 	if !ok {
 		p.renderError(w, http.StatusServiceUnavailable, "注册暂不可用", "服务端尚未启用注册策略。")
@@ -740,24 +785,42 @@ func (p *Portal) beginOIDC(w http.ResponseWriter, r *http.Request, returnTo, the
 		return
 	}
 	challenge := sha256.Sum256([]byte(verifier))
-	stateCookie, err := p.oauthCodec.seal(oauthState{
-		State:      state,
-		Nonce:      nonce,
-		Verifier:   verifier,
-		ReturnTo:   returnTo,
-		Theme:      theme,
-		Purpose:    purpose,
-		Method:     method,
-		IssuedAtMS: p.now().UnixMilli(),
-	})
+	redirectURI := p.config.RedirectURI
+	if _, dynamic := p.flow.(dynamicOIDCFlow); dynamic {
+		if origin, ok := requestOrigin(r); ok {
+			redirectURI = origin + "/auth/callback"
+		}
+	}
+	pending := oauthState{
+		State:       state,
+		Nonce:       nonce,
+		Verifier:    verifier,
+		ReturnTo:    returnTo,
+		Theme:       theme,
+		Purpose:     purpose,
+		Method:      method,
+		RedirectURI: redirectURI,
+		IssuedAtMS:  p.now().UnixMilli(),
+	}
+	pending.CookieName = oauthCookieForState(state)
+	stateCookie, err := p.oauthCodec.seal(pending)
 	if err != nil {
 		p.internalError(w, err)
 		return
 	}
+	p.setCookie(w, pending.CookieName, stateCookie, p.now().Add(oauthStateTTL))
+	// Keep the legacy slot for older embedded pages and clients; callbacks prefer
+	// the per-flow cookie above, so parallel windows no longer overwrite state.
 	p.setCookie(w, oauthCookieName, stateCookie, p.now().Add(oauthStateTTL))
 	location := p.flow.AuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme)
+	if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
+		location = dynamic.AuthorizationURLForRedirect(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme, redirectURI)
+	}
 	if purpose == sensitiveOIDCPurpose {
 		location = p.flow.StepUpAuthorizationURL(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme, method)
+		if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
+			location = dynamic.StepUpAuthorizationURLForRedirect(state, nonce, base64.RawURLEncoding.EncodeToString(challenge[:]), theme, method, redirectURI)
+		}
 	}
 	clear(challenge[:])
 	w.Header().Set("Cache-Control", "no-store")
@@ -766,8 +829,14 @@ func (p *Portal) beginOIDC(w http.ResponseWriter, r *http.Request, returnTo, the
 
 func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	loginTraceID := uuid.NewString()
+	cookieName := oauthCookieForState(r.URL.Query().Get("state"))
+	cookie, err := r.Cookie(cookieName)
+	if err != nil {
+		cookieName = oauthCookieName
+		cookie, err = r.Cookie(cookieName)
+	}
+	p.clearCookie(w, cookieName)
 	p.clearCookie(w, oauthCookieName)
-	cookie, err := r.Cookie(oauthCookieName)
 	if err != nil {
 		p.renderError(w, http.StatusBadRequest, "登录已过期", "授权状态已失效，请返回首页重新登录。")
 		return
@@ -776,8 +845,13 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	if err := p.oauthCodec.open(cookie.Value, &pending); err != nil ||
 		p.now().Sub(time.UnixMilli(pending.IssuedAtMS)) < 0 ||
 		p.now().Sub(time.UnixMilli(pending.IssuedAtMS)) > oauthStateTTL ||
-		!constantTextEqual(pending.State, r.URL.Query().Get("state")) {
+		!constantTextEqual(pending.State, r.URL.Query().Get("state")) ||
+		(pending.CookieName != "" && cookieName != oauthCookieName && pending.CookieName != cookieName) {
 		p.renderError(w, http.StatusBadRequest, "登录校验失败", "授权响应未通过状态校验，请返回首页重新登录。")
+		return
+	}
+	if current, ok := requestOrigin(r); ok && pending.RedirectURI != "" && !sameCallbackURI(pending.RedirectURI, current+"/auth/callback") {
+		p.renderError(w, http.StatusBadRequest, "登录校验失败", "授权回调来源与发起来源不一致，请重新登录。")
 		return
 	}
 	if pending.Purpose != "" && pending.Purpose != sensitiveOIDCPurpose {
@@ -796,9 +870,17 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	var identity accountIdentity
 	if pending.Purpose == sensitiveOIDCPurpose {
-		identity, err = p.flow.ExchangeStepUpAndVerify(r.Context(), code, pending.Verifier, pending.Nonce, pending.Method)
+		if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
+			identity, err = dynamic.ExchangeStepUpAndVerifyForRedirect(r.Context(), code, pending.Verifier, pending.Nonce, pending.Method, pending.RedirectURI)
+		} else {
+			identity, err = p.flow.ExchangeStepUpAndVerify(r.Context(), code, pending.Verifier, pending.Nonce, pending.Method)
+		}
 	} else {
-		identity, err = p.flow.ExchangeAndVerify(r.Context(), code, pending.Verifier, pending.Nonce)
+		if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
+			identity, err = dynamic.ExchangeAndVerifyForRedirect(r.Context(), code, pending.Verifier, pending.Nonce, pending.RedirectURI)
+		} else {
+			identity, err = p.flow.ExchangeAndVerify(r.Context(), code, pending.Verifier, pending.Nonce)
+		}
 	}
 	if err != nil {
 		_ = p.config.Repository.RecordPortalLoginFailure(r.Context(), loginTraceID, "token_verification_failed")
@@ -882,7 +964,19 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "/account/identity", "/account/identity/password", "/account/identity/mfa", "/account/identity/sessions":
-		returnTo = identityAccountSectionURL(p.identityURL, pending.ReturnTo, pending.Theme)
+		identityURL := p.identityURL
+		if _, dynamic := p.flow.(dynamicOIDCFlow); dynamic && pending.RedirectURI != "" {
+			if origin, ok := requestOrigin(r); ok {
+				if parsed, parseErr := url.Parse(identityURL); parseErr == nil {
+					parsed.Scheme, parsed.Host = "https", strings.TrimPrefix(origin, "https://")
+					query := parsed.Query()
+					query.Set("referrer_uri", origin+"/account")
+					parsed.RawQuery = query.Encode()
+					identityURL = parsed.String()
+				}
+			}
+		}
+		returnTo = identityAccountSectionURL(identityURL, pending.ReturnTo, pending.Theme)
 	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
@@ -959,6 +1053,26 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		p.internalError(w, err)
 		return
 	}
+	if p.config.Presence != nil {
+		for index := range dashboard.Connections {
+			seen, online := p.config.Presence.OnlineDevice(dashboard.Connections[index].ID)
+			dashboard.Connections[index].Online = online
+			if online {
+				seen = seen.UTC()
+				dashboard.Connections[index].LastSeenAt = &seen
+			}
+		}
+	}
+	transportRoutingPermitted := false
+	transportRoutingConfigured := false
+	if section == "connections" {
+		if routingRepository, ok := p.config.Repository.(transportRoutingRepository); ok {
+			if permitted, policyErr := routingRepository.GetDirectRoutingPolicy(r.Context()); policyErr == nil {
+				transportRoutingPermitted = permitted
+				transportRoutingConfigured = true
+			}
+		}
+	}
 	var systemVersions SystemVersions
 	if section == "versions" {
 		systemVersions = p.systemVersions.Load(r.Context())
@@ -994,6 +1108,7 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	p.render(w, http.StatusOK, "admin.html", adminPageData{
 		Username:           session.Username,
+		Nickname:           firstNonEmpty(session.Nickname, session.Username),
 		Role:               account.Role,
 		RoleLabel:          roleLabel(account.Role),
 		CSRF:               session.CSRF,
@@ -1012,6 +1127,9 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		HumanVerification:  humanVerificationSettings,
 		AdminRoute:         adminRoute,
 		CanConfigureSystem: account.Role == store.RoleSuperAdmin,
+
+		TransportRoutingPermitted:   transportRoutingPermitted,
+		TransportRoutingConfigured:  transportRoutingConfigured,
 	})
 }
 
@@ -1091,6 +1209,30 @@ func (p *Portal) adminUpdateHumanVerification(w http.ResponseWriter, r *http.Req
 		return
 	}
 	http.Redirect(w, r, "/admin?section=settings&notice=human-verification-updated", http.StatusSeeOther)
+}
+
+func (p *Portal) adminUpdateTransportRouting(w http.ResponseWriter, r *http.Request) {
+	session, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	routingRepository, ok := p.config.Repository.(transportRoutingRepository)
+	if !ok {
+		p.renderError(w, http.StatusServiceUnavailable, "直连路由策略不可用", "当前部署尚未配置直连路由策略存储能力。")
+		return
+	}
+	permitted := r.Form.Get("routing_permitted") == "true"
+	if err := routingRepository.SetDirectRoutingPolicy(r.Context(), permitted, account.ID); err != nil {
+		p.handleAdminMutationError(w, err)
+		return
+	}
+	adminBasePath, basePathErr := p.adminBasePath(r.Context())
+	if basePathErr != nil {
+		p.internalError(w, basePathErr)
+		return
+	}
+	http.Redirect(w, r, adminBasePath+"?section=connections&notice=transport-routing-updated", http.StatusSeeOther)
+	_ = session
 }
 
 func (p *Portal) adminUpdateRoute(w http.ResponseWriter, r *http.Request) {
@@ -1202,7 +1344,13 @@ func (p *Portal) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	p.clearCookie(w, sessionCookieName)
 	p.clearCookie(w, legacySessionCookie)
-	http.Redirect(w, r, p.flow.LogoutURL(), http.StatusSeeOther)
+	target := p.flow.LogoutURL()
+	if dynamic, ok := p.flow.(dynamicOIDCFlow); ok {
+		if origin, originOK := requestOrigin(r); originOK {
+			target = dynamic.LogoutURLForOrigin(origin)
+		}
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (p *Portal) notFound(w http.ResponseWriter, _ *http.Request) {
@@ -1351,6 +1499,14 @@ func (p *Portal) clearCookie(w http.ResponseWriter, name string) {
 	})
 }
 
+func oauthCookieForState(state string) string {
+	state = strings.TrimSpace(state)
+	if len(state) < 16 || len(state) > 128 || strings.ContainsAny(state, " \t\r\n;=") {
+		return oauthCookieName
+	}
+	return oauthCookieName + "-" + state
+}
+
 func (p *Portal) usesPublicOrigin(value string) bool {
 	origin, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" ||
@@ -1409,10 +1565,47 @@ func forwardedRequestHost(r *http.Request) (string, bool) {
 	return "", false
 }
 
+func requestOrigin(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	host := strings.TrimSpace(r.Host)
+	if forwarded, ok := forwardedRequestHost(r); ok {
+		host = forwarded
+	}
+	if host == "" || strings.ContainsAny(host, " /\\\t\r\n@") {
+		return "", false
+	}
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS == nil {
+			return "", false
+		}
+		proto = "https"
+	}
+	if !strings.EqualFold(proto, "https") {
+		return "", false
+	}
+	return "https://" + host, true
+}
+
+func sameCallbackURI(left, right string) bool {
+	a, aErr := url.Parse(left)
+	b, bErr := url.Parse(right)
+	return aErr == nil && bErr == nil && strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host) && a.Path == b.Path && a.RawQuery == b.RawQuery && a.Fragment == b.Fragment
+}
+
 func (p *Portal) now() time.Time { return p.config.Clock().UTC() }
 
 func (f *productionOIDCFlow) AuthorizationURL(state, nonce, challenge, theme string) string {
 	return oidcAuthorizationURL(f.oauthConfig, state, nonce, challenge, theme, true)
+}
+
+func (f *productionOIDCFlow) AuthorizationURLForRedirect(state, nonce, challenge, theme, redirectURI string) string {
+	config := f.oauthConfig
+	config.RedirectURL = redirectURI
+	config.Endpoint = oidcEndpointForRedirect(config.Endpoint, redirectURI)
+	return oidcAuthorizationURL(config, state, nonce, challenge, theme, true)
 }
 
 func (f *productionOIDCFlow) StepUpAuthorizationURL(state, nonce, challenge, theme, method string) string {
@@ -1423,6 +1616,30 @@ func (f *productionOIDCFlow) StepUpAuthorizationURL(state, nonce, challenge, the
 		return oidcAuthorizationURL(f.stepUpOAuthConfig, state, nonce, challenge, theme, false)
 	}
 	return oidcAuthorizationURL(f.oauthConfig, state, nonce, challenge, theme, true)
+}
+
+func (f *productionOIDCFlow) StepUpAuthorizationURLForRedirect(state, nonce, challenge, theme, method, redirectURI string) string {
+	config := f.oauthConfig
+	if method == sensitiveMethodMFA {
+		config = f.stepUpOAuthConfig
+	}
+	config.RedirectURL = redirectURI
+	config.Endpoint = oidcEndpointForRedirect(config.Endpoint, redirectURI)
+	return oidcAuthorizationURL(config, state, nonce, challenge, theme, method != sensitiveMethodMFA)
+}
+
+func oidcEndpointForRedirect(endpoint oauth2.Endpoint, redirectURI string) oauth2.Endpoint {
+	redirect, err := url.Parse(redirectURI)
+	if err != nil || redirect.Scheme != "https" || redirect.Host == "" {
+		return endpoint
+	}
+	authorize, err := url.Parse(endpoint.AuthURL)
+	if err != nil || authorize.Path == "" {
+		return endpoint
+	}
+	authorize.Scheme, authorize.Host = redirect.Scheme, redirect.Host
+	endpoint.AuthURL = authorize.String()
+	return endpoint
 }
 
 func oidcAuthorizationURL(config oauth2.Config, state, nonce, challenge, theme string, promptLogin bool) string {
@@ -1449,6 +1666,15 @@ func (f *productionOIDCFlow) ExchangeAndVerify(ctx context.Context, code, verifi
 	return exchangePortalIdentity(ctx, f.oauthConfig, f.verifier, f.clientID, code, verifier, expectedNonce)
 }
 
+func (f *productionOIDCFlow) ExchangeAndVerifyForRedirect(ctx context.Context, code, verifier, expectedNonce, redirectURI string) (accountIdentity, error) {
+	if f.httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, f.httpClient)
+	}
+	config := f.oauthConfig
+	config.RedirectURL = redirectURI
+	return exchangePortalIdentity(ctx, config, f.verifier, f.clientID, code, verifier, expectedNonce)
+}
+
 func (f *productionOIDCFlow) ExchangeStepUpAndVerify(ctx context.Context, code, verifier, expectedNonce, method string) (accountIdentity, error) {
 	if method == sensitiveMethodMFA {
 		if f.httpClient != nil {
@@ -1457,6 +1683,18 @@ func (f *productionOIDCFlow) ExchangeStepUpAndVerify(ctx context.Context, code, 
 		return exchangePortalIdentity(ctx, f.stepUpOAuthConfig, f.stepUpVerifier, f.stepUpOAuthConfig.ClientID, code, verifier, expectedNonce)
 	}
 	return f.ExchangeAndVerify(ctx, code, verifier, expectedNonce)
+}
+
+func (f *productionOIDCFlow) ExchangeStepUpAndVerifyForRedirect(ctx context.Context, code, verifier, expectedNonce, method, redirectURI string) (accountIdentity, error) {
+	if f.httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, f.httpClient)
+	}
+	config, verifierKey, clientID := f.oauthConfig, f.verifier, f.clientID
+	if method == sensitiveMethodMFA {
+		config, verifierKey, clientID = f.stepUpOAuthConfig, f.stepUpVerifier, f.stepUpOAuthConfig.ClientID
+	}
+	config.RedirectURL = redirectURI
+	return exchangePortalIdentity(ctx, config, verifierKey, clientID, code, verifier, expectedNonce)
 }
 
 func exchangePortalIdentity(ctx context.Context, config oauth2.Config, verifier *oidc.IDTokenVerifier, clientID, code, pkceVerifier, expectedNonce string) (accountIdentity, error) {
@@ -1544,6 +1782,24 @@ func (f *productionOIDCFlow) LogoutURL() string {
 	return endpoint.String()
 }
 
+func (f *productionOIDCFlow) LogoutURLForOrigin(origin string) string {
+	if strings.TrimSpace(f.endSessionEndpoint) == "" {
+		return origin + "/"
+	}
+	endpoint, err := url.Parse(f.endSessionEndpoint)
+	if err != nil || endpoint.Scheme != "https" {
+		return origin + "/"
+	}
+	if parsedOrigin, originErr := url.Parse(origin); originErr == nil && parsedOrigin.Host != "" {
+		endpoint.Scheme, endpoint.Host = parsedOrigin.Scheme, parsedOrigin.Host
+	}
+	query := endpoint.Query()
+	query.Set("client_id", f.clientID)
+	query.Set("post_logout_redirect_uri", origin+"/")
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String()
+}
+
 func (f *productionOIDCFlow) AccountURL() string { return f.accountURL }
 
 func randomText(length int) (string, error) {
@@ -1595,7 +1851,7 @@ func normalizePortalReturnTo(value string) string {
 	}
 }
 
-func normalizeRegistrationContinueURL(config Config, value string) string {
+func normalizeRegistrationContinueURL(config Config, value string, requests ...*http.Request) string {
 	value = strings.TrimSpace(value)
 	if value == "" || len(value) > 4096 {
 		return ""
@@ -1606,7 +1862,7 @@ func normalizeRegistrationContinueURL(config Config, value string) string {
 	}
 	issuer, err := url.Parse(strings.TrimRight(strings.TrimSpace(config.Issuer), "/"))
 	if err != nil || !strings.EqualFold(target.Scheme, issuer.Scheme) ||
-		!strings.EqualFold(target.Host, issuer.Host) {
+		(!strings.EqualFold(target.Host, issuer.Host) && !registrationContinueUsesRequestOrigin(target, requests)) {
 		return ""
 	}
 	legacyPath := strings.TrimRight(issuer.Path, "/") + "/login-actions/authenticate"
@@ -1630,6 +1886,14 @@ func normalizeRegistrationContinueURL(config Config, value string) string {
 		return ""
 	}
 	return target.String()
+}
+
+func registrationContinueUsesRequestOrigin(target *url.URL, requests []*http.Request) bool {
+	if len(requests) == 0 {
+		return false
+	}
+	origin, ok := requestOrigin(requests[0])
+	return ok && strings.EqualFold(target.Scheme+"://"+target.Host, origin)
 }
 
 func identityReturnPath(action string) string {
@@ -1663,7 +1927,11 @@ func validateIdentityAccountURL(config Config, value string) (string, error) {
 		return "", errors.New("web portal identity issuer is invalid")
 	}
 	target, err := url.Parse(strings.TrimSpace(value))
-	if err != nil || target.Scheme != "https" || target.Host == "" || target.User != nil ||
+	// The target inherits the issuer scheme, which the local-development
+	// relaxation may already have downgraded to plain HTTP.
+	targetSchemeOK := target != nil && (target.Scheme == "https" ||
+		(localnet.AllowHTTP() && target.Scheme == "http" && localnet.IsLoopbackOrPrivateHost(target.Hostname())))
+	if err != nil || !targetSchemeOK || target.Host == "" || target.User != nil ||
 		target.RawPath != "" || target.Fragment != "" || !strings.EqualFold(target.Scheme, issuer.Scheme) ||
 		!strings.EqualFold(target.Host, issuer.Host) {
 		return "", errors.New("web portal identity account URL must use the configured issuer origin")
@@ -1805,6 +2073,8 @@ func adminNotice(value string) string {
 		return bilingualPortalNotice("测试邮件已发送，服务邮箱配置和功能开关已发布。", "The test email was sent, and the service email settings are now active.")
 	case "human-verification-updated":
 		return bilingualPortalNotice("登录与注册人机验证设置已更新并立即生效。", "Login and registration human-verification settings were updated and are active immediately.")
+	case "transport-routing-updated":
+		return bilingualPortalNotice("直连数据面路由策略已更新：新连接将按当前策略生效。", "The direct data-plane routing policy was updated: new connections follow the current policy.")
 	case "admin-route-updated":
 		return bilingualPortalNotice("管理中心安全入口已经更新，旧入口已立即失效。请将新地址保存在受信任的密码管理器中。", "The secure admin route was updated and the old route is no longer valid. Store the new address in a trusted password manager.")
 	default:

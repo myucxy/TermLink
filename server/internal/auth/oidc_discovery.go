@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/termlink/termlink/server/internal/localnet"
 	"golang.org/x/oauth2"
 )
 
@@ -31,7 +32,14 @@ func NewLocalOIDCDiscoveryWithKeySet(issuer, authorizationEndpoint, tokenEndpoin
 		return OIDCDiscovery{}, errors.New("local OIDC discovery is incomplete")
 	}
 	issuerURL, err := url.Parse(issuer)
-	if err != nil || issuerURL.Scheme != "https" || issuerURL.Host == "" || issuerURL.User != nil {
+	schemeOK := issuerURL != nil && issuerURL.Scheme == "https"
+	// Local-development relaxation mirrors the config/identity switch: the
+	// operator opt-in permits a plain-HTTP loopback/private issuer.
+	if !schemeOK && localnet.AllowHTTP() && issuerURL != nil && issuerURL.Scheme == "http" &&
+		localnet.IsLoopbackOrPrivateHost(issuerURL.Hostname()) {
+		schemeOK = true
+	}
+	if err != nil || !schemeOK || issuerURL == nil || issuerURL.Host == "" || issuerURL.User != nil {
 		return OIDCDiscovery{}, errors.New("local OIDC issuer is invalid")
 	}
 	for _, endpoint := range []string{authorizationEndpoint, tokenEndpoint, jwksEndpoint, endSessionEndpoint} {

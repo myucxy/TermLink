@@ -31,6 +31,7 @@ import (
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/kv"
+	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
 )
@@ -61,6 +62,7 @@ const pairingCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 type API struct {
 	Store                 *store.Postgres
 	Valkey                kv.Coordinator
+	Presence              *presence.Registry
 	Tokens                auth.TokenVerifier
 	Auth                  auth.Middleware
 	SubjectKey            []byte
@@ -136,6 +138,7 @@ func (a *API) Handler() http.Handler {
 	public := http.NewServeMux()
 	public.HandleFunc("POST /v1/devices/register", a.registerDevice)
 	public.HandleFunc("POST /v1/pcs/resolve-machine", a.resolvePCMachine)
+	// Kept as an empty compatibility catalog for released Android clients.
 	public.HandleFunc("GET /v1/billing/plans", a.listPlans)
 	public.HandleFunc("GET /v1/client-config", a.getClientConfiguration)
 	public.HandleFunc("GET /v1/registration-policy", a.getRegistrationPolicy)
@@ -184,6 +187,8 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads", retiredTerminalHistory)
 	trusted.HandleFunc("POST /v1/sessions/{id}/history/uploads/{uploadId}/commit", retiredTerminalHistory)
 	trusted.HandleFunc("GET /v1/audit-events", a.listAudit)
+	// Commercial billing is removed; this stable response keeps old clients'
+	// refresh flow functional without restoring plans, payments, or quotas.
 	trusted.HandleFunc("GET /v1/account/entitlements", a.getEntitlement)
 	trusted.HandleFunc("GET /v1/admin/registration-policy", a.adminGetRegistrationPolicy)
 	trusted.HandleFunc("PATCH /v1/admin/registration-policy", a.adminUpdateRegistrationPolicy)
@@ -274,6 +279,20 @@ func (a *API) sendRegistrationEmailCode(w http.ResponseWriter, r *http.Request) 
 	if a.ServiceEmail == nil {
 		writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", serviceemail.ErrUnavailable)
 		return
+	}
+	// Verification mails are registration material: honour the registration
+	// policy so a closed deployment cannot be used to mail arbitrary inboxes.
+	// A nil store (test fixtures only) has no policy to enforce.
+	if a.Store != nil {
+		policy, policyErr := a.Store.GetRegistrationPolicy(r.Context())
+		if policyErr != nil {
+			writeStoreError(w, r, policyErr)
+			return
+		}
+		if policy.Mode == store.RegistrationClosed {
+			writeError(w, r, http.StatusForbidden, "REGISTRATION_CLOSED", store.ErrRegistrationClosed)
+			return
+		}
 	}
 	if a.Valkey != nil {
 		allowed, err := a.Valkey.Consume(r.Context(), accountRegistrationRateLimitScope(r), "email-code", time.Minute)
@@ -624,6 +643,16 @@ func (a *API) listDevices(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, r, err)
 		return
 	}
+	if a.Presence != nil {
+		for index := range items {
+			seen, online := a.Presence.Online(p.UserID, items[index].ID)
+			items[index].Online = online
+			if online {
+				seen = seen.UTC()
+				items[index].LastSeenAt = &seen
+			}
+		}
+	}
 	// Device list V1 predates PC_AGENT and is still consumed by released
 	// Android clients using a closed enum. Preserve that wire value during the
 	// compatibility window; platform and capability truth is exposed by /v1/pcs.
@@ -894,6 +923,16 @@ func (a *API) listPCs(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
+	}
+	if a.Presence != nil {
+		for index := range items {
+			seen, online := a.Presence.Online(p.UserID, items[index].DeviceID)
+			items[index].Online = online
+			if online {
+				seen = seen.UTC()
+				items[index].LastSeenAt = &seen
+			}
+		}
 	}
 	projectPCServerCapabilities(items)
 	writeJSON(w, 200, map[string]any{"items": items})
@@ -1288,7 +1327,9 @@ func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var items []store.SessionRecord
-	if includeEnded {
+	if a.Presence != nil {
+		items, err = a.Store.ListSessionsUsingPresence(r.Context(), p.UserID, p.Device.ID, pcID, includeEnded)
+	} else if includeEnded {
 		items, err = a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID)
 	} else {
 		items, err = a.Store.ListSessions(r.Context(), p.UserID, p.Device.ID, pcID)
@@ -1296,6 +1337,21 @@ func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
+	}
+	if a.Presence != nil {
+		filtered := items[:0]
+		for index := range items {
+			seen, online := a.Presence.Online(p.UserID, items[index].PCDeviceID)
+			items[index].Online = online && items[index].State == "RUNNING"
+			if online {
+				seen = seen.UTC()
+				items[index].LastSeenAt = &seen
+			}
+			if includeEnded || items[index].Online {
+				filtered = append(filtered, items[index])
+			}
+		}
+		items = filtered
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
 }
@@ -2497,22 +2553,6 @@ func (a *API) historyResponseItems(ctx context.Context, items []store.HistoryIte
 	}
 	return responseItems, nil
 }
-func (a *API) listPlans(w http.ResponseWriter, r *http.Request) {
-	// Older clients refresh this endpoint alongside account metadata. Keep the
-	// wire contract, but expose no commercial catalog.
-	writeJSON(w, http.StatusOK, map[string]any{"catalog_version": 0, "plans": []any{}})
-}
-func (a *API) getEntitlement(w http.ResponseWriter, r *http.Request) {
-	// Entitlements are no longer a server feature. This unlimited projection is
-	// retained only so released Android clients continue to refresh normally.
-	writeJSON(w, http.StatusOK, map[string]any{
-		"plan_key": "community", "catalog_version": 1,
-		"max_remote_pcs": -1, "max_live_sessions": -1,
-		"feature_flags": map[string]any{}, "version": 1,
-		"effective_at": time.Unix(0, 0).UTC(), "expires_at": nil,
-	})
-}
-
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	before, _ := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
@@ -2523,6 +2563,21 @@ func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (a *API) listPlans(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"catalog_version": 0, "plans": []any{}})
+}
+
+func (a *API) getEntitlement(w http.ResponseWriter, _ *http.Request) {
+	// Entitlements are no longer enforced. Keep the old wire shape so released
+	// clients can refresh their device catalog while the server stays free.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"plan_key": "community", "catalog_version": 1,
+		"max_remote_pcs": -1, "max_live_sessions": -1,
+		"feature_flags": map[string]any{}, "version": 1,
+		"effective_at": time.Unix(0, 0).UTC(), "expires_at": nil,
+	})
 }
 
 func (a *API) now() time.Time {

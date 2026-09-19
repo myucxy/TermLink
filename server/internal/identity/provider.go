@@ -15,6 +15,7 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ory/fosite"
+	"github.com/termlink/termlink/server/internal/localnet"
 	"github.com/ory/fosite/compose"
 	"github.com/ory/fosite/token/jwt"
 	"github.com/termlink/termlink/server/internal/auth"
@@ -104,8 +105,20 @@ func New(ctx context.Context, config Config) (*Provider, error) {
 	}
 	accounts.clock = config.Clock
 	accounts.credentialKey = append([]byte(nil), config.KeyEncryptionKey...)
-	if config.InitialAdminPassword != "" {
-		if _, err = accounts.BootstrapInitialAdministrator(ctx, config.InitialAdminPassword); err != nil {
+	bootstrapPassword := config.InitialAdminPassword
+	if bootstrapPassword == "" {
+		// No operator credential configured: generate a one-time random
+		// bootstrap password, but only if the database is still empty. The
+		// value is surfaced once, on the log line below.
+		bootstrapPassword = generateBootstrapPassword()
+		if inserted, bootstrapErr := accounts.BootstrapInitialAdministrator(ctx, bootstrapPassword); bootstrapErr != nil {
+			return nil, fmt.Errorf("bootstrap embedded identity administrator: %w", bootstrapErr)
+		} else if inserted {
+			slog.Warn("generated one-time initial administrator password; copy it now, it will not be shown again",
+				"password", bootstrapPassword)
+		}
+	} else {
+		if _, err = accounts.BootstrapInitialAdministrator(ctx, bootstrapPassword); err != nil {
 			return nil, fmt.Errorf("bootstrap embedded identity administrator: %w", err)
 		}
 	}
@@ -121,7 +134,7 @@ func New(ctx context.Context, config Config) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	storage := &oauthStore{pool: config.Pool, accounts: accounts, clients: clients, clock: config.Clock}
+	storage := &oauthStore{pool: config.Pool, accounts: accounts, clients: clients, webClientID: config.WebClientID, stepUpClientID: config.StepUpClientID, clock: config.Clock}
 	tokenURL := issuer + "/protocol/openid-connect/token"
 	fositeConfig := &fosite.Config{
 		GlobalSecret:                   append([]byte(nil), config.HMACSecret...),
@@ -225,9 +238,14 @@ func (p *Provider) maintainIdentityState(ctx context.Context) {
 func validateEmbeddedIssuer(raw string) (string, string, error) {
 	issuer := strings.TrimRight(strings.TrimSpace(raw), "/")
 	parsed, err := url.Parse(issuer)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
-		parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" ||
-		!strings.HasSuffix(parsed.Path, "/realms/termlink") {
+	// Local-development relaxation mirrors the config-level switch: an
+	// explicit operator opt-in permits plain HTTP for loopback/private
+	// issuers so a dev Docker server runs without a TLS edge.
+	httpAllowed := parsed != nil && parsed.Scheme == "http" && localnet.AllowHTTP() &&
+		localnet.IsLoopbackOrPrivateHost(parsed.Hostname())
+	if err != nil || (parsed.Scheme != "https" && !httpAllowed) || parsed.Host == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		parsed.RawPath != "" || !strings.HasSuffix(parsed.Path, "/realms/termlink") {
 		return "", "", errors.New("embedded OIDC issuer must be an HTTPS /realms/termlink URL")
 	}
 	basePath := strings.TrimSuffix(parsed.Path, "/realms/termlink")
@@ -236,6 +254,8 @@ func validateEmbeddedIssuer(raw string) (string, string, error) {
 	}
 	return issuer, parsed.Scheme + "://" + parsed.Host, nil
 }
+
+
 
 func embeddedClients(config Config) (map[string]fosite.Client, error) {
 	entries := []struct {

@@ -21,6 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/kv"
+	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/realtimewire"
 	"github.com/termlink/termlink/server/internal/store"
 )
@@ -77,6 +78,10 @@ const (
 // make the authoritative WSS path unavailable to an older client.
 type HubOptions struct {
 	DirectTransportDataV1 bool
+	// DirectTransportDataV1Override, when set, is consulted instead of the
+	// static value so the portal-owned routing policy can toggle the data
+	// plane at runtime without a server restart.
+	DirectTransportDataV1Override func() bool
 }
 
 type Hub struct {
@@ -85,7 +90,9 @@ type Hub struct {
 	leases                liveSessionStore
 	logger                *slog.Logger
 	observer              Observer
-	directTransportDataV1 bool
+	directTransportDataV1           bool
+	directTransportDataV1Override  func() bool
+	presence              *presence.Registry
 	mu                    sync.RWMutex
 	peers                 map[uuid.UUID]*peer
 	subscriptions         map[uuid.UUID]map[uuid.UUID]*peer
@@ -188,12 +195,37 @@ func NewHubWithObserverAndOptions(repository *store.Postgres, leases liveSession
 	}
 	return &Hub{
 		store: authorityStore, policyStore: policyStore, leases: leases, logger: logger, observer: observer,
-		directTransportDataV1: options.DirectTransportDataV1,
+		directTransportDataV1:          options.DirectTransportDataV1,
+		directTransportDataV1Override: options.DirectTransportDataV1Override,
 		peers:                 map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{},
 	}
 }
 
 func (h *Hub) Handler() http.Handler { return http.HandlerFunc(h.serveHTTP) }
+
+// directTransportDataV1Allowed resolves the runtime routing policy: the
+// override (portal-owned) wins over the static construction-time value.
+func (h *Hub) directTransportDataV1Allowed() bool {
+	if h == nil {
+		return false
+	}
+	if h.directTransportDataV1Override != nil {
+		return h.directTransportDataV1Override()
+	}
+	return h.directTransportDataV1
+}
+
+
+// SetPresence attaches the process-local online registry. It is intentionally
+// optional so focused tests and legacy embedders keep the database fallback.
+func (h *Hub) SetPresence(registry *presence.Registry) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.presence = registry
+	h.mu.Unlock()
+}
 
 type clientHello struct {
 	Role             string   `json:"role"`
@@ -240,6 +272,7 @@ type peer struct {
 	subscriptionControls map[uuid.UUID]retainedSubscriberControl
 	controlPolicies      map[uuid.UUID]cachedControlPolicy
 	capabilities         map[string]bool
+	presenceID           uuid.UUID
 }
 
 type retainedSubscriberControl struct {
@@ -375,7 +408,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	negotiated := h.negotiatedCapabilities(hello.Capabilities)
-	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, send: make(chan []byte, peerQueueFrames), controlSend: make(chan []byte, 4), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{}, subscriptionFrames: map[uuid.UUID][]byte{}, subscriptionACKs: map[uuid.UUID]uint64{}, subscriptionControls: map[uuid.UUID]retainedSubscriberControl{}, controlPolicies: map[uuid.UUID]cachedControlPolicy{}, lastSequences: map[uuid.UUID]uint64{}, pcReplayRoutes: map[pcRouteKey]*pcReplayRoute{}, capabilities: capabilitySet(negotiated)}
+	connection := &peer{hub: h, socket: socket, principal: principal, role: hello.Role, presenceID: uuid.New(), send: make(chan []byte, peerQueueFrames), controlSend: make(chan []byte, 4), done: make(chan struct{}), subscriptions: map[uuid.UUID]bool{}, subscriptionRoutes: map[uuid.UUID]cachedSessionRoute{}, subscriptionFrames: map[uuid.UUID][]byte{}, subscriptionACKs: map[uuid.UUID]uint64{}, subscriptionControls: map[uuid.UUID]retainedSubscriberControl{}, controlPolicies: map[uuid.UUID]cachedControlPolicy{}, lastSequences: map[uuid.UUID]uint64{}, pcReplayRoutes: map[pcRouteKey]*pcReplayRoute{}, capabilities: capabilitySet(negotiated)}
 	if !h.add(connection) {
 		closeSocket(socket, websocket.CloseTryAgainLater, "relay shutting down")
 		return
@@ -383,8 +416,20 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	h.observer.ConnectionOpened(connection.role)
 	defer func() {
 		h.remove(connection)
+		h.mu.RLock()
+		registry := h.presence
+		h.mu.RUnlock()
+		if registry != nil {
+			registry.Remove(connection.presenceID)
+		}
 		h.observer.ConnectionClosed(connection.role)
 	}()
+	h.mu.RLock()
+	registry := h.presence
+	h.mu.RUnlock()
+	if registry != nil {
+		registry.Register(connection.principal.UserID, connection.principal.Device.ID, connection.presenceID, connection.role)
+	}
 	welcome := serverWelcome{
 		Type: "welcome", ProtocolVersion: 1,
 		HeartbeatSeconds: int(pingInterval.Seconds()), ConnectionID: uuid.NewString(),
@@ -446,7 +491,7 @@ func negotiatedCapabilities(offered []string) []string {
 
 func (h *Hub) negotiatedCapabilities(offered []string) []string {
 	result := negotiatedCapabilities(offered)
-	if h != nil && h.directTransportDataV1 &&
+	if h != nil && h.directTransportDataV1Allowed() &&
 		slices.Contains(offered, directTransportDataV1Capability) &&
 		slices.Contains(offered, directSessionCutoverV1Capability) {
 		result = append(
@@ -677,12 +722,29 @@ func (p *peer) acceptSequence(sessionID uuid.UUID, sequence uint64) bool {
 		return false
 	}
 	if sequence > last {
+		if last == 0 && len(p.lastSequences) >= maxTrackedSessionsPerPeer {
+			// Authenticated-peer memory guard: one connection may not register
+			// an unbounded number of session sequence cursors. The client is
+			// expected to reconnect; its real sessions re-register on demand.
+			p.close(websocket.ClosePolicyViolation, "session tracking budget exceeded")
+			return false
+		}
 		p.lastSequences[sessionID] = sequence
 	}
 	return true
 }
 
 const maxPCReplayFrames = 4096
+
+// Per-connection bounds for the replay/sequence tracking maps. Both maps grow
+// one entry per distinct session (or session/recipient pair) a peer mentions,
+// so an authenticated peer could otherwise inflate relay memory without limit.
+// Exceeding a budget closes the connection; real clients re-register their
+// active sessions on the next connection.
+const (
+	maxTrackedSessionsPerPeer = 1024
+	maxPCReplayRoutesPerPeer  = 1024
+)
 
 var errPCSequenceRejected = errors.New("pc sequence rejected")
 
@@ -705,6 +767,9 @@ func (p *peer) acceptPCSequence(sessionID, recipientID uuid.UUID, sequence uint6
 	p.pcReplayMu.Lock()
 	defer p.pcReplayMu.Unlock()
 	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
+	if state == nil {
+		return false
+	}
 	commit, ok := state.validate(sequence, realtimewire.OutputChunk, sha256.Sum256(frame))
 	if ok {
 		state.commit(commit)
@@ -727,6 +792,10 @@ func (p *peer) routePCFrame(envelope realtimewire.Envelope, sessionID, recipient
 	}
 	p.pcReplayMu.Lock()
 	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
+	if state == nil {
+		p.pcReplayMu.Unlock()
+		return errPCSequenceRejected
+	}
 	commit, ok := state.validate(envelope.Sequence, envelope.MessageType, sha256.Sum256(frame))
 	if !ok {
 		p.pcReplayMu.Unlock()
@@ -808,6 +877,13 @@ func (p *peer) pcReplayRoute(key pcRouteKey) *pcReplayRoute {
 	}
 	state := p.pcReplayRoutes[key]
 	if state == nil {
+		if len(p.pcReplayRoutes) >= maxPCReplayRoutesPerPeer {
+			// Authenticated-peer memory guard, mirrored from the session
+			// sequence budget: unbounded (session, recipient) routes would let
+			// one connection inflate relay memory without limit.
+			p.close(websocket.ClosePolicyViolation, "replay tracking budget exceeded")
+			return nil
+		}
 		state = &pcReplayRoute{digests: map[uint64][32]byte{}}
 		p.pcReplayRoutes[key] = state
 	}
@@ -836,6 +912,9 @@ func (p *peer) beginPCReplayEpoch(sessionID, recipientID uuid.UUID, ack uint64) 
 
 func (p *peer) beginPCReplayEpochLocked(sessionID, recipientID uuid.UUID, ack uint64) {
 	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
+	if state == nil {
+		return
+	}
 	if ack == ^uint64(0) {
 		state.epoch = nil
 		return
@@ -855,6 +934,9 @@ func (p *peer) beginPCReplayEpochLocked(sessionID, recipientID uuid.UUID, ack ui
 // SUBSCRIBE or replacement-PC restoration boundary.
 func (p *peer) advancePCVisibleACKLocked(sessionID, recipientID uuid.UUID, ack uint64) {
 	state := p.pcReplayRoute(pcRouteKey{sessionID: sessionID, recipientID: recipientID})
+	if state == nil {
+		return
+	}
 	if ack > state.highWater {
 		state.highWater = ack
 	}
@@ -1952,6 +2034,13 @@ func (p *peer) retainSubscriptionDuringTransientFailure(sessionID uuid.UUID, now
 }
 
 func (p *peer) refreshPresence() {
+	p.hub.mu.RLock()
+	registry := p.hub.presence
+	p.hub.mu.RUnlock()
+	if registry != nil {
+		registry.Touch(p.presenceID)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	var err error

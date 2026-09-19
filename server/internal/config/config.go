@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/termlink/termlink/server/internal/localnet"
 )
 
 const (
@@ -37,6 +39,7 @@ const (
 	defaultRedisPoolSize     = 20
 	defaultRedisMinIdleConns = 2
 	defaultRedisDialTimeout  = 5 * time.Second
+
 	defaultRedisReadTimeout  = 3 * time.Second
 	defaultRedisWriteTimeout = 3 * time.Second
 	defaultRedisPoolTimeout  = 4 * time.Second
@@ -46,6 +49,7 @@ const (
 	IdentityProviderExternal = "external"
 	IdentityProviderEmbedded = "embedded"
 )
+
 
 var (
 	// ErrMissing identifies a required configuration value that was not set.
@@ -486,8 +490,26 @@ func LoadSource(source Source) (Config, error) {
 		return strings.TrimSpace(value)
 	}
 
-	runtimeMode := strings.ToLower(lookupOptional("TERMLINK_RUNTIME_MODE", RuntimeModeDistributed))
-	identityProvider := strings.ToLower(lookupOptional("TERMLINK_IDENTITY_PROVIDER", IdentityProviderExternal))
+	// Single-node with embedded identity is the only supported production
+	// topology. Keep an explicit compatibility inference for old env files so
+	// they fail through their existing validation path instead of silently
+	// changing identity or coordination backends.
+	runtimeMode := strings.ToLower(lookupOptional("TERMLINK_RUNTIME_MODE", ""))
+	if runtimeMode == "" {
+		if strings.TrimSpace(lookupOptional("TERMLINK_REDIS_URL_FILE", "")) != "" {
+			runtimeMode = RuntimeModeDistributed
+		} else {
+			runtimeMode = RuntimeModeSingleNode
+		}
+	}
+	identityProvider := strings.ToLower(lookupOptional("TERMLINK_IDENTITY_PROVIDER", ""))
+	if identityProvider == "" {
+		if strings.TrimSpace(lookupOptional("TERMLINK_OIDC_CLIENT_SECRET_FILE", "")) != "" {
+			identityProvider = IdentityProviderExternal
+		} else {
+			identityProvider = IdentityProviderEmbedded
+		}
+	}
 	publicURL, err := lookupRequired("TERMLINK_PUBLIC_URL")
 	if err != nil {
 		return Config{}, err
@@ -607,7 +629,7 @@ func LoadSource(source Source) (Config, error) {
 			return Config{}, err
 		}
 	}
-	databaseURL, err := readSecret(source, "TERMLINK_DATABASE_URL_FILE")
+	databaseURL, err := readSecretOrValue(source, "TERMLINK_DATABASE_URL_FILE", "TERMLINK_DATABASE_URL")
 	if err != nil {
 		return Config{}, err
 	}
@@ -618,15 +640,27 @@ func LoadSource(source Source) (Config, error) {
 			return Config{}, err
 		}
 	}
-	tokenSigningKey, err := readSecret(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE")
-	if err != nil {
-		return Config{}, err
+	var tokenSigningKey Secret
+	if filePath, ok := source.LookupEnv("TERMLINK_TOKEN_SIGNING_KEY_FILE"); ok && strings.TrimSpace(filePath) != "" {
+		tokenSigningKey, err = readSecret(source, "TERMLINK_TOKEN_SIGNING_KEY_FILE")
+		if err != nil {
+			return Config{}, err
+		}
+	} else if value := strings.TrimSpace(lookupOptional("TERMLINK_TOKEN_SIGNING_KEY", "")); value != "" {
+		tokenSigningKey = Secret(value)
 	}
 	var initialAdminPassword Secret
 	if identityProvider == IdentityProviderEmbedded {
-		initialAdminPassword, err = readSecret(source, "TERMLINK_INITIAL_ADMIN_PASSWORD_FILE")
-		if err != nil {
-			return Config{}, err
+		if filePath, ok := source.LookupEnv("TERMLINK_INITIAL_ADMIN_PASSWORD_FILE"); ok && strings.TrimSpace(filePath) != "" {
+			initialAdminPassword, err = readSecret(source, "TERMLINK_INITIAL_ADMIN_PASSWORD_FILE")
+			if err != nil {
+				return Config{}, err
+			}
+		} else {
+			// Empty means: the identity provider generates a one-time random
+			// bootstrap password only when it actually creates the first
+			// administrator (never on restarts of an initialized database).
+			initialAdminPassword = Secret(lookupOptional("TERMLINK_INITIAL_ADMIN_PASSWORD", ""))
 		}
 	}
 	var keycloakAdminClientSecret Secret
@@ -645,9 +679,19 @@ func LoadSource(source Source) (Config, error) {
 	}
 	var accountDeletionIdentityKey Secret
 	if accountDeletionEnabled {
-		accountDeletionIdentityKey, err = readSecret(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE")
-		if err != nil {
-			return Config{}, err
+		// Single-node embedded deployments derive this key from the database-backed
+		// runtime master key. External/distributed deployments still require the
+		// explicitly mounted key for compatibility and key rotation.
+		if filePath, configured := source.LookupEnv("TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE"); configured && strings.TrimSpace(filePath) != "" {
+			accountDeletionIdentityKey, err = readSecret(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE")
+			if err != nil {
+				return Config{}, err
+			}
+		} else if runtimeMode != RuntimeModeSingleNode || identityProvider != IdentityProviderEmbedded {
+			accountDeletionIdentityKey, err = readSecret(source, "TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE")
+			if err != nil {
+				return Config{}, err
+			}
 		}
 	}
 
@@ -737,6 +781,17 @@ func readSecret(source Source, envName string) (Secret, error) {
 	return Secret(value), nil
 }
 
+func readSecretOrValue(source Source, fileEnv, valueEnv string) (Secret, error) {
+	if filePath, ok := source.LookupEnv(fileEnv); ok && strings.TrimSpace(filePath) != "" {
+		return readSecret(source, fileEnv)
+	}
+	value, ok := source.LookupEnv(valueEnv)
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%w: %s", ErrMissing, fileEnv)
+	}
+	return Secret(strings.TrimSpace(value)), nil
+}
+
 func envPath(source Source, envName string) string {
 	value, ok := source.LookupEnv(envName)
 	if !ok {
@@ -772,14 +827,22 @@ func parseDurationRange(name, value string, minimum, maximum time.Duration) (tim
 func validate(c Config) (Config, error) {
 	c.RuntimeMode = strings.ToLower(strings.TrimSpace(c.RuntimeMode))
 	if c.RuntimeMode == "" {
-		c.RuntimeMode = RuntimeModeDistributed
+		if !c.RedisURL.Empty() {
+			c.RuntimeMode = RuntimeModeDistributed
+		} else {
+			c.RuntimeMode = RuntimeModeSingleNode
+		}
 	}
 	if c.RuntimeMode != RuntimeModeDistributed && c.RuntimeMode != RuntimeModeSingleNode {
 		return Config{}, fmt.Errorf("%w: TERMLINK_RUNTIME_MODE", ErrInvalid)
 	}
 	c.IdentityProvider = strings.ToLower(strings.TrimSpace(c.IdentityProvider))
 	if c.IdentityProvider == "" {
-		c.IdentityProvider = IdentityProviderExternal
+		if !c.OIDCClientSecret.Empty() {
+			c.IdentityProvider = IdentityProviderExternal
+		} else {
+			c.IdentityProvider = IdentityProviderEmbedded
+		}
 	}
 	if c.IdentityProvider != IdentityProviderExternal && c.IdentityProvider != IdentityProviderEmbedded {
 		return Config{}, fmt.Errorf("%w: TERMLINK_IDENTITY_PROVIDER", ErrInvalid)
@@ -892,9 +955,9 @@ func validate(c Config) (Config, error) {
 	if c.IdentityProvider == IdentityProviderExternal && c.OIDCClientSecret.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_SECRET_FILE", ErrSecret)
 	}
-	if c.IdentityProvider == IdentityProviderEmbedded &&
-		(len(c.InitialAdminPassword.Value()) < 16 || len(c.InitialAdminPassword.Value()) > 1024) {
-		return Config{}, fmt.Errorf("%w: TERMLINK_INITIAL_ADMIN_PASSWORD_FILE", ErrSecret)
+	if c.IdentityProvider == IdentityProviderEmbedded && c.InitialAdminPassword.Value() != "" &&
+		(len(c.InitialAdminPassword.Value()) < 8 || len(c.InitialAdminPassword.Value()) > 1024) {
+		return Config{}, fmt.Errorf("%w: TERMLINK_INITIAL_ADMIN_PASSWORD", ErrSecret)
 	}
 	if strings.TrimSpace(c.KeycloakAdminClientID) == "" {
 		c.KeycloakAdminClientID = defaultKeycloakAdminClientID
@@ -920,11 +983,17 @@ func validate(c Config) (Config, error) {
 		if c.AccountDeletionIdentityKeyVersion < 1 {
 			return Config{}, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_VERSION", ErrInvalid)
 		}
-		keys, err := c.AccountDeletionIdentityKeys()
-		if err != nil {
-			return Config{}, err
+		if c.AccountDeletionIdentityKey.Empty() {
+			if !(c.RuntimeMode == RuntimeModeSingleNode && c.IdentityProvider == IdentityProviderEmbedded) {
+				return Config{}, fmt.Errorf("%w: TERMLINK_ACCOUNT_DELETION_IDENTITY_KEY_FILE", ErrSecret)
+			}
+		} else {
+			keys, err := c.AccountDeletionIdentityKeys()
+			if err != nil {
+				return Config{}, err
+			}
+			clearAccountDeletionIdentityKeys(keys)
 		}
-		clearAccountDeletionIdentityKeys(keys)
 	}
 	if strings.TrimSpace(c.WebOIDCClientID) == "" {
 		c.WebOIDCClientID = "termlink-web"
@@ -940,7 +1009,12 @@ func validate(c Config) (Config, error) {
 	}
 	publicURL, _ := url.Parse(c.PublicURL)
 	webRedirect, err := url.Parse(c.WebOIDCRedirectURI)
-	if err != nil || webRedirect.Scheme != "https" ||
+	// The local-development HTTP relaxation applies to the web redirect as
+	// well: same host as the (already validated) public URL, plain http only
+	// when the operator switch is set and the origin is loopback/private.
+	webRedirectSchemeOK := webRedirect != nil && (webRedirect.Scheme == "https" ||
+		(allowLocalHTTP() && webRedirect.Scheme == "http" && isLoopbackOrPrivateHost(publicURL.Hostname())))
+	if err != nil || webRedirect == nil || !webRedirectSchemeOK ||
 		!strings.EqualFold(webRedirect.Host, publicURL.Host) || webRedirect.Path != "/auth/callback" ||
 		webRedirect.RawQuery != "" || webRedirect.Fragment != "" || webRedirect.User != nil {
 		return Config{}, fmt.Errorf("%w: TERMLINK_WEB_OIDC_REDIRECT_URI", ErrInvalid)
@@ -951,10 +1025,10 @@ func validate(c Config) (Config, error) {
 	if c.RuntimeMode == RuntimeModeDistributed && c.RedisURL.Empty() {
 		return Config{}, fmt.Errorf("%w: TERMLINK_REDIS_URL_FILE", ErrSecret)
 	}
-	if c.TokenSigningKey.Empty() {
+	if c.TokenSigningKey.Empty() && !(c.RuntimeMode == RuntimeModeSingleNode && c.IdentityProvider == IdentityProviderEmbedded) {
 		return Config{}, fmt.Errorf("%w: TERMLINK_TOKEN_SIGNING_KEY_FILE", ErrSecret)
 	}
-	if len(c.TokenSigningKey.Value()) < 32 {
+	if !c.TokenSigningKey.Empty() && len(c.TokenSigningKey.Value()) < 32 {
 		return Config{}, fmt.Errorf("%w: TERMLINK_TOKEN_SIGNING_KEY_FILE", ErrSecret)
 	}
 	postgresPoolUnspecified := c.PostgresMaxConns == 0 && c.PostgresMinConns == 0 &&
@@ -1112,10 +1186,25 @@ func validateHTTPSURL(name, value string) error {
 		return err
 	}
 	parsed, _ := url.Parse(strings.TrimSpace(value))
-	if !strings.EqualFold(parsed.Scheme, "https") {
-		return fmt.Errorf("%w: %s", ErrInvalid, name)
+	if strings.EqualFold(parsed.Scheme, "https") {
+		return nil
 	}
-	return nil
+	// Local-development relaxation: with the explicit operator switch set, a
+	// loopback or private-network origin may use plain HTTP so a dev Docker
+	// server can be exercised end-to-end without a TLS edge. Production
+	// deployments never set the switch and keep the https-only contract.
+	if allowLocalHTTP() && isLoopbackOrPrivateHost(parsed.Hostname()) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrInvalid, name)
+}
+
+func allowLocalHTTP() bool {
+	return localnet.AllowHTTP()
+}
+
+func isLoopbackOrPrivateHost(hostname string) bool {
+	return localnet.IsLoopbackOrPrivateHost(hostname)
 }
 
 func validateOIDCBackchannelIssuer(publicIssuer, value string) error {
@@ -1136,7 +1225,8 @@ func validateOIDCBackchannelIssuer(publicIssuer, value string) error {
 		}
 	}
 	if parsed.Scheme == "http" {
-		if parsed.Port() == "" || !isLoopbackOrSingleLabelHost(parsed.Hostname()) {
+		privateHTTPAllowed := allowLocalHTTP() && isLoopbackOrPrivateHost(parsed.Hostname())
+		if parsed.Port() == "" || (!isLoopbackOrSingleLabelHost(parsed.Hostname()) && !privateHTTPAllowed) {
 			return fmt.Errorf("%w: %s", ErrInvalid, name)
 		}
 	}

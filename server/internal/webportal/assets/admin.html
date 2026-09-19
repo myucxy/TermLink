@@ -27,10 +27,6 @@
 
       {{template "admin-navigation" .}}
 
-      <a class="admin-user" href="/account" aria-label="返回个人中心">
-        <span class="admin-avatar" aria-hidden="true">{{printf "%.1s" .Username}}</span>
-        <span><strong>{{.Username}}</strong><small>{{.RoleLabel}} · {{.Role}}</small></span>
-      </a>
     </aside>
 
     <main class="admin-main">
@@ -79,9 +75,22 @@
           <thead><tr><th>设备</th><th>类型</th><th>信任</th><th>运行 Session</th><th>最后序号</th><th>最后活动</th></tr></thead>
           <tbody>{{range .Dashboard.Connections}}<tr>
             <td><strong>{{.Name}}</strong><small>{{shortID .ID}}</small></td><td>{{.DeviceType}}</td>
-            <td><span class="state-pill state-{{.TrustState}}">{{.TrustState}}</span></td><td>{{.RunningSessions}}</td><td>{{.LastOutputSeq}}</td><td>{{formatOptionalTime .LastSeenAt}}</td>
+            <td><span class="state-pill state-{{.TrustState}}">{{.TrustState}}</span></td><td>{{.RunningSessions}}</td><td>{{.LastOutputSeq}}</td><td>{{if .Online}}在线 / Online{{else}}离线 / Offline{{end}} · {{formatOptionalTime .LastSeenAt}}</td>
           </tr>{{else}}<tr><td colspan="6" class="empty-cell">当前没有已注册设备。连接 Windows Agent 后会在这里出现。</td></tr>{{end}}</tbody>
         </table></div>
+        {{if .TransportRoutingConfigured}}{{if eq .Role "SUPER_ADMIN"}}
+        <div class="admin-panel" style="margin-top:16px">
+          <div class="panel-heading"><div><p class="eyebrow">DIRECT TRANSPORT</p><h2>直连数据面路由</h2><p>开启后，已认证的 PC 与 Android 设备在 NAT 直连成功时直接承载数据流；关闭后全部流量回到 Relay（已建立的直连在下一票据到期时退出）。变更立即生效，无需重启。</p></div></div>
+          <p>当前状态：<span class="state-pill state-{{if .TransportRoutingPermitted}}TRUSTED{{else}}PENDING{{end}}">{{if .TransportRoutingPermitted}}已开启直连路由{{else}}仅 Relay 转发{{end}}</span></p>
+          <form method="post" action="{{.AdminBasePath}}/transport/routing">
+            <input type="hidden" name="csrf" value="{{.CSRF}}">
+            <input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce (printf "transport-routing:%t" .TransportRoutingPermitted)}}">
+            <input type="hidden" name="reason" value="系统自动记录">
+            <input type="hidden" name="routing_permitted" value="{{if .TransportRoutingPermitted}}false{{else}}true{{end}}">
+            <button class="button" type="submit">{{if .TransportRoutingPermitted}}关闭直连路由{{else}}开启直连路由{{end}}</button>
+          </form>
+        </div>
+        {{end}}{{end}}
       </section>
       {{end}}
 
@@ -91,7 +100,7 @@
           <dl class="detail-list"><div><dt>公开 Origin</dt><dd>{{.PublicURL}}</dd></div><div><dt>数据库 Schema</dt><dd>v{{.Dashboard.SchemaVersion}}</dd></div><div><dt>运行形态</dt><dd>Docker Compose · TLS edge</dd></div><div><dt>Secret</dt><dd>文件挂载 · 页面不回显</dd></div></dl>
         </article>
         <article class="admin-panel"><div class="panel-heading"><div><p class="eyebrow">SAFETY BASELINE</p><h2>部署边界</h2></div></div>
-          <ul class="check-list"><li>应用容器非 root、只读 RootFS</li><li>PostgreSQL 与 Valkey 仅位于内部网络</li><li>OIDC、API 与 Realtime 共用受信 HTTPS Origin</li><li>备份内容仅含元数据与 E2EE 密文</li></ul>
+          <ul class="check-list"><li>应用容器非 root、只读 RootFS</li><li>PostgreSQL 仅位于内部网络，数据使用持久卷</li><li>内置身份服务、API 与 Realtime 共用受信 HTTPS Origin</li><li>备份内容仅含元数据与 E2EE 密文</li></ul>
           <p class="muted-note">容器级 CPU、内存和版本应由受保护的 Grafana/Prometheus 运维面查看，本页面不伪造监控数字。</p>
         </article>
       </section>

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/localnet"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/store"
 )
@@ -142,8 +143,16 @@ func validIssuer(raw string) bool {
 		return false
 	}
 	issuer, err := url.Parse(raw)
-	return err == nil && issuer.Scheme == "https" && issuer.Host != "" && issuer.User == nil &&
-		issuer.RawQuery == "" && issuer.Fragment == ""
+	if err != nil || issuer.Host == "" || issuer.User != nil ||
+		issuer.RawQuery != "" || issuer.Fragment != "" {
+		return false
+	}
+	if issuer.Scheme == "https" {
+		return true
+	}
+	// Local-development relaxation shared with the config/auth packages: the
+	// operator opt-in permits a plain-HTTP loopback/private issuer.
+	return localnet.AllowHTTP() && localnet.IsLoopbackOrPrivateHost(issuer.Hostname())
 }
 
 // RunOnce reconciles one bounded batch. Errors on an individual candidate do

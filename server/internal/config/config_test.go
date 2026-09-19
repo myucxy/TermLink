@@ -70,6 +70,47 @@ func TestLoadFromEnvReadsSecretsAndRedactsDiagnostics(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvDefaultsToSingleNodeEmbeddedIdentity(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"db":    "postgres://termlink:password@postgres/termlink",
+		"admin": "Embedded_Admin_Test_8mP4qV7nR2xK",
+		"sign":  "01234567890123456789012345678901",
+	})
+	env := map[string]string{
+		"TERMLINK_PUBLIC_URL":                  "https://termlink.example.test",
+		"TERMLINK_DATABASE_URL_FILE":           files["db"],
+		"TERMLINK_INITIAL_ADMIN_PASSWORD_FILE": files["admin"],
+		"TERMLINK_TOKEN_SIGNING_KEY_FILE":      files["sign"],
+	}
+	c, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+	if c.RuntimeMode != RuntimeModeSingleNode || c.IdentityProvider != IdentityProviderEmbedded {
+		t.Fatalf("defaults = runtime %q identity %q, want single-node/embedded", c.RuntimeMode, c.IdentityProvider)
+	}
+	if c.OIDCIssuer != "https://termlink.example.test/realms/termlink" || c.OIDCClientID != "termlink-server" {
+		t.Fatalf("embedded OIDC defaults = issuer %q client %q", c.OIDCIssuer, c.OIDCClientID)
+	}
+}
+
+func TestLoadFromEnvGeneratesOneTimeInitialAdminPassword(t *testing.T) {
+	files := writeSecrets(t, map[string]string{
+		"db": "postgres://termlink:password@postgres/termlink",
+	})
+	env := map[string]string{
+		"TERMLINK_PUBLIC_URL":        "https://termlink.example.test",
+		"TERMLINK_DATABASE_URL_FILE": files["db"],
+	}
+	first, err := LoadFromEnv(env)
+	if err != nil {
+		t.Fatalf("LoadFromEnv() without initial admin password error = %v", err)
+	}
+	if first.InitialAdminPassword.Value() != "" {
+		t.Fatalf("unconfigured initial admin password = %d chars, want empty (generated at bootstrap)", len(first.InitialAdminPassword.Value()))
+	}
+}
+
 func TestLoadTurnstileUsesDedicatedSecretAndFailsClosed(t *testing.T) {
 	files := writeSecrets(t, map[string]string{
 		"oidc": "oidc-secret", "human": "turnstile-secret", "db": "db-secret", "redis": "redis-secret",
