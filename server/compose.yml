@@ -1,0 +1,79 @@
+# No .env file is required. Every deployment value has a local default and can
+# be overridden with an environment variable on the compose command:
+#
+#   TERMLINK_IMAGE='docker.io/myucxy/termlink:TAG@sha256:DIGEST' \
+#   TERMLINK_PUBLIC_URL='https://termlink.example.com' \
+#   docker compose -f server/compose.yml up -d --wait
+#
+# Defaults are suitable for a local/LAN trial. Override the image, public URL,
+# and database password for any shared or production deployment.
+name: ${COMPOSE_PROJECT_NAME:-termlink}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${TERMLINK_CONTAINER_LOG_MAX_SIZE:-10m}
+    max-file: ${TERMLINK_CONTAINER_LOG_MAX_FILES:-5}
+
+services:
+  postgres:
+    image: postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+    environment:
+      POSTGRES_DB: termlink
+      POSTGRES_USER: termlink
+      POSTGRES_PASSWORD: ${TERMLINK_POSTGRES_PASSWORD:-TermLinkDbPass_2026}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U termlink -d termlink"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+  server:
+    image: ${TERMLINK_IMAGE:-docker.io/myucxy/termlink:latest}
+    environment:
+      # The server auto-adapts everything else (internal/config: runtime mode,
+      # embedded identity, OIDC issuer/clients/redirects, listen address, log
+      # level). Only deployment-specific values live here; deriving issuer or
+      # redirect URIs here instead would risk contradictory overrides.
+      TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:-https://termlink.example.invalid}
+      TERMLINK_DATABASE_URL: postgres://termlink:${TERMLINK_POSTGRES_PASSWORD:-TermLinkDbPass_2026}@postgres:5432/termlink?sslmode=disable
+      TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: ${TERMLINK_INITIAL_ADMIN_PASSWORD_FILE:-}
+      TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
+      TERMLINK_ACCOUNT_DELETION_ENABLED: "true"
+      TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
+      TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
+      TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
+      TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+    ports:
+      - "${TERMLINK_HTTP_BIND_IP:-0.0.0.0}:${TERMLINK_HTTP_PORT:-8080}:8080"
+    networks: [database, egress]
+    read_only: true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/termlink-server", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+
+networks:
+  database:
+    internal: true
+  egress:

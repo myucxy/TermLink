@@ -25,7 +25,9 @@ artifacts/
 # Local tooling
 .idea/
 **/.codex/
-.tmp-*.json
+.tmp-*
 *.log
 Thumbs.db
 .DS_Store
+# Local build artifacts not covered by generic rules
+server/termlink-server.exe
