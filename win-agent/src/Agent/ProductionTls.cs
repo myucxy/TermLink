@@ -104,12 +104,15 @@ namespace TermLink.Agent
         private static Uri ParseServerOrigin(string serverUrl)
         {
             if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) ||
-                server.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(server.Host) ||
+                server.Scheme != Uri.UriSchemeHttps && server.Scheme != Uri.UriSchemeHttp ||
+                string.IsNullOrWhiteSpace(server.Host) ||
                 !string.IsNullOrEmpty(server.UserInfo) || !string.IsNullOrEmpty(server.Query) ||
                 !string.IsNullOrEmpty(server.Fragment) || server.AbsolutePath != "/")
             {
                 throw new ArgumentException("The TermLink server URL must be an HTTPS origin.", nameof(serverUrl));
             }
+            // Local development: plain HTTP is allowed for loopback/private
+            // hosts so a local Docker server can be reached without a TLS edge.
             return server;
         }
 

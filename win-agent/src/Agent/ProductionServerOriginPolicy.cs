@@ -13,6 +13,9 @@ namespace TermLink.Agent
     /// </summary>
     internal static class ProductionServerOriginPolicy
     {
+        public static bool IsAllowedUrl(string url) =>
+            Uri.TryCreate(url, UriKind.Absolute, out var uri) && IsAllowedOrigin(uri);
+
         public static bool IsAllowedOrigin(Uri uri) =>
             uri != null && (
                 uri.Scheme == Uri.UriSchemeHttps ||

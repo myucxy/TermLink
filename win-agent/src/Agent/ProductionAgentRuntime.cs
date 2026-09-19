@@ -2848,7 +2848,11 @@ namespace TermLink.Agent
                 ProductionTls.ConfigureWebSocket(active.Options, config.ServerUrl);
                 var accessToken = await GetAccessTokenAsync(false, token).ConfigureAwait(false);
                 AddProofHeaders(active.Options, HttpMethod.Get, "/v1/realtime", Array.Empty<byte>(), accessToken);
-                var wsUri = new Uri(config.ServerUrl.Replace("https://", "wss://", StringComparison.OrdinalIgnoreCase) + "/v1/realtime");
+                // Plain-HTTP local development servers speak ws:// for the
+                // relay; only https:// origins upgrade to wss://.
+                var realtimeRoot = new Uri(config.ServerUrl);
+                var realtimeScheme = realtimeRoot.Scheme == Uri.UriSchemeHttps ? "wss" : "ws";
+                var wsUri = new UriBuilder(realtimeRoot) { Scheme = realtimeScheme, Path = "/v1/realtime" }.Uri;
                 using (var handshakeCancellation = CancellationTokenSource.CreateLinkedTokenSource(token))
                 {
                     handshakeCancellation.CancelAfter(RealtimeHandshakeTimeout);

@@ -48,10 +48,10 @@ namespace TermLink.Agent
                 }
             }
             if (!link || !Uri.TryCreate(serverUrl, UriKind.Absolute, out var server) ||
-                server.Scheme != Uri.UriSchemeHttps || !string.IsNullOrEmpty(server.Query) ||
+                !ProductionServerOriginPolicy.IsAllowedOrigin(server) || !string.IsNullOrEmpty(server.Query) ||
                 !string.IsNullOrEmpty(server.Fragment))
             {
-                throw new ArgumentException("--server-url must be an HTTPS TermLink origin.");
+                throw new ArgumentException("--server-url must be a TermLink origin.");
             }
             if (string.IsNullOrWhiteSpace(pcName) || pcName.Length > 128)
             {
@@ -368,7 +368,8 @@ namespace TermLink.Agent
                     throw new InvalidOperationException("TermLink account registration was rejected.");
             }
             var discovery = await GetJsonAsync<OIDCConfiguration>(http, client.OIDCIssuer.TrimEnd('/') + "/.well-known/openid-configuration", CancellationToken.None).ConfigureAwait(false);
-            if (!IsHttps(discovery.TokenEndpoint)) throw new InvalidDataException("OIDC token endpoint is invalid.");
+            if (!IsHttps(discovery.TokenEndpoint))
+                throw new InvalidDataException("OIDC token endpoint must be HTTPS or a local HTTP origin.");
             using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, discovery.TokenEndpoint)
             {
                 Content = new FormUrlEncodedContent(new Dictionary<string, string>
@@ -685,7 +686,15 @@ namespace TermLink.Agent
 
         private static bool IsHttps(string value)
         {
-            return Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps;
+            // Local development relaxation: allow plain HTTP for loopback and
+            // private-network origins so a local Docker server works without
+            // a TLS edge.
+            if (Uri.TryCreate(value, UriKind.Absolute, out var uri))
+            {
+                if (uri.Scheme == Uri.UriSchemeHttps) return true;
+                if (uri.Scheme == Uri.UriSchemeHttp && ProductionServerOriginPolicy.IsPrivateOrLoopbackHost(uri.Host)) return true;
+            }
+            return false;
         }
 
         internal static ProcessStartInfo CreateBrowserStartInfo(string authorizationUrl)
