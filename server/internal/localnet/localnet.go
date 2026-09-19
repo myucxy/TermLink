@@ -37,7 +37,6 @@ func IsLoopbackOrPrivateHost(hostname string) bool {
 	return ip.IsLoopback() || ip.IsPrivate()
 }
 
-
 // InsecureCookieAllowed reports whether cookies for the given request Host may
 // be stored without the Secure attribute under the local-development HTTP
 // relaxation (loopback/private host + explicit operator opt-in). Browsers
