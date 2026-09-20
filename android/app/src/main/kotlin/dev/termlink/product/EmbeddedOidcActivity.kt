@@ -161,7 +161,11 @@ internal class EmbeddedOidcActivity : ComponentActivity() {
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
             settings.safeBrowsingEnabled = true
             CookieManager.getInstance().setAcceptCookie(true)
-            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            // The embedded flow talks only to the configured identity origin.
+            // Third-party content embedded in that page must not receive or
+            // set cookies (audit #43): first-party cookies stay enabled for
+            // the sign-in session, third-party access is denied outright.
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
             webChromeClient = object : WebChromeClient() {
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
                     this@EmbeddedOidcActivity.progress.progress = newProgress
