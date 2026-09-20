@@ -9,7 +9,7 @@
 |---|------|------|----------|------|
 | 1 | 历史回看链路不通（快照 EMPTY/page_up 超时/chunk 0） | Server+Win+Android | 专项排查四段链路（SessionHost 缓冲→agent HistoryUploader→server 中继→手机拉取），5200 行标记会话作为复现用例 | **已修复**（29caac4/2ad8f8e）：根因为三层叠加——①安卓 hello 未广告 host_history_v1（relay 静默丢弃全部历史帧）；②快照权威校验单发即弃（目录尾巴心跳竞态，改为有界追赶重试）；③宿主 PrepareArtifact oldest-first 永远服务最旧快照（突发后恢复的是空屏旧快照，翻页产物集为空）。修复后实测：REMOTE_SNAPSHOT 引导、恢复 complete、scrollback 滚动可用。注：V2 TerminalCore 权威模式下 TRANSCRIPT_PAGE 产物按设计不产出（checkpoint 内嵌有界 scrollback 即回看边界，安卓渲染器容量 2000 行），翻页验收语义随架构更新 | ✔ 已修复 |
 | 2 | 会话终止误导提示 + 外部 SessionHost 标注 | Android+Win | 复查结论（2026-09-20）：终止链路已实现 87 确认等待与失败 snackbar，无需改码；"外部会话"架构上不存在（所有会话均来自 SessionHost 注册，按 PID+启动时间精确终止，实测正常会话 12s 内完成）。此前"乐观 Exited"为测试行映射误判；终止已死宿主会话时 agent 正确返回失败 | ✔ 已核实 |
-| 3 | 会话状态传播延迟 | Win Agent+Server | 会话进程退出时 Agent 经现有 realtime 通道主动推送终结事件，订阅端即时更新 | 待开工 |
+| 3 | 会话状态传播延迟 | Win Agent+Server | 精确计时实测（2026-09-20）：kill 宿主后 4 秒 DB 标记 INTERRUPTED、10 秒内手机 UI 免刷新翻转（生命周期帧经现有通道推送）。早期"2 分钟无反应"为 taskkill 静默失败的测试假象。**无需修改** | ✔ 已验证 |
 | 4 | 会话初始标题继承启动控制台 | Win SessionHost | 启动时显式发布 managed-shell 名称作初始标题；程序后续动态改标题的链路（TerminalTitleTracker OSC 0/2）已存在且正常，不动 | 待开工 |
 
 ## 二、安全加固（第二阶段）
