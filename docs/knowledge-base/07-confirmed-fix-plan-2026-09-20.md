@@ -17,8 +17,8 @@
 | # | 问题 | 模块 | 确认方案 |
 |---|------|------|----------|
 | 5 | 主密钥明文存库（#5） | Server | 可选 TERMLINK_MASTER_KEY_PASSPHRASE → argon2 → AES-GCM 包裹存库；未配置保持兼容+告警；首次配置自动迁移 |
-| 6 | 更新信任锚自指（#6） | Win | 锚点编译进二进制嵌入资源（带 manifest）；安装目录 .cer 与进程自签退出信任链 |
-| 7 | Authenticode 无链校验/吊销（#18） | Win | 完整链校验（可信根+全链+CRL/OCSP），SHA-1 pin 保留为第二因子；内测环境兼容开关 |
+| 6 | 更新信任锚自指（#6） | Win | 锚点编译进二进制嵌入资源（UpdatePublisher.cer 可选 EmbeddedResource）；安装目录 .cer 与进程自签退出信任链；无锚点部署 fail-closed |
+| 7 | Authenticode 无链校验/吊销（#18） | Win | 已实现：签名策略 auto/strict/compat（TERMLINK_UPDATE_SIGNATURE_POLICY），strict 启用整链吊销检查仅接受 TrustSuccess，SHA-1 pin 保留第二因子 |
 | 8 | 更新元数据无签名（#16） | Server+Win | Ed25519 签名 catalog + 客户端内置公钥强校验；REQUIRED 仅验签通过生效 |
 | 9 | 管道 ACL + 握手 token argv（#37/38） | Win | 管道 ACL 加完整性级别；token 改经继承环境变量/受控临时文件 |
 | 10 | Android 安全四件套（#7设置化/#22/#41/#42/#43） | Android | FLAG_SECURE 设置化（默认开，Settings→Secure screen）；WebView 禁第三方 Cookie 已合入；StrongBox 可用探测+可选生物识别与 SQLCipher 评估后续进行 |
