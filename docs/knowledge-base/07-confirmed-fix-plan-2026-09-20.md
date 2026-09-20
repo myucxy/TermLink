@@ -27,7 +27,7 @@
 
 | # | 问题 | 模块 | 确认方案 |
 |---|------|------|----------|
-| 11 | 票据 120s TTL 硬拆（#2） | Server+Win+Android | 先设计（双向 proof 续期、TTL 延长+滑动、保留紧急撤销）评审后实现 |
+| 11 | 票据 120s TTL 硬拆（#2） | Server+Win+Android | 设计稿 v1 已完成：docs/DIRECT_TICKET_RENEWAL_DESIGN.md（续期票据双向交换、TTL 20 分钟滑动、保留紧急撤销、兼容降级矩阵、S1-S4 实施分解），待评审后进入 S1 实现 |
 | 12 | 真实网络 e2e 为零（#3/24） | 测试设施 | 按 gap 清单实现真实 socket 适配器：同 LAN/跨 NAT/对称 NAT/防火墙拒 UDP/VPN/网络切换 |
 | 13 | 队列满即整体退役（#25） | network-core | 有界降级：丢可丢帧+退役计数指标 |
 | 14 | 直连 P3 四项（#46/47/49/50） | network-core+信令 | 探测抖动、QUIC 握手 keepalive、离线 peer 信令显式拒绝、FFI 忙轮询改事件等待 |
