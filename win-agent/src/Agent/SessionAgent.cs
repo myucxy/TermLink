@@ -380,6 +380,9 @@ namespace TermLink.Agent
             var terminalFrames = new List<LocalFrame>(2);
             lock (statusSync)
             {
+                WriteSessionAgentDiagnostic("interrupt_commit_enter session=" + options.SessionId.ToString("N") +
+                    " lifecycle=" + lifecycle + " removed=" + removed + " ended=" + ended +
+                    " interruptedCommitted=" + interruptedCommitted + " commitInterruptedOnStop=" + commitInterruptedOnStop);
                 var stoppedWithInterruption = lifecycle == SessionAgentLifecycle.RemoteStopped && commitInterruptedOnStop;
                 if (removed || interruptedCommitted ||
                     (!ended && lifecycle != SessionAgentLifecycle.HostLost &&
@@ -552,6 +555,8 @@ namespace TermLink.Agent
             {
                 if (actualHostProcessId > 0 && !IsProcessRunning(actualHostProcessId))
                 {
+                    WriteSessionAgentDiagnostic("host_lost session=" + options.SessionId.ToString("N") +
+                        " host_pid=" + actualHostProcessId);
                     TryTransitionUnlessStopping(SessionAgentLifecycle.HostLost);
                     return;
                 }
@@ -619,6 +624,26 @@ namespace TermLink.Agent
                 ";resize_applied=" + resizeApplied +
                 ";reconnects=" + reconnects +
                 ";exit=" + exitCode);
+        }
+
+        // Temporary lifecycle diagnostics: bounded structural metadata only.
+        private static void WriteSessionAgentDiagnostic(string message)
+        {
+            try
+            {
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink", "logs");
+                Directory.CreateDirectory(root);
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-background-runtime.log"),
+                    DateTime.UtcNow.ToString("O") + " session-agent-diag " + message + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch
+            {
+                // Diagnostics must never become a request-path dependency.
+            }
         }
 
         private void ProcessConnection(NamedPipeServerStream pipe)
