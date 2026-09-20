@@ -723,7 +723,8 @@ namespace TermLink.Agent
                 terminalHistoryProducer,
                 credentials.DeviceId,
                 sessionId => destroyedHistorySessions.ContainsKey(sessionId) ||
-                    terminalHistoryStore.IsSessionDeleted(sessionId));
+                    terminalHistoryStore.IsSessionDeleted(sessionId),
+                WriteHostHistoryDiagnostic);
 #if TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE
             directAcceptanceDiagnostics =
                 ProductionDirectAcceptanceDiagnosticsServer.TryCreateFromEnvironment(
@@ -5051,7 +5052,11 @@ namespace TermLink.Agent
                     try { historyRequest = HostHistoryRequestPayload.Parser.ParseFrom(plaintext); }
                     catch (InvalidProtocolBufferException) { return; }
                     WriteHostHistoryDiagnostic("request_received session=" + sessionId.ToString("N") +
-                        " kind=" + historyRequest.Kind + " sender=" + senderId.ToString("N"));
+                        " kind=" + historyRequest.Kind + " sender=" + senderId.ToString("N") +
+                        " snapshot_seq=" + historyRequest.SnapshotSeq +
+                        " before_line_id=" + historyRequest.BeforeLineId +
+                        " after_seq=" + historyRequest.AfterSeq +
+                        " through_seq=" + historyRequest.ThroughSeq);
                     if (historyRequest.RequestId.Length != 16 ||
                         GuidFromBytes(historyRequest.RequestId.Span) == Guid.Empty)
                     {

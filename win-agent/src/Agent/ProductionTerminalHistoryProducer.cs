@@ -851,11 +851,14 @@ namespace TermLink.Agent
             ProductionHistoryRecipient recipient)
         {
             ValidateRecipient(recipient);
-            return store.PrepareArtifact(
+            // Multiple production passes coexist per session; serve the newest
+            // snapshot so a restore reflects the full retained transcript
+            // rather than a stale pre-burst screen (whose empty page set
+            // permanently broke transcript paging for that restore).
+            return store.PrepareLatestSnapshotArtifact(
                 sessionId,
                 recipient.DeviceId,
                 recipient.KeyEpoch,
-                artifact => artifact.Kind == ProductionTerminalHistoryArtifactKind.Snapshot,
                 artifact => SealArtifact(sessionId, recipient, artifact));
         }
 

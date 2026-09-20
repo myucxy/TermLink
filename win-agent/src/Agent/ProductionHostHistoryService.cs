@@ -62,18 +62,21 @@ namespace TermLink.Agent
         private readonly ProductionTerminalHistoryProducer producer;
         private readonly Guid pcDeviceId;
         private readonly Func<Guid, bool> isDestroyed;
+        private readonly Action<string> diagnostic;
 
         public ProductionHostHistoryService(
             ProductionTerminalHistoryStore store,
             ProductionTerminalHistoryProducer producer,
             Guid pcDeviceId,
-            Func<Guid, bool> isDestroyed)
+            Func<Guid, bool> isDestroyed,
+            Action<string> diagnostic = null)
         {
             this.store = store ?? throw new ArgumentNullException(nameof(store));
             this.producer = producer ?? throw new ArgumentNullException(nameof(producer));
-            if (pcDeviceId == Guid.Empty) throw new ArgumentException("PC device ID is required.", nameof(pcDeviceId));
+            if (pcDeviceId == Guid.Empty) throw new ArgumentException("A PC device ID is required.", nameof(pcDeviceId));
             this.pcDeviceId = pcDeviceId;
             this.isDestroyed = isDestroyed ?? throw new ArgumentNullException(nameof(isDestroyed));
+            this.diagnostic = diagnostic;
         }
 
         public ProductionHostHistorySelection Select(
@@ -125,7 +128,14 @@ namespace TermLink.Agent
                 recipient,
                 request.SnapshotSeq,
                 request.BeforeLineId);
-            if (prepared == null) return NotFound("TRANSCRIPT_PAGE_NOT_FOUND");
+            if (prepared == null)
+            {
+                diagnostic?.Invoke("transcript_page_missing session=" + sessionId.ToString("N") +
+                    " requested_snapshot_seq=" + request.SnapshotSeq +
+                    " requested_before_line_id=" + request.BeforeLineId +
+                    " baked_pages=" + store.DescribeTranscriptPageCursors(sessionId));
+                return NotFound("TRANSCRIPT_PAGE_NOT_FOUND");
+            }
             return PreparedArtifact(
                 prepared,
                 HostHistoryObjectKindV1.Transcript,

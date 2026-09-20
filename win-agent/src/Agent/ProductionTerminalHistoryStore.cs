@@ -663,32 +663,104 @@ namespace TermLink.Agent
                     .OrderBy(value => value.UploadOrder)
                     .FirstOrDefault(value => selector(value.Clone()));
                 if (artifact == null) return null;
-                var deliveryKey = DeliveryKey(recipientDeviceId, keyEpoch);
-                if (!outbox.Deliveries.TryGetValue(deliveryKey, out var delivery))
+                return PrepareSealedArtifact(path, sessionId, recipientDeviceId, keyEpoch, artifact, outbox, seal);
+            }
+        }
+
+        /// <summary>
+        /// Prepares the newest snapshot artifact for the recipient. Multiple
+        /// production passes legitimately coexist in the outbox (each output
+        /// burst produces a newer snapshot); serving the oldest one would hand
+        /// the phone a pre-burst screen and permanently break transcript
+        /// paging for that restore.
+        /// </summary>
+        public ProductionTerminalHistoryPreparedUpload PrepareLatestSnapshotArtifact(
+            Guid sessionId,
+            Guid recipientDeviceId,
+            long keyEpoch,
+            Func<ProductionTerminalHistoryArtifact, byte[]> seal)
+        {
+            ValidateSessionId(sessionId);
+            if (recipientDeviceId == Guid.Empty || recipientDeviceId == pcDeviceId)
+                throw new ArgumentException("A distinct recipient device is required.", nameof(recipientDeviceId));
+            if (keyEpoch < 1) throw new ArgumentOutOfRangeException(nameof(keyEpoch));
+            if (seal == null) throw new ArgumentNullException(nameof(seal));
+            lock (SessionLock(sessionId))
+            {
+                var path = Path.Combine(SessionDirectory(sessionId), OutboxFileName);
+                if (!File.Exists(path)) return null;
+                var outbox = ReadPersistedOutbox(path, sessionId);
+                var artifact = outbox.Artifacts
+                    .Where(value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
+                    .OrderByDescending(value => value.SnapshotSequence)
+                    .ThenByDescending(value => value.UploadOrder)
+                    .FirstOrDefault();
+                if (artifact == null) return null;
+                return PrepareSealedArtifact(path, sessionId, recipientDeviceId, keyEpoch, artifact, outbox, seal);
+            }
+        }
+
+        private ProductionTerminalHistoryPreparedUpload PrepareSealedArtifact(
+            string outboxPath,
+            Guid sessionId,
+            Guid recipientDeviceId,
+            long keyEpoch,
+            ProductionTerminalHistoryArtifact artifact,
+            ProductionTerminalHistoryOutbox outbox,
+            Func<ProductionTerminalHistoryArtifact, byte[]> seal)
+        {
+            var deliveryKey = DeliveryKey(recipientDeviceId, keyEpoch);
+            if (!outbox.Deliveries.TryGetValue(deliveryKey, out var delivery))
+            {
+                delivery = new ProductionTerminalHistoryDelivery
                 {
-                    delivery = new ProductionTerminalHistoryDelivery
-                    {
-                        RecipientDeviceId = recipientDeviceId,
-                        KeyEpoch = keyEpoch
-                    };
-                    outbox.Deliveries.Add(deliveryKey, delivery);
-                }
-                if (!delivery.SealedObjects.TryGetValue(artifact.ArtifactId, out var sealedObject))
-                {
-                    sealedObject = seal(artifact.Clone());
-                    if (sealedObject == null || sealedObject.Length == 0)
-                        throw new InvalidDataException("Terminal artifact sealing returned no ciphertext.");
-                    delivery.SealedObjects[artifact.ArtifactId] = (byte[])sealedObject.Clone();
-                    WriteJson(path, sessionId, "outbox", outbox);
-                }
-                return new ProductionTerminalHistoryPreparedUpload
-                {
-                    SessionId = sessionId,
                     RecipientDeviceId = recipientDeviceId,
-                    KeyEpoch = keyEpoch,
-                    Artifact = artifact.Clone(),
-                    SealedObject = (byte[])sealedObject.Clone()
+                    KeyEpoch = keyEpoch
                 };
+                outbox.Deliveries.Add(deliveryKey, delivery);
+            }
+            if (!delivery.SealedObjects.TryGetValue(artifact.ArtifactId, out var sealedObject))
+            {
+                sealedObject = seal(artifact.Clone());
+                if (sealedObject == null || sealedObject.Length == 0)
+                    throw new InvalidDataException("Terminal artifact sealing returned no ciphertext.");
+                delivery.SealedObjects[artifact.ArtifactId] = (byte[])sealedObject.Clone();
+                WriteJson(outboxPath, sessionId, "outbox", outbox);
+            }
+            return new ProductionTerminalHistoryPreparedUpload
+            {
+                SessionId = sessionId,
+                RecipientDeviceId = recipientDeviceId,
+                KeyEpoch = keyEpoch,
+                Artifact = artifact.Clone(),
+                SealedObject = (byte[])sealedObject.Clone()
+            };
+        }
+
+        /// <summary>
+        /// Bounded structural metadata for diagnostics: the transcript page
+        /// cursors currently baked for the session. Never includes terminal
+        /// text or key material.
+        /// </summary>
+        public string DescribeTranscriptPageCursors(Guid sessionId)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                var path = Path.Combine(SessionDirectory(sessionId), OutboxFileName);
+                if (!File.Exists(path)) return "no_outbox";
+                var outbox = ReadPersistedOutbox(path, sessionId);
+                var pages = outbox.Artifacts
+                    .Where(value => value.Kind == ProductionTerminalHistoryArtifactKind.Transcript)
+                    .OrderBy(value => value.SnapshotSequence)
+                    .ThenBy(value => value.ExclusiveBeforeLineId)
+                    .Take(12)
+                    .Select(value => "(seq=" + value.SnapshotSequence +
+                        " before=" + value.ExclusiveBeforeLineId +
+                        " lines=" + value.FirstLineId + ".." + value.LastLineId + ")");
+                return "count=" + outbox.Artifacts.Count(value =>
+                    value.Kind == ProductionTerminalHistoryArtifactKind.Transcript) +
+                    " cursors=" + string.Join(",", pages);
             }
         }
 
