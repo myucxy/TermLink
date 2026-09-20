@@ -471,6 +471,10 @@ namespace TermLink.SessionHost
         private bool restoreOuterConsoleInputMode;
         private bool restoreOuterConsoleOutputMode;
         private string lastPublishedTitle;
+        // The console title inherited from the launching process is launcher
+        // noise (e.g. a shell path), not a shell-chosen title; it is filtered
+        // from publication so the initial managed-shell name stays visible.
+        private string inheritedConsoleTitle;
         private AgentPipeBridge agentPipe;
         private AgentRegistryRegistration agentRegistration;
         private TerminalCoreAuthority terminalAuthority;
@@ -556,7 +560,13 @@ namespace TermLink.SessionHost
             // so the first server upsert never invents an Android viewport or
             // a default 80x24 size.
             PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
-            PublishCurrentConsoleTitle();
+            // The launching process's console title is launcher noise; remember
+            // it to filter later no-op polls, and publish the managed-shell
+            // name as the session's initial title instead.
+            var titleBuffer = new StringBuilder(4096);
+            var inheritedLength = GetConsoleTitle(titleBuffer, titleBuffer.Capacity);
+            inheritedConsoleTitle = inheritedLength > 0 ? titleBuffer.ToString() : string.Empty;
+            PublishTitleIfChanged(ManagedShellDisplayName(ShellType));
             PublishAgentFrame(
                 LocalFrameType.Lifecycle,
                 LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0));
@@ -1389,7 +1399,24 @@ namespace TermLink.SessionHost
             var buffer = new StringBuilder(4096);
             var length = GetConsoleTitle(buffer, buffer.Capacity);
             if (length > 0 || Marshal.GetLastWin32Error() == 0)
-                PublishTitleIfChanged(buffer.ToString());
+            {
+                // The inherited launcher title is filtered: only titles the
+                // shell or its programs actually set are published.
+                if (!string.Equals(buffer.ToString(), inheritedConsoleTitle, StringComparison.Ordinal))
+                    PublishTitleIfChanged(buffer.ToString());
+            }
+        }
+
+        private static string ManagedShellDisplayName(ManagedShellType shellType)
+        {
+            switch (shellType)
+            {
+                case ManagedShellType.CommandPrompt: return "Command Prompt";
+                case ManagedShellType.WindowsPowerShell: return "Windows PowerShell";
+                case ManagedShellType.PowerShell7: return "PowerShell 7";
+                case ManagedShellType.Wsl: return "WSL";
+                default: return "TermLink Shell";
+            }
         }
 
         private void PublishTitleIfChanged(string title)
