@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/termlink/termlink/server/internal/buildinfo"
 	"github.com/termlink/termlink/server/internal/config"
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
+	"github.com/termlink/termlink/server/internal/keywrap"
 	"github.com/termlink/termlink/server/internal/filetransfer"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/identity"
@@ -152,9 +154,9 @@ func runProduction() error {
 	}
 	keyMaster := cfg.TokenSigningKey.Value()
 	if strings.TrimSpace(keyMaster) == "" && cfg.RuntimeMode == config.RuntimeModeSingleNode && cfg.IdentityProvider == config.IdentityProviderEmbedded {
-		master, secretErr := repository.EnsureRuntimeSecret(ctx, "token-signing-master", 32)
-		if secretErr != nil {
-			return fmt.Errorf("initialize database-backed server secret: %w", secretErr)
+		master, err := resolveWrappedMasterSecret(ctx, repository)
+		if err != nil {
+			return err
 		}
 		keyMaster = string(master)
 		clear(master)
@@ -707,6 +709,77 @@ func configureLogging(levelName string) {
 		level = slog.LevelError
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+}
+
+// masterSecretName is the runtime secret row holding the server master key.
+const masterSecretName = "token-signing-master"
+
+// masterWrapPassphraseEnv optionally protects the database-stored master key
+// with a passphrase-derived AES-GCM wrap (audit #5): with it configured, the
+// database alone no longer yields the derived keys.
+const masterWrapPassphraseEnv = "TERMLINK_MASTER_KEY_PASSPHRASE"
+
+// resolveWrappedMasterSecret returns the server master key, creating it on
+// first start. When TERMLINK_MASTER_KEY_PASSPHRASE is set, the stored value
+// is an AES-GCM wrap keyed by the passphrase: a stored plaintext value is
+// migrated to wrapped form automatically, and a wrapped value without the
+// passphrase fails closed instead of silently deriving wrong keys.
+func resolveWrappedMasterSecret(ctx context.Context, repository *store.Postgres) ([]byte, error) {
+	passphrase := os.Getenv(masterWrapPassphraseEnv)
+	stored, found, err := repository.GetRuntimeSecretValue(ctx, masterSecretName)
+	if err != nil {
+		return nil, fmt.Errorf("read database-backed server secret: %w", err)
+	}
+	if found && keywrap.IsWrapped(string(stored)) {
+		if passphrase == "" {
+			return nil, errors.New("the database master secret is wrapped but " +
+				masterWrapPassphraseEnv + " is not configured")
+		}
+		master, unwrapErr := keywrap.Unwrap(passphrase, string(stored))
+		if unwrapErr != nil {
+			return nil, fmt.Errorf("unwrap database-backed server secret: %w", unwrapErr)
+		}
+		slog.Warn("database master secret unwrapped with " + masterWrapPassphraseEnv +
+			"; the passphrase is required on every start of this deployment")
+		return master, nil
+	}
+	if !found {
+		master := make([]byte, 32)
+		if _, err := rand.Read(master); err != nil {
+			return nil, fmt.Errorf("generate database-backed server secret: %w", err)
+		}
+		if passphrase != "" {
+			wrapped, wrapErr := keywrap.Wrap(passphrase, master)
+			if wrapErr != nil {
+				return nil, fmt.Errorf("wrap database-backed server secret: %w", wrapErr)
+			}
+			stored = []byte(wrapped)
+		} else {
+			stored = master
+		}
+		if err := repository.UpdateRuntimeSecretValue(ctx, masterSecretName, stored); err != nil {
+			return nil, fmt.Errorf("store database-backed server secret: %w", err)
+		}
+		return master, nil
+	}
+	// A plaintext secret exists. Wrap it when a passphrase is configured
+	// (one-time migration); otherwise keep legacy behavior with a warning.
+	master := append([]byte(nil), stored...)
+	if passphrase == "" {
+		slog.Warn("database master secret is stored unwrapped; set " + masterWrapPassphraseEnv +
+			" to encrypt it at rest")
+		return master, nil
+	}
+	wrapped, wrapErr := keywrap.Wrap(passphrase, master)
+	if wrapErr != nil {
+		return nil, fmt.Errorf("wrap database-backed server secret: %w", wrapErr)
+	}
+	if err := repository.UpdateRuntimeSecretValue(ctx, masterSecretName, []byte(wrapped)); err != nil {
+		return nil, fmt.Errorf("store wrapped database-backed server secret: %w", err)
+	}
+	slog.Warn("database master secret migrated to wrapped storage; " +
+		masterWrapPassphraseEnv + " is required on every start of this deployment")
+	return master, nil
 }
 
 func deriveServerKey(master, purpose string) []byte {

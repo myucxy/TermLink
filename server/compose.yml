@@ -58,6 +58,10 @@ services:
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
       TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      # Optional master-key at-rest wrap (audit #5). The passphrase transits
+      # the compose environment; prefer a long random value and treat it as a
+      # deployment secret (losing it makes the deployment unstartable).
+      TERMLINK_MASTER_KEY_PASSPHRASE: ${TERMLINK_MASTER_KEY_PASSPHRASE:-}
     ports:
       - "${TERMLINK_HTTP_BIND_IP:-0.0.0.0}:${TERMLINK_HTTP_PORT:-8080}:8080"
     networks: [database, egress]
