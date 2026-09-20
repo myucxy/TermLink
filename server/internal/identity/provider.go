@@ -24,10 +24,13 @@ import (
 
 const (
 	embeddedAccessTokenLifetime    = 5 * time.Minute
-	embeddedRefreshTokenLifetime   = 8 * time.Hour
+	// The refresh grant re-issues the refresh token with a fresh window on
+	// every use (fosite sliding semantics), so this is an inactivity
+	// lifetime: clients that go 20 days without refreshing sign in again.
+	embeddedRefreshTokenLifetime   = 20 * 24 * time.Hour
 	embeddedAuthorizeCodeLifetime  = time.Minute
 	embeddedIDTokenLifetime        = 5 * time.Minute
-	embeddedBrowserSessionLifetime = 8 * time.Hour
+	embeddedBrowserSessionLifetime = 20 * 24 * time.Hour
 	serverAudience                 = "termlink-server"
 )
 

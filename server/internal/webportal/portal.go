@@ -45,7 +45,10 @@ const (
 	sensitiveMethodMFA      = "mfa"
 	sensitiveMethodPassword = "password"
 	oauthStateTTL           = 10 * time.Minute
-	webSessionTTL           = 8 * time.Hour
+	// Sliding inactivity window: requireAccount re-issues the cookie once
+	// less than half of it remains, so active browsers stay signed in while
+	// abandoned ones age out.
+	webSessionTTL           = 20 * 24 * time.Hour
 	recentLoginTTL          = 10 * time.Minute
 	sensitiveActionTTL      = 20 * time.Minute
 	maximumCookieSize       = 3800

@@ -228,7 +228,25 @@ func (p *Portal) requireAccount(w http.ResponseWriter, r *http.Request) (webSess
 		p.renderError(w, http.StatusForbidden, "账号不可用", "账号已被停用或浏览器会话需要重新登录。")
 		return webSession{}, store.PortalAccount{}, false
 	}
+	// Slide on reads only: mutating handlers may re-issue the session cookie
+	// themselves, and a second Set-Cookie here would race their write.
+	if r.Method == http.MethodGet {
+		p.slideSession(w, r, &session)
+	}
 	return session, account, true
+}
+
+// slideSession re-issues the portal cookie once less than half of the
+// inactivity window remains, so browsers in regular use never see the login
+// page while abandoned ones age out after webSessionTTL.
+func (p *Portal) slideSession(w http.ResponseWriter, r *http.Request, session *webSession) {
+	if time.UnixMilli(session.ExpiresAtMS).Sub(p.now()) > webSessionTTL/2 {
+		return
+	}
+	session.ExpiresAtMS = p.now().Add(webSessionTTL).UnixMilli()
+	if err := p.refreshSessionCookie(r, w, *session); err != nil {
+		p.renderError(w, http.StatusInternalServerError, "会话续期失败", "浏览器会话无法续期，请重新登录。")
+	}
 }
 
 func (p *Portal) requireAccountAction(w http.ResponseWriter, r *http.Request) (webSession, store.PortalAccount, bool) {
