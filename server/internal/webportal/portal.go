@@ -2254,6 +2254,8 @@ func adminNotice(value string) string {
 		return bilingualPortalNotice("登录与注册人机验证设置已更新并立即生效。", "Login and registration human-verification settings were updated and are active immediately.")
 	case "transport-routing-updated":
 		return bilingualPortalNotice("直连数据面路由策略已更新：新连接将按当前策略生效。", "The direct data-plane routing policy was updated: new connections follow the current policy.")
+	case "runtime-setting-updated":
+		return bilingualPortalNotice("运行时参数已保存并即时生效；重启后仍保持。", "The runtime setting was saved and is effective immediately; it persists across restarts.")
 	case "admin-route-updated":
 		return bilingualPortalNotice("管理中心安全入口已经更新，旧入口已立即失效。请将新地址保存在受信任的密码管理器中。", "The secure admin route was updated and the old route is no longer valid. Store the new address in a trusted password manager.")
 	default:
