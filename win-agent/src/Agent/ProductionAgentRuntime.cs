@@ -731,6 +731,27 @@ namespace TermLink.Agent
 #endif
         }
 
+        // Temporary host-history diagnostics: bounded structural metadata only
+        // (session/kind/status), never terminal text or key material.
+        private static void WriteHostHistoryDiagnostic(string message)
+        {
+            try
+            {
+                var root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink", "logs");
+                Directory.CreateDirectory(root);
+                File.AppendAllText(
+                    Path.Combine(root, "TermLink-background-runtime.log"),
+                    DateTime.UtcNow.ToString("O") + " host-history-diag " + message + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch
+            {
+                // Diagnostics must never become a request-path dependency.
+            }
+        }
+
         private static string ProductionTerminalHistoryRoot(ProductionAgentConfig config)
         {
             if (config == null || config.PcId == Guid.Empty)
@@ -5029,6 +5050,8 @@ namespace TermLink.Agent
                     HostHistoryRequestPayload historyRequest;
                     try { historyRequest = HostHistoryRequestPayload.Parser.ParseFrom(plaintext); }
                     catch (InvalidProtocolBufferException) { return; }
+                    WriteHostHistoryDiagnostic("request_received session=" + sessionId.ToString("N") +
+                        " kind=" + historyRequest.Kind + " sender=" + senderId.ToString("N"));
                     if (historyRequest.RequestId.Length != 16 ||
                         GuidFromBytes(historyRequest.RequestId.Span) == Guid.Empty)
                     {
@@ -5638,6 +5661,9 @@ namespace TermLink.Agent
                 try
                 {
                     using var selection = hostHistoryService.Select(sessionId, request, recipient);
+                    WriteHostHistoryDiagnostic("selection session=" + sessionId.ToString("N") +
+                        " status=" + selection.Status + " errorCode=" + selection.ErrorCode +
+                        " hasObject=" + (selection.Object != null));
                     await SendHostHistorySelectionAsync(
                         active,
                         sessionId,

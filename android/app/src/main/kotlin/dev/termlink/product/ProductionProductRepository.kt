@@ -369,15 +369,18 @@ private class RevokedDeviceIdentityException : Exception()
 /**
  * Data-plane Hello capabilities are an optional advertisement. They must not
  * enter the required Welcome set because Relay-only servers remain supported.
+ * Host-owned history is negotiated per connection too: without advertising it
+ * here the relay silently drops HOST_HISTORY_* frames from the phone, which
+ * degrades every session open to live-only output with no snapshot bootstrap
+ * and no transcript paging.
  */
 internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set<String> =
-    if (dataPlaneEnabled) {
-        setOf(
-            DIRECT_SESSION_CUTOVER_CAPABILITY,
-            DIRECT_TRANSPORT_DATA_CAPABILITY,
-        )
-    } else {
-        emptySet()
+    buildSet {
+        add(PcCapabilityIds.HOST_HISTORY_V1)
+        if (dataPlaneEnabled) {
+            add(DIRECT_SESSION_CUTOVER_CAPABILITY)
+            add(DIRECT_TRANSPORT_DATA_CAPABILITY)
+        }
     }
 
 /** Only a rejected refresh credential terminates an established sign-in. */
@@ -6890,7 +6893,12 @@ internal class ProductionProductRepository(
             )
             try {
                 restoreStage = "authority_confirm"
-                val confirmedTail = latestAuthoritativeSessionTail(session, authenticationGeneration)
+                val confirmedTail = awaitBoundedAuthoritativeTail(
+                    session = session,
+                    snapshotSequence = sequence,
+                    authenticationGeneration = authenticationGeneration,
+                    restoreAttempt = restoreAttempt,
+                )
                 if (confirmedTail == null) {
                     logHostSnapshotRestore(restoreAttempt, "authority_missing", "snapshot_seq=$sequence")
                     return null
@@ -7310,6 +7318,38 @@ internal class ProductionProductRepository(
                 .singleOrNull { it.id == initialSession.id }
                 ?.lastOutputSequence
         }
+
+    /**
+     * Confirms the snapshot sits within the server-authoritative output tail.
+     * The Agent flushes catalog metadata on a heartbeat cadence, so a snapshot
+     * served for a freshly spawned session can legitimately run ahead of the
+     * catalog for one flush interval. Re-poll the tail (bounded) before
+     * declaring the snapshot out of bounds; a persistent mismatch still
+     * fails closed.
+     */
+    private suspend fun awaitBoundedAuthoritativeTail(
+        session: SessionSummary,
+        snapshotSequence: ULong,
+        authenticationGeneration: Long?,
+        restoreAttempt: Int,
+    ): ULong? {
+        var tail = latestAuthoritativeSessionTail(session, authenticationGeneration)
+        var attempt = 0
+        while (tail != null && !snapshotHasBoundedLiveSuffix(snapshotSequence, tail) &&
+            attempt < AUTHORITY_TAIL_CATCHUP_RETRY_DELAYS_MILLIS.size
+        ) {
+            val delayMillis = AUTHORITY_TAIL_CATCHUP_RETRY_DELAYS_MILLIS[attempt]
+            logHostSnapshotRestore(
+                restoreAttempt,
+                "authority_catchup_wait",
+                "snapshot_seq=$snapshotSequence output_tail=$tail retry_in=${delayMillis}ms attempt=${attempt + 1}",
+            )
+            delay(delayMillis)
+            attempt++
+            tail = latestAuthoritativeSessionTail(session, authenticationGeneration)
+        }
+        return tail
+    }
 
     /**
      * Reads only the newest, recipient-filtered Chunk catalog pages needed by
@@ -9843,6 +9883,16 @@ internal suspend fun <T> awaitHostHistoryReady(
 
 internal val HOST_HISTORY_READINESS_RETRY_DELAYS_MILLIS =
     listOf(100L, 200L, 400L, 800L, 1_500L, 2_000L, 4_000L)
+
+/**
+ * Bounded catch-up window for the snapshot-vs-catalog authority check. The
+ * Agent flushes session catalog metadata on a heartbeat cadence (about 15
+ * seconds), so a snapshot served right after session spawn can run ahead of
+ * the catalog tail for one flush interval; the schedule covers several such
+ * intervals before the restore fails closed.
+ */
+internal val AUTHORITY_TAIL_CATCHUP_RETRY_DELAYS_MILLIS =
+    listOf(500L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L, 15_000L, 15_000L)
 
 internal fun shouldReplaceLiveSessionForOpen(
     liveSessionExists: Boolean,
