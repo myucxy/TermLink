@@ -36,8 +36,8 @@
 
 | # | 问题 | 模块 | 确认方案 |
 |---|------|------|----------|
-| 15 | Server P3 四项（#32/34/35/33） | Server | 登录限速指数退避；补 000046 down；email-code 补注册关闭策略检查；确认 AdminRoutes 默认启用 |
-| 16 | metrics/告警（#26） | Server+运维 | compose 默认开 /metrics（绑内部网络）；修过时 Valkey 告警文案；提供最小 Prometheus 抓取样例 |
+| 15 | Server P3 四项（#32/34/35/33） | Server | 000046 down 已补（53d2ca7）；email-code 注册关闭策略检查复核已存在（sendRegistrationEmailCode 内 REGISTRATION_CLOSED 门禁）；登录退避与 AdminRoutes 默认启用待做 |
+| 16 | metrics/告警（#26） | Server+运维 | 暂缓：/metrics 无认证（#36），公开端口启用前需先定认证方案；告警文案修正待做 |
 | 17 | presence 统一同源（#9/31） | Server+Web+Android | presence registry 唯一在线源、会话级粒度，门户与 Android 同源 |
 | 18 | 发版 CI 回归 + 恢复演练（#12/15） | 发布/运维 | 推测试 tag 验证 release.yml 与 secrets；真实恢复演练记入 VALIDATION_BASELINE |
 
