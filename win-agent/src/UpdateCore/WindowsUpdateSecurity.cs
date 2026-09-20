@@ -13,8 +13,39 @@ namespace TermLink.UpdateCore
         public const uint CertificateChaining = 0x800B010A;
         public const uint TrustBadDigest = 0x80096010;
         public const uint TrustNoSignature = 0x800B0100;
+        public const uint CertRevoked = 0x800B010C;
+        public const uint CertRevocationFailed = 0x80092010;
+        public const uint CertExpired = 0x800B010E;
         private const string PublisherCertificateFileName = "TermLink.UpdatePublisher.cer";
+        private const string EmbeddedPublisherCertificateResourceName = "TermLink.UpdateCore.UpdatePublisher.cer";
+        private const string SignaturePolicyEnvironmentVariable = "TERMLINK_UPDATE_SIGNATURE_POLICY";
         private static readonly Guid GenericVerifyV2 = new Guid("00AAC56B-CD44-11D0-8CC2-00C04FC295EE");
+
+        /// <summary>
+        /// Signature validation policy. Strict requires a trusted root, a full
+        /// healthy chain, and successful revocation checking; Compat preserves
+        /// the legacy acceptance window (untrusted roots and chaining allowed)
+        /// for self-signed internal test builds. Auto picks Strict when the
+        /// publisher identity is explicitly anchored and Compat when the only
+        /// available identity is the local-build fallback.
+        /// </summary>
+        public enum SignaturePolicyMode
+        {
+            Auto,
+            Strict,
+            Compat
+        }
+
+        public static SignaturePolicyMode ResolveSignaturePolicy()
+        {
+            switch ((Environment.GetEnvironmentVariable(SignaturePolicyEnvironmentVariable) ??
+                     string.Empty).Trim().ToLowerInvariant())
+            {
+                case "strict": return SignaturePolicyMode.Strict;
+                case "compat": return SignaturePolicyMode.Compat;
+                default: return SignaturePolicyMode.Auto;
+            }
+        }
 
         public static void ValidateIntegrity(string path, long expectedSize, string expectedSha256)
         {
@@ -34,21 +65,52 @@ namespace TermLink.UpdateCore
         public static string ValidateAuthenticode(
             string path,
             string expectedThumbprint,
-            string reportedThumbprint)
+            string reportedThumbprint,
+            string applicationDirectory = null)
         {
-            var status = VerifyEmbeddedSignature(path);
-            if (!IsAcceptableAuthenticodeStatus(status))
+            var policy = ResolveSignaturePolicy();
+            var anchored = HasExplicitPublisherIdentity(applicationDirectory);
+            var strict = policy == SignaturePolicyMode.Strict ||
+                (policy == SignaturePolicyMode.Auto && anchored);
+            var status = VerifyEmbeddedSignature(path, checkRevocation: strict);
+            if (!IsAcceptableAuthenticodeStatus(status, strict))
             {
                 throw new CryptographicException(
-                    "The update Authenticode signature failed validation (0x" + status.ToString("X8") + ").");
+                    "The update Authenticode signature failed validation (0x" + status.ToString("X8") +
+                    ", policy=" + (strict ? "strict" : "compat") + ").");
             }
             var actual = ReadSignerThumbprint(path);
             ValidateSignerIdentity(actual, expectedThumbprint, reportedThumbprint);
             return actual;
         }
 
+        // An anchored deployment explicitly configures its publisher identity
+        // (environment) or ships a build-time embedded publisher certificate.
+        // Unanchored local builds can only fall back to the local executable's
+        // own signature and are validated in compatibility mode with a pinned
+        // thumbprint as the sole identity check.
+        private static bool HasExplicitPublisherIdentity(string applicationDirectory)
+        {
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TERMLINK_UPDATE_SIGNER_THUMBPRINT")) ||
+                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TERMLINK_UPDATE_PUBLISHER_CERTIFICATE")))
+            {
+                return true;
+            }
+            var root = string.IsNullOrWhiteSpace(applicationDirectory)
+                ? AppContext.BaseDirectory
+                : Path.GetFullPath(applicationDirectory);
+            return File.Exists(Path.Combine(root, PublisherCertificateFileName));
+        }
+
         public static bool IsAcceptableAuthenticodeStatus(uint status) =>
-            status == TrustSuccess || status == CertificateUntrustedRoot || status == CertificateChaining;
+            IsAcceptableAuthenticodeStatus(status, strict: false);
+
+        public static bool IsAcceptableAuthenticodeStatus(uint status, bool strict)
+        {
+            if (status == TrustSuccess) return true;
+            if (strict) return false;
+            return status == CertificateUntrustedRoot || status == CertificateChaining;
+        }
 
         public static void ValidateSignerIdentity(
             string actualThumbprint,
@@ -82,39 +144,42 @@ namespace TermLink.UpdateCore
             }
             if (expected != null) return expected;
 
+            // The embedded build-time publisher certificate is the trust
+            // anchor. The previous fallbacks (an install-directory .cer or
+            // the running executable's own signature) let a same-user
+            // attacker replace the installed files and permanently anchor
+            // their own updates, so they no longer participate in trust.
+            var embedded = ReadEmbeddedPublisherCertificateThumbprint();
+            if (!string.IsNullOrWhiteSpace(embedded)) return embedded;
+
             var root = string.IsNullOrWhiteSpace(applicationDirectory)
                 ? AppContext.BaseDirectory
                 : Path.GetFullPath(applicationDirectory);
-            var bundledCertificate = Path.Combine(root, PublisherCertificateFileName);
-            if (File.Exists(bundledCertificate))
-            {
-                expected = ReadCertificateThumbprint(bundledCertificate, true);
-                var installedTray = Path.Combine(root, "TermLink.exe");
-                var installedProcessPath = Environment.ProcessPath;
-                if (!string.IsNullOrWhiteSpace(installedProcessPath) && File.Exists(installedProcessPath) &&
-                    string.Equals(
-                        Path.GetFullPath(installedProcessPath),
-                        Path.GetFullPath(installedTray),
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    var status = VerifyEmbeddedSignature(installedProcessPath);
-                    if (!IsAcceptableAuthenticodeStatus(status))
-                        throw new CryptographicException(
-                            "The installed executable signature cannot establish the bundled update publisher identity.");
-                    ValidateSignerIdentity(ReadSignerThumbprint(installedProcessPath), expected, null);
-                }
-                return expected;
-            }
+            throw new CryptographicException(
+                "No update publisher identity is available. Embed " +
+                PublisherCertificateFileName + " at build time or configure " +
+                "TERMLINK_UPDATE_SIGNER_THUMBPRINT / TERMLINK_UPDATE_PUBLISHER_CERTIFICATE " +
+                "(looked for " + Path.Combine(root, PublisherCertificateFileName) + ").");
+        }
 
-            var processPath = Environment.ProcessPath;
-            if (!string.IsNullOrWhiteSpace(processPath) && File.Exists(processPath))
+        private static string ReadEmbeddedPublisherCertificateThumbprint()
+        {
+            using (var stream = typeof(WindowsUpdateSecurity).Assembly.GetManifestResourceStream(
+                EmbeddedPublisherCertificateResourceName))
             {
-                var status = VerifyEmbeddedSignature(processPath);
-                if (!IsAcceptableAuthenticodeStatus(status))
-                    throw new CryptographicException("The installed executable signature cannot establish an update publisher identity.");
-                return NormalizeThumbprint(ReadSignerThumbprint(processPath), "installed executable signer");
+                if (stream == null) return null;
+                using (var certificate = new X509Certificate2(ReadAllBytes(stream)))
+                    return NormalizeThumbprint(certificate.Thumbprint, "embedded update publisher certificate thumbprint");
             }
-            throw new CryptographicException("No installed or configured TermLink update publisher identity is available.");
+        }
+
+        private static byte[] ReadAllBytes(Stream stream)
+        {
+            using (var buffer = new MemoryStream())
+            {
+                stream.CopyTo(buffer);
+                return buffer.ToArray();
+            }
         }
 
         public static string ReadCertificateThumbprint(string path, bool required)
@@ -128,7 +193,9 @@ namespace TermLink.UpdateCore
                 return NormalizeThumbprint(certificate.Thumbprint, "update publisher certificate thumbprint");
         }
 
-        public static uint VerifyEmbeddedSignature(string path)
+        public static uint VerifyEmbeddedSignature(string path) => VerifyEmbeddedSignature(path, checkRevocation: false);
+
+        public static uint VerifyEmbeddedSignature(string path, bool checkRevocation)
         {
             if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Authenticode verification requires Windows.");
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -149,6 +216,9 @@ namespace TermLink.UpdateCore
                 {
                     StructureSize = checked((uint)Marshal.SizeOf<WinTrustData>()),
                     UiChoice = 2,
+                    // Strict policy validates the whole certificate chain's
+                    // revocation state; a revoked signer fails the update.
+                    RevocationChecks = checkRevocation ? 1u : 0u,
                     UnionChoice = 1,
                     File = filePointer,
                     ProviderFlags = 0x00001000

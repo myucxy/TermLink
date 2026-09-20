@@ -1,7 +1,14 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>TermLink.UpdateCore</AssemblyName>
     <RootNamespace>TermLink.UpdateCore</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Build-time update publisher trust anchor (audit #6). Place the
+         production publisher certificate here as UpdatePublisher.cer before
+         building; it is embedded into the assembly and becomes the only
+         update trust anchor for the deployed agent. -->
+    <EmbeddedResource Include="UpdatePublisher.cer" Condition="Exists('UpdatePublisher.cer')" />
+  </ItemGroup>
 </Project>

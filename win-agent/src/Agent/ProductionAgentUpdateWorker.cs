@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -348,7 +348,8 @@ namespace TermLink.Agent
                 WindowsUpdateSecurity.ValidateAuthenticode(
                     setupPath,
                     expectedSigner,
-                    update.ArtifactSignerFingerprint);
+                    update.ArtifactSignerFingerprint,
+                    AppContext.BaseDirectory);
                 StageExternalUpdater(transactionRoot);
 
                 phase = "DRAINING_SESSIONS";

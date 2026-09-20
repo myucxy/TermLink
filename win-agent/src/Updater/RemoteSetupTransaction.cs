@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -195,7 +195,8 @@ namespace TermLink.Updater
             WindowsUpdateSecurity.ValidateAuthenticode(
                 record.SetupPath,
                 WindowsUpdateSecurity.ResolveExpectedSignerThumbprint(record.InstallRoot),
-                record.ExpectedSignerFingerprint);
+                record.ExpectedSignerFingerprint,
+                record.InstallRoot);
         }
 
         private static int LaunchSetup(RemoteUpdateTransactionRecord record, string journalPath)
