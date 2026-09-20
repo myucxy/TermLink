@@ -207,6 +207,10 @@ func (p *Portal) userPortalRequestAccountDeletion(w http.ResponseWriter, r *http
 		p.renderError(w, http.StatusServiceUnavailable, "账号注销暂不可用", "服务端尚未配置安全的身份注销能力，本次没有创建注销申请。")
 		return
 	}
+	if p.config.AccountDeletionEnabled != nil && !p.config.AccountDeletionEnabled(r.Context()) {
+		p.renderError(w, http.StatusForbidden, "账号注销未开放", "当前部署的管理员已暂停账号注销功能，本次没有创建注销申请。")
+		return
+	}
 	traceID, err := randomText(12)
 	var item store.UserPortalAccountDeletion
 	if err == nil {

@@ -154,6 +154,18 @@ func New(ctx context.Context, config Config) (*Provider, error) {
 		AllowedPromptValues:            []string{"login", "none", "consent", "select_account"},
 		JWTScopeClaimKey:               jwt.JWTScopeFieldString,
 		SendDebugMessagesToClients:     false,
+		// The local-development HTTP relaxation must also cover the token
+		// phase: fosite's default secure checker accepts plain-HTTP
+		// redirects only for loopback hosts, which would break the web
+		// client's LAN-IP callback (and any private-host client redirect)
+		// after the login form. Gate stays operator-opt-in via localnet.
+		RedirectSecureChecker: func(ctx context.Context, redirectURI *url.URL) bool {
+			if fosite.IsRedirectURISecure(ctx, redirectURI) {
+				return true
+			}
+			return localnet.AllowHTTP() && redirectURI != nil &&
+				redirectURI.Scheme == "http" && localnet.IsLoopbackOrPrivateHost(redirectURI.Hostname())
+		},
 	}
 	keyGetter := func(ctx context.Context) (interface{}, error) {
 		key, ok := ctx.Value(signingKeyContextKey{}).(signingKey)

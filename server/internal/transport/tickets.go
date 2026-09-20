@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -148,6 +149,23 @@ func (s *RouteTicketService) SetRoutingPermittedOverride(fn func() bool) {
 		return
 	}
 	s.routingPermittedOverride = fn
+}
+
+// SetSTUNServers replaces the STUN server list handed to clients in the
+// direct-transport device config. The management portal calls it when a
+// SUPER_ADMIN updates the runtime setting; empty lists are rejected because
+// a direct transport without discovery servers cannot gather candidates.
+func (s *RouteTicketService) SetSTUNServers(stunServers []string) error {
+	if s == nil {
+		return nil
+	}
+	if len(stunServers) == 0 {
+		return fmt.Errorf("direct transport requires at least one STUN server")
+	}
+	s.mu.Lock()
+	s.stunServers = append([]string(nil), stunServers...)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *RouteTicketService) routingPermittedNow() bool {

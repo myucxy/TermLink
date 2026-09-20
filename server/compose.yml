@@ -40,6 +40,14 @@ services:
       # embedded identity, OIDC issuer/clients/redirects, listen address, log
       # level). Only deployment-specific values live here; deriving issuer or
       # redirect URIs here instead would risk contradictory overrides.
+      #
+      # REGISTRATION_RECOVERY / ACCOUNT_DELETION / DIRECT_STUN_SERVERS /
+      # APPSHIP_* are bootstrap defaults: SUPER_ADMIN can override them at
+      # runtime from the admin page (runtime_settings); the values below apply
+      # whenever no override was saved. IMAGE, PUBLIC_URL, DATABASE_URL,
+      # INITIAL_ADMIN_PASSWORD_FILE, the HTTP binding, container logging,
+      # ALLOW_LOCAL_HTTP, and DIRECT_TRANSPORT_ENABLED stay container or
+      # bootstrap level and are intentionally not runtime-editable.
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:-https://termlink.example.invalid}
       TERMLINK_DATABASE_URL: postgres://termlink:${TERMLINK_POSTGRES_PASSWORD:-TermLinkDbPass_2026}@postgres:5432/termlink?sslmode=disable
       TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: ${TERMLINK_INITIAL_ADMIN_PASSWORD_FILE:-}

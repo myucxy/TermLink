@@ -81,6 +81,18 @@ type Config struct {
 	BuildInfo                 buildinfo.Info
 	RegistrationCodeKey       []byte
 	AccountDeletionBinder     accountdeletion.RequestBinder
+	// RegistrationRecoveryEnabled and AccountDeletionEnabled resolve the
+	// runtime feature flags (DB override with the environment default as
+	// fallback). A nil predicate keeps the deployment-level default.
+	RegistrationRecoveryEnabled func(context.Context) bool
+	AccountDeletionEnabled      func(context.Context) bool
+	// RuntimeSettingStore powers the admin-page deployment parameter panel;
+	// Defaults holds the environment bootstrap values for display, and the
+	// Apply callbacks push accepted values into the live subsystems.
+	RuntimeSettingStore    RuntimeSettingStore
+	RuntimeSettingDefaults map[string]string
+	ApplyDirectSTUNServers func(raw string) error
+	ApplyAppShipTarget     func(baseURL string, allowedPrivateIPs string) error
 	ServiceEmail              *serviceemail.Service
 	AdminRoutes               *adminroute.Service
 	IdentityProfiles          identityProfileService
@@ -156,6 +168,23 @@ type sectionPortalRepository interface {
 type transportRoutingRepository interface {
 	GetDirectRoutingPolicy(context.Context) (bool, error)
 	SetDirectRoutingPolicy(context.Context, bool, uuid.UUID) error
+}
+
+// RuntimeSettingStore is the portal-owned persistence for deployment
+// parameters that SUPER_ADMIN can override at runtime (see migrations for
+// runtime_settings). Absent rows mean the environment default applies.
+type RuntimeSettingStore interface {
+	GetRuntimeSetting(context.Context, string) (string, bool, error)
+	SetRuntimeSetting(context.Context, string, string, uuid.UUID) error
+}
+
+// runtimeSettingView is one row of the admin deployment-parameter panel.
+type runtimeSettingView struct {
+	Key    string
+	Label  string
+	Value  string
+	Source string
+	IsBool bool
 }
 
 type oidcFlow interface {
@@ -301,6 +330,9 @@ type adminPageData struct {
 
 	TransportRoutingPermitted   bool
 	TransportRoutingConfigured bool
+
+	RuntimeSettings           []runtimeSettingView
+	RuntimeSettingsConfigured bool
 }
 
 type errorPageData struct {
@@ -644,6 +676,7 @@ func (p *Portal) Handler() http.Handler {
 	mux.HandleFunc("GET /admin", p.admin)
 	mux.HandleFunc("GET /admin/registration", p.adminRegistrationDashboard)
 	mux.HandleFunc("POST /admin/transport/routing", p.sensitiveAction("transport.routing.update", p.adminUpdateTransportRouting))
+	mux.HandleFunc("POST /admin/runtime-settings", p.sensitiveAction("runtime.setting.update", p.adminUpdateRuntimeSetting))
 	mux.HandleFunc("POST /admin/registration/policy", p.sensitiveAction("registration.policy.update", p.adminUpdateRegistrationPolicy))
 	mux.HandleFunc("POST /admin/registration/invitations/batches", p.sensitiveAction("registration.invitation_batch.create", p.adminCreateInvitationBatch))
 	mux.HandleFunc("POST /admin/registration/invitations/batches/{id}/codes", p.sensitiveAction("registration.invitation_codes.generate", p.adminGenerateInvitationCodes))
@@ -832,10 +865,13 @@ func (p *Portal) beginOIDC(w http.ResponseWriter, r *http.Request, returnTo, the
 
 func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 	loginTraceID := uuid.NewString()
-	cookieName := oauthCookieForState(r.URL.Query().Get("state"))
+	// Read through the same localnet name relaxation setCookie used at
+	// initiation: under the local HTTP relaxation the stored cookie lost its
+	// __Host- prefix, so the raw lookup would always miss.
+	cookieName := localnet.CookieName(r.Host, oauthCookieForState(r.URL.Query().Get("state")))
 	cookie, err := r.Cookie(cookieName)
 	if err != nil {
-		cookieName = oauthCookieName
+		cookieName = localnet.CookieName(r.Host, oauthCookieName)
 		cookie, err = r.Cookie(cookieName)
 	}
 	p.clearCookie(r, w, cookieName)
@@ -849,7 +885,8 @@ func (p *Portal) callback(w http.ResponseWriter, r *http.Request) {
 		p.now().Sub(time.UnixMilli(pending.IssuedAtMS)) < 0 ||
 		p.now().Sub(time.UnixMilli(pending.IssuedAtMS)) > oauthStateTTL ||
 		!constantTextEqual(pending.State, r.URL.Query().Get("state")) ||
-		(pending.CookieName != "" && cookieName != oauthCookieName && pending.CookieName != cookieName) {
+		(pending.CookieName != "" && cookieName != localnet.CookieName(r.Host, oauthCookieName) &&
+			pending.CookieName != cookieName && localnet.CookieName(r.Host, pending.CookieName) != cookieName) {
 		p.renderError(w, http.StatusBadRequest, "登录校验失败", "授权响应未通过状态校验，请返回首页重新登录。")
 		return
 	}
@@ -1076,6 +1113,11 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	var runtimeSettings []runtimeSettingView
+	runtimeSettingsConfigured := false
+	if section == "deployment" {
+		runtimeSettings, runtimeSettingsConfigured = p.runtimeSettingViews(r.Context())
+	}
 	var systemVersions SystemVersions
 	if section == "versions" {
 		systemVersions = p.systemVersions.Load(r.Context())
@@ -1133,7 +1175,141 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 
 		TransportRoutingPermitted:   transportRoutingPermitted,
 		TransportRoutingConfigured:  transportRoutingConfigured,
+
+		RuntimeSettings:          runtimeSettings,
+		RuntimeSettingsConfigured: runtimeSettingsConfigured,
 	})
+}
+
+// runtimeSettingDefinitions fixes the admin panel order, labels, and kinds.
+// Keys mirror store.RuntimeSettingKeys; keep the two lists aligned.
+var runtimeSettingDefinitions = []struct {
+	Key   string
+	Label string
+	IsBool bool
+}{
+	{store.RuntimeSettingRegistrationRecoveryEnabled, "注册找回（邮箱验证码注册）", true},
+	{store.RuntimeSettingAccountDeletionEnabled, "账号注销", true},
+	{store.RuntimeSettingDirectSTUNServers, "直连 STUN 服务器（逗号分隔）", false},
+	{store.RuntimeSettingAppShipBaseURL, "升级分发源 AppShip 地址", false},
+	{store.RuntimeSettingAppShipAllowedPrivateIPs, "AppShip 内网 IP 白名单（逗号分隔）", false},
+}
+
+func (p *Portal) runtimeSettingViews(ctx context.Context) ([]runtimeSettingView, bool) {
+	settingRepository, ok := p.config.Repository.(RuntimeSettingStore)
+	if !ok {
+		return nil, false
+	}
+	views := make([]runtimeSettingView, 0, len(runtimeSettingDefinitions))
+	for _, definition := range runtimeSettingDefinitions {
+		view := runtimeSettingView{Key: definition.Key, Label: definition.Label, IsBool: definition.IsBool}
+		if override, found, err := settingRepository.GetRuntimeSetting(ctx, definition.Key); err == nil && found {
+			view.Value = override
+			view.Source = "管理页覆盖"
+		} else {
+			view.Value = p.config.RuntimeSettingDefaults[definition.Key]
+			view.Source = "环境默认"
+		}
+		if view.IsBool {
+			view.Value = map[string]string{"true": "已开启", "false": "已关闭"}[view.Value]
+			if view.Value == "" {
+				view.Value = "已关闭"
+			}
+		}
+		views = append(views, view)
+	}
+	return views, true
+}
+
+func (p *Portal) adminUpdateRuntimeSetting(w http.ResponseWriter, r *http.Request) {
+	session, account, ok := p.requireSuperAdminAction(w, r)
+	if !ok {
+		return
+	}
+	settingRepository, ok := p.config.Repository.(RuntimeSettingStore)
+	if !ok {
+		p.renderError(w, http.StatusServiceUnavailable, "运行时参数不可用", "当前部署尚未配置运行时参数存储能力。")
+		return
+	}
+	key := strings.TrimSpace(r.Form.Get("setting"))
+	value := strings.TrimSpace(r.Form.Get("value"))
+	definition, known := runtimeSettingKey(key)
+	if !known {
+		p.renderError(w, http.StatusBadRequest, "未知参数", "运行时参数不在可配置范围内。")
+		return
+	}
+	if definition.IsBool && value != "true" && value != "false" {
+		p.renderError(w, http.StatusBadRequest, "参数值无效", "开关参数只接受 true 或 false。")
+		return
+	}
+	if !definition.IsBool && value == "" {
+		p.renderError(w, http.StatusBadRequest, "参数值无效", "参数值不能为空。")
+		return
+	}
+	if err := settingRepository.SetRuntimeSetting(r.Context(), key, value, account.ID); err != nil {
+		p.handleAdminMutationError(w, err)
+		return
+	}
+	if applyErr := p.applyRuntimeSetting(key, value); applyErr != nil {
+		p.renderError(w, http.StatusInternalServerError, "参数已保存但生效失败", applyErr.Error()+" 请修正参数值后重新保存。")
+		return
+	}
+	adminBasePath, basePathErr := p.adminBasePath(r.Context())
+	if basePathErr != nil {
+		p.internalError(w, basePathErr)
+		return
+	}
+	http.Redirect(w, r, adminBasePath+"?section=deployment&notice=runtime-setting-updated", http.StatusSeeOther)
+	_ = session
+}
+
+func runtimeSettingKey(key string) (struct {
+	Key    string
+	Label  string
+	IsBool bool
+}, bool) {
+	for _, definition := range runtimeSettingDefinitions {
+		if definition.Key == key {
+			return definition, true
+		}
+	}
+	return struct {
+		Key    string
+		Label  string
+		IsBool bool
+	}{}, false
+}
+
+func (p *Portal) applyRuntimeSetting(key, value string) error {
+	switch key {
+	case store.RuntimeSettingDirectSTUNServers:
+		if p.config.ApplyDirectSTUNServers == nil {
+			return nil
+		}
+		return p.config.ApplyDirectSTUNServers(value)
+	case store.RuntimeSettingAppShipBaseURL, store.RuntimeSettingAppShipAllowedPrivateIPs:
+		if p.config.ApplyAppShipTarget == nil {
+			return nil
+		}
+		baseURL := p.effectiveRuntimeSetting(store.RuntimeSettingAppShipBaseURL, value, key == store.RuntimeSettingAppShipBaseURL)
+		privateIPs := p.effectiveRuntimeSetting(store.RuntimeSettingAppShipAllowedPrivateIPs, value, key == store.RuntimeSettingAppShipAllowedPrivateIPs)
+		return p.config.ApplyAppShipTarget(baseURL, privateIPs)
+	}
+	return nil
+}
+
+// effectiveRuntimeSetting blends the just-saved value with the stored/default
+// value of the sibling key so AppShip URL and allowlist apply as one target.
+func (p *Portal) effectiveRuntimeSetting(key, freshValue string, isFresh bool) string {
+	if isFresh {
+		return freshValue
+	}
+	if settingRepository, ok := p.config.Repository.(RuntimeSettingStore); ok {
+		if override, found, err := settingRepository.GetRuntimeSetting(context.Background(), key); err == nil && found {
+			return override
+		}
+	}
+	return p.config.RuntimeSettingDefaults[key]
 }
 
 func (p *Portal) adminUpdateServiceEmail(w http.ResponseWriter, r *http.Request) {

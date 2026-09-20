@@ -104,6 +104,50 @@
           <p class="muted-note">容器级 CPU、内存和版本应由受保护的 Grafana/Prometheus 运维面查看，本页面不伪造监控数字。</p>
         </article>
       </section>
+      {{if .RuntimeSettingsConfigured}}
+      <section class="admin-grid deployment-grid">
+        <article class="admin-panel">
+          <div class="panel-heading"><div><p class="eyebrow">RUNTIME SETTINGS</p><h2>运行时参数</h2><p>环境变量提供初始默认值；此处保存的覆盖值即时生效并跨重启保持。</p></div>{{if ne .Role "SUPER_ADMIN"}}<span class="state-pill state-PENDING">只读</span>{{end}}</div>
+          <table class="admin-table">
+            <thead><tr><th scope="col">参数</th><th scope="col">当前值</th><th scope="col">来源</th>{{if eq .Role "SUPER_ADMIN"}}<th scope="col">修改</th>{{end}}</tr></thead>
+            <tbody>
+            {{range .RuntimeSettings}}
+              <tr>
+                <td data-label="参数">{{.Label}}</td>
+                <td data-label="当前值"><code>{{.Value}}</code></td>
+                <td data-label="来源">{{.Source}}</td>
+                {{if eq $.Role "SUPER_ADMIN"}}
+                <td data-label="修改">
+                  {{if .IsBool}}
+                  <form method="post" action="{{$.AdminBasePath}}/runtime-settings" class="inline-form">
+                    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                    <input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "runtime-setting:%s:%s" .Key .Value)}}">
+                    <input type="hidden" name="reason" value="系统自动记录">
+                    <input type="hidden" name="setting" value="{{.Key}}">
+                    <input type="hidden" name="value" value="{{if eq .Value "已开启"}}false{{else}}true{{end}}">
+                    <button class="button" type="submit">{{if eq .Value "已开启"}}关闭{{else}}开启{{end}}</button>
+                  </form>
+                  {{else}}
+                  <form method="post" action="{{$.AdminBasePath}}/runtime-settings" class="inline-form">
+                    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                    <input type="hidden" name="idempotency_key" value="{{actionKey $.ActionNonce (printf "runtime-setting:%s" .Key)}}">
+                    <input type="hidden" name="reason" value="系统自动记录">
+                    <input type="hidden" name="setting" value="{{.Key}}">
+                    <label class="visually-hidden" for="value-{{.Key}}">{{.Label}}</label>
+                    <input id="value-{{.Key}}" name="value" type="text" value="{{.Value}}" autocomplete="off" spellcheck="false">
+                    <button class="button" type="submit">保存</button>
+                  </form>
+                  {{end}}
+                </td>
+                {{end}}
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+          <p class="muted-note">镜像、公开 Origin、数据库、端口和日志策略属于容器/引导层，仍在 Compose 中管理；本地 HTTP 放行与直连传输紧急停用保持环境变量控制。</p>
+        </article>
+      </section>
+      {{end}}
       {{end}}
 
       {{if eq .Section "versions"}}

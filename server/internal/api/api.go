@@ -70,6 +70,10 @@ type API struct {
 	RegistrationCodeKey   []byte
 	History               HistoryObjectStore
 	AccountDeletionBinder accountdeletion.RequestBinder
+	// RegistrationRecoveryEnabled resolves the runtime flag gating the
+	// registration email-code endpoint (DB override, environment fallback).
+	// A nil predicate keeps the feature available.
+	RegistrationRecoveryEnabled func(context.Context) bool
 	Registration          interface {
 		Register(context.Context, auth.DirectRegistrationInput) error
 		RegisterAttempt(context.Context, uuid.UUID, auth.DirectRegistrationInput) error
@@ -276,6 +280,10 @@ type registrationEmailCodeRequest struct {
 }
 
 func (a *API) sendRegistrationEmailCode(w http.ResponseWriter, r *http.Request) {
+	if a.RegistrationRecoveryEnabled != nil && !a.RegistrationRecoveryEnabled(r.Context()) {
+		writeError(w, r, http.StatusForbidden, "REGISTRATION_RECOVERY_DISABLED", errors.New("registration recovery is disabled on this deployment"))
+		return
+	}
 	if a.ServiceEmail == nil {
 		writeError(w, r, http.StatusServiceUnavailable, "EMAIL_SERVICE_UNAVAILABLE", serviceemail.ErrUnavailable)
 		return

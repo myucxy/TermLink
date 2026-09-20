@@ -320,12 +320,28 @@ func runProduction() error {
 		accountDeletionBinder = binder
 		accountDeletionRunner = accountdeletion.NewRunner(deletionService, accountdeletion.RunnerOptions{Logger: slog.Default()})
 	}
+	// Portal-owned runtime settings resolve as DB override first, then the
+	// environment bootstrap default. Defined before the API/portal wiring so
+	// both surfaces share the same predicates.
+	effectiveRegistrationRecovery := func(ctx context.Context) bool {
+		if override, found, err := repository.GetRuntimeSetting(ctx, store.RuntimeSettingRegistrationRecoveryEnabled); err == nil && found {
+			return override == "true"
+		}
+		return cfg.RegistrationRecoveryEnabled
+	}
+	effectiveAccountDeletion := func(ctx context.Context) bool {
+		if override, found, err := repository.GetRuntimeSetting(ctx, store.RuntimeSettingAccountDeletionEnabled); err == nil && found {
+			return override == "true"
+		}
+		return cfg.AccountDeletionEnabled
+	}
 	productionAPI := &api.API{
 		Store: repository, Valkey: coordinator, Presence: onlinePresence, Tokens: verifier, Auth: authentication,
 		ServiceEmail:      serviceEmail,
 		HumanVerification: humanVerificationManager,
 		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey,
 		AccountDeletionBinder: accountDeletionBinder, AgentUpdateCatalog: updateCatalog,
+		RegistrationRecoveryEnabled: effectiveRegistrationRecovery,
 		ClientConfig: api.ClientConfiguration{
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
 			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRegistrationParties: cfg.WindowsRegistrationOIDCParties,
@@ -460,6 +476,34 @@ func runProduction() error {
 			_ = directHub.Close(shutdown)
 		}()
 	}
+	// Portal-owned runtime settings override the environment defaults at
+	// startup; the admin page can change them again while running.
+	settingCtx, settingCancel := context.WithTimeout(ctx, 3*time.Second)
+	if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingDirectSTUNServers); overrideErr == nil && found {
+		if servers, parseErr := parseDirectSTUNServers(override); parseErr == nil {
+			if applyErr := directTickets.SetSTUNServers(servers); applyErr != nil {
+				slog.Warn("runtime setting direct_stun_servers rejected", "error_class", "runtime_setting_apply_failed")
+			}
+		} else {
+			slog.Warn("runtime setting direct_stun_servers is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
+		}
+	}
+	if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipBaseURL); overrideErr == nil && found {
+		privateIPs := os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS")
+		if ipsOverride, ipsFound, ipsErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipAllowedPrivateIPs); ipsErr == nil && ipsFound {
+			privateIPs = ipsOverride
+		}
+		if err := updateCatalog.UpdateTarget(override, privateIPs); err != nil {
+			slog.Warn("runtime setting appship_base_url is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
+		}
+	} else if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipAllowedPrivateIPs); overrideErr == nil && found {
+		if err := updateCatalog.UpdateTarget(appShipBaseURL, override); err != nil {
+			slog.Warn("runtime setting appship_allowed_private_ips is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
+		}
+	}
+	settingCancel()
+	// Portal-owned runtime settings override the environment defaults at
+	// startup; the admin page can change them again while running.
 	hub := realtime.NewHubWithObserverAndOptions(
 		repository,
 		coordinator,
@@ -514,6 +558,26 @@ func runProduction() error {
 		BuildInfo:                 buildinfo.Current(),
 		RegistrationCodeKey:       registrationCodeKey,
 		AccountDeletionBinder:     accountDeletionBinder,
+		RegistrationRecoveryEnabled: effectiveRegistrationRecovery,
+		AccountDeletionEnabled:      effectiveAccountDeletion,
+		RuntimeSettingStore:         repository,
+		RuntimeSettingDefaults: map[string]string{
+			store.RuntimeSettingRegistrationRecoveryEnabled: strconv.FormatBool(cfg.RegistrationRecoveryEnabled),
+			store.RuntimeSettingAccountDeletionEnabled:      strconv.FormatBool(cfg.AccountDeletionEnabled),
+			store.RuntimeSettingDirectSTUNServers:           os.Getenv("TERMLINK_DIRECT_STUN_SERVERS"),
+			store.RuntimeSettingAppShipBaseURL:              appShipBaseURL,
+			store.RuntimeSettingAppShipAllowedPrivateIPs:    os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
+		},
+		ApplyDirectSTUNServers: func(raw string) error {
+			servers, parseErr := parseDirectSTUNServers(raw)
+			if parseErr != nil {
+				return parseErr
+			}
+			return directTickets.SetSTUNServers(servers)
+		},
+		ApplyAppShipTarget: func(baseURL string, allowedPrivateIPs string) error {
+			return updateCatalog.UpdateTarget(baseURL, allowedPrivateIPs)
+		},
 		ServiceEmail:              serviceEmail,
 		AdminRoutes:               adminRoutes,
 		IdentityProfiles:          identityProfiles,

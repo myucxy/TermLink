@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,8 +53,11 @@ type Catalog interface {
 }
 
 type AppShipCatalog struct {
-	baseURL *url.URL
-	client  *http.Client
+	// mu guards the live target so the management portal can retarget the
+	// catalog without a restart; readers snapshot all three fields together.
+	mu                      sync.Mutex
+	baseURL                 *url.URL
+	client                  *http.Client
 	// signerFingerprintAnchor is an optional operator trust anchor (SHA-1
 	// Authenticode thumbprint, 40 lowercase hex chars). When set, every update
 	// offer must carry the matching artifact signer fingerprint; offers
@@ -175,10 +179,11 @@ func newAppShipCatalog(baseURL string, client *http.Client, network appShipNetwo
 }
 
 func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild int64) (Offer, error) {
-	if c == nil || c.baseURL == nil || c.client == nil || ctx == nil || currentBuild < 0 {
+	baseURL, client, signerAnchor := c.currentTarget()
+	if c == nil || baseURL == nil || client == nil || ctx == nil || currentBuild < 0 {
 		return Offer{}, ErrUnavailable
 	}
-	endpoint := *c.baseURL
+	endpoint := *baseURL
 	endpoint.Path = "/api/v1/apps/" + ApplicationSlug + "/updates"
 	query := url.Values{}
 	query.Set("platform", "windows")
@@ -193,12 +198,12 @@ func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild i
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Cache-Control", "no-cache")
 	request.Header.Set("User-Agent", "TermLink-Server-Agent-Updates/1")
-	response, err := c.client.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return Offer{}, fmt.Errorf("%w: request failed", ErrUnavailable)
 	}
 	defer response.Body.Close()
-	if response.Request == nil || response.Request.URL == nil || !sameAppShipOrigin(c.baseURL, response.Request.URL) {
+	if response.Request == nil || response.Request.URL == nil || !sameAppShipOrigin(baseURL, response.Request.URL) {
 		return Offer{}, fmt.Errorf("%w: response origin is invalid", ErrUnavailable)
 	}
 	if response.StatusCode == http.StatusNotModified {
@@ -218,7 +223,37 @@ func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild i
 	if len(body) == 0 || len(body) > maximumResponseBytes {
 		return Offer{}, fmt.Errorf("%w: response size is invalid", ErrUnavailable)
 	}
-	return parseOffer(body, currentBuild, c.baseURL, c.signerFingerprintAnchor)
+	return parseOffer(body, currentBuild, baseURL, signerAnchor)
+}
+
+// UpdateTarget retargets the catalog at runtime so the management portal can
+// repoint agent update distribution without a restart. The replacement goes
+// through the same constructor validation as startup (HTTPS-only origin,
+// public host, exact-address private allowlist); the signer anchor set at
+// startup is preserved. Custom test seams (injected resolver or client) are
+// intentionally replaced by the production defaults.
+func (c *AppShipCatalog) UpdateTarget(baseURL string, allowedPrivateIPsValue string) error {
+	if c == nil {
+		return nil
+	}
+	fresh, err := NewAppShipCatalogWithAllowedPrivateIPs(baseURL, nil, allowedPrivateIPsValue)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.baseURL = fresh.baseURL
+	c.client = fresh.client
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *AppShipCatalog) currentTarget() (*url.URL, *http.Client, string) {
+	if c == nil {
+		return nil, nil, ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.baseURL, c.client, c.signerFingerprintAnchor
 }
 
 func appShipDialContext(resolver appShipResolver, dial appShipDialFunc, allowedPrivateIPs ...net.IP) appShipDialFunc {
