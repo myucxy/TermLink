@@ -38,7 +38,7 @@
 |---|------|------|----------|
 | 15 | Server P3 四项（#32/34/35/33） | Server | 000046 down 已补；email-code 策略门禁复核已存在；登录锁定指数退避已实现并强制执行（5ab51a7，此前 locked_until 从未被读取——锁定形同虚设）；AdminRoutes 随机化能力已有（opt-in，默认 /admin 保持以避免锁死操作员） |
 | 16 | metrics/告警（#26） | Server+运维 | 暂缓：/metrics 无认证（#36），公开端口启用前需先定认证方案；告警文案修正待做 |
-| 17 | presence 统一同源（#9/31） | Server+Web+Android | presence registry 唯一在线源、会话级粒度，门户与 Android 同源 |
+| 17 | presence 统一同源（#9/31） | Server+Web+Android | 复核确认（2026-09-21）：门户和 API 均已从同一个 presence registry 读取在线状态，会话级通过 `PC presence AND state==RUNNING` 组合判定；4 秒状态传播修复后窗口已可接受 |
 | 18 | 发版 CI 回归 + 恢复演练（#12/15） | 发布/运维 | **用户决定暂不处理**；推真实 tag 验证 CI 与恢复演练留待正式发版前统一执行 |
 
 ## 五、明确不处理（本轮确认）
