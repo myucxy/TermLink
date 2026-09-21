@@ -62,3 +62,29 @@
 - 每阶段完成：本地验证（必要时浏览器/模拟器/WT 实测）→ 提交 → push。
 - 直连两项（#11/#12）工作量大且相互依赖（e2e 适配器是开数据面准入的前置），排在功能缺陷与安全加固之后。
 - 追加记录：本轮管理页"运行时参数"面板已上线（77676da 补保存成功提示）；本地 Docker 为最新构建。
+
+## 七、全链路回归结果（2026-09-21 实测）
+
+环境：本地 Docker server（192.168.9.28:8080，schema v50）+ Windows Agent（D:\Dev\Tool\TermLink，注册模式后台运行时）+ Android 模拟器（dev.termlink.harness debug APK）。
+
+| 项 | 结果 | 证据 |
+|----|------|------|
+| Android 全输入链（IME→engine→Relay→Agent→ConPTY→pwsh） | ✅ | 远程执行 Set-Content，PC 落盘 C:/Temp/tl-regress.txt（值 OK0921） |
+| dock 快捷键（普通 shell） | ✅ | Esc 清行、Tab 补全 Get-Child→Get-ChildItem、Ctrl+C 多次 ^C、Enter 执行、Up 历史回溯 |
+| Claude CLI `/` 崩溃修复 | ✅ | Claude Code v2.1.116 TUI 中输入 `/` 弹出命令菜单，应用存活 |
+| dock 方向键/Esc 在 kitty TUI 下（本次新修复 503de70） | ✅ | dock ↓ 移动菜单选中项到 /add-dir；dock Esc 关闭菜单；修复前该路径抛 encodeInputV1 UNSUPPORTED 并杀死进程（dropbox data_app_crash 两次复现） |
+| 20 天生命周期（行为面） | ✅ | 反复 force-stop/重启 APK 均保持登录态，仅切换端点后才要求重登 |
+| FLAG_SECURE 默认开 | ✅ | 终端页 screencap 全黑；关闭开关后恢复可见 |
+| Web 门户 | ✅ | 首页/仪表盘/PC Agent（含批量控制策略）/设备/会话记录/系统设置（Turnstile、SMTP）/系统运行/账号角色/版本 全部渲染正常 |
+| 管理页"运行时参数"面板 | ✅ | /admin?section=deployment 五项参数渲染；账号注销显示"管理页覆盖"来源并即时生效；注册找回/STUN/AppShip 地址/内网白名单可编辑 |
+| 直连状态 | ✅ | 会话经"服务器中转 / Relay"建立并 Controlling（本环境为同网 NAT，直连数据面仍按既定门禁关闭） |
+
+### 回归中发现并修复
+
+- **dock 功能键在 kitty 协议下崩溃/失效**（真缺陷）：编码路径仍走 Input V1 Key 被拒 → `NativeTerminalException(UNSUPPORTED)` 未捕获直接杀进程（键盘硬件键路径）或被 runOperation 吞掉（dock 路径，表现为无响应）。修复：`encodeKey/encodeCharacter` 迁移 Input V3 KittyKey（503de70），已随本提交推送并装回模拟器验证。
+
+### 复核确认的已知项（非回归失败）
+
+- 门户 PC 列表"离线"与 Android"PC online"并存 = 审计 #31 门户读 DB 心跳的陈旧显示（realtime presence 已同源，仅该列展示待切）；会话打开不受影响。
+- 会话标题重复时多 tab 输入路由（此前已修）与死会话（HostLost）重复打开会得到 TL-H114/TIMEOUT——符合 fail-closed 预期，但 TL-H114 提示"产生新输出后恢复"在无新输出时不会自动重试 bootstrap，留作后续改进项。
+- Claude Code 在 TermLink 管理会话内启动需要 `CLAUDE_CODE_GIT_BASH_PATH` 指向 bash.exe（宿主全局 env 或会话继承），已通过 `setx` 固化到本机用户环境。
