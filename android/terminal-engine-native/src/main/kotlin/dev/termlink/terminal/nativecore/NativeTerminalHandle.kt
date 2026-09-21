@@ -2,7 +2,10 @@ package dev.termlink.terminal.nativecore
 
 import dev.termlink.terminal.api.TerminalHostEffectFrameV2
 import dev.termlink.terminal.api.TerminalInputModifiers
+import dev.termlink.terminal.api.TerminalKittyFunctionalKey
+import dev.termlink.terminal.api.TerminalKittyKey
 import dev.termlink.terminal.api.TerminalKittyKeyInput
+import dev.termlink.terminal.api.TerminalKittyModifiers
 import dev.termlink.terminal.api.TerminalKey
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
@@ -350,36 +353,43 @@ class NativeTerminalHandle private constructor(
         decoded
     }
 
-    /** Encodes one mode-aware semantic key through terminal-core Input V1. */
+    /** Encodes one mode-aware semantic key through terminal-core Input V3. */
     fun encodeKey(
         key: TerminalKey,
         modifiers: TerminalInputModifiers = TerminalInputModifiers(),
-    ): ByteArray = encodeInputV1(
-        NativeTerminalInputV1(
-            kind = NATIVE_INPUT_KIND_KEY,
-            key = nativeKey(key),
-            modifiers = nativeModifiers(modifiers),
+    ): ByteArray = encodeKittyKey(
+        TerminalKittyKeyInput(
+            key = TerminalKittyKey.Functional(kittyFunctionalKey(key)),
+            modifiers = kittyModifiers(modifiers),
         ),
     )
 
-    /** Encodes one Unicode scalar through terminal-core Input V1. */
+    /** Encodes one Unicode key identity through terminal-core Input V3. */
     fun encodeCharacter(
         codePoint: Int,
         modifiers: TerminalInputModifiers = TerminalInputModifiers(),
+        shiftedCodePoint: Int? = null,
     ): ByteArray {
         require(
             Character.isValidCodePoint(codePoint) &&
                 codePoint !in Character.MIN_SURROGATE.code..Character.MAX_SURROGATE.code,
         ) { "character must be a Unicode scalar" }
-        return encodeInputV1(
-            NativeTerminalInputV1(
-                kind = NATIVE_INPUT_KIND_KEY,
-                key = NATIVE_INPUT_KEY_CHARACTER.toInt(),
-                modifiers = nativeModifiers(modifiers),
-                character = codePoint,
+        return encodeKittyKey(
+            TerminalKittyKeyInput(
+                key = TerminalKittyKey.Character(codePoint),
+                modifiers = kittyModifiers(modifiers),
+                shiftedKey = shiftedCodePoint,
             ),
         )
     }
+
+    /** Encodes committed IME text whose physical key identity is unavailable. */
+    fun encodeCommittedText(text: String): ByteArray = encodeKittyKey(
+        TerminalKittyKeyInput(
+            key = TerminalKittyKey.UnidentifiedText,
+            associatedText = text,
+        ),
+    )
 
     /** Encodes an owned paste payload through terminal-core Input V1. */
     fun encodePaste(bytes: ByteArray): ByteArray {
@@ -620,40 +630,41 @@ class NativeTerminalHandle private constructor(
         private const val UNSIGNED_SHORT_MAX = 0xffff
         private const val UNSIGNED_INT_MAX = 0xffff_ffffL
 
-        private fun nativeModifiers(modifiers: TerminalInputModifiers): Int = with(modifiers) {
-            (if (shift) NATIVE_INPUT_MODIFIER_SHIFT else 0) or
-                (if (alt) NATIVE_INPUT_MODIFIER_ALT else 0) or
-                (if (control) NATIVE_INPUT_MODIFIER_CONTROL else 0) or
-                (if (meta) NATIVE_INPUT_MODIFIER_META else 0)
-        }
+        private fun kittyModifiers(modifiers: TerminalInputModifiers): TerminalKittyModifiers =
+            TerminalKittyModifiers(
+                shift = modifiers.shift,
+                alt = modifiers.alt,
+                control = modifiers.control,
+                meta = modifiers.meta,
+            )
 
-        private fun nativeKey(key: TerminalKey): Int = when (key) {
-            TerminalKey.ENTER -> 2
-            TerminalKey.BACKSPACE -> 3
-            TerminalKey.TAB -> 4
-            TerminalKey.ESCAPE -> 5
-            TerminalKey.DELETE -> 6
-            TerminalKey.INSERT -> 7
-            TerminalKey.HOME -> 8
-            TerminalKey.END -> 9
-            TerminalKey.PAGE_UP -> 10
-            TerminalKey.PAGE_DOWN -> 11
-            TerminalKey.ARROW_UP -> 12
-            TerminalKey.ARROW_DOWN -> 13
-            TerminalKey.ARROW_LEFT -> 14
-            TerminalKey.ARROW_RIGHT -> 15
-            TerminalKey.F1 -> 16
-            TerminalKey.F2 -> 17
-            TerminalKey.F3 -> 18
-            TerminalKey.F4 -> 19
-            TerminalKey.F5 -> 20
-            TerminalKey.F6 -> 21
-            TerminalKey.F7 -> 22
-            TerminalKey.F8 -> 23
-            TerminalKey.F9 -> 24
-            TerminalKey.F10 -> 25
-            TerminalKey.F11 -> 26
-            TerminalKey.F12 -> 27
+        private fun kittyFunctionalKey(key: TerminalKey): TerminalKittyFunctionalKey = when (key) {
+            TerminalKey.ENTER -> TerminalKittyFunctionalKey.ENTER
+            TerminalKey.BACKSPACE -> TerminalKittyFunctionalKey.BACKSPACE
+            TerminalKey.TAB -> TerminalKittyFunctionalKey.TAB
+            TerminalKey.ESCAPE -> TerminalKittyFunctionalKey.ESCAPE
+            TerminalKey.DELETE -> TerminalKittyFunctionalKey.DELETE
+            TerminalKey.INSERT -> TerminalKittyFunctionalKey.INSERT
+            TerminalKey.HOME -> TerminalKittyFunctionalKey.HOME
+            TerminalKey.END -> TerminalKittyFunctionalKey.END
+            TerminalKey.PAGE_UP -> TerminalKittyFunctionalKey.PAGE_UP
+            TerminalKey.PAGE_DOWN -> TerminalKittyFunctionalKey.PAGE_DOWN
+            TerminalKey.ARROW_UP -> TerminalKittyFunctionalKey.ARROW_UP
+            TerminalKey.ARROW_DOWN -> TerminalKittyFunctionalKey.ARROW_DOWN
+            TerminalKey.ARROW_LEFT -> TerminalKittyFunctionalKey.ARROW_LEFT
+            TerminalKey.ARROW_RIGHT -> TerminalKittyFunctionalKey.ARROW_RIGHT
+            TerminalKey.F1 -> TerminalKittyFunctionalKey.F1
+            TerminalKey.F2 -> TerminalKittyFunctionalKey.F2
+            TerminalKey.F3 -> TerminalKittyFunctionalKey.F3
+            TerminalKey.F4 -> TerminalKittyFunctionalKey.F4
+            TerminalKey.F5 -> TerminalKittyFunctionalKey.F5
+            TerminalKey.F6 -> TerminalKittyFunctionalKey.F6
+            TerminalKey.F7 -> TerminalKittyFunctionalKey.F7
+            TerminalKey.F8 -> TerminalKittyFunctionalKey.F8
+            TerminalKey.F9 -> TerminalKittyFunctionalKey.F9
+            TerminalKey.F10 -> TerminalKittyFunctionalKey.F10
+            TerminalKey.F11 -> TerminalKittyFunctionalKey.F11
+            TerminalKey.F12 -> TerminalKittyFunctionalKey.F12
         }
 
         fun create(

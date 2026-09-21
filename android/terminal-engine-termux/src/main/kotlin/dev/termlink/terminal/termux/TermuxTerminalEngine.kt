@@ -469,10 +469,17 @@ class TermuxTerminalEngine(
     }
 
     /** Sends a printable code point, including the VT control and Alt transformations. */
-    override fun submitCodePoint(codePoint: Int, controlDown: Boolean, altDown: Boolean): Boolean {
+    override fun submitCodePoint(
+        codePoint: Int,
+        controlDown: Boolean,
+        altDown: Boolean,
+        shiftDown: Boolean,
+        shiftedCodePoint: Int?,
+    ): Boolean {
         require(Character.isValidCodePoint(codePoint)) { "Invalid Unicode code point: $codePoint" }
         if (!canWriteInput()) return false
-        val transformed = if (controlDown) controlCodePoint(codePoint) else codePoint
+        val resolved = if (shiftDown) shiftedCodePoint ?: codePoint else codePoint
+        val transformed = if (controlDown) controlCodePoint(codePoint) else resolved
         val encoded = String(Character.toChars(transformed)).encodeToByteArray()
         val accepted = emitInput(if (altDown) byteArrayOf(ESCAPE) + encoded else encoded)
         if (accepted) {

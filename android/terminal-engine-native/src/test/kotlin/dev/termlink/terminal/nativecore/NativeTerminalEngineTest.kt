@@ -1,5 +1,6 @@
 package dev.termlink.terminal.nativecore
 
+import android.view.KeyEvent
 import dev.termlink.terminal.api.TerminalSize
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -21,6 +22,49 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class NativeTerminalEngineTest {
+    @Test
+    fun keyboardInputsUseInputV3WithoutPasteFallback() {
+        val bridge = FakeNativeBridge()
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(80, 24),
+            bridge = bridge,
+        )
+        try {
+            engine.setReadOnly(false)
+
+            assertTrue(engine.submitText("/"))
+            assertEquals(NATIVE_INPUT_KITTY_KEY_UNIDENTIFIED_TEXT, bridge.lastInputV3?.key)
+            assertEquals("/", bridge.lastInputV3?.copyAssociatedText()?.decodeToString())
+
+            assertTrue(engine.submitCodePoint('c'.code, controlDown = true))
+            assertEquals(NATIVE_INPUT_KEY_CHARACTER, bridge.lastInputV3?.key)
+            assertEquals('c'.code, bridge.lastInputV3?.character)
+            assertEquals(NATIVE_KITTY_MODIFIER_CONTROL, bridge.lastInputV3?.kittyModifiers)
+
+            assertTrue(
+                engine.submitCodePoint(
+                    '/'.code,
+                    shiftDown = true,
+                    shiftedCodePoint = '?'.code,
+                ),
+            )
+            assertEquals('/'.code, bridge.lastInputV3?.character)
+            assertEquals('?'.code, bridge.lastInputV3?.kittyShiftedKey)
+            assertEquals(NATIVE_KITTY_MODIFIER_SHIFT, bridge.lastInputV3?.kittyModifiers)
+
+            assertTrue(engine.submitKeyCode(KeyEvent.KEYCODE_DPAD_UP))
+            assertEquals(12L, bridge.lastInputV3?.key)
+            assertEquals(4, bridge.inputV3Calls)
+            assertEquals(0, bridge.inputV1Calls)
+
+            assertTrue(engine.submitPaste("paste"))
+            assertEquals(NATIVE_INPUT_KIND_PASTE, bridge.lastInputV1?.kind)
+            assertEquals(1, bridge.inputV1Calls)
+        } finally {
+            engine.dispose()
+        }
+    }
+
     @Test
     fun orderedRemoteEventsUseHostEffectV2AndNeverUseLegacyApply() = runBlocking {
         val bridge = FakeNativeBridge()

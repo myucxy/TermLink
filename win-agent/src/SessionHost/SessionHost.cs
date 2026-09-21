@@ -566,7 +566,7 @@ namespace TermLink.SessionHost
             var titleBuffer = new StringBuilder(4096);
             var inheritedLength = GetConsoleTitle(titleBuffer, titleBuffer.Capacity);
             inheritedConsoleTitle = inheritedLength > 0 ? titleBuffer.ToString() : string.Empty;
-            PublishTitleIfChanged(ManagedShellDisplayName(ShellType));
+            PublishTitleIfChanged(ManagedShellDisplayName(options.ShellType));
             PublishAgentFrame(
                 LocalFrameType.Lifecycle,
                 LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0));

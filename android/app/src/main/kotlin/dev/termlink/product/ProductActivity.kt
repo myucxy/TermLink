@@ -7452,7 +7452,9 @@ internal fun terminalCombinationFromAndroidKeyEvent(event: AndroidKeyEvent): Ter
             ('a'.code + event.keyCode - AndroidKeyEvent.KEYCODE_A).toChar().toString()
         in AndroidKeyEvent.KEYCODE_0..AndroidKeyEvent.KEYCODE_9 ->
             ('0'.code + event.keyCode - AndroidKeyEvent.KEYCODE_0).toChar().toString()
-        else -> event.unicodeChar.takeIf { it > 0 && !Character.isISOControl(it) }
+        else -> event.getUnicodeChar(
+            event.metaState and AndroidKeyEvent.META_SHIFT_MASK.inv(),
+        ).takeIf { it > 0 && !Character.isISOControl(it) }
             ?.let { String(Character.toChars(it)) }
     } ?: return null
     return TerminalKeyCombination(

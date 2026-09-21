@@ -563,14 +563,34 @@ internal class NativeTerminalView @JvmOverloads constructor(
                 shiftDown = event.isShiftPressed,
             )
         ) return true
+        val metaState = event.metaState
+        val leftAltDown = metaState and KeyEvent.META_ALT_LEFT_ON != 0
+        val rightAltDown = metaState and KeyEvent.META_ALT_RIGHT_ON != 0
+        val terminalAltDown = leftAltDown || event.isAltPressed && !rightAltDown
+        var effectiveMetaState = metaState and KeyEvent.META_CTRL_MASK.inv()
+        if (!rightAltDown) effectiveMetaState = effectiveMetaState and KeyEvent.META_ALT_MASK.inv()
+        val resolvedCodePoint = event.getUnicodeChar(effectiveMetaState)
+        val unshiftedCodePoint = event.getUnicodeChar(
+            effectiveMetaState and KeyEvent.META_SHIFT_MASK.inv(),
+        )
         val codePoint = when {
-            event.unicodeChar > 0 -> event.unicodeChar
+            (event.isCtrlPressed || terminalAltDown || event.isShiftPressed) &&
+                unshiftedCodePoint > 0 -> unshiftedCodePoint
+            resolvedCodePoint > 0 -> resolvedCodePoint
             event.isCtrlPressed && keyCode in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z ->
                 'a'.code + keyCode - KeyEvent.KEYCODE_A
             else -> 0
         }
-        return if (codePoint > 0) {
-            owner.submitCodePoint(codePoint, event.isCtrlPressed, event.isAltPressed)
+        return if (codePoint > 0 && !Character.isISOControl(codePoint)) {
+            owner.submitCodePoint(
+                codePoint = codePoint,
+                controlDown = event.isCtrlPressed,
+                altDown = terminalAltDown,
+                shiftDown = event.isShiftPressed,
+                shiftedCodePoint = resolvedCodePoint.takeIf {
+                    event.isShiftPressed && it > 0 && !Character.isISOControl(it)
+                },
+            )
         } else {
             super.onKeyDown(keyCode, event)
         }

@@ -48,9 +48,13 @@ class TerminalShortcutInputTest {
         val shifted = terminalCombinationFromAndroidKeyEvent(
             keyDown(KeyEvent.KEYCODE_P, KeyEvent.META_SHIFT_ON),
         )
+        val shiftedSlash = terminalCombinationFromAndroidKeyEvent(
+            keyDown(KeyEvent.KEYCODE_SLASH, KeyEvent.META_SHIFT_ON),
+        )
 
         assertEquals("p", plain?.canonical)
         assertEquals("Shift+p", shifted?.canonical)
+        assertEquals("Shift+/", shiftedSlash?.canonical)
         assertEquals("Backspace", terminalCombinationFromAndroidKeyEvent(keyDown(KeyEvent.KEYCODE_DEL))?.canonical)
         assertEquals("Delete", terminalCombinationFromAndroidKeyEvent(keyDown(KeyEvent.KEYCODE_FORWARD_DEL))?.canonical)
         assertEquals("Home", terminalCombinationFromAndroidKeyEvent(keyDown(KeyEvent.KEYCODE_MOVE_HOME))?.canonical)

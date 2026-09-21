@@ -260,7 +260,7 @@ class JniNativeBridgeInstrumentedTest {
         }
 
     @Test
-    fun inputV1AndRenderFrameV3AreProductionNativeContracts() {
+    fun semanticInputTracksKittyProtocolAndRenderFrameV3IsNative() {
         NativeTerminalHandle.create(
             bridge = JniNativeBridge,
             size = TerminalSize(80, 24),
@@ -285,8 +285,41 @@ class JniNativeBridgeInstrumentedTest {
             assertArrayEquals("\u001b[I".encodeToByteArray(), terminal.encodeFocus(true))
             assertArrayEquals("\u001b[O".encodeToByteArray(), terminal.encodeFocus(false))
 
+            terminal.feed(2, "\u001b[=31u".encodeToByteArray())
+            assertArrayEquals("/".encodeToByteArray(), terminal.encodeCommittedText("/"))
+            assertArrayEquals(
+                "\u001b[99;5:1u".encodeToByteArray(),
+                terminal.encodeCharacter('c'.code, TerminalInputModifiers(control = true)),
+            )
+            assertArrayEquals(
+                "\u001b[47:63;2:1u".encodeToByteArray(),
+                terminal.encodeCharacter(
+                    '/'.code,
+                    TerminalInputModifiers(shift = true),
+                    shiftedCodePoint = '?'.code,
+                ),
+            )
+            assertArrayEquals(
+                "\u001b[13;1:1u".encodeToByteArray(),
+                terminal.encodeKey(TerminalKey.ENTER),
+            )
+            assertArrayEquals(
+                "\u001b[27;1:1u".encodeToByteArray(),
+                terminal.encodeKey(TerminalKey.ESCAPE),
+            )
+            assertArrayEquals(
+                "\u001b[1;1:1A".encodeToByteArray(),
+                terminal.encodeKey(TerminalKey.ARROW_UP),
+            )
+
+            terminal.feed(3, "\u001b[<u".encodeToByteArray())
+            assertArrayEquals(
+                byteArrayOf(3),
+                terminal.encodeCharacter('c'.code, TerminalInputModifiers(control = true)),
+            )
+
             val frame = terminal.renderV3().renderFrame
-            assertEquals(2, frame.nextSourceSequence)
+            assertEquals(4, frame.nextSourceSequence)
             assertEquals("Native V3", frame.title)
             assertEquals(80, frame.size.columns)
             assertEquals(24, frame.size.rows)

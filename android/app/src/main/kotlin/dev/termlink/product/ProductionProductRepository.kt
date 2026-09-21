@@ -2922,11 +2922,14 @@ internal class ProductionProductRepository(
             else -> parsed.printableCodePoint
         }
         val accepted = if (printable != null) {
-            val shifted = if (parsed.shift) terminalShiftedCodePoint(printable) else printable
+            val base = if (parsed.shift) Character.toLowerCase(printable) else printable
+            val shifted = if (parsed.shift) terminalShiftedCodePoint(base) else null
             live.engine.submitCodePoint(
-                shifted,
+                base,
                 controlDown = parsed.control,
                 altDown = parsed.alt,
+                shiftDown = parsed.shift,
+                shiftedCodePoint = shifted,
             )
         } else {
             val keyCode = when (parsed.key) {

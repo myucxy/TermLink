@@ -47,6 +47,8 @@ interface TerminalViewportEngine : TerminalEngine {
         codePoint: Int,
         controlDown: Boolean = false,
         altDown: Boolean = false,
+        shiftDown: Boolean = false,
+        shiftedCodePoint: Int? = null,
     ): Boolean
 
     fun submitKeyCode(keyCode: Int, modifiers: Int = 0): Boolean
