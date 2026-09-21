@@ -75,7 +75,8 @@ namespace TermLink.Agent
         SignRequest = 4,
         ShadowReady = 5,
         IgnoredStale = 6,
-        CandidatesReady = 7
+        CandidatesReady = 7,
+        RenewalDue = 13
     }
 
     internal sealed class ProductionDirectNativeSnapshot
@@ -485,6 +486,7 @@ namespace TermLink.Agent
                     CryptographicOperations.ZeroMemory(native.Payload);
                     if (decoded.Kind != ProductionDirectNativeEventKind.IgnoredStale &&
                         decoded.Kind != ProductionDirectNativeEventKind.IdentityReady &&
+                        decoded.Kind != ProductionDirectNativeEventKind.RenewalDue &&
                         !IsCurrentLocked(decoded.Epoch, decoded.AttemptId))
                     {
                         result.Add(new ProductionDirectNativeEvent
@@ -660,7 +662,7 @@ namespace TermLink.Agent
             result = null;
             if (native.AbiVersion != ProductionDirectNativeAbiV3.AbiVersion ||
                 native.StructSize != ProductionDirectNativeAbiV2.EventSize ||
-                native.Kind is < 1 or > 7 || native.State is < 1 or > 5 || native.Reason > 15 ||
+                native.Kind is < 1 or > 13 || native.State is < 1 or > 5 || native.Reason > 15 ||
                 native.PayloadLength > ProductionDirectNativeAbiV2.MaximumEventPayloadBytes ||
                 native.AttemptId == null || native.AttemptId.Length != 16 ||
                 native.Payload == null || native.Payload.Length != ProductionDirectNativeAbiV2.MaximumEventPayloadBytes ||
@@ -704,6 +706,10 @@ namespace TermLink.Agent
                         native.Reason != 0 || native.Epoch == 0 || native.RequestId != 0 ||
                         attemptEmpty || endpointEmpty ||
                         native.PayloadLength != ProductionDirectNativeAbiV3.CandidatesSize,
+                    (uint)ProductionDirectNativeEventKind.RenewalDue =>
+                        native.Reason != 0 || native.Epoch == 0 ||
+                        native.RequestId != 0 || attemptEmpty || !endpointEmpty ||
+                        native.PayloadLength != 0,
                     _ => true
                 })
                 return false;
