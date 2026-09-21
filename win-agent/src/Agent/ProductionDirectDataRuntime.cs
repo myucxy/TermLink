@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -2178,6 +2178,15 @@ namespace TermLink.Agent
                         if (value.Status != ProductionDirectNativeResultV5.Accepted)
                             throw new PeerRetiredException("DIRECT_PATH_READY_INVALID");
                         TryObservePathReady();
+                        continue;
+                    }
+                    if (value.Kind == ProductionDirectNativeEventKindV5.RenewalDue)
+                    {
+                        // Ticket renewal due (audit #2): the transport-level
+                        // renewal coroutine handles fetching and applying the
+                        // new ticket. The data loop just notes the event and
+                        // continues; the FFI hard-stop at expiry+grace is the
+                        // fallback if renewal fails.
                         continue;
                     }
                     if (value.Kind == ProductionDirectNativeEventKindV5.DirectFailed ||

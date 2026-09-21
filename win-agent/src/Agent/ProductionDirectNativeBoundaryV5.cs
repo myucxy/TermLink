@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -29,7 +29,7 @@ namespace TermLink.Agent
     {
         PathUsed = 1, EnvelopeQueued = 2, EnvelopeAvailable = 3, TransportReceipt = 4,
         Cancelled = 5, NetworkChanged = 6, QueueLimit = 7, PathReady = 8,
-        DirectFailed = 9, Ping = 10, Pong = 11, SignRequest = 12
+        DirectFailed = 9, Ping = 10, Pong = 11, SignRequest = 12, RenewalDue = 13
     }
 
     [Flags]

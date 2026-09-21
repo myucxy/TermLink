@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -106,9 +106,12 @@ namespace TermLink.Agent
         private readonly IngressDelegate arbitrateIngress;
         private readonly TickIngressDelegate tickIngress;
         private readonly PollEventDelegate pollEvent;
+        private readonly RenewApplyDelegate renewApply;
         private readonly PathDelegate cancel;
         private readonly PathDelegate networkChanged;
         private readonly DestroyDelegate destroy;
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int RenewApplyDelegate(IntPtr handle, byte[] ticket, UIntPtr ticketLength);
         private IntPtr module;
 
         internal ProductionDirectNativeLibraryApiV5(IntPtr module)
@@ -138,6 +141,7 @@ namespace TermLink.Agent
             arbitrateIngress = Export<IngressDelegate>(module, "termlink_direct_arbitrate_ingress_v5");
             tickIngress = Export<TickIngressDelegate>(module, "termlink_direct_tick_ingress_v5");
             pollEvent = Export<PollEventDelegate>(module, "termlink_direct_poll_event_v5");
+            renewApply = Export<RenewApplyDelegate>(module, "termlink_direct_renew_apply_v5");
             cancel = Export<PathDelegate>(module, "termlink_direct_cancel_v5");
             networkChanged = Export<PathDelegate>(module, "termlink_direct_network_changed_v5");
             destroy = Export<DestroyDelegate>(module, "termlink_direct_destroy_v5");
@@ -145,6 +149,7 @@ namespace TermLink.Agent
         }
 
         public uint AbiVersion() => abi();
+        public int RenewApply(IntPtr handle, byte[] ticket) => renewApply(handle, ticket, (UIntPtr)ticket.Length);
         public IntPtr Create(ref TermLinkDirectCreateV5 value) => create(ref value);
         public int PathUsage(IntPtr handle, ref TermLinkDirectPathV5 value) => pathUsage(handle, ref value);
         public int Attach(IntPtr handle, ref TermLinkDirectPathV5 value) => attach(handle, ref value);
