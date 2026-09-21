@@ -26,8 +26,12 @@ import (
 )
 
 const (
-	ticketDomain            = "TERMLINK-DIRECT-TICKET-V1\n"
-	ticketTTL               = 120 * time.Second
+	ticketDomain = "TERMLINK-DIRECT-TICKET-V1\n"
+	ticketTTL    = 20 * time.Minute
+	// Renewal lead: a connection may request a fresh ticket once half of its
+	// current lifetime has elapsed, and at most twice per minute per connection.
+	ticketRenewalAfter      = ticketTTL / 2
+	maxRenewalsPerMinute    = 2
 	connectionReplayTTL     = 10 * time.Minute
 	maxTicketBodyBytes      = 4 << 10
 	maxTicketStates         = 4096
@@ -52,15 +56,15 @@ type TransportAuthority interface {
 }
 
 type RouteTicketService struct {
-	authority              TransportAuthority
-	state                  DirectStateStore
-	directRoutingPermitted bool
+	authority                TransportAuthority
+	state                    DirectStateStore
+	directRoutingPermitted   bool
 	routingPermittedOverride func() bool
-	private                ed25519.PrivateKey
-	public                 ed25519.PublicKey
-	keyID                  []byte
-	clock                  func() time.Time
-	random                 io.Reader
+	private                  ed25519.PrivateKey
+	public                   ed25519.PublicKey
+	keyID                    []byte
+	clock                    func() time.Time
+	random                   io.Reader
 
 	mu                 sync.Mutex
 	connections        map[connectionKey]*routeState
@@ -69,6 +73,7 @@ type RouteTicketService struct {
 	accountTicketRate  map[uuid.UUID]rateState
 	deviceSignalRate   map[uuid.UUID]rateState
 	accountSignalRate  map[uuid.UUID]rateState
+	connectionRenewals map[uuid.UUID][]time.Time
 	stunServers        []string
 }
 
@@ -193,12 +198,63 @@ func newRouteTicketService(authority TransportAuthority, state DirectStateStore,
 		connections: map[connectionKey]*routeState{}, pendingConnections: map[connectionKey]struct{}{},
 		deviceTicketRate: map[uuid.UUID]rateState{}, accountTicketRate: map[uuid.UUID]rateState{},
 		deviceSignalRate: map[uuid.UUID]rateState{}, accountSignalRate: map[uuid.UUID]rateState{},
-		stunServers: append([]string(nil), stunServers...),
+		connectionRenewals: map[uuid.UUID][]time.Time{},
+		stunServers:        append([]string(nil), stunServers...),
 	}, nil
 }
 
 func (s *RouteTicketService) TicketHandler() http.Handler { return http.HandlerFunc(s.issueTicketHTTP) }
+func (s *RouteTicketService) RenewHandler() http.Handler  { return http.HandlerFunc(s.renewTicketHTTP) }
 func (s *RouteTicketService) ConfigHandler() http.Handler { return http.HandlerFunc(s.configHTTP) }
+
+type ticketRenewalRequest struct {
+	TargetDeviceID string `json:"target_device_id"`
+	ConnectionID   string `json:"connection_id"`
+	TicketProtobuf string `json:"ticket_protobuf"`
+}
+
+func (s *RouteTicketService) renewTicketHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxTicketBodyBytes)
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	if !ok {
+		writeTransportError(w, http.StatusUnauthorized, "UNAUTHENTICATED")
+		return
+	}
+	var input ticketRenewalRequest
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeTransportError(w, http.StatusBadRequest, ErrTransportInvalid.Error())
+		return
+	}
+	targetID, err := uuid.Parse(input.TargetDeviceID)
+	connectionID, errConnection := uuid.Parse(input.ConnectionID)
+	proof, errProof := base64.RawURLEncoding.DecodeString(input.TicketProtobuf)
+	if err != nil || errConnection != nil || errProof != nil {
+		writeTransportError(w, http.StatusBadRequest, ErrTransportInvalid.Error())
+		return
+	}
+	ticket, err := s.Renew(r.Context(), principal, targetID, connectionID, proof)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrDirectStateUnavailable):
+			writeTransportError(w, http.StatusServiceUnavailable, "RENEWAL_UNAVAILABLE")
+		case errors.Is(err, ErrTransportRateLimited):
+			writeTransportError(w, http.StatusTooManyRequests, ErrTransportRateLimited.Error())
+		case errors.Is(err, ErrTransportDenied), errors.Is(err, ErrTransportInvalid):
+			writeTransportError(w, http.StatusForbidden, "RENEWAL_DENIED")
+		default:
+			writeTransportError(w, http.StatusInternalServerError, ErrTransportInvalid.Error())
+		}
+		return
+	}
+	writeTransportJSON(w, http.StatusOK, map[string]any{
+		"ticket_protobuf": base64.RawURLEncoding.EncodeToString(ticket),
+	})
+}
 
 func (s *RouteTicketService) configHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -648,6 +704,190 @@ func appendVarintField(dst []byte, number protowire.Number, value uint64) []byte
 func appendBytesField(dst []byte, number protowire.Number, value []byte) []byte {
 	dst = protowire.AppendTag(dst, number, protowire.BytesType)
 	return protowire.AppendBytes(dst, value)
+}
+
+// Renew issues a fresh ticket for an existing direct-transport connection so
+// an established data path can outlive the original ticket TTL without
+// tearing down (audit #2). The caller presents its current ticket as proof:
+// the signature is verified with this server's public key, the claims must
+// match the authenticated principal and the requested peer, and the live
+// connection state must still exist with an unexpired ticket. Renewal never
+// advances the path epoch and never changes the connection identity; shared
+// (multi-replica) state stores do not support renewal yet, so those
+// deployments answer with ErrDirectStateUnavailable and clients keep the
+// legacy reissue behavior.
+func (s *RouteTicketService) Renew(ctx context.Context, principal auth.Principal, targetID, connectionID uuid.UUID, proof []byte) ([]byte, error) {
+	if s.state != nil {
+		return nil, ErrDirectStateUnavailable
+	}
+	claims, err := parseSignedTicket(proof, s.public, s.keyID)
+	if err != nil {
+		return nil, ErrTransportInvalid
+	}
+	if claims.accountID != principal.UserID || principal.Device.UserID != principal.UserID ||
+		principal.Device.TrustState != "TRUSTED" {
+		return nil, ErrTransportDenied
+	}
+	var peer uuid.UUID
+	switch principal.Device.ID {
+	case claims.initiator:
+		peer = claims.responder
+	case claims.responder:
+		peer = claims.initiator
+	default:
+		return nil, ErrTransportDenied
+	}
+	if targetID != peer || claims.connectionID != connectionID || claims.epoch == 0 {
+		return nil, ErrTransportDenied
+	}
+	now := s.clock().UTC()
+	if !now.Before(claims.expiresAt) {
+		// Expired tickets renew through a fresh Issue, never in place.
+		return nil, ErrTransportDenied
+	}
+	s.mu.Lock()
+	s.cleanupLocked(now)
+	state := s.connections[connectionKey{accountID: principal.UserID, connection: connectionID}]
+	if state == nil || state.pathEpoch != claims.epoch || !now.Before(state.expiresAt) ||
+		state.accountID != claims.accountID || !state.containsDirection(claims.initiator, claims.responder) {
+		s.mu.Unlock()
+		return nil, ErrTransportDenied
+	}
+	if len(s.connectionRenewals[connectionID]) >= maxRenewalsPerMinute {
+		s.mu.Unlock()
+		return nil, ErrTransportRateLimited
+	}
+	ticketID := uuid.New()
+	nonce := make([]byte, 16)
+	if _, err := io.ReadFull(s.random, nonce); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	expiresAt := now.Add(ticketTTL)
+	claimsBytes := marshalTicketClaims(ticketID, state.accountID, state.initiator, state.responder, connectionID, state.pathEpoch, now, expiresAt, nonce, s.keyID)
+	signature := ed25519.Sign(s.private, append([]byte(ticketDomain), claimsBytes...))
+	ticket := append(append([]byte(nil), claimsBytes...), appendBytesField(nil, 13, signature)...)
+	state.issuedAt = now
+	state.expiresAt = expiresAt
+	s.connectionRenewals[connectionID] = appendRenewal(s.connectionRenewals[connectionID], now)
+	s.mu.Unlock()
+	return ticket, nil
+}
+
+func appendRenewal(history []time.Time, now time.Time) []time.Time {
+	window := now.Add(-time.Minute)
+	kept := history[:0]
+	for _, at := range history {
+		if at.After(window) {
+			kept = append(kept, at)
+		}
+	}
+	return append(kept, now)
+}
+
+type signedTicketClaims struct {
+	ticketID                        uuid.UUID
+	accountID, initiator, responder uuid.UUID
+	connectionID                    uuid.UUID
+	epoch                           uint64
+	issuedAt, expiresAt             time.Time
+	nonce, keyID                    []byte
+}
+
+// parseSignedTicket verifies the server signature over the canonical claim
+// prefix (fields 1-12; field 13 carries the signature) and decodes the
+// claims. The original encoder emits fields in ascending order, so
+// re-marshaling fields 1-12 reproduces the signed byte prefix exactly.
+func parseSignedTicket(ticket []byte, public ed25519.PublicKey, keyID []byte) (*signedTicketClaims, error) {
+	raw := map[int][]byte{}
+	segments := map[int][]byte{}
+	rest := ticket
+	for len(rest) > 0 {
+		number, typ, consumed := protowire.ConsumeTag(rest)
+		if consumed < 0 {
+			return nil, errors.New("ticket field tag is invalid")
+		}
+		fieldStart := rest
+		rest = rest[consumed:]
+		var value []byte
+		var width int
+		switch typ {
+		case protowire.VarintType:
+			_, width = protowire.ConsumeVarint(rest)
+			value = append([]byte(nil), rest[:width]...)
+		case protowire.BytesType:
+			value, width = protowire.ConsumeBytes(rest)
+		default:
+			return nil, errors.New("ticket field type is invalid")
+		}
+		if width < 0 {
+			return nil, errors.New("ticket field value is invalid")
+		}
+		if _, duplicate := raw[int(number)]; !duplicate {
+			raw[int(number)] = append([]byte(nil), value...)
+			// The signed canonical prefix spans tag+value for every field,
+			// so the segment must capture both.
+			segments[int(number)] = append([]byte(nil), fieldStart[:consumed+width]...)
+		}
+		rest = rest[width:]
+	}
+	if raw[13] == nil {
+		return nil, fmt.Errorf("ticket signature is missing (fields=%d)", len(raw))
+	}
+	var canonical []byte
+	for number := 1; number <= 12; number++ {
+		segment, ok := segments[number]
+		if !ok {
+			return nil, errors.New("ticket claim is missing")
+		}
+		canonical = append(canonical, segment...)
+	}
+	if !ed25519.Verify(public, append([]byte(ticketDomain), canonical...), raw[13]) {
+		return nil, errors.New("ticket signature is invalid")
+	}
+	decodeVarint := func(raw []byte) (uint64, error) {
+		value, consumed := protowire.ConsumeVarint(raw)
+		if consumed != len(raw) {
+			return 0, errors.New("ticket varint claim is malformed")
+		}
+		return value, nil
+	}
+	decodeFixed := func(raw []byte, what string) (uuid.UUID, error) {
+		if len(raw) != 16 {
+			return uuid.Nil, fmt.Errorf("ticket %s claim is malformed", what)
+		}
+		return uuid.FromBytes(raw)
+	}
+	claims := &signedTicketClaims{}
+	var err error
+	if claims.ticketID, err = decodeFixed(raw[2], "ticket_id"); err != nil {
+		return nil, err
+	}
+	if claims.accountID, err = decodeFixed(raw[3], "account"); err != nil {
+		return nil, err
+	}
+	if claims.initiator, err = decodeFixed(raw[4], "initiator"); err != nil {
+		return nil, err
+	}
+	if claims.responder, err = decodeFixed(raw[5], "responder"); err != nil {
+		return nil, err
+	}
+	if claims.connectionID, err = decodeFixed(raw[6], "connection"); err != nil {
+		return nil, err
+	}
+	if claims.epoch, err = decodeVarint(raw[7]); err != nil {
+		return nil, err
+	}
+	issuedAt, errIssued := decodeVarint(raw[8])
+	expiresAt, errExpires := decodeVarint(raw[9])
+	if errIssued != nil || errExpires != nil {
+		return nil, errors.New("ticket lifetime claims are malformed")
+	}
+	claims.issuedAt = time.UnixMilli(int64(issuedAt))
+	claims.expiresAt = time.UnixMilli(int64(expiresAt))
+	claims.nonce = append([]byte(nil), raw[11]...)
+	claims.keyID = append([]byte(nil), raw[12]...)
+	return claims, nil
 }
 
 func writeTransportJSON(w http.ResponseWriter, status int, value any) {

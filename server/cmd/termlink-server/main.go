@@ -611,6 +611,7 @@ func runProduction() error {
 		registerDirectTransportRoutes(mux,
 			directAuthentication.Authenticate(directTickets.ConfigHandler()),
 			directAuthentication.Authenticate(directTickets.TicketHandler()),
+			directAuthentication.Authenticate(directTickets.RenewHandler()),
 			transport.AuthenticateSignals(directAuthentication, directHub.Handler()),
 		)
 	}
@@ -891,9 +892,10 @@ func validSTUNHost(host string) bool {
 	return true
 }
 
-func registerDirectTransportRoutes(mux *http.ServeMux, config, tickets, signals http.Handler) {
+func registerDirectTransportRoutes(mux *http.ServeMux, config, tickets, renew, signals http.Handler) {
 	mux.Handle("/v1/transport/config", config)
 	mux.Handle("/v1/transport/tickets", tickets)
+	mux.Handle("/v1/transport/tickets/renew", renew)
 	mux.Handle("/v1/transport/signals", signals)
 }
 
