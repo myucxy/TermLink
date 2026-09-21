@@ -1978,7 +1978,7 @@ async fn data_loop(
                     renewal_due_emitted = true;
                     let mut locked = state.lock().unwrap_or_else(|entry| entry.into_inner());
                     locked.renewal_due_emitted = true;
-                    let _ = locked.push_event(EVENT_RENEWAL_DUE_V5, V5_OK, 0, 0, 0, 0);
+                    let _ = locked.push_event(EVENT_RENEWAL_DUE_V5, 5, 0, 0, 0, 0);
                 }
             }
         }
