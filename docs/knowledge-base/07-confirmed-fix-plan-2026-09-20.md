@@ -21,7 +21,7 @@
 | 7 | Authenticode 无链校验/吊销（#18） | Win | 已实现：签名策略 auto/strict/compat（TERMLINK_UPDATE_SIGNATURE_POLICY），strict 启用整链吊销检查仅接受 TrustSuccess，SHA-1 pin 保留第二因子 |
 | 8 | 更新元数据无签名（#16） | Server+Win | Ed25519 签名 catalog + 客户端内置公钥强校验；REQUIRED 仅验签通过生效 |
 | 9 | 管道 ACL + 握手 token argv（#37/38） | Win | 管道 ACL 加完整性级别；token 改经继承环境变量/受控临时文件 |
-| 10 | Android 安全四件套（#7设置化/#22/#41/#42/#43） | Android | FLAG_SECURE 设置化（默认开，Settings→Secure screen）；WebView 禁第三方 Cookie 已合入；StrongBox 可用探测+可选生物识别与 SQLCipher 评估后续进行 |
+| 10 | Android 安全四件套（#7设置化/#22/#41/#42/#43） | Android | FLAG_SECURE 设置化与 WebView 禁第三方 Cookie 已合入（ca2e353）；StrongBox 与 SQLCipher **用户决定不处理**（收益为纵深防御，成本/体验代价高于实际需求；企业客户有合规要求时再启用） |
 
 ## 三、直连传输（第三阶段，产品意图核心）
 
