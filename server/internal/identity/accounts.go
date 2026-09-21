@@ -63,6 +63,11 @@ type Account struct {
 	TOTPConfigured        bool
 	RealmRoles            []string
 	Password              passwordDigest
+	// FailedLoginCount and LockedUntil drive the exponential login lockout:
+	// after maximumFailedLogins failures the account locks for a window that
+	// doubles per subsequent failure, and login rejects while locked.
+	FailedLoginCount int
+	LockedUntil      time.Time
 }
 
 type AccountStore struct {
@@ -265,17 +270,29 @@ func (s *AccountStore) authenticate(ctx context.Context, login, password string,
 		verifyDummyPassword(password)
 		return "", fosite.ErrNotFound
 	}
+	// Lockout enforcement (audit #34): reject while a lockout window from
+	// previous failures is still open. The dummy verification keeps this
+	// path computationally comparable to a real credential check.
+	if account.LockedUntil.After(now) {
+		verifyDummyPassword(password)
+		return "", fosite.ErrNotFound
+	}
 	if (!allowPasswordReset && account.PasswordResetRequired) || len(account.Password.Hash) == 0 {
 		verifyDummyPassword(password)
 		return "", ErrAccountSetupRequired
 	}
 	if !verifyPassword(password, account.Password) {
+		failures := account.FailedLoginCount + 1
+		// Exponential backoff (audit #34): the first lock after the failure
+		// threshold is 30 seconds and doubles per additional failure, capped
+		// at 8 minutes so an account never becomes permanently unusable.
+		lockSeconds := 30 << uint(min(failures-maximumFailedLogins, 4))
 		_, _ = s.pool.Exec(ctx, `
 			UPDATE identity_accounts SET
 				failed_login_count=least(failed_login_count+1,1000),
-				locked_until=CASE WHEN failed_login_count+1 >= $2 THEN $3 ELSE locked_until END,
+				locked_until=CASE WHEN failed_login_count+1 >= $2 THEN $3 + make_interval(secs => $4) ELSE locked_until END,
 				updated_at=now()
-			WHERE subject=$1`, account.Subject, maximumFailedLogins, now.Add(30*time.Second))
+			WHERE subject=$1`, account.Subject, maximumFailedLogins, now, float64(lockSeconds))
 		return "", fosite.ErrNotFound
 	}
 	command, err := s.pool.Exec(ctx, `
@@ -307,13 +324,14 @@ func (s *AccountStore) loadForLogin(ctx context.Context, login string) (Account,
 		SELECT a.subject,a.username,a.nickname,a.email,a.email_verified,a.enabled,a.password_reset_required,
 		       a.auth_epoch,a.password_hash,a.password_salt,a.password_memory_kib,a.password_iterations,
 		       a.password_parallelism,EXISTS(SELECT 1 FROM identity_totp_credentials t WHERE t.subject=a.subject AND t.confirmed_at IS NOT NULL),
-		       a.realm_roles
+		       a.realm_roles,a.failed_login_count,COALESCE(a.locked_until,'epoch'::timestamptz)
 		FROM identity_accounts a
 		WHERE lower(a.username)=$1 OR lower(a.email)=$1
 		LIMIT 1`, login).Scan(
 		&account.Subject, &account.Username, &account.Nickname, &account.Email, &account.EmailVerified,
 		&account.Enabled, &account.PasswordResetRequired, &account.AuthEpoch, &account.Password.Hash,
-		&account.Password.Salt, &memory, &iterations, &parallelism, &account.TOTPConfigured, &account.RealmRoles)
+		&account.Password.Salt, &memory, &iterations, &parallelism, &account.TOTPConfigured, &account.RealmRoles,
+		&account.FailedLoginCount, &account.LockedUntil)
 	if err != nil {
 		return Account{}, err
 	}
