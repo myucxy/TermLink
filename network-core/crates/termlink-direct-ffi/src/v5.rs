@@ -35,7 +35,8 @@ use termlink_direct_route::{
     SessionId, SessionRouteState, TransitionOutcome,
 };
 use termlink_direct_wire::{
-    DirectTicketExpectation, DirectTicketRole, TicketError, sha256, verify_direct_path_ticket,
+    DirectTicketExpectation, DirectTicketRole, MAX_DIRECT_TICKET_BYTES, TicketError, sha256,
+    verify_direct_path_ticket,
 };
 
 use super::v4::{
@@ -80,6 +81,7 @@ pub const EVENT_PATH_READY_V5: u32 = 8;
 pub const EVENT_DIRECT_FAILED_V5: u32 = 9;
 pub const EVENT_PING_V5: u32 = 10;
 pub const EVENT_PONG_V5: u32 = 11;
+pub const EVENT_RENEWAL_DUE_V5: u32 = 13;
 pub const EVENT_SIGN_REQUEST_V5: u32 = 12;
 
 pub const EVENT_FLAG_OUTBOUND_V5: u32 = 1;
@@ -476,6 +478,13 @@ struct State {
     route_actions: VecDeque<OwnedRouteAction>,
     ingress: VecDeque<IngressEntry>,
     delivered_ingress: VecDeque<DeliveredIngress>,
+    // Ticket-renewal state (audit #2): the applied expiry moves forward when
+    // the host applies a server-issued renewal ticket; the due flag suppresses
+    // duplicate EVENT_RENEWAL_DUE emissions for one window.
+    ticket_expiry_ms: i64,
+    renewal_due_emitted: bool,
+    ticket_renewal_binding: Option<DirectTicketExpectation>,
+    server_signing_key: Option<[u8; 32]>,
 }
 
 impl State {
@@ -503,6 +512,10 @@ impl State {
             route_actions: VecDeque::new(),
             ingress: VecDeque::new(),
             delivered_ingress: VecDeque::new(),
+            ticket_expiry_ms: 0,
+            renewal_due_emitted: false,
+            ticket_renewal_binding: None,
+            server_signing_key: None,
         }
     }
 
@@ -1722,6 +1735,24 @@ async fn run_production_path(
     if ticket_expires_at_ms <= now_ms() {
         return Err(V5_ERR_TICKET_EXPIRED);
     }
+    {
+        let mut locked = state.lock().unwrap_or_else(|entry| entry.into_inner());
+        locked.ticket_expiry_ms = ticket_expires_at_ms;
+        locked.renewal_due_emitted = false;
+        locked.ticket_renewal_binding = Some(DirectTicketExpectation {
+            connection_id: begin.connection_id,
+            path_epoch: begin.epoch,
+            local_device_id: begin.local_device_id,
+            peer_device_id: begin.peer_device_id,
+            local_role: if role == PeerRole::Initiator {
+                DirectTicketRole::Initiator
+            } else {
+                DirectTicketRole::Responder
+            },
+            now_ms: commit.now_ms,
+        });
+        locked.server_signing_key = Some(begin.server_signing_public_key);
+    }
     let endpoint = if role == PeerRole::Initiator {
         DirectEndpoint::client(
             handoff.handoff,
@@ -1885,7 +1916,6 @@ async fn run_production_path(
         &mut writer,
         &mut reader,
         &control,
-        ticket_expires_at_ms,
         stop,
     )
     .await
@@ -1898,7 +1928,6 @@ async fn data_loop(
     writer: &mut DirectDataWriter,
     reader: &mut DirectDataReader,
     control: &DirectConnectionControl,
-    ticket_expires_at_ms: i64,
     stop: &AtomicBool,
 ) -> Result<(), ()> {
     let direction = {
@@ -1911,18 +1940,48 @@ async fn data_loop(
     let writer_task = writer_loop(state, path, writer, &tracker, stop);
     let reader_task = reader_loop(state, path, direction.opposite(), reader, &tracker, stop);
     let liveness_task = liveness_loop(state, path, direction, &tracker, stop);
-    let ticket_expiry = tokio::time::sleep(duration_until_ms(ticket_expires_at_ms));
-    tokio::pin!(ticket_expiry);
-    let result = tokio::select! {
-        biased;
-        () = &mut ticket_expiry => {
-            fail_state(state, path, V5_ERR_TICKET_EXPIRED);
-            Err(())
-        },
-        () = control.cancelled() => data_loop_cancelled_result(state, path, stop),
-        result = writer_task => result,
-        result = reader_task => result,
-        result = liveness_task => result,
+    // Ticket renewal (audit #2): the data loop polls the applied expiry once
+    // a second. When the remaining lifetime falls inside the renewal window
+    // the host receives EVENT_RENEWAL_DUE once and is expected to fetch a
+    // server-renewed ticket and apply it via termlink_direct_renew_apply_v5;
+    // the applied expiry then slides forward and the loop continues. Only a
+    // grace period past the applied expiry without a renewal tears the path
+    // down — the pre-renewal hard stop that forced a rebuild every ticket
+    // generation.
+    const RENEWAL_LEAD_MS: i64 = 60_000;
+    const RENEWAL_GRACE_MS: i64 = 30_000;
+    const RENEWAL_POLL_MS: u64 = 1_000;
+    let mut renewal_poll = tokio::time::interval(Duration::from_millis(RENEWAL_POLL_MS));
+    renewal_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut renewal_due_emitted = false;
+    tokio::pin!(writer_task, reader_task, liveness_task);
+    let result = loop {
+        let hard_deadline_ms = {
+            let locked = state.lock().unwrap_or_else(|entry| entry.into_inner());
+            locked.ticket_expiry_ms.saturating_add(RENEWAL_GRACE_MS)
+        };
+        tokio::select! {
+            biased;
+            () = control.cancelled() => {
+                break data_loop_cancelled_result(state, path, stop);
+            },
+            result = &mut writer_task => break result,
+            result = &mut reader_task => break result,
+            result = &mut liveness_task => break result,
+            _ = renewal_poll.tick() => {
+                let now = now_ms();
+                if now >= hard_deadline_ms {
+                    fail_state(state, path, V5_ERR_TICKET_EXPIRED);
+                    break Err(());
+                }
+                if now >= hard_deadline_ms - RENEWAL_LEAD_MS && !renewal_due_emitted {
+                    renewal_due_emitted = true;
+                    let mut locked = state.lock().unwrap_or_else(|entry| entry.into_inner());
+                    locked.renewal_due_emitted = true;
+                    let _ = locked.push_event(EVENT_RENEWAL_DUE_V5, V5_OK, 0, 0, 0, 0);
+                }
+            }
+        }
     };
     control.cancel();
     result
@@ -1943,6 +2002,55 @@ fn data_loop_cancelled_result(
     } else {
         Err(())
     }
+}
+
+/// Applies a server-renewed direct-transport ticket to a live V5 path
+/// (audit #2). The ticket is verified against the same
+/// connection/epoch/device binding and server signing key as the original;
+/// the applied expiry must be strictly newer than the currently applied one
+/// (monotonic, rollback-proof). On success the data loop slides its
+/// hard-stop forward; the host is expected to have requested the renewal
+/// from the server after EVENT_RENEWAL_DUE.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termlink_direct_renew_apply_v5(
+    handle: *mut c_void,
+    ticket: *const u8,
+    ticket_length: usize,
+) -> i32 {
+    if handle.is_null() || ticket.is_null() || ticket_length == 0
+        || ticket_length > MAX_DIRECT_TICKET_BYTES
+    {
+        return V5_ERR_INVALID_ARGUMENT;
+    }
+    let packet = unsafe { std::slice::from_raw_parts(ticket, ticket_length) };
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: handle must be live and externally synchronized.
+        let Some(bridge) = (unsafe { bridge_ref(handle) }) else {
+            return V5_ERR_INVALID_HANDLE;
+        };
+        let mut locked = bridge.lock_state();
+        let Some(binding) = locked.ticket_renewal_binding else {
+            return V5_ERR_PROTOCOL;
+        };
+        let Some(server_key) = locked.server_signing_key else {
+            return V5_ERR_PROTOCOL;
+        };
+        let expectation = DirectTicketExpectation {
+            now_ms: now_ms(),
+            ..binding
+        };
+        let verified = match verify_direct_path_ticket(packet, &server_key, &expectation) {
+            Ok(verified) => verified,
+            Err(_) => return V5_ERR_TICKET_EXPIRED,
+        };
+        if verified.expires_at_ms <= locked.ticket_expiry_ms {
+            return V5_ERR_TICKET_EXPIRED;
+        }
+        locked.ticket_expiry_ms = verified.expires_at_ms;
+        locked.renewal_due_emitted = false;
+        V5_OK
+    }))
+    .unwrap_or(V5_ERR_PROTOCOL)
 }
 
 fn duration_until_ms(deadline_ms: i64) -> Duration {
