@@ -33,3 +33,5 @@ Thumbs.db
 server/termlink-server.exe
 # local packaging output
 win-agent/publish/
+# Local experiment scratch space (audit #30)
+zcodeDemo/

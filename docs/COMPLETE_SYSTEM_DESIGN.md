@@ -1,5 +1,7 @@
 # TermLink 完整产品与系统设计
 
+> **⚠️ 状态警告（2026-09-20，审计 #29）**：本文档 §6（部署架构）描述的 Redis+Caddy+ghcr.io 多容器架构已废弃。当前生产拓扑为"反向代理 → 单 Server 容器 → PostgreSQL"（内置身份/OIDC/协调/直连信令全部内置于 Server 进程），详见 `server/README-runtime.md`、`server/compose.yml` 与 `docs/EDGE_GATEWAY.md`。其余章节仍作设计背景参考，但部署相关内容以运行文档为准。
+
 文档版本：1.0
 状态：开发基线
 更新日期：2026-09-05
