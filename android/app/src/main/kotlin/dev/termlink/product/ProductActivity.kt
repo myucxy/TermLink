@@ -7430,7 +7430,7 @@ private fun TerminalSpecialKeySection(
 
 internal fun terminalCombinationFromAndroidKeyEvent(event: AndroidKeyEvent): TerminalKeyCombination? {
     if (event.action != AndroidKeyEvent.ACTION_DOWN || AndroidKeyEvent.isModifierKey(event.keyCode)) return null
-    val key = when (event.keyCode) {
+    val key: String = when (event.keyCode) {
         AndroidKeyEvent.KEYCODE_ESCAPE -> "Esc"
         AndroidKeyEvent.KEYCODE_TAB -> "Tab"
         AndroidKeyEvent.KEYCODE_ENTER -> "Enter"
@@ -7452,9 +7452,16 @@ internal fun terminalCombinationFromAndroidKeyEvent(event: AndroidKeyEvent): Ter
             ('a'.code + event.keyCode - AndroidKeyEvent.KEYCODE_A).toChar().toString()
         in AndroidKeyEvent.KEYCODE_0..AndroidKeyEvent.KEYCODE_9 ->
             ('0'.code + event.keyCode - AndroidKeyEvent.KEYCODE_0).toChar().toString()
-        else -> event.getUnicodeChar(
-            event.metaState and AndroidKeyEvent.META_SHIFT_MASK.inv(),
-        ).takeIf { it > 0 && !Character.isISOControl(it) }
+        else -> run {
+            val rightAltDown = event.metaState and AndroidKeyEvent.META_ALT_RIGHT_ON != 0
+            var baseMetaState = event.metaState and AndroidKeyEvent.META_SHIFT_MASK.inv() and
+                AndroidKeyEvent.META_CTRL_MASK.inv()
+            if (!rightAltDown) baseMetaState = baseMetaState and AndroidKeyEvent.META_ALT_MASK.inv()
+            event.getUnicodeChar(baseMetaState)
+        }.takeIf {
+            it > 0 && it and android.view.KeyCharacterMap.COMBINING_ACCENT == 0 &&
+                !Character.isISOControl(it)
+        }
             ?.let { String(Character.toChars(it)) }
     } ?: return null
     return TerminalKeyCombination(

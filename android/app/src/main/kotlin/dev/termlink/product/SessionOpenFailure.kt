@@ -41,7 +41,10 @@ enum class SessionOpenFailureCode(
     LOCAL_CHECKPOINT("TL-H111", true, R.string.terminal_error_local_checkpoint, R.string.terminal_error_action_retry),
     SNAPSHOT_INSTALL("TL-H112", true, R.string.terminal_error_snapshot_install, R.string.terminal_error_action_retry),
     HISTORY_NOT_READY("TL-H113", true, R.string.terminal_error_history_not_ready, R.string.terminal_error_action_wait_history),
-    HISTORY_GAP("TL-H114", false, R.string.terminal_error_history_gap, R.string.terminal_error_action_republish_history),
+    // A history gap can self-heal: fresh host output republishes the
+    // snapshot, so the session re-opens automatically once the agent
+    // produces output again instead of demanding a manual retry.
+    HISTORY_GAP("TL-H114", true, R.string.terminal_error_history_gap, R.string.terminal_error_action_republish_history),
     HISTORY_REPLAY("TL-H116", true, R.string.terminal_error_history_replay, R.string.terminal_error_action_retry),
     SNAPSHOT_UNSUPPORTED("TL-H117", false, R.string.terminal_error_snapshot_unsupported, R.string.terminal_error_action_update),
     SNAPSHOT_PRODUCTION_FAILED("TL-H118", true, R.string.terminal_error_snapshot_production_failed, R.string.terminal_error_action_retry),

@@ -499,6 +499,22 @@ internal fun reconcileSessionCatalog(
     return pruned.copy(pcs = pcs, sessions = filtered)
 }
 
+internal fun historyGapSessionsReadyForAutoReopen(
+    previous: ProductSnapshot,
+    incoming: List<SessionSummary>,
+): Set<UUID> {
+    val previousSessions = previous.sessions.associateBy(SessionSummary::id)
+    return incoming.asSequence()
+        .filter { session ->
+            session.online && session.state == SessionState.RUNNING &&
+                previous.sessionOpenFailures[session.id]?.code == SessionOpenFailureCode.HISTORY_GAP &&
+                previousSessions[session.id]?.let {
+                    session.lastOutputSequence > it.lastOutputSequence
+                } == true
+        }
+        .mapTo(linkedSetOf(), SessionSummary::id)
+}
+
 /** Applies authenticated directory titles without retaining a stale value after a replacement envelope fails closed. */
 internal fun reconcileSessionDirectoryTitles(
     current: Map<UUID, String>,
@@ -1973,6 +1989,12 @@ internal class ProductionProductRepository(
             )
             return
         }
+        if (summary.state == SessionState.INTERRUPTED) {
+            // The Windows host confirmed the session is gone (host-lost).
+            // Opening would bootstrap against a dead ConPTY and stall until
+            // timeout; fail fast instead of letting the tab spin.
+            throw sessionOpenException(SessionOpenFailureCode.SESSION_ENDED)
+        }
         if (!summary.online) throw sessionOpenException(SessionOpenFailureCode.SESSION_OFFLINE)
         freshAccessToken(expectedGeneration = authenticationGeneration)
         val bootstrapStarted = authenticationLifecycle.runIfCurrent(
@@ -3426,6 +3448,8 @@ internal class ProductionProductRepository(
                     cancelKnownRemoteFileOperationBestEffort(initial.pcId, failedOperationId)
                     runCatching { fileTransferCache.cleanup(failedOperationId) }
                 }
+                discardIncompleteRemoteDocument(destination)
+                releaseRemoteDocumentPermission(destination)
             }
             updateRemoteDownload(recordId) { record ->
                 if (record.status == RemoteDownloadStatus.COMPLETED) record else record.copy(
@@ -3847,78 +3871,94 @@ internal class ProductionProductRepository(
     private suspend fun pollSessionCatalogWithApi(
         api: ProductionApiClient,
         authenticationGeneration: Long,
-    ): Unit = refreshStateLock.withLock {
-        requireCurrentAuthentication(authenticationGeneration)
-        val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
-        val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
-        val catalogSessions = pcs.flatMap { pc ->
-            ProductResponseParser.itemObjects(
-                api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
-            ).map { it.toSession() }
-        }.filterNot { it.id in deletedSessionIds }
-        authenticationStateMutationLock.withLock {
+    ) {
+        val readyToReopen = refreshStateLock.withLock {
             requireCurrentAuthentication(authenticationGeneration)
-        validateAuthoritativePcKeyTransitions(devices, pcs)
-        closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions)
-        validateLiveSessionKeys(devices, pcs, catalogSessions)
-        historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
-        catalogSessions.forEach { historyRepository.upsertSession(it) }
-        val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, catalogSessions, identity())
-        rotateLiveSessionKeys(devices, pcs, catalogSessions)
+            val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
+            val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
+            val catalogSessions = pcs.flatMap { pc ->
+                ProductResponseParser.itemObjects(
+                    api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
+                ).map { it.toSession() }
+            }.filterNot { it.id in deletedSessionIds }
+            authenticationStateMutationLock.withLock {
+                requireCurrentAuthentication(authenticationGeneration)
+                validateAuthoritativePcKeyTransitions(devices, pcs)
+                closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions)
+                validateLiveSessionKeys(devices, pcs, catalogSessions)
+                historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
+                catalogSessions.forEach { historyRepository.upsertSession(it) }
+                val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, catalogSessions, identity())
+                rotateLiveSessionKeys(devices, pcs, catalogSessions)
 
-        val trustedPcIds = pcs.asSequence()
-            .filter { pc ->
-                devices.any { device ->
-                    device.id == pc.deviceId &&
-                        device.type.isPcAgent() &&
-                        device.trustState == DeviceTrustState.TRUSTED
+                val trustedPcIds = pcs.asSequence()
+                    .filter { pc ->
+                        devices.any { device ->
+                            device.id == pc.deviceId &&
+                                device.type.isPcAgent() &&
+                                device.trustState == DeviceTrustState.TRUSTED
+                        }
+                    }
+                    .mapTo(hashSetOf(), PcSummary::id)
+                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(catalogSessions, pcs, trustedPcIds))
+                closeLiveSessionsExcept(retainedLiveSessionIds(catalogSessions, trustedPcIds))
+
+                val runtimeSessions = catalogSessions.map { session ->
+                    liveSessions[session.id]?.let { live ->
+                        projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
+                    } ?: session
+                }
+                val previous = mutableSnapshot.value
+                val ready = historyGapSessionsReadyForAutoReopen(previous, runtimeSessions)
+                val published = authenticationLifecycle.runIfCurrent(
+                    authenticationGeneration,
+                    predicate = { !closed && authState != null },
+                ) {
+                    mutableSnapshot.update { current ->
+                        val reconciled = reconcileSessionCatalog(
+                            current = current.copy(devices = devices),
+                            pcs = pcs,
+                            sessions = runtimeSessions,
+                            deletedSessionIds = deletedSessionIds,
+                        )
+                        reconciled.copy(
+                            pcCarrierStates = retainAuthoritativePcCarrierStates(
+                                reconciled.pcCarrierStates,
+                                devices,
+                                pcs,
+                            ),
+                            sessionCarrierStates = retainAuthoritativeSessionCarrierStates(
+                                reconciled.sessionCarrierStates,
+                                devices,
+                                pcs,
+                                runtimeSessions,
+                            ),
+                            sessionTitles = reconcileSessionDirectoryTitles(
+                                reconciled.sessionTitles,
+                                runtimeSessions,
+                                directoryTitles,
+                                currentLiveSessionTitles(),
+                            ),
+                            lastSyncedAt = Instant.now(),
+                        )
+                    }
+                    sessionAuthorityTransitionFences.clear()
+                }
+                check(published) { "Authentication lifecycle changed" }
+                refreshDirectAuthorizedPeers(authenticationGeneration, identity(), devices, pcs)
+                ready
+            }
+        }
+        readyToReopen.forEach { sessionId ->
+            scope.launch {
+                try {
+                    openSession(sessionId)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    // The normal bootstrap path records the classified failure; wait for more output.
                 }
             }
-            .mapTo(hashSetOf(), PcSummary::id)
-        closeReadOnlySessionsExcept(retainedReadOnlySessionIds(catalogSessions, pcs, trustedPcIds))
-        closeLiveSessionsExcept(retainedLiveSessionIds(catalogSessions, trustedPcIds))
-
-        val runtimeSessions = catalogSessions.map { session ->
-            liveSessions[session.id]?.let { live ->
-                projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
-            } ?: session
-        }
-        val published = authenticationLifecycle.runIfCurrent(
-            authenticationGeneration,
-            predicate = { !closed && authState != null },
-        ) {
-            mutableSnapshot.update { current ->
-                val reconciled = reconcileSessionCatalog(
-                    current = current.copy(devices = devices),
-                    pcs = pcs,
-                    sessions = runtimeSessions,
-                    deletedSessionIds = deletedSessionIds,
-                )
-                reconciled.copy(
-                    pcCarrierStates = retainAuthoritativePcCarrierStates(
-                        reconciled.pcCarrierStates,
-                        devices,
-                        pcs,
-                    ),
-                    sessionCarrierStates = retainAuthoritativeSessionCarrierStates(
-                        reconciled.sessionCarrierStates,
-                        devices,
-                        pcs,
-                        runtimeSessions,
-                    ),
-                    sessionTitles = reconcileSessionDirectoryTitles(
-                        reconciled.sessionTitles,
-                        runtimeSessions,
-                        directoryTitles,
-                        currentLiveSessionTitles(),
-                    ),
-                    lastSyncedAt = Instant.now(),
-                )
-            }
-            sessionAuthorityTransitionFences.clear()
-        }
-            check(published) { "Authentication lifecycle changed" }
-            refreshDirectAuthorizedPeers(authenticationGeneration, identity(), devices, pcs)
         }
     }
 
