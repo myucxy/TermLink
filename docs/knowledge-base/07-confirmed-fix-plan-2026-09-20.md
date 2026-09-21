@@ -27,7 +27,7 @@
 
 | # | 问题 | 模块 | 确认方案 |
 |---|------|------|----------|
-| 11 | 票据 120s TTL 硬拆（#2） | Server+Win+Android | S1 已完成（b68bd42）：TTL 120s→20 分钟 + RenewTicket 端点（proof 验签/状态校验/限速 2/min/单节点内存态）；设计文档 docs/DIRECT_TICKET_RENEWAL_DESIGN.md；S2 FFI 续期与 S3 宿主接线需 Rust 工具链后实施 |
+| 11 | 票据 120s TTL 硬拆（#2） | Server+Win+Android | S1 已完成（b68bd42）：TTL 120s→20 分钟 + RenewTicket 端点（proof 验签/状态校验/限速 2/min/单节点内存态）；S2 FFI 已完成（e6ae05c）：State 增 ticket_expiry_ms/绑定/server key，data_loop 改 1s 续期轮询（软事件 EVENT_RENEWAL_DUE + 30s 宽限硬拆），新增 termlink_direct_renew_apply_v5 导出；S3 宿主接线（Win C# EVENT_RENEWAL_DUE 处理 + renew REST 调用 + renew_apply 导入；Android 同构）待下一轮；S4 指标待 S3 |
 | 12 | 真实网络 e2e 为零（#3/24） | 测试设施 | 按 gap 清单实现真实 socket 适配器：同 LAN/跨 NAT/对称 NAT/防火墙拒 UDP/VPN/网络切换 |
 | 13 | 队列满即整体退役（#25） | network-core | 有界降级：丢可丢帧+退役计数指标 |
 | 14 | 直连 P3 四项（#46/47/49/50） | network-core+信令 | 探测抖动、QUIC 握手 keepalive、离线 peer 信令显式拒绝、FFI 忙轮询改事件等待 |
