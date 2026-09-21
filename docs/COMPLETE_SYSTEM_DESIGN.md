@@ -595,298 +595,65 @@ stateDiagram-v2
 
 ## 6. Docker 服务端设计
 
+> **⚠️ 本节已重写（2026-09-21）**：反映当前单 Server 容器拓扑。原始多容器（Redis/Valkey+Caddy）设计已废弃。
+
 ### 6.1 服务边界
 
-MVP 将 REST API、WebSocket Relay、租约协调和后台清理任务编译成一个 Go 二进制，通过不同启动参数运行。这样既能使用单容器部署，也可以在规模扩大后拆分副本。
+当前生产将 REST API、WebSocket Relay、内嵌 OIDC 身份服务、租约协调、直连信令、文件传输路由和后台任务编译为**一个 Go 二进制**（distroless 容器）。
 
-| 逻辑组件 | 职责 | 是否接触正文 |
+| 逻辑组件 | 职责 | 接触终端正文 |
 | --- | --- | --- |
-| API | 账号归属、设备、PC、会话索引、撤销和审计 API；兼容授权/配对端点 | 否 |
-| Realtime Relay | WebSocket 认证、路由、ACK、背压和心跳 | 只见 Envelope |
+| API | 账号归属、设备/PC/会话索引、撤销和审计 | 否 |
+| Realtime Relay | WebSocket 认证、路由、ACK、背压和心跳 | 只见 Envelope（E2EE） |
 | Lease Coordinator | 输入租约申请、续约、释放和抢占 | 否 |
-| File Transfer Router | 为 Windows 与 Android 的分块传输绑定短时路由；不落文件正文 | 只见密文帧 |
-| Worker | 撤销传播、过期任务和审计保留 | 否 |
+| Embedded OIDC | 内嵌身份发行方（登录/注册/令牌签发/MFA） | 密码哈希（argon2id） |
+| Direct Signaling | 直连传输票据签发、STUN 配置、信令路由 | 只见信令帧 |
+| File Transfer Router | 分块传输绑定短时路由 | 只见密文帧 |
+| Worker | 撤销传播、过期任务、审计保留、注册找回 | 否 |
 
-### 6.2 Docker Compose 拓扑
+### 6.2 当前 Docker Compose 拓扑
 
-```mermaid
-flowchart TB
-    INTERNET[Internet :443] --> EDGE[Caddy / Existing Reverse Proxy]
-    EDGE --> APP[termlink-server :8080]
-    APP --> PG[(PostgreSQL)]
-    APP --> KV[(Redis / Valkey)]
-    APP --> OIDC[External OIDC Issuer]
-
-    subgraph public[public network]
-        EDGE
-    end
-    subgraph private[private network]
-        APP
-        PG
-        KV
-    end
+```text
+Internet → 反向代理（Nginx/Caddy/Lucky，TLS 终结）→ termlink-server:8080 → PostgreSQL（内部网络）
 ```
 
-默认只暴露 443。PostgreSQL、Redis/Valkey 和应用的 8080 端口仅在 Docker private network 可见。已有 Nginx、Traefik 或 Cloudflare Tunnel 的部署可关闭 Caddy Profile。
+- 单 Server 容器（distroless、只读 RootFS、非 root UID 65532、cap_drop ALL）
+- PostgreSQL 仅在 Docker 内部网络可见，数据使用持久卷
+- 可选 Valkey 用于多副本部署（单节点使用内存协调器）
+- 直连传输票据由 Server Ed25519 签发，支持续期（`/v1/transport/tickets/renew`）
+- 运行时参数（STUN/AppShip/注册找回/账号注销）由管理页 SUPER_ADMIN 覆盖（`runtime_settings` 表）
+- 主密钥可选口令包裹（`TERMLINK_MASTER_KEY_PASSPHRASE`）
 
 ### 6.3 镜像设计
 
-官方镜像：
+- Multi-stage Build，distroless 运行时，`linux/amd64`
+- 固定非 root UID/GID 65532，根文件系统只读，`/tmp` tmpfs
+- 不在镜像层写入默认密码、OIDC Secret 或数据库密码
+- 提供 OCI Label 和可复现构建（`SOURCE_DATE_EPOCH`）
+- `SIGTERM` 后停止接收新连接，排空 WebSocket 后退出
+- 健康检查 `/readyz`
 
-```text
-ghcr.io/termlink/termlink-server:<semver>
-```
+### 6.4 环境变量
 
-镜像要求：
+部署参数分为两类：
 
-- Multi-stage Build，最终使用 distroless 或精简运行时镜像；
-- 发布 `linux/amd64` 与 `linux/arm64`；
-- 固定非 root UID/GID，根文件系统只读；
-- `/tmp` 使用有大小限制的 tmpfs；
-- 不在镜像层写入默认密码、OIDC Secret 或数据库密码；
-- 提供 OCI Label、SBOM、来源证明和镜像签名；
-- 启动时先执行兼容性检查，迁移使用独立 `migrate` 命令；
-- `SIGTERM` 后停止接收新连接，等待有限时间排空 WebSocket 再退出。
+**bootstrap 级（compose 管理，不可运行时修改）**：`TERMLINK_IMAGE`、`TERMLINK_PUBLIC_URL`、`TERMLINK_DATABASE_URL`、`TERMLINK_INITIAL_ADMIN_PASSWORD_FILE`、`TERMLINK_HTTP_BIND_IP/PORT`、容器日志、`TERMLINK_ALLOW_LOCAL_HTTP`、`TERMLINK_DIRECT_TRANSPORT_ENABLED`
 
-### 6.4 Compose Profiles
+**运行时参数（管理页可覆盖，env 为初始默认）**：`TERMLINK_REGISTRATION_RECOVERY_ENABLED`、`TERMLINK_ACCOUNT_DELETION_ENABLED`、`TERMLINK_DIRECT_STUN_SERVERS`、`TERMLINK_APPSHIP_BASE_URL`、`TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS`
 
-| Profile | 组件 | 用途 |
-| --- | --- | --- |
-| `core` | TermLink Server、PostgreSQL、Redis/Valkey | 最小自托管 |
-| `edge` | Core + Caddy | 无现有反向代理的公网部署 |
-| `observability` | Prometheus、Grafana、Loki/OTel Collector | 运维诊断，可选 |
+其他：`TERMLINK_MASTER_KEY_PASSPHRASE`（可选主密钥包裹）、`TERMLINK_TOKEN_SIGNING_KEY_FILE`（可选外部主密钥）
 
-生产部署必须固定镜像版本和 Digest，不使用 `latest`。数据库使用 Named Volume 或宿主机受管目录，应用容器本身保持无状态。
+### 6.5 管理
 
-### 6.5 关键配置
+SUPER_ADMIN 管理页（`/admin` 或自定义路由）提供：
 
-| 配置 | 说明 | 是否 Secret |
-| --- | --- | --- |
-| `TERMLINK_PUBLIC_URL` | 外部 HTTPS 地址 | 否 |
-| `TERMLINK_OIDC_ISSUER` | OIDC Issuer | 否 |
-| `TERMLINK_OIDC_CLIENT_ID` | 公共客户端 ID 或服务端 Client ID | 否 |
-| `TERMLINK_OIDC_CLIENT_SECRET_FILE` | OIDC Secret 文件路径 | 是 |
-| `TERMLINK_DATABASE_URL_FILE` | PostgreSQL DSN 文件路径 | 是 |
-| `TERMLINK_REDIS_URL_FILE` | Redis/Valkey DSN 文件路径 | 是 |
-| `TERMLINK_TOKEN_SIGNING_KEY_FILE` | 服务端 Token 签名私钥 | 是 |
-| `TERMLINK_LOG_LEVEL` | `info`/`warn`/`error` | 否 |
+- 设备与连接路由（直连开/关）
+- 运行时参数（上述 5 项，即时生效跨重启保持）
+- 系统版本（当前运行版本 + AppShip 可用更新）
+- 身份与安全（MFA 状态、人机验证设置）
+- 账号与角色（角色管理、停用/启用）
+- 注册与邀请码
 
-Secret 优先使用 Docker Secret 文件；环境变量只保存非敏感值。配置加载失败时进程必须 Fail Fast，不静默使用不安全默认值。
-
-### 6.5.1 本机 LAN 产品 E2E / Local-LAN product E2E
-
-本机跨设备验收只使用当前 TermLink 仓库，不复制其他仓库的产物，也不依赖同级仓库。
-All commands and artifacts for this flow come from the current TermLink checkout;
-no sibling repository is required.
-
-1. 在仓库根目录运行
-   `.\server\ops\Start-ProductionAcceptance.ps1 -LanAddress 192.168.9.28`。
-   Run the same command from the repository root; `-LanAddress` must be an IPv4
-   address assigned to this host.
-2. 地址 `<LAN-IP>` 对应的产品、API、Realtime 和 OIDC Origin 是
-   `https://termlink.<LAN-IP>.sslip.io:9443`。脚本导出一次性 CA 到
-   `server\secrets\acceptance\acceptance-root-ca.crt`。The script exports that
-   disposable CA at the same path.
-3. 在 `android` 目录构建 Debug APK 时传入
-   `-PtermlinkServerUrl=https://termlink.<LAN-IP>.sslip.io:9443`，并在测试手机或
-   模拟器上显式配置对上述 CA 的信任。Build the Android Debug APK with that
-   Gradle property and explicitly configure the test device/emulator to trust
-   the exported CA; the app does not install or bypass CA trust automatically.
-4. Windows Agent 账号关联和 Tray 分别通过
-   `--server-url https://termlink.<LAN-IP>.sslip.io:9443` 选择 LAN Origin，并让测试
-   进程的 `TERMLINK_ACCEPTANCE_CA_FILE` 指向导出的 CA。Use `--server-url` for
-   both the Agent CLI and Tray; hostname verification remains enabled.
-5. Windows 与 Android 登录同一 OIDC 账号，在 Windows 创建 TermLink 受管 Session，
-   再由 Android 发现该 Session、建立生产 Relay/E2EE 连接并取得输入租约。Sign in on
-   both clients with the same OIDC account, create a TermLink-managed session on
-   Windows, discover it on Android, then acquire a lease before sending input.
-
-该脚本自动完成的是服务端生产 REST/Realtime/Lease 协议探测，不代替真实 Android
-与 Windows 产品链路的人工 E2E。手机和 PC 必须能解析 `sslip.io` 并访问主机 TCP 9443；
-宿主机防火墙规则由操作者按局域网范围配置。一次性 CA 只用于 Debug/E2E，不是生产信任锚。
-Android Release 和 Windows 默认配置不会继承 LAN 覆盖，仍固定使用公开 Origin
-`https://termlink.kget.cc:8910`。只有 TermLink 创建并管理的 Session 会被转发；系统不能附加
-或接管任意已经打开的 cmd、PowerShell 或 Windows Terminal 标签页。当前发布运行时仍通过旧
-ConPTY/SessionHost 管理这些会话，目标 terminal-main 注册/IPC 切换完成前不得宣称该新链路已
-完成跨设备生产 E2E。
-
-The script's automatic probe validates the server-side production protocol, not
-the complete physical Android-to-Windows product path. DNS, TCP 9443, firewall,
-and explicit device trust must be prepared separately. Release clients continue
-to use the public origin, and only TermLink-managed sessions are forwarded.
-
-### 6.5.2 2026-08-21 真实 LAN 验收证据 / Live LAN acceptance evidence
-
-本次验收使用产品/API/OIDC Origin
-`https://termlink.192.168.9.28.sslip.io:9443`，Android 16 模拟器和 Windows Agent 均登录
-`acceptance-probe`。Windows 侧运行 PowerShell 7 受管 Session；Android 发出的第一条命令在
-Windows 创建 marker `D:\Dev\Temp\TLANDROID1787315819158`，终端输出也返回 Android。
-数据库验收查询确认 Device Grant 行数为 `0`、Pairing Challenge 行数为 `0`，因此该结果没有
-依赖配对、自授信或逐 PC Grant。
-
-This live run used `https://termlink.192.168.9.28.sslip.io:9443` for product,
-API, and OIDC traffic. Both an Android 16 emulator and the Windows Agent signed
-in as `acceptance-probe`. Input sent by Android executed in a managed PowerShell
-7 session and created `D:\Dev\Temp\TLANDROID1787315819158` on Windows; terminal
-output returned to Android. Acceptance database checks found zero Device Grant
-rows and zero Pairing Challenge rows, so pairing, self-trust, and per-PC Grants
-were not prerequisites for this path.
-
-早期复验在人工切换 `Devices -> Sessions` 后重新取得租约，第二条 Android 输入在 Windows 创建
-`D:\Dev\Temp\TLRECONNECT1787316577617`。同持有者租约恢复实现后的后续复验已经取代当时的
-Tab 切换限制：Android PID 从 `8234` 经强停变为空，再冷启动为 `8360`；无需切换 Tab，恢复页
-语义即为 `SessionsSelected=True`、`SessionTitle=True`、`EnterPresent=True`，历史 marker
-`TLANDROID1787315819158` 和 `TLRECONNECT1787316577617` 均自动恢复。同一过程中 Valkey 租约
-TTL 依次观测为 `27882 ms`、`25145 ms`、`20007 ms`。因此强停/冷启后的 Session 页面、历史和同持有者
-租约恢复已经验证；证据截图为
-`D:\Dev\Temp\termlink-fixed-cold-start-20260821-221034.png`。
-
-Android 16 IME 修复和标准命令输入框已经实现，但最新命令 marker
-`tlcold20260821223551` 尚未确认在 Windows 执行成功。该项仍属于真实 E2E 待验证，不能从上述
-页面、历史和租约证据推断为已通过。
-
-The earlier run reacquired control only after a manual `Devices -> Sessions`
-transition and then created `D:\Dev\Temp\TLRECONNECT1787316577617`. A later run
-after same-holder lease resume was implemented superseded that tab-switch
-limitation: Android PID `8234` was force-stopped, disappeared, and cold-started
-as PID `8360`. With no tab transition, the restored screen reported
-`SessionsSelected=True`, `SessionTitle=True`, and `EnterPresent=True`; historical
-markers `TLANDROID1787315819158` and `TLRECONNECT1787316577617` were restored
-automatically. Valkey lease TTL observations during the sequence were `27882 ms`,
-`25145 ms`, and `20007 ms`. Cold-start Session/UI, history, and same-holder lease
-restoration are therefore verified. The evidence screenshot is
-`D:\Dev\Temp\termlink-fixed-cold-start-20260821-221034.png`.
-
-The Android 16 IME fix and standard command input field are implemented, but
-successful Windows execution of the latest marker `tlcold20260821223551` has
-not been confirmed. That live E2E command result remains pending and must not be
-inferred from the UI, history, or lease evidence above.
-
-为避免与同一 Windows 用户下的其他 Agent 共用 `%LOCALAPPDATA%\TermLink`，该次运行设置了
-`TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT`，实际隔离根为
-`D:\Dev\Temp\TermLink-MainE2E-mainmt2xowb8`。Agent 只有在
-`TERMLINK_ACCEPTANCE_CA_FILE` 同时设置时才接受此覆盖；默认配置和 DPAPI 凭据路径不变，
-验收前后的默认文件哈希也保持一致。This acceptance-only storage override is
-enabled only when the explicit acceptance CA environment variable is also set;
-it does not redirect normal production storage.
-
-该环境的用户系统代理为 `127.0.0.1:7897`。REST/OIDC 已走 LAN acceptance 直连，但
-`ClientWebSocket` 最初继承系统代理并出现 WSS TLS EOF。修复后，只有加载显式 acceptance CA
-的受限 WebSocket 配置会设置 `Proxy = null`，TLS 主机名校验仍保留；Relay 随后稳定进入
-Connected。The explicit LAN-acceptance WebSocket path now bypasses the inherited
-system proxy while retaining hostname validation.
-
-本机验收截图是
-`D:\Dev\Temp\termlink-TLANDROID1787315819158-output.png`、
-`D:\Dev\Temp\termlink-TLRECONNECT1787316577617-reconnect.png` 和
-`D:\Dev\Temp\termlink-fixed-cold-start-20260821-221034.png`。These screenshots
-are local acceptance artifacts only; they are not checked into this repository
-and are not portable test fixtures. No password, token, private key, or secret
-is recorded in this evidence.
-
-### 6.6 REST API
-
-所有路径以 `/v1` 开头，使用 OIDC Access Token 与设备签名证明。当前生产主流程按 OIDC subject 做账号级设备/PC/Session 路由；下表中的 approve/pairing/grant 接口仅为旧部署和旧客户端兼容，不是用户前置步骤：
-
-| 方法与路径 | 用途 |
-| --- | --- |
-| `POST /v1/devices/register` | 注册设备公钥和设备证明 |
-| `GET /v1/devices` | 获取账号设备与信任状态 |
-| `POST /v1/devices/{id}/approve` | 兼容：批准旧 `PENDING` 设备 |
-| `POST /v1/devices/{id}/revoke` | 撤销设备 |
-| `GET /v1/pcs` | PC 列表与 Presence |
-| `GET /v1/pcs/{pcId}/sessions` | 会话摘要列表 |
-| `POST /v1/pcs/{pcId}/grants` | 兼容：设置旧客户端设备对 PC 的权限 |
-| `POST /v1/sessions/{id}/subscribe` | 创建短时订阅授权 |
-| `POST /v1/sessions/{id}/lease` | 请求输入租约 |
-| `DELETE /v1/sessions/{id}/lease/{leaseId}` | 主动释放租约 |
-| `GET /v1/sessions/{id}/history` | 分页选择 Event Chunk、Terminal Snapshot 或 Terminal Transcript Page 元数据和签名下载地址 |
-| `DELETE /v1/sessions/{id}` | 删除索引并触发密文清理 |
-| `GET /v1/audit-events` | 获取不含正文的安全审计 |
-| `GET /v1/billing/plans` | 获取已发布套餐目录、权益与渠道 Product ID 映射 |
-| `GET /v1/account/entitlements` | 获取服务端签发的当前功能状态（数量字段为 `-1` 表示不限） |
-| `POST /v1/billing/google/verify` | 验证 Google Play Purchase Token |
-| `POST /v1/billing/web/checkout` | 创建合规的 Web Checkout |
-| `POST /v1/billing/restore` | 恢复/重新同步购买 |
-| `POST /v1/admin/billing/plans` | 新建套餐草稿 |
-| `PUT /v1/admin/billing/plans/{id}` | 修改套餐、功能标记和渠道映射（数量字段仅兼容保留） |
-| `POST /v1/admin/billing/catalog/publish` | 校验并发布新套餐目录版本 |
-
-所有变更 API 支持 Idempotency Key。列表接口使用游标分页，错误返回稳定的机器码、用户可读文案 Key 与 Trace ID。
-
-### 6.7 Realtime WebSocket
-
-入口：`GET /v1/realtime`。连接建立后完成：
-
-1. Bearer Token 校验；
-2. Device ID、设备签名 Challenge 和撤销状态校验；
-3. 协议版本与能力协商；
-4. 注册 PC 或 Android 连接角色；
-5. 仅对同账号、未撤销设备的受管 Session 建立路由；不查询显式 Grant 作为首版必需前置条件。
-
-服务端限制：
-
-- 单 Envelope 默认最大 1 MiB；
-- 单连接、单账号和单 IP 分级限流；
-- 慢消费者先发 `flow_control`，超过缓冲上限后断开并要求从 ACK 恢复；
-- Heartbeat 建议 15 秒，45 秒无响应判定离线；
-- Relay 不保证永久队列，持久恢复由 PC 本地 Buffer 与可选历史块负责。
-
-### 6.8 数据模型
-
-| 表 | 关键字段 |
-| --- | --- |
-| `users` | `id`, `oidc_subject_hash`, `status`, `created_at` |
-| `devices` | `id`, `user_id`, `type`, `name`, `public_key`, `trust_state`, `revoked_at`；`user_id`/撤销状态是当前主流程边界，`trust_state` 兼容保留 |
-| `pcs` | `id`, `owner_user_id`, `name`, `agent_version`, `last_seen_at` |
-| `device_grants` | 兼容层：`device_id`, `pc_id`, `permission`, `approved_by`, `expires_at`；账号级直连不依赖该表 |
-| `sessions` | `id`, `pc_id`, `shell_type`, opaque `title_cipher`, `state`, `created_at`, `ended_at`；标题密文合同见 4.3.1 |
-| `control_leases` | `session_id`, `holder_device_id`, `lease_id`, `expires_at`, `version` |
-| `pc_file_operations` | 文件操作元数据、协议、状态和过期时间；不含对象键或文件正文 |
-| `audit_events` | `actor_device_id`, `action`, `target_type`, `target_id`, `result`, `ip_hash`, `created_at` |
-| `subscriptions` | `account_id`, `provider`, `product_id`, `provider_ref_hash`, `status`, `renews_at`, `grace_until` |
-| `entitlements` | `account_id`, `plan`, `max_remote_pcs`, `max_live_sessions`, `version`, `effective_at`, `expires_at` |
-| `outbox` | `event_type`, `payload`, `available_at`, `attempts` |
-
-标题与工作目录可能包含敏感信息。当前只同步经大小限制、逐 recipient 认证加密的标题；数据库不得
-增加明文标题列。Agent 没有可用 recipient 或 recipient directory 暂时不可用时保留旧
-`title_cipher`；Android 解密失败时忽略标题并继续使用目录，而不是把未认证值投影到 UI。
-
-Snapshot、Event Range 与 Transcript 都由 Windows 本地 durable producer/WAL 物化，按请求
-Android 设备进行 recipient-bound 密封，再通过 `host_history_v1` 实时响应返回。Android 使用
-独立分页 viewport 和本地 renderer checkpoint；服务端不保存或选择这些对象。主机离线时不提供
-历史，显式关闭会话后 Windows 销毁对应历史目录。
-
-### 6.9 租约一致性
-
-输入租约使用 Redis/Valkey 原子脚本或 `SET NX PX` + 版本校验：
-
-- 默认租约 30 秒；持有者每 10 秒续约；
-- 同一 Session 只能存在一个远程租约；
-- PC 本地输入可通过 Agent 发送高优先级 `lease_revoked`；
-- Relay 故障时 Agent 默认拒绝新的远端输入，但不影响本地终端；
-- Agent 最终执行前再次验证 `lease_id`、Holder、Expiry 和 Input Sequence，不能只信 Relay。
-
-### 6.10 扩展、备份与恢复
-
-- 单实例 MVP：一个 Server 容器即可承载 API + Relay；
-- 多实例：Presence/Lease 放 Redis，连接路由使用节点登记 + Pub/Sub/NATS；
-- PostgreSQL 每日全量备份 + WAL/PITR，定期执行恢复演练；
-- Redis 只保存可重建状态，不作为唯一历史来源；
-- Windows 历史目录属于会话生命周期；显式关闭成功后删除本地 WAL/checkpoint；
-- 文件传输临时分块统一进入两端私有缓存，完成、取消或过期后清理。
-
-### 6.11 可观测性
-
-指标只记录规模与性能：
-
-- 活跃 PC、Android、Session 和 WebSocket；
-- Envelope 数量、字节数、路由延迟、ACK Lag、慢消费者断开；
-- Lease 申请/拒绝/过期数量；
-- REST 延迟、状态码、数据库连接池和任务积压；
-- Event Chunk/Snapshot/Transcript 大小，不记录内容。
-
-日志字段允许：Trace ID、Device/Session 的不可逆短 Hash、消息类型、大小、耗时和错误码。禁止记录 Ciphertext、Token、完整公钥、标题、命令、终端正文和剪贴板内容。
 
 ## 7. Android 客户端设计
 
