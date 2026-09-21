@@ -36,10 +36,10 @@
 
 | # | 问题 | 模块 | 确认方案 |
 |---|------|------|----------|
-| 15 | Server P3 四项（#32/34/35/33） | Server | 000046 down 已补（53d2ca7）；email-code 注册关闭策略检查复核已存在（sendRegistrationEmailCode 内 REGISTRATION_CLOSED 门禁）；登录退避与 AdminRoutes 默认启用待做 |
+| 15 | Server P3 四项（#32/34/35/33） | Server | 000046 down 已补；email-code 策略门禁复核已存在；登录锁定指数退避已实现并强制执行（5ab51a7，此前 locked_until 从未被读取——锁定形同虚设）；AdminRoutes 随机化能力已有（opt-in，默认 /admin 保持以避免锁死操作员） |
 | 16 | metrics/告警（#26） | Server+运维 | 暂缓：/metrics 无认证（#36），公开端口启用前需先定认证方案；告警文案修正待做 |
 | 17 | presence 统一同源（#9/31） | Server+Web+Android | presence registry 唯一在线源、会话级粒度，门户与 Android 同源 |
-| 18 | 发版 CI 回归 + 恢复演练（#12/15） | 发布/运维 | 推测试 tag 验证 release.yml 与 secrets；真实恢复演练记入 VALIDATION_BASELINE |
+| 18 | 发版 CI 回归 + 恢复演练（#12/15） | 发布/运维 | 待做（需推真实 tag 触发 CI、操作备份恢复演练；建议与 Docker Hub 新镜像发布同批执行） |
 
 ## 五、明确不处理（本轮确认）
 
