@@ -326,7 +326,11 @@ namespace TermLink.Agent
         private const int MaximumKeyIdBytes = 64;
         private const long MaximumSignalClockSkewMilliseconds = 30_000;
         private const long MaximumTicketClockSkewMilliseconds = 30_000;
-        private const long MaximumTicketLifetimeMilliseconds = 120_000;
+        // The server issues renewable 20-minute tickets (transport audit #2).
+        // The cap admits exactly one full lifetime plus the clock-skew window
+        // so a re-signed offer near a skew boundary is not rejected, while a
+        // lifetime beyond one renewable generation still fails closed.
+        private const long MaximumTicketLifetimeMilliseconds = 20 * 60 * 1_000 + 30_000;
         private const int MinimumTicketBytes = 128;
         private const int MaximumTicketBytes = 2_048;
         private const int MaximumConfigResponseBytes = 16 * 1024;
@@ -573,7 +577,6 @@ namespace TermLink.Agent
                 Guid targetDeviceId,
                 Guid connectionId,
                 byte[] currentTicket,
-                ProductionDirectTransportServerConfig config,
                 CancellationToken cancellationToken = default)
         {
             if (!enabled)
@@ -583,7 +586,7 @@ namespace TermLink.Agent
                     ProductionDirectSignalingFaultCode.Closed);
             if (targetDeviceId == Guid.Empty || targetDeviceId == deviceId ||
                 currentTicket == null || currentTicket.Length < MinimumTicketBytes ||
-                currentTicket.Length > MaximumTicketBytes || config == null)
+                currentTicket.Length > MaximumTicketBytes)
                 return ProductionDirectSignalingCallResult<byte[]>.Failed(
                     ProductionDirectSignalingFaultCode.TicketRejected);
             var body = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object>

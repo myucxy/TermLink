@@ -15,6 +15,7 @@ namespace TermLink.Agent
     {
         private byte[] pairwiseKey;
         private byte[] signalKeyId;
+        private byte[] ticketWireBytes;
         private ProductionDirectCommitRequestV4 nomination;
         private int disposed;
 
@@ -32,7 +33,8 @@ namespace TermLink.Agent
             ProductionDirectCommitRequestV4 nomination,
             Func<byte[], byte[]> signNativeTranscript,
             Action<byte[]> nominationCompleted = null,
-            Action<string> nominationFailed = null)
+            Action<string> nominationFailed = null,
+            byte[] ticketWireBytes = null)
         {
             if (peerDeviceId == Guid.Empty || connectionId == Guid.Empty || keyEpoch < 1 ||
                 admissionGeneration < 1 || pairwiseKey?.Length != 32 ||
@@ -41,7 +43,8 @@ namespace TermLink.Agent
                 native == null || nomination == null || nomination.Epoch == 0 ||
                 nomination.AttemptId == Guid.Empty || nomination.CheckRoundId == Guid.Empty ||
                 nomination.NominationId == Guid.Empty || nomination.WinningPair == null ||
-                signNativeTranscript == null || remoteSignalAcknowledgement > localSignalSequence)
+                signNativeTranscript == null || remoteSignalAcknowledgement > localSignalSequence ||
+                ticketWireBytes?.Length is < 1 or > 2_048)
                 throw new ArgumentException("The Direct V4-to-V5 handoff is invalid.");
 
             PeerDeviceId = peerDeviceId;
@@ -53,6 +56,10 @@ namespace TermLink.Agent
             RemoteSignalAcknowledgement = remoteSignalAcknowledgement;
             this.pairwiseKey = pairwiseKey.ToArray();
             this.signalKeyId = signalKeyId.ToArray();
+            // The validated path ticket is the bearer proof for server-side
+            // renewals (transport audit #2): the V5 data actor keeps exactly
+            // one current generation and slides it forward on each renewal.
+            this.ticketWireBytes = ticketWireBytes?.ToArray();
             Native = native;
             this.nomination = CopyNomination(nomination);
             SignNativeTranscript = signNativeTranscript;
@@ -91,6 +98,12 @@ namespace TermLink.Agent
             return signalKeyId.ToArray();
         }
 
+        internal byte[] CopyTicketWireBytes()
+        {
+            ThrowIfDisposed();
+            return ticketWireBytes?.ToArray();
+        }
+
         internal ProductionDirectCommitRequestV4 CopyNomination()
         {
             ThrowIfDisposed();
@@ -113,8 +126,10 @@ namespace TermLink.Agent
             nomination = null;
             if (pairwiseKey != null) CryptographicOperations.ZeroMemory(pairwiseKey);
             if (signalKeyId != null) CryptographicOperations.ZeroMemory(signalKeyId);
+            if (ticketWireBytes != null) CryptographicOperations.ZeroMemory(ticketWireBytes);
             pairwiseKey = null;
             signalKeyId = null;
+            ticketWireBytes = null;
         }
 
         private void ThrowIfDisposed()

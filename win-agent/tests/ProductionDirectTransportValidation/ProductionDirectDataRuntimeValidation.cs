@@ -44,6 +44,8 @@ namespace TermLink.ProductionDirectTransport.Validation
             await ValidateWrongSignalKeyRetiresOnlyItsPeerAsync().ConfigureAwait(false);
             await ValidateSignRequestIsNarrowAndZeroedAsync().ConfigureAwait(false);
             await ValidateRetirementDrainsOnlyFencedRecoveryAsync().ConfigureAwait(false);
+            await ValidateTicketRenewalSlidesTheProofGenerationAsync().ConfigureAwait(false);
+            await ValidateRenewalDueWithoutARenewalDelegateIsInertAsync().ConfigureAwait(false);
         }
 
         private static async Task ValidateReadOnlyCumulativeDiagnosticsAsync()
@@ -1945,6 +1947,79 @@ namespace TermLink.ProductionDirectTransport.Validation
                 "A native sign request escaped request-id fencing or retained its transcript.");
         }
 
+        private static async Task ValidateTicketRenewalSlidesTheProofGenerationAsync()
+        {
+            var local = Guid.NewGuid();
+            var peer = Guid.NewGuid();
+            var session = Guid.NewGuid();
+            var native = new FakeNative();
+            var originalTicket = Enumerable.Repeat((byte)0x11, 200).ToArray();
+            var renewedTicket = Enumerable.Repeat((byte)0x22, 200).ToArray();
+            var presentedProofs = new ConcurrentQueue<byte[]>();
+            var renewCalls = 0;
+            native.RenewApplies.Enqueue(ProductionDirectNativeResultV5.RelayFallback);
+            native.RenewApplies.Enqueue(ProductionDirectNativeResultV5.Accepted);
+            native.Events.Enqueue(new ProductionDirectNativeEventV5
+            {
+                Kind = ProductionDirectNativeEventKindV5.RenewalDue,
+                Status = ProductionDirectNativeResultV5.Accepted,
+                PathEpoch = 2,
+                AttemptId = Fence(2).AttemptId
+            });
+            await using var runtime = new ProductionDirectDataRuntime(
+                local, new FakeSignaling(), Options(renewTicket: (ticketPeer, connection, proof, _) =>
+                {
+                    if (ticketPeer != peer || connection != Fence(2).ConnectionId)
+                        throw new InvalidOperationException("renewal identity mismatch");
+                    presentedProofs.Enqueue(proof.ToArray());
+                    return Task.FromResult(Interlocked.Increment(ref renewCalls) == 1
+                        ? null
+                        : renewedTicket.ToArray());
+                }));
+            await runtime.RegisterPeerAsync(
+                Registration(peer, 2, native, ticketWireBytes: originalTicket))
+                .ConfigureAwait(false);
+            {
+                var exact = OutputEnvelope(local, peer, session, 1);
+                Require(await runtime.RouteEnvelopeAsync(peer, session, 1, exact, true)
+                        .ConfigureAwait(false) == ProductionDirectDataRouteOutcome.DirectAccepted,
+                    "Renewal wiring changed the direct routing path.");
+                var applicationDeadline = DateTime.UtcNow.AddSeconds(15);
+                while (presentedProofs.Count < 3 && DateTime.UtcNow < applicationDeadline)
+                    await Task.Delay(50).ConfigureAwait(false);
+                Require(native.RenewApplyCalls == 2 &&
+                        native.RenewApplies.IsEmpty &&
+                        presentedProofs.Count == 3 &&
+                        presentedProofs.All(proof => proof.SequenceEqual(originalTicket)) &&
+                        native.LastRenewTicket.SequenceEqual(renewedTicket),
+                    "Ticket renewal did not slide the proof generation after one refused fetch " +
+                    "and one refused apply.");
+            }
+        }
+
+        private static async Task ValidateRenewalDueWithoutARenewalDelegateIsInertAsync()
+        {
+            var local = Guid.NewGuid();
+            var peer = Guid.NewGuid();
+            var session = Guid.NewGuid();
+            var native = new FakeNative();
+            native.Events.Enqueue(new ProductionDirectNativeEventV5
+            {
+                Kind = ProductionDirectNativeEventKindV5.RenewalDue,
+                Status = ProductionDirectNativeResultV5.Accepted,
+                PathEpoch = 2,
+                AttemptId = Fence(2).AttemptId
+            });
+            await using var runtime = new ProductionDirectDataRuntime(
+                local, new FakeSignaling(), Options());
+            await runtime.RegisterPeerAsync(Registration(peer, 2, native)).ConfigureAwait(false);
+            var exact = OutputEnvelope(local, peer, session, 1);
+            Require(await runtime.RouteEnvelopeAsync(peer, session, 1, exact, true)
+                    .ConfigureAwait(false) == ProductionDirectDataRouteOutcome.DirectAccepted &&
+                    native.RenewApplyCalls == 0,
+                "A runtime without a renewal delegate still attempted a renewal.");
+        }
+
         private static async Task ValidateRetirementDrainsOnlyFencedRecoveryAsync()
         {
             var local = Guid.NewGuid();
@@ -2002,7 +2077,8 @@ namespace TermLink.ProductionDirectTransport.Validation
             ConcurrentQueue<ProductionDirectDataPeerSnapshot> peerStates = null,
             Func<ProductionDirectDataRelayEnvelope, bool> enqueueRelay = null,
             Action<ProductionDirectDataIngressDelivery> enqueueIngress = null,
-            ConcurrentQueue<ProductionDirectDataNativeAction> nativeActions = null) => new()
+            ConcurrentQueue<ProductionDirectDataNativeAction> nativeActions = null,
+            Func<Guid, Guid, byte[], CancellationToken, Task<byte[]>> renewTicket = null) => new()
         {
             PeerMailboxCapacity = 4,
             PeerMailboxCapacityBytes = mailboxBytes,
@@ -2033,7 +2109,8 @@ namespace TermLink.ProductionDirectTransport.Validation
             EnqueueNativeAction = nativeActions == null
                 ? null
                 : value => nativeActions.Enqueue(value),
-            PeerStateChanged = value => peerStates?.Enqueue(value)
+            PeerStateChanged = value => peerStates?.Enqueue(value),
+            RenewTicketAsync = renewTicket
         };
 
         private static ProductionDirectDataPeerRegistration Registration(
@@ -2041,7 +2118,8 @@ namespace TermLink.ProductionDirectTransport.Validation
             long generation,
             FakeNative native,
             ulong pathEpoch = 2,
-            ProductionDirectPathFenceV5 path = null) => new()
+            ProductionDirectPathFenceV5 path = null,
+            byte[] ticketWireBytes = null) => new()
         {
             PeerDeviceId = peer,
             Path = path ?? Fence(pathEpoch),
@@ -2049,6 +2127,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             AdmissionGeneration = generation,
             PairwiseKey = Enumerable.Repeat((byte)0x2a, 32).ToArray(),
             SignalKeyId = ByteString.CopyFromUtf8("device-key-1").ToByteArray(),
+            TicketWireBytes = ticketWireBytes,
             SignNativeTranscript = _ => Enumerable.Repeat((byte)0x5a, 64).ToArray(),
             Native = native
         };
@@ -2455,6 +2534,18 @@ namespace TermLink.ProductionDirectTransport.Validation
             }
             public ProductionDirectNativeResultV5 NetworkChanged(ProductionDirectPathFenceV5 path) =>
                 ProductionDirectNativeResultV5.Accepted;
+            internal readonly ConcurrentQueue<ProductionDirectNativeResultV5> RenewApplies = new();
+            internal int RenewApplyCalls;
+            internal byte[] LastRenewTicket;
+            public ProductionDirectNativeResultV5 RenewApplyTicket(
+                ProductionDirectPathFenceV5 path, byte[] ticket)
+            {
+                Interlocked.Increment(ref RenewApplyCalls);
+                LastRenewTicket = ticket?.ToArray();
+                return RenewApplies.TryDequeue(out var status)
+                    ? status
+                    : ProductionDirectNativeResultV5.Accepted;
+            }
             public ProductionDirectNativeResultV5 Cancel(ProductionDirectPathFenceV5 path) =>
                 DrainCancelActions();
             public void Dispose()

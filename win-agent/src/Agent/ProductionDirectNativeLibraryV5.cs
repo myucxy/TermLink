@@ -149,7 +149,8 @@ namespace TermLink.Agent
         }
 
         public uint AbiVersion() => abi();
-        public int RenewApply(IntPtr handle, byte[] ticket) => renewApply(handle, ticket, (UIntPtr)ticket.Length);
+        public int RenewApply(IntPtr handle, byte[] ticket, UIntPtr ticketLength) =>
+            renewApply(handle, ticket, ticketLength);
         public IntPtr Create(ref TermLinkDirectCreateV5 value) => create(ref value);
         public int PathUsage(IntPtr handle, ref TermLinkDirectPathV5 value) => pathUsage(handle, ref value);
         public int Attach(IntPtr handle, ref TermLinkDirectPathV5 value) => attach(handle, ref value);

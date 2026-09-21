@@ -471,6 +471,24 @@ internal class DirectNativeHandleV5(
     fun networkChanged(path: DirectNativePathV5): DirectNativeResultV5<Unit> =
         exactPathOperation(path) { methods.networkChangedV5(token, it) }
 
+    /**
+     * Applies one server-renewed path ticket (transport audit #2). The peer
+     * verifies the renewed ticket against the cutover-time binding and the
+     * pinned server signing key, then slides the applied expiry forward.
+     */
+    fun renewApply(path: DirectNativePathV5, ticket: ByteArray): DirectNativeResultV5<Unit> =
+        synchronized(lock) {
+            if (closed) return@synchronized closedFailure(path)
+            if (!owns(path)) return@synchronized staleFailure(path)
+            if (ticket.isEmpty() || ticket.size > DIRECT_NATIVE_MAX_TICKET_BYTES_V5) {
+                return@synchronized statusFailure(path, DirectNativeStatusV5.INVALID_ARGUMENT)
+            }
+            val status = call { methods.renewApplyV5(token, ticket) }
+                ?: return@synchronized ffiFailure(path)
+            if (status == DirectNativeStatusV5.OK) DirectNativeResultV5.Success(Unit)
+            else statusFailure(path, status)
+        }
+
     override fun close() {
         synchronized(lock) {
             if (closed) return
@@ -565,6 +583,11 @@ internal class DirectNativeHandleV5(
             DirectNativeEventKindV5.SIGN_REQUEST ->
                 status == DirectNativeStatusV5.OK && flags == 0 && frameSequence > 0 &&
                     payloadBytes > 0 && noRelease
+            // The FFI emits the renewal reminder once per ticket generation
+            // with its dedicated status literal (see termlink v5 worker).
+            DirectNativeEventKindV5.RENEWAL_DUE ->
+                status == RENEWAL_DUE_STATUS && flags == 0 && frameSequence == 0L &&
+                    noPayload && noRelease
             DirectNativeEventKindV5.UNKNOWN -> false
         }
         if (!validShape) return invalidResponse(currentPath)
@@ -645,6 +668,8 @@ internal class DirectNativeHandleV5(
         const val EVENT_BYTES = 80
         const val POLL_NO_EVENT = 0
         const val POLL_EVENT = 1
+        /** Dedicated status literal accompanying the once-per-generation renewal reminder. */
+        const val RENEWAL_DUE_STATUS = 5
         const val EVENT_FLAG_OUTBOUND = 1
         const val EVENT_FLAG_INBOUND = 2
         const val EVENT_FLAG_TRANSPORT_COPY = 4

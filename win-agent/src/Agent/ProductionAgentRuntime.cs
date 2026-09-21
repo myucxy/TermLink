@@ -667,7 +667,17 @@ namespace TermLink.Agent
                             HandlePrePromotionSignalAsync = DispatchPrePromotionSignalAsync,
                             ParseIngressMetadata = ParseDirectIngressMetadata,
                             PeerStateChanged = ObserveDirectDataPeerState,
-                            SignalingReaderFaulted = ObserveDirectSignalingReaderFault
+                            SignalingReaderFaulted = ObserveDirectSignalingReaderFault,
+                            RenewTicketAsync = async (peerDeviceId, connectionId, currentTicket,
+                                    cancellationToken) =>
+                            {
+                                var renewal = await createdSignaling.RenewTicketAsync(
+                                        peerDeviceId, connectionId, currentTicket, cancellationToken)
+                                    .ConfigureAwait(false);
+                                return renewal.Status == ProductionDirectSignalingCallStatus.Success
+                                    ? renewal.Value
+                                    : null;
+                            }
                         });
                     createdShadowRuntime = new ProductionDirectMultipairShadowRuntime(
                         enabled: true,
@@ -1196,6 +1206,7 @@ namespace TermLink.Agent
             byte[] pairwiseKey = null;
             byte[] signalKeyId = null;
             ProductionDirectCommitRequestV4 nomination = null;
+            byte[] ticketWireBytes = null;
             ProductionDirectPathFenceV5 promotionPath = null;
             try
             {
@@ -1203,6 +1214,7 @@ namespace TermLink.Agent
                 pairwiseKey = handoff.CopyPairwiseKey();
                 signalKeyId = handoff.CopySignalKeyId();
                 nomination = handoff.CopyNomination();
+                ticketWireBytes = handoff.CopyTicketWireBytes();
                 using var admitted = new ProductionDirectDataPromotionHandoff(
                     handoff.PeerDeviceId,
                     handoff.ConnectionId,
@@ -1219,7 +1231,8 @@ namespace TermLink.Agent
                     nomination,
                     handoff.SignNativeTranscript,
                     handoff.NominationCompleted,
-                    handoff.NominationFailed);
+                    handoff.NominationFailed,
+                    ticketWireBytes);
                 var promoted = await directDataRuntime.PromotePeerAsync(admitted, token)
                     .ConfigureAwait(false);
                 if (promoted && (!directDataAdmission.IsCurrent(admission) ||
@@ -1246,6 +1259,8 @@ namespace TermLink.Agent
             {
                 if (pairwiseKey != null) CryptographicOperations.ZeroMemory(pairwiseKey);
                 if (signalKeyId != null) CryptographicOperations.ZeroMemory(signalKeyId);
+                if (ticketWireBytes != null)
+                    CryptographicOperations.ZeroMemory(ticketWireBytes);
                 ProductionDirectDataPromotionHandoff.ZeroNomination(nomination);
             }
         }

@@ -76,9 +76,9 @@ namespace TermLink.ProductionDirectNative.Validation
                 "A partial v5 export surface was admitted.");
 
             var methods = typeof(IProductionDirectNativeApiV5).GetMethods();
-            Require(methods.Length == 26 &&
+            Require(methods.Length == 27 &&
                     methods.All(item => item.Name is not ("SendEnvelope" or "SubmitReceipt")),
-                "Managed API does not expose exactly the frozen 26 native operations.");
+                "Managed API does not expose exactly the frozen 27 native operations.");
         }
 
         private static void ValidateCapacityAndPathFence()
@@ -939,6 +939,7 @@ namespace TermLink.ProductionDirectNative.Validation
                 }
                 output = value; return 1;
             }
+            public int RenewApply(IntPtr handle, byte[] ticket, UIntPtr ticketLength) => 0;
             public int Cancel(IntPtr handle, ref TermLinkDirectPathV5 path) => 0;
             public int NetworkChanged(IntPtr handle, ref TermLinkDirectPathV5 path) => 0;
             public void Destroy(IntPtr handle)

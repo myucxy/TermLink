@@ -48,6 +48,7 @@ internal interface DirectNativeMethodsV5 {
     fun pollEventV5(handle: Long, output: ByteArray): Int
     fun cancelV5(handle: Long, path: ByteArray): Int
     fun networkChangedV5(handle: Long, path: ByteArray): Int
+    fun renewApplyV5(handle: Long, ticket: ByteArray): Int
     fun destroyV5(handle: Long): Int
 }
 
@@ -104,6 +105,7 @@ internal object JniDirectNativeMethodsV5 : DirectNativeMethodsV5 {
     ): Int
     external override fun tickIngressV5(handle: Long, path: ByteArray, nowMillis: Long): Int
     external override fun pollEventV5(handle: Long, output: ByteArray): Int
+    external override fun renewApplyV5(handle: Long, ticket: ByteArray): Int
     external override fun cancelV5(handle: Long, path: ByteArray): Int
     external override fun networkChangedV5(handle: Long, path: ByteArray): Int
     external override fun destroyV5(handle: Long): Int

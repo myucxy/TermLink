@@ -741,7 +741,8 @@ namespace TermLink.Agent
                         nomination,
                         identity.Sign,
                         binding => ObservePromotedReady(lease, binding),
-                        reason => ObservePromotedFailure(lease, reason));
+                        reason => ObservePromotedFailure(lease, reason),
+                        attempt.Ticket.WireBytes);
                     bool promoted;
                     try
                     {

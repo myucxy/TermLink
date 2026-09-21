@@ -157,6 +157,15 @@ namespace TermLink.Agent
         internal Func<byte[], ProductionDirectDataIngressMetadata> ParseIngressMetadata { get; init; }
         internal Action<ProductionDirectDataPeerSnapshot> PeerStateChanged { get; init; }
         internal Action<Exception> SignalingReaderFaulted { get; init; }
+        /// <summary>
+        /// Exchanges the peer's current ticket for a server-renewed one
+        /// (transport audit #2). Returns the renewed ticket wire bytes, or
+        /// null when the server refused or the endpoint was unreachable; the
+        /// actor retries with backoff and the native hard stop remains the
+        /// final fallback. Null disables renewal (shadow/test runtimes).
+        /// </summary>
+        internal Func<Guid, Guid, byte[], CancellationToken, Task<byte[]>> RenewTicketAsync
+        { get; init; }
     }
 
     internal interface IProductionDirectDataNativePeer : IDisposable
@@ -206,6 +215,15 @@ namespace TermLink.Agent
             ProductionDirectSessionDeregisterV5 request);
         ProductionDirectNativeResultV5 NetworkChanged(ProductionDirectPathFenceV5 path);
         ProductionDirectNativeResultV5 Cancel(ProductionDirectPathFenceV5 path);
+
+        /// <summary>
+        /// Applies a server-renewed path ticket. Default-disabled so test
+        /// fakes that predate renewals keep compiling; the production peer
+        /// forwards to the boundary's renew_apply export.
+        /// </summary>
+        ProductionDirectNativeResultV5 RenewApplyTicket(
+            ProductionDirectPathFenceV5 path, byte[] ticket) =>
+            ProductionDirectNativeResultV5.InvalidArgument;
     }
 
     internal sealed class ProductionDirectDataNativePeer : IProductionDirectDataNativePeer
@@ -264,6 +282,9 @@ namespace TermLink.Agent
             boundary.NetworkChanged(path);
         public ProductionDirectNativeResultV5 Cancel(ProductionDirectPathFenceV5 path) =>
             boundary.Cancel(path);
+        public ProductionDirectNativeResultV5 RenewApplyTicket(
+            ProductionDirectPathFenceV5 path, byte[] ticket) =>
+            boundary.RenewApplyTicket(path, ticket);
         public void Dispose() => boundary.Dispose();
     }
 
@@ -278,6 +299,12 @@ namespace TermLink.Agent
         internal ulong InitialRemoteSignalAcknowledgement { get; init; }
         internal byte[] PairwiseKey { get; init; }
         internal byte[] SignalKeyId { get; init; }
+        /// <summary>
+        /// The validated path ticket wire bytes at promotion time. The actor
+        /// keeps exactly one current generation: it is the renewal proof for
+        /// the server and is replaced after each accepted renew_apply.
+        /// </summary>
+        internal byte[] TicketWireBytes { get; init; }
         internal Func<byte[], byte[]> SignNativeTranscript { get; init; }
         internal IProductionDirectDataNativePeer Native { get; init; }
         internal ProductionDirectCommitRequestV4 PromotedNomination { get; init; }
@@ -354,6 +381,7 @@ namespace TermLink.Agent
             ProductionDirectCommitRequestV4 nomination = null;
             byte[] registrationKey = null;
             byte[] registrationKeyId = null;
+            byte[] registrationTicket = null;
             ProductionDirectCommitRequestV4 registrationNomination = null;
             try
             {
@@ -372,6 +400,7 @@ namespace TermLink.Agent
 
                 registrationKey = handoff.CopyPairwiseKey();
                 registrationKeyId = handoff.CopySignalKeyId();
+                registrationTicket = handoff.CopyTicketWireBytes();
                 registrationNomination = ProductionDirectDataPromotionHandoff.CopyNomination(
                     nomination);
                 var registration = new ProductionDirectDataPeerRegistration
@@ -385,6 +414,7 @@ namespace TermLink.Agent
                     InitialRemoteSignalAcknowledgement = handoff.RemoteSignalAcknowledgement,
                     PairwiseKey = registrationKey,
                     SignalKeyId = registrationKeyId,
+                    TicketWireBytes = registrationTicket,
                     SignNativeTranscript = handoff.SignNativeTranscript,
                     Native = native,
                     PromotedNomination = registrationNomination,
@@ -409,6 +439,8 @@ namespace TermLink.Agent
                 ProductionDirectDataPromotionHandoff.ZeroNomination(registrationNomination);
                 if (registrationKey != null) CryptographicOperations.ZeroMemory(registrationKey);
                 if (registrationKeyId != null) CryptographicOperations.ZeroMemory(registrationKeyId);
+                if (registrationTicket != null)
+                    CryptographicOperations.ZeroMemory(registrationTicket);
                 try { native?.Dispose(); }
                 catch (Exception error) when (error is not OutOfMemoryException) { }
             }
@@ -1276,6 +1308,12 @@ namespace TermLink.Agent
             private byte[] pairwiseKey;
             private byte[] localPathBinding;
             private byte[] peerPathBinding;
+            // The current ticket generation is the renewal proof for the
+            // server. Guarded by ticketSync; replaced only after the native
+            // peer accepts a renewed ticket whose expiry slides forward.
+            private readonly object ticketSync = new();
+            private byte[] currentTicket;
+            private long renewalInFlight;
             private Task worker;
             private ulong localSignalSequence;
             private ulong remoteSignalSequence;
@@ -1330,6 +1368,7 @@ namespace TermLink.Agent
                 remoteSignalAcknowledgement = registration.InitialRemoteSignalAcknowledgement;
                 pairwiseKey = registration.PairwiseKey.ToArray();
                 signalKeyId = registration.SignalKeyId.ToArray();
+                currentTicket = registration.TicketWireBytes?.ToArray();
                 native = registration.Native;
                 signNativeTranscript = registration.SignNativeTranscript;
                 nomination = ProductionDirectDataPromotionHandoff.CopyNomination(
@@ -2122,6 +2161,12 @@ namespace TermLink.Agent
                     if (localPathBinding != null)
                         CryptographicOperations.ZeroMemory(localPathBinding);
                     localPathBinding = null;
+                    lock (ticketSync)
+                    {
+                        if (currentTicket != null)
+                            CryptographicOperations.ZeroMemory(currentTicket);
+                        currentTicket = null;
+                    }
                     foreach (var cutover in cutovers.Values)
                         CryptographicOperations.ZeroMemory(cutover.BarrierSha256);
                     cutovers.Clear();
@@ -2142,7 +2187,79 @@ namespace TermLink.Agent
                 }
             }
 
-            private Task<ProductionDirectDataRouteOutcome?> DrainNativeAsync(
+            /// <summary>
+        /// Single-flight entry from the RenewalDue native event. The FFI emits
+        /// the event once per ticket generation, so the actor owns the retry
+        /// loop: fetch → apply → on accepted, the stored proof slides to the
+        /// new generation; on any failure, retry with backoff until the path
+        /// retires and let the native hard stop terminate the carrier.
+        /// </summary>
+        private void KickTicketRenewal()
+        {
+            if (options.RenewTicketAsync == null) return;
+            if (Interlocked.CompareExchange(ref renewalInFlight, 1, 0) != 0) return;
+            byte[] proof;
+            lock (ticketSync) proof = currentTicket?.ToArray();
+            if (proof == null)
+            {
+                Interlocked.Exchange(ref renewalInFlight, 0);
+                return;
+            }
+            var _ = RenewTicketLoopAsync(proof);
+        }
+
+        private async Task RenewTicketLoopAsync(byte[] proof)
+        {
+            try
+            {
+                // Renewal opens at expiry minus 60s and the native hard stop
+                // lands at expiry plus 30s, so the whole budget is ~90s. The
+                // backoff keeps attempts inside that window without hammering
+                // the server: 1s, 2s, 4s, then 8s floors.
+                var backoffMilliseconds = 1_000;
+                while (Volatile.Read(ref retired) == 0)
+                {
+                    byte[] renewed = null;
+                    try
+                    {
+                        renewed = await options.RenewTicketAsync(
+                                PeerDeviceId, path.ConnectionId, proof, lifetime.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception error) when (
+                        error is not OutOfMemoryException &&
+                        error is not OperationCanceledException)
+                    {
+                        renewed = null;
+                    }
+                    if (renewed != null)
+                    {
+                        var status = native.RenewApplyTicket(path, renewed);
+                        if (status == ProductionDirectNativeResultV5.Accepted)
+                        {
+                            lock (ticketSync)
+                            {
+                                currentTicket = renewed;
+                            }
+                            return;
+                        }
+                        renewed = null;
+                    }
+                    if (Volatile.Read(ref retired) != 0) return;
+                    await Task.Delay(backoffMilliseconds, lifetime.Token)
+                        .ConfigureAwait(false);
+                    backoffMilliseconds = Math.Min(backoffMilliseconds * 2, 8_000);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+            finally
+            {
+                Interlocked.Exchange(ref renewalInFlight, 0);
+            }
+        }
+
+        private Task<ProductionDirectDataRouteOutcome?> DrainNativeAsync(
                 Guid routedSessionId = default,
                 ulong routedSequence = 0)
             {
@@ -2182,11 +2299,13 @@ namespace TermLink.Agent
                     }
                     if (value.Kind == ProductionDirectNativeEventKindV5.RenewalDue)
                     {
-                        // Ticket renewal due (audit #2): the transport-level
-                        // renewal coroutine handles fetching and applying the
-                        // new ticket. The data loop just notes the event and
-                        // continues; the FFI hard-stop at expiry+grace is the
-                        // fallback if renewal fails.
+                        // Ticket renewal due (transport audit #2). The FFI
+                        // emits the event once per ticket generation; the
+                        // actor owns the renewal loop from here — fetch from
+                        // the server, apply through renew_apply, retry with
+                        // backoff until it lands or the path retires. The
+                        // native hard stop at expiry+grace stays the fallback.
+                        KickTicketRenewal();
                         continue;
                     }
                     if (value.Kind == ProductionDirectNativeEventKindV5.DirectFailed ||

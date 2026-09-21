@@ -302,6 +302,67 @@ internal class DirectTransportSignalingClient(
         return DirectSignalingCallResult.Success(ticket)
     }
 
+    /**
+     * Presents the current path ticket as proof and returns the renewed wire
+     * bytes (transport audit #2). The renewed ticket is verified by the
+     * native renew_apply, not here; this only bounds and decodes the payload.
+     */
+    suspend fun renewTicketCancellable(
+        targetDeviceId: UUID,
+        connectionId: UUID,
+        currentTicketProtobuf: ByteArray,
+    ): DirectSignalingCallResult<ByteArray> {
+        if (!feature.enabled) return DirectSignalingCallResult.Disabled
+        if (closed.get()) return closedFault()
+        if (targetDeviceId == NIL_UUID || targetDeviceId == deviceId ||
+            connectionId.version() != 4 ||
+            currentTicketProtobuf.size !in MIN_TICKET_BYTES..MAX_TICKET_BYTES
+        ) {
+            return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
+            )
+        }
+        val jsonBody = buildJsonObject {
+            put("target_device_id", targetDeviceId.toString())
+            put("connection_id", connectionId.toString())
+            put(
+                "ticket_protobuf",
+                DirectTransportSignalingProof.run { currentTicketProtobuf.base64Url() },
+            )
+        }
+        val body = JSON.encodeToString(JsonObject.serializer(), jsonBody).encodeToByteArray()
+        if (body.size > MAX_TICKET_REQUEST_BYTES) {
+            return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
+            )
+        }
+        val response = executeHttpBodyCancellable(
+            "POST",
+            RENEW_PATH,
+            body,
+            MAX_TICKET_RESPONSE_BYTES,
+        )
+            ?: return DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.HTTP_UNAVAILABLE),
+            )
+        val failure = httpFailure(response)
+        if (failure != null) return DirectSignalingCallResult.Fault(failure)
+        val raw = response.body ?: return DirectSignalingCallResult.Fault(
+            DirectSignalingFault(DirectSignalingFaultCode.RESPONSE_TOO_LARGE),
+        )
+        return try {
+            val renewed = (JSON.parseToJsonElement(raw.decodeToString()) as JsonObject)
+                .requiredString("ticket_protobuf")
+                .decodeBase64UrlStrict()
+            require(renewed.size in MIN_TICKET_BYTES..MAX_TICKET_BYTES)
+            DirectSignalingCallResult.Success(renewed)
+        } catch (_: Exception) {
+            DirectSignalingCallResult.Fault(
+                DirectSignalingFault(DirectSignalingFaultCode.TICKET_REJECTED),
+            )
+        }
+    }
+
     /** Starts an independently retried signalling socket. Feature-off performs no network I/O. */
     fun startSignaling(): Boolean {
         if (!feature.enabled) {
@@ -1239,6 +1300,7 @@ internal class DirectTransportSignalingClient(
     internal companion object {
         internal const val CONFIG_PATH = "/v1/transport/config"
         internal const val TICKET_PATH = "/v1/transport/tickets"
+        internal const val RENEW_PATH = "/v1/transport/tickets/renew"
         internal const val SIGNAL_PATH = "/v1/transport/signals"
         internal const val SIGNAL_SUBPROTOCOL = "termlink.transport.v1"
         /** Client Hello protocol request; this value never authorizes application-data routing. */

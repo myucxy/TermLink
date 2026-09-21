@@ -65,6 +65,7 @@ val expectedDirectV5JniExports = setOf(
     "arbitrateIngressV5",
     "tickIngressV5",
     "pollEventV5",
+    "renewApplyV5",
     "cancelV5",
     "networkChangedV5",
     "destroyV5",

@@ -16,6 +16,7 @@ internal const val DIRECT_NATIVE_MAX_FRAME_SEQUENCE_V5 = Long.MAX_VALUE
 internal const val DIRECT_NATIVE_MAX_APPLIED_CURSORS_PER_DIRECTION_V5 = 256
 internal const val DIRECT_NATIVE_MAX_SESSIONS_V5 = 32
 internal const val DIRECT_NATIVE_MAX_SIGNATURE_BYTES_V5 = 128
+internal const val DIRECT_NATIVE_MAX_TICKET_BYTES_V5 = 2_048
 
 internal object DirectNativeStatusV5 {
     const val OK = 0
@@ -406,7 +407,7 @@ internal data class DirectNativeRouteActionV5(
 internal enum class DirectNativeEventKindV5(val code: Int) {
     PATH_USED(1), ENVELOPE_QUEUED(2), ENVELOPE_AVAILABLE(3), TRANSPORT_RECEIPT(4),
     CANCELLED(5), NETWORK_CHANGED(6), QUEUE_LIMIT(7), PATH_READY(8), DIRECT_FAILED(9),
-    PING(10), PONG(11), SIGN_REQUEST(12), UNKNOWN(-1);
+    PING(10), PONG(11), SIGN_REQUEST(12), RENEWAL_DUE(13), UNKNOWN(-1);
 
     companion object {
         fun from(code: Int) = entries.firstOrNull { it.code == code } ?: UNKNOWN

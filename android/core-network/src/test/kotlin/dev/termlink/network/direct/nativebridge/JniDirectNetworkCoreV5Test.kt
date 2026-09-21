@@ -53,8 +53,8 @@ class JniDirectNetworkCoreV5Test {
                 "receiveAcceptV5", "receiveCommitV5", "commitEchoSentV5",
                 "receiveFallbackV5", "tickV5", "updateAppliedCursorV5", "deregisterSessionV5",
                 "routeEnvelopeV5", "pollRouteActionV5", "arbitrateIngressV5",
-                "tickIngressV5", "pollEventV5", "cancelV5", "networkChangedV5",
-                "destroyV5",
+                "tickIngressV5", "pollEventV5", "renewApplyV5", "cancelV5",
+                "networkChangedV5", "destroyV5",
             ),
             names,
         )
@@ -1068,6 +1068,7 @@ class JniDirectNetworkCoreV5Test {
             value.copyInto(output)
             return 1
         }
+        override fun renewApplyV5(handle: Long, ticket: ByteArray) = 0
         override fun cancelV5(handle: Long, path: ByteArray) = 0
         override fun networkChangedV5(handle: Long, path: ByteArray) = 0
         override fun destroyV5(handle: Long): Int {

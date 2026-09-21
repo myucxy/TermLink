@@ -48,6 +48,7 @@
   (TERMLINK_DIRECT_MAX_FRAMES_V5 + TERMLINK_DIRECT_FAILURE_ACTION_TAIL_V5)
 /* A realtime Envelope must be strictly smaller than 1 MiB. */
 #define TERMLINK_DIRECT_MAX_ENVELOPE_BYTES_V5 ((1024u * 1024u) - 1u)
+#define TERMLINK_DIRECT_MAX_TICKET_BYTES_V5 (2u * 1024u)
 #define TERMLINK_DIRECT_FIRST_DATA_FRAME_SEQ_V5 UINT64_C(4)
 #define TERMLINK_DIRECT_MAX_FRAME_SEQ_V5 UINT64_C(9223372036854775807)
 #define TERMLINK_DIRECT_MAX_APPLIED_CURSORS_PER_DIRECTION_V5 256u
@@ -526,6 +527,16 @@ int32_t termlink_direct_tick_ingress_v5(
  */
 int32_t termlink_direct_poll_event_v5(void *handle,
                                       TermLinkDirectEventV5 *output);
+
+/*
+ * Applies one server-renewed path ticket (transport audit #2). The peer
+ * verifies the renewed ticket against the cutover-time binding and the pinned
+ * server signing key, then slides the applied expiry forward. Returns OK only
+ * when the renewed expiry is strictly later than the applied one; anything
+ * else fails without mutating the peer.
+ */
+int32_t termlink_direct_renew_apply_v5(void *handle, const uint8_t *ticket,
+                                       size_t ticket_length);
 
 /* Both calls synchronously retire the exact path after worker processing. */
 int32_t termlink_direct_cancel_v5(void *handle,

@@ -323,6 +323,17 @@ internal interface ProductionDirectShadowSignaling : Closeable {
         connectionId: UUID,
         config: DirectTransportServerConfig,
     ): DirectSignalingCallResult<ValidatedDirectPathTicket>
+
+    /**
+     * Presents the current path ticket as proof and returns the renewed wire
+     * bytes (transport audit #2). Default null: no renewal support.
+     */
+    suspend fun renewTicket(
+        targetDeviceId: UUID,
+        connectionId: UUID,
+        proof: ByteArray,
+    ): ByteArray? = null
+
     fun send(envelope: TransportSignalEnvelopeV1): Boolean
 }
 
@@ -339,6 +350,16 @@ private class ClientProductionDirectShadowSignaling(
         connectionId: UUID,
         config: DirectTransportServerConfig,
     ) = client.issueTicketCancellable(targetDeviceId, connectionId, config)
+    override suspend fun renewTicket(
+        targetDeviceId: UUID,
+        connectionId: UUID,
+        proof: ByteArray,
+    ): ByteArray? = when (val result = client.renewTicketCancellable(
+        targetDeviceId, connectionId, proof,
+    )) {
+        is DirectSignalingCallResult.Success -> result.value
+        else -> null
+    }
     override fun send(envelope: TransportSignalEnvelopeV1) = client.send(envelope)
     override fun close() = client.close()
 }
@@ -1168,6 +1189,24 @@ class ProductionDirectShadowRuntime internal constructor(
     }
 
     /** Called only after [driveAttemptV4] has cancelled and joined its discovery pump. */
+    /**
+     * Server ticket renewal exchange (transport audit #2) over a short-lived
+     * signaling client. The attempt's own client is closed after promotion,
+     * so renewal opens its own authed HTTP channel per exchange.
+     */
+    internal suspend fun renewTicketCancellable(
+        peerDeviceId: UUID,
+        connectionId: UUID,
+        proof: ByteArray,
+    ): ByteArray? {
+        val signaling = signalingFactory(false)
+        return try {
+            signaling.renewTicket(peerDeviceId, connectionId, proof)
+        } finally {
+            signaling.close()
+        }
+    }
+
     private fun promoteReadyV4(
         attempt: Attempt,
         native: ProductionDirectShadowNativeV4,
@@ -1205,13 +1244,20 @@ class ProductionDirectShadowRuntime internal constructor(
                 localSignalSequence = attempt.localSequence,
                 remoteSignalSequence = attempt.lastRemoteSequence,
                 remoteSignalAcknowledgement = attempt.lastRemoteAck,
+                ticketWire = attempt.ticketWire.copyOf(),
             )
         } catch (failure: Throwable) {
             source.close()
             throw failure
         }
         attempt.nominationRequestV4 = null
-        val handoff = ProductionDirectV4ReadyHandoff(registration, nomination, gate, source)
+        val handoff = ProductionDirectV4ReadyHandoff(
+            registration,
+            nomination,
+            gate,
+            source,
+            renewTicket = ::renewTicketCancellable,
+        )
         val installed = runCatching { consumer(handoff) }.getOrDefault(false)
         if (!installed) {
             handoff.close()
@@ -1872,7 +1918,8 @@ class ProductionDirectShadowRuntime internal constructor(
             attempt.nominationRequestV4 = request
             attempt.nominationCommitted = true
             attempt.nominated = true
-            attempt.ticketWire.fill(0)
+            // ticketWire stays owned by the attempt: promotion copies it as
+            // the server renewal proof; attempt disposal still zeroes it.
         } finally {
             localProofNonce.fill(0)
         }
@@ -2475,7 +2522,8 @@ class ProductionDirectShadowRuntime internal constructor(
                 throw DirectAttemptFailure("DIRECT_NATIVE_NOMINATION_FAILED")
             }
             attempt.nominated = true
-            attempt.ticketWire.fill(0)
+            // ticketWire stays owned by the attempt: promotion copies it as
+            // the server renewal proof; attempt disposal still zeroes it.
         } finally {
             listOf(
                 localProbeKey,

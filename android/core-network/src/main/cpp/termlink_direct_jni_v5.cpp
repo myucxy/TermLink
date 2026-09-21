@@ -501,6 +501,26 @@ Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV5_pollEvent
 }
 
 extern "C" JNIEXPORT jint JNICALL
+Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV5_renewApplyV5(
+    JNIEnv* env, jobject, jlong handle, jbyteArray ticket) {
+    if (ticket == nullptr) return kInvalid;
+    const jsize ticket_length = env->GetArrayLength(ticket);
+    if (ticket_length <= 0 ||
+        static_cast<std::size_t>(ticket_length) > TERMLINK_DIRECT_MAX_TICKET_BYTES_V5) {
+        return kInvalid;
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(ticket_length));
+    SecureZeroVectorGuard ticket_guard(bytes);
+    env->GetByteArrayRegion(ticket, 0, ticket_length,
+                            reinterpret_cast<jbyte*>(bytes.data()));
+    if (env->ExceptionCheck()) return kInvalid;
+    return with_v5_bridge(handle, [&](void* bridge) {
+        return termlink_direct_renew_apply_v5(
+            bridge, bytes.data(), static_cast<std::size_t>(bytes.size()));
+    });
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_dev_termlink_network_direct_nativebridge_JniDirectNativeMethodsV5_destroyV5(
     JNIEnv*, jobject, jlong handle) {
     auto holder = remove_v5_holder(handle);

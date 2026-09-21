@@ -15,7 +15,10 @@ pub const PROBE_HMAC_DOMAIN_V2: &[u8] = b"TERMLINK-DIRECT-PROBE-HMAC-V2\0";
 pub const PAIR_PROBE_NONCE_DOMAIN_V2: &[u8] = b"TERMLINK-DIRECT-PAIR-PROBE-NONCE-V2\0";
 pub const DIRECT_TICKET_DOMAIN: &[u8] = b"TERMLINK-DIRECT-TICKET-V1\n";
 pub const MAX_DIRECT_TICKET_BYTES: usize = 2_048;
-pub const MAX_DIRECT_TICKET_LIFETIME_MS: i64 = 120_000;
+// Renewable 20-minute tickets (transport audit #2). The cap admits exactly
+// one full lifetime; renewals slide the applied expiry forward instead of
+// extending a single ticket beyond one generation.
+pub const MAX_DIRECT_TICKET_LIFETIME_MS: i64 = 20 * 60 * 1_000;
 pub const DIRECT_TICKET_CLOCK_SKEW_MS: i64 = 30_000;
 
 /// Derives the direction-specific probe nonce for exactly one canonical

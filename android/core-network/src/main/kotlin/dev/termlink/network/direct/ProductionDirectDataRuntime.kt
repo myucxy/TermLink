@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -99,6 +100,15 @@ internal interface ProductionDirectDataNative : Closeable {
     fun receiveEnvelope(): DirectNativeResultV5<DirectNativeDataEnvelope?>
     fun cancel(): DirectNativeResultV5<Unit>
     fun networkChanged(): DirectNativeResultV5<Unit>
+
+    /**
+     * Applies one server-renewed path ticket (transport audit #2). The peer
+     * verifies the renewed ticket against the cutover-time binding and the
+     * pinned server signing key, then slides the applied expiry forward.
+     * Default-success so pre-renewal test fakes keep compiling.
+     */
+    fun renewApplyTicket(ticket: ByteArray): DirectNativeResultV5<Unit> =
+        DirectNativeResultV5.Success(Unit)
 }
 
 internal class JniProductionDirectDataNative(
@@ -123,6 +133,7 @@ internal class JniProductionDirectDataNative(
     override fun pollRouteAction() = handle.pollRouteAction(path)
     override fun pollEvent() = handle.pollEvent()
     override fun receiveSigningPayload() = handle.receiveSigningPayload(path)
+    override fun renewApplyTicket(ticket: ByteArray) = handle.renewApply(path, ticket)
     override fun submitSignature(requestId: Long, signature: ByteArray) =
         handle.submitSignature(path, requestId, signature)
     override fun receiveEnvelope(): DirectNativeResultV5<DirectNativeDataEnvelope?> =
@@ -215,6 +226,10 @@ internal data class ProductionDirectDataPeerInstall(
     val keyEpoch: Long,
     val native: ProductionDirectDataNative,
     val gate: ProductionDirectDataGate,
+    /** Validated path ticket wire bytes at promotion; the renewal proof. */
+    val ticketWire: ByteArray? = null,
+    /** Server renewal exchange; null disables renewal for this install. */
+    val renewTicket: (suspend (UUID, UUID, ByteArray) -> ByteArray?)? = null,
 )
 
 private sealed interface ProductionDirectPeerWork {
@@ -257,11 +272,16 @@ internal class ProductionDirectDataPeerActor(
     private val onCarrier: (Direction, DirectNativeCarrierV5) -> Unit,
     private val onSessionCarrier: (UUID, Direction, DirectNativeCarrierV5) -> Unit,
     private val onRetired: (ProductionDirectDataPeerActor, ProductionDirectPeerRetirementReason) -> Unit,
+    ticketWire: ByteArray?,
+    private val renewTicket: (suspend (peerDeviceId: UUID, connectionId: UUID, proof: ByteArray) -> ByteArray?)?,
 ) : ProductionDirectPeerActor, ProductionDirectDataPeerBoundary, Closeable {
     private val retired = AtomicBoolean(false)
     private val activated = AtomicBoolean(false)
     private val pumpQueued = AtomicBoolean(false)
     private val queuedBytes = AtomicInteger(0)
+    private val renewalInFlight = AtomicBoolean(false)
+    private val currentTicketLock = Any()
+    private var currentTicket: ByteArray? = ticketWire?.copyOf()
     private val retirementReason = AtomicReference<ProductionDirectPeerRetirementReason?>(null)
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
@@ -319,6 +339,10 @@ internal class ProductionDirectDataPeerActor(
                 drainUnprocessedWork()
                 deliverHeldRelayIngress()
                 runCatching(native::close)
+                synchronized(currentTicketLock) {
+                    currentTicket?.fill(0)
+                    currentTicket = null
+                }
                 retryRelayRecovery()
                 signalProcessor.retired(this@ProductionDirectDataPeerActor)
                 work.cancel()
@@ -596,6 +620,7 @@ internal class ProductionDirectDataPeerActor(
             DirectNativeEventKindV5.PONG,
             -> true
             DirectNativeEventKindV5.SIGN_REQUEST -> processSigningRequest()
+            DirectNativeEventKindV5.RENEWAL_DUE -> processTicketRenewal()
             DirectNativeEventKindV5.UNKNOWN -> false
         }
     }
@@ -618,6 +643,55 @@ internal class ProductionDirectDataPeerActor(
             request.bytes.fill(0)
             signature.fill(0)
         }
+    }
+
+    /**
+     * Ticket renewal due (transport audit #2). The FFI emits the event once
+     * per ticket generation, so the actor owns the retry loop: fetch a
+     * renewed ticket from the server, apply it through renew_apply, and on
+     * acceptance slide the stored proof to the new generation. Failures back
+     * off and retry until the path retires; the native hard stop at
+     * expiry+grace remains the final fallback.
+     */
+    private fun processTicketRenewal(): Boolean {
+        val renew = renewTicket ?: return true
+        val proof = synchronized(currentTicketLock) {
+            val snapshot = currentTicket ?: return true
+            snapshot.copyOf()
+        }
+        if (!renewalInFlight.compareAndSet(false, true)) return true
+        scope.launch {
+            try {
+                var backoffMillis = 1_000L
+                while (!retired.get()) {
+                    val renewed = try {
+                        renew(peerDeviceId, pathFence.connectionId, proof)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (renewed != null &&
+                        native.renewApplyTicket(renewed) is DirectNativeResultV5.Success
+                    ) {
+                        synchronized(currentTicketLock) {
+                            currentTicket?.fill(0)
+                            currentTicket = renewed.copyOf()
+                        }
+                        return@launch
+                    }
+                    if (retired.get()) return@launch
+                    delay(backoffMillis)
+                    backoffMillis = (backoffMillis * 2).coerceAtMost(8_000L)
+                }
+            } catch (error: CancellationException) {
+                // Path retired or runtime closed; the latch resets below.
+            } finally {
+                proof.fill(0)
+                renewalInFlight.set(false)
+            }
+        }
+        return true
     }
 
     private fun applyAction(action: DirectNativeRouteActionV5, recoveryOnly: Boolean): Boolean {
@@ -954,6 +1028,8 @@ internal class ProductionDirectDataRuntime(
             queueFramesPerPeer,
             queueBytesPerPeer,
             pumpIntervalMillis,
+            ticketWire = value.ticketWire,
+            renewTicket = value.renewTicket,
             onCarrier = { direction, carrier ->
                 when (carrier) {
                     DirectNativeCarrierV5.LAN_DIRECT,
@@ -984,17 +1060,18 @@ internal class ProductionDirectDataRuntime(
                     carrier,
                 )
             },
-        ) actorRetired@{ retired, reason ->
-            // A stale install never owned the registry fence. Its actor still
-            // runs its local native cleanup, but must not re-enter failPeer(),
-            // which is reserved for the currently installed actor.
-            if (reason == ProductionDirectPeerRetirementReason.STALE_INSTALL) {
-                return@actorRetired
+            onRetired = actorRetired@{ retired, reason ->
+                // A stale install never owned the registry fence. Its actor still
+                // runs its local native cleanup, but must not re-enter failPeer(),
+                // which is reserved for the currently installed actor.
+                if (reason == ProductionDirectPeerRetirementReason.STALE_INSTALL) {
+                    return@actorRetired
+                }
+                if (registry.failPeer(retired.peerDeviceId, retired.pathFence, reason)) {
+                    peerRetirementObserver(retired.peerDeviceId, reason)
+                }
             }
-            if (registry.failPeer(retired.peerDeviceId, retired.pathFence, reason)) {
-                peerRetirementObserver(retired.peerDeviceId, reason)
-            }
-        }
+        )
         val installed = synchronized(actorLifecycleLock) {
             actors[actor] = Unit
             actor.invokeOnCompletion { actors.remove(actor) }

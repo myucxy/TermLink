@@ -481,6 +481,7 @@ namespace TermLink.Agent
             IntPtr envelope, uint envelopeBytes);
         int TickIngress(IntPtr handle, ref TermLinkDirectPathV5 path, ulong nowMilliseconds);
         int PollEvent(IntPtr handle, ref TermLinkDirectEventV5 output);
+        int RenewApply(IntPtr handle, byte[] ticket, UIntPtr ticketLength);
         int Cancel(IntPtr handle, ref TermLinkDirectPathV5 path);
         int NetworkChanged(IntPtr handle, ref TermLinkDirectPathV5 path);
         void Destroy(IntPtr handle);

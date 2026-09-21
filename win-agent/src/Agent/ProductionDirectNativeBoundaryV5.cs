@@ -707,6 +707,25 @@ namespace TermLink.Agent
             WithCurrentPath(path, (ref TermLinkDirectPathV5 native) =>
                 api.TickIngress(handle, ref native, nowMilliseconds));
 
+        /// <summary>
+        /// Applies a server-renewed path ticket (transport audit #2). The
+        /// native peer verifies the renewed ticket against the cutover-time
+        /// binding and the pinned server signing key, then slides the applied
+        /// expiry forward; anything else fails without mutating the peer.
+        /// </summary>
+        internal ProductionDirectNativeResultV5 RenewApplyTicket(
+            ProductionDirectPathFenceV5 path, byte[] ticket)
+        {
+            lock (sync)
+            {
+                if (!CanCallLocked()) return ProductionDirectNativeResultV5.RelayFallback;
+                if (!Current(path)) return ProductionDirectNativeResultV5.StalePath;
+                if (ticket == null || ticket.Length is < 1 or > 2_048)
+                    return ProductionDirectNativeResultV5.InvalidArgument;
+                return InvokeLocked(() => api.RenewApply(handle, ticket, (UIntPtr)ticket.Length));
+            }
+        }
+
         internal IReadOnlyList<ProductionDirectNativeEventV5> Poll(int maximumEvents = 32)
         {
             lock (sync)
@@ -907,6 +926,10 @@ namespace TermLink.Agent
                     flags is ProductionDirectNativeEventFlagsV5.Outbound or ProductionDirectNativeEventFlagsV5.Inbound,
                 ProductionDirectNativeEventKindV5.SignRequest => value.Status == 0 && value.FrameSequence > 0 &&
                     value.PayloadBytes > 0 && value.ReleasedFrames == 0 && flags == 0,
+                // The FFI emits the renewal reminder once per ticket generation
+                // with its dedicated status literal (see termlink v5 worker).
+                ProductionDirectNativeEventKindV5.RenewalDue => NoFrame(value) && flags == 0 &&
+                    value.FrameSequence == 0 && value.Status == 5 && value.ReleasedFrames == 0,
                 _ => false
             };
             if (!valid) return false;

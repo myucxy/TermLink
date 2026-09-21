@@ -133,10 +133,14 @@ internal class ProductionDirectCutoverPeerRegistration(
     val localSignalSequence: Long,
     val remoteSignalSequence: Long,
     val remoteSignalAcknowledgement: Long,
+    ticketWire: ByteArray? = null,
 ) : Closeable {
     val keyId = keyId.copyOf()
     val pairwiseKey = pairwiseKey.copyOf()
     val directPathBinding = directPathBinding.copyOf()
+
+    /** Validated path ticket wire bytes; the server renewal proof. */
+    val ticketWire = ticketWire?.copyOf()
 
     init {
         require(peerDeviceId != PRODUCTION_DIRECT_NIL_UUID && keyEpoch > 0 && signalingGeneration > 0)
@@ -151,6 +155,7 @@ internal class ProductionDirectCutoverPeerRegistration(
         keyId.fill(0)
         pairwiseKey.fill(0)
         directPathBinding.fill(0)
+        ticketWire?.fill(0)
     }
 }
 
@@ -159,6 +164,8 @@ internal class ProductionDirectV4ReadyHandoff(
     val nomination: dev.termlink.network.direct.nativebridge.DirectNativeCommitNominationRequestV4,
     val gate: ProductionDirectDataGate,
     val source: ProductionDirectV4ReadySource,
+    /** Server renewal exchange threaded to the installed peer actor. */
+    val renewTicket: (suspend (UUID, UUID, ByteArray) -> ByteArray?)? = null,
 ) : Closeable {
     private val consumed = AtomicBoolean(false)
     private val secretsDestroyed = AtomicBoolean(false)
@@ -297,6 +304,8 @@ internal class ProductionDirectDataCoordinator(
                     registration.keyEpoch,
                     native,
                     value.gate,
+                    ticketWire = registration.ticketWire,
+                    renewTicket = value.renewTicket,
                 ),
             )
         }.getOrElse {
