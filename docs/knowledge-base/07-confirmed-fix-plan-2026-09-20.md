@@ -88,3 +88,30 @@
 - 门户 PC 列表"离线"与 Android"PC online"并存 = 审计 #31 门户读 DB 心跳的陈旧显示（realtime presence 已同源，仅该列展示待切）；会话打开不受影响。
 - 会话标题重复时多 tab 输入路由（此前已修）与死会话（HostLost）重复打开会得到 TL-H114/TIMEOUT——符合 fail-closed 预期，但 TL-H114 提示"产生新输出后恢复"在无新输出时不会自动重试 bootstrap，留作后续改进项。
 - Claude Code 在 TermLink 管理会话内启动需要 `CLAUDE_CODE_GIT_BASH_PATH` 指向 bash.exe（宿主全局 env 或会话继承），已通过 `setx` 固化到本机用户环境。
+
+## 八、直连票据续期 S3 落地（f256bc3 + 166a441，2026-09-22）
+
+- **Win**：PeerActor 持有晋升时的票据 wire bytes；RenewalDue → /v1/transport/tickets/renew →
+  boundary.RenewApplyTicket（renew_apply）→ 接受后滑动 proof 世代。单飞 + 1s/2s/4s/8s 退避重试，
+  路径退役或原生硬停（expiry+30s）兜底。票据生存期上限 120s → 20 分钟 + 30s skew。
+- **Android**：RENEWAL_DUE(13) 进入事件契约（此前映射 UNKNOWN 会直接退役路径）；JNI/c++/header
+  声明 renewApplyV5；晋升注册携带 ticketWire（nominate 后不再立即清零，registration.close 清零）；
+  影子运行时经短期 signaling client 调 renewTicketCancellable 换取新票据。三端票据生存期上限
+  统一为一个可再生 20 分钟世代。
+- 验证：Win ProductionDirectTransportValidation（含新增续期滑动世代用例）与
+  ProductionDirectNativeValidation（冻结 ABI 计数 26→27）全绿；core-network 单测全绿；
+  APK 装回模拟器。
+
+## 九、回归补充修复（166a441，2026-09-22）
+
+- TL-H114 归类改为可重试：失败卡提供 Retry 动作（模拟器实机截图验证按钮出现）。
+- 目录状态为 INTERRUPTED 的会话打开即快速失败 TL-S003，不再对死亡 ConPTY 做引导直到超时。
+- 门户 PCs 页在线列补齐 presence 同源读取（此前仅 Devices/PCs 顶层与 admin 连接页覆盖），
+  实测 HOME-PC 由"离线"纠正为"在线"。
+
+### 仍开放（记录在案）
+
+- 长生命周期会话缓冲轮转后，客户端持久水位与服务器缓冲失配会持续 TL-H114；Retry 可重试，
+  但需要"跳过历史、从实时尾部续订"的回退路径才是完整解（涉及引导协议扩展，暂缓）。
+- Agent 启动时的孤儿会话对账（把管道易主后死亡的会话及时标 Interrupted 并推送目录刷新）
+  是消除"Running 幽灵会话"的根治项；当前 Android 目录刷新后才能看到 Interrupted。
