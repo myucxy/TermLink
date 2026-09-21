@@ -312,12 +312,21 @@ class NativeTerminalEngine(
         val payloads = ArrayList<ByteArray>()
         synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            text.codePoints().forEach { codePoint ->
-                payloads += if (codePoint == '\n'.code || codePoint == '\r'.code) {
-                    terminal.encodeKey(TerminalKey.ENTER)
-                } else {
-                    terminal.encodeCharacter(codePoint)
+            try {
+                text.codePoints().forEach { codePoint ->
+                    payloads += if (codePoint == '\n'.code || codePoint == '\r'.code) {
+                        terminal.encodeKey(TerminalKey.ENTER)
+                    } else {
+                        terminal.encodeCharacter(codePoint)
+                    }
                 }
+            } catch (ignored: Exception) {
+                // Kitty keyboard protocol is active (enabled by TUI apps like
+                // Claude CLI) and rejects Input V1 key events. Fall back to
+                // paste encoding, which is accepted in both Kitty and
+                // non-Kitty modes and preserves the text content.
+                payloads.clear()
+                payloads += terminal.encodePaste(text.toByteArray(Charsets.UTF_8))
             }
         }
         return emitPayloads(payloads)
@@ -326,10 +335,17 @@ class NativeTerminalEngine(
     override fun submitCodePoint(codePoint: Int, controlDown: Boolean, altDown: Boolean): Boolean {
         val payload = synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            terminal.encodeCharacter(
-                codePoint,
-                TerminalInputModifiers(control = controlDown, alt = altDown),
-            )
+            try {
+                terminal.encodeCharacter(
+                    codePoint,
+                    TerminalInputModifiers(control = controlDown, alt = altDown),
+                )
+            } catch (ignored: Exception) {
+                // Kitty protocol rejects Input V1; fall back to paste of the
+                // single code point encoded as UTF-8.
+                val bytes = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8)
+                terminal.encodePaste(bytes)
+            }
         }
         return emitPayloads(listOf(payload))
     }

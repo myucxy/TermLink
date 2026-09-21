@@ -607,7 +607,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
                 imeEditable.clear()
-                return text != null && (engine?.submitText(text.toString()) == true)
+                if (text == null) return false
+                return try {
+                    engine?.submitText(text.toString()) == true
+                } catch (ignored: Exception) {
+                    // Input encoding must never crash the UI thread.
+                    false
+                }
             }
 
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
