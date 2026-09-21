@@ -300,6 +300,7 @@ namespace TermLink.Agent
     {
         internal const string ConfigPath = "/v1/transport/config";
         internal const string TicketPath = "/v1/transport/tickets";
+        internal const string RenewPath = "/v1/transport/tickets/renew";
         internal const string SignalPath = "/v1/transport/signals";
         internal const string SignalSubprotocol = "termlink.transport.v1";
         internal const string DirectCapability = "direct_transport_v1";
@@ -559,6 +560,74 @@ namespace TermLink.Agent
                     Volatile.Read(ref disposed) != 0
                         ? ProductionDirectSignalingFaultCode.Closed
                         : ProductionDirectSignalingFaultCode.HttpUnavailable);
+            }
+            finally { CryptographicOperations.ZeroMemory(body); }
+        }
+
+        /// <summary>
+        /// Renews a direct-transport ticket by presenting the current ticket
+        /// as proof to the server's renewal endpoint (audit #2 step S3).
+        /// </summary>
+        public async Task<ProductionDirectSignalingCallResult<byte[]>>
+            RenewTicketAsync(
+                Guid targetDeviceId,
+                Guid connectionId,
+                byte[] currentTicket,
+                ProductionDirectTransportServerConfig config,
+                CancellationToken cancellationToken = default)
+        {
+            if (!enabled)
+                return ProductionDirectSignalingCallResult<byte[]>.Disabled();
+            if (Volatile.Read(ref disposed) != 0)
+                return ProductionDirectSignalingCallResult<byte[]>.Failed(
+                    ProductionDirectSignalingFaultCode.Closed);
+            if (targetDeviceId == Guid.Empty || targetDeviceId == deviceId ||
+                currentTicket == null || currentTicket.Length < MinimumTicketBytes ||
+                currentTicket.Length > MaximumTicketBytes || config == null)
+                return ProductionDirectSignalingCallResult<byte[]>.Failed(
+                    ProductionDirectSignalingFaultCode.TicketRejected);
+            var body = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object>
+            {
+                ["target_device_id"] = targetDeviceId.ToString("D").ToLowerInvariant(),
+                ["connection_id"] = connectionId.ToString("D").ToLowerInvariant(),
+                ["ticket_protobuf"] = Convert.ToBase64String(currentTicket)
+            });
+            try
+            {
+                using var response = await SendHttpAsync(
+                    HttpMethod.Post, RenewPath, body, cancellationToken).ConfigureAwait(false);
+                var failure = HttpFailure<byte[]>(response.StatusCode);
+                if (failure != null) return failure;
+                var raw = await ReadBoundedResponseAsync(
+                    response, MaximumTicketResponseBytes, cancellationToken).ConfigureAwait(false);
+                if (raw == null)
+                    return ProductionDirectSignalingCallResult<byte[]>.Failed(
+                        ProductionDirectSignalingFaultCode.ResponseTooLarge);
+                try
+                {
+                    using var document = JsonDocument.Parse(raw, new JsonDocumentOptions
+                    {
+                        AllowTrailingCommas = false,
+                        CommentHandling = JsonCommentHandling.Disallow,
+                        MaxDepth = 2
+                    });
+                    RequireObjectKeys(document.RootElement, "ticket_protobuf");
+                    var renewed = DecodeBase64UrlStrict(
+                        ReadExactString(document.RootElement, "ticket_protobuf"));
+                    return ProductionDirectSignalingCallResult<byte[]>.Success(renewed);
+                }
+                catch (Exception error) when (
+                    error is JsonException or InvalidDataException or FormatException or ArgumentException)
+                {
+                    return ProductionDirectSignalingCallResult<byte[]>.Failed(
+                        ProductionDirectSignalingFaultCode.TicketRejected);
+                }
+            }
+            catch (Exception error) when (
+                error is HttpRequestException or TaskCanceledException or OperationCanceledException)
+            {
+                return ProductionDirectSignalingCallResult<byte[]>.Failed(
+                    ProductionDirectSignalingFaultCode.HttpUnavailable);
             }
             finally { CryptographicOperations.ZeroMemory(body); }
         }
