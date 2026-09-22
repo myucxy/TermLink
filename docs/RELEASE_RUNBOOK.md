@@ -25,8 +25,10 @@
    Production MSIX 尚不支持；`Build-Release.ps1 -ServerImage` 只产生本地 OCI tar，不是 Docker Hub 发布命令。
 5. **发布并验证**：Android/Windows 仅通过 `scripts/Publish-AppShipProduction.ps1` 顺序发布；每端必须有
    已人工审核的签名、`published` release 和 `ready` artifact。Docker 首选经审核的 Git tag 工作流，
-   核对 amd64/arm64、OCI index digest、revision、Cosign 签名及三类 attestation。失败或网络受限时
-   保留原 AppShip 状态/镜像 tag；恢复同一操作，不移动 tag 或以降级结果冒充首选流程。
+   但 GitHub 只作为 CI 触发器：Server 镜像只发布到 `docker.io/myucxy/termlink`，不创建 GitHub Release，
+   也不发布到 GHCR/GitHub Packages。核对 amd64/arm64、OCI index digest、revision、Cosign 签名及三类
+   attestation。失败或网络受限时保留原 AppShip 状态/镜像 tag；恢复同一操作，不移动 tag 或以降级结果
+   冒充首选流程。
 6. **部署与回归**：只有用户明确要求部署时，先做 age 加密备份，再以不可变 `tag@sha256:index-digest`
    无损升级单节点 Server；核对两个健康常驻容器、数据卷、migration、OIDC 和公网 `/readyz`。
    对客户端做原地覆盖安装与登录、历史/会话/输入全链路验证；AppShip 旧 build 应为 `optional`，
