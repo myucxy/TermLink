@@ -686,7 +686,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
         outAttrs.initialSelStart = 0
         outAttrs.initialSelEnd = 0
-        return object : BaseInputConnection(this, false) {
+        return object : BaseInputConnection(this, true) {
             override fun getEditable(): Editable = imeEditable
 
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {

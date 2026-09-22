@@ -21,12 +21,19 @@ Date: 2026-09-22 (Asia/Shanghai)
   behaves consistently on supported Android runtimes.
 - Android can emit opt-in, redacted Direct diagnostics through `TermLinkDirectShadow`; the diagnostics contain
   stages and native reason/status codes only, not addresses, ticket contents, IDs, tokens, or keys.
+- Android declares its composing `InputConnection` as a full editor, matching Termux's `TerminalView`, so one
+  IME composition commit produces one terminal input while intentional repeated commits remain distinct.
 
 ## Verification before the release build
 
 - Android `:app:testReleaseUnitTest`, `:app:testDebugUnitTest`, `:core-crypto:testDebugUnitTest`,
   `:core-network:testDebugUnitTest`, and `:terminal-engine-native:testDebugUnitTest`: passed.
-- Android emulator instrumentation `:core-network:connectedDebugAndroidTest`: 8/8 passed on Android 16.
+- Android emulator instrumentation passed on Android 16: Direct/network 8/8 and native terminal/JNI 13/13.
+- The native terminal regression reproducing one `setComposingText("1")` plus `commitText("1")` as three native
+  submissions fails before the fix and passes with exactly one submission after it. A second independent commit
+  still produces a second input, so intentional repeated characters are not suppressed.
+- Android `:terminal-engine-native:testDebugUnitTest`, `:app:testDebugUnitTest`, and
+  `:app:testReleaseUnitTest` passed after the input fix.
 - Windows `TermLink.Windows.sln` Release build: passed with zero warnings and zero errors.
 - Windows Setup prerequisite/ownership validation and `ProductionDirectTransportValidation`: passed.
 - Direct fault-model suite: 16/16 passed.
@@ -40,12 +47,19 @@ Date: 2026-09-22 (Asia/Shanghai)
   production socket validation remains pending until the remote Windows client `HT-LPC-1326` upgrades to this
   release. Unit, instrumentation, and shadow-state evidence must not be reported as a Direct carrier pass.
 - Relay remains the stable fallback and the Server's Relay-only strategy remains the operational rollback.
+- The emulator's debug-signed app was upgraded in place from `0.2.46 (102)` to `0.2.47 (103)` without changing
+  `appId=10224` or `firstInstallTime=2026-09-19 10:16:29`; the retained logged-in session opened without a crash.
+  Its current `TL-H114` history gap prevented a live remote command input check, so this is not recorded as a
+  complete product-chain input pass.
 
 ## Termux reference boundary
 
-- Reviewed `termux/termux-app@3df69d1da197dd9bd71a3bafd902dffd720576b4`,
+- Reviewed `termux/termux-app@3df69d1da197dd9bd71a3bafd902dffd720576b4`, including
+  `terminal-view/.../TerminalView.java` and its full-editor `BaseInputConnection`,
   `terminal-forks/termux-terminal/UPSTREAM.md`, the checked-in Termux patch queue, and
   `android/terminal-engine-termux/`.
+- Also reviewed `termux/termux-app#686` (Samsung keyboard characters not echoed). Termux's full-editor connection
+  can be reused as Android IME behavior, but TermLink keeps its own native terminal/E2EE/remote transport path.
 - Termux has no equivalent TermLink ticket, NAT, or remote transport implementation. It is behavior reference
   only; no local PTY, shell, Bootstrap/APT, plugin-signing, or local-process architecture was copied.
 

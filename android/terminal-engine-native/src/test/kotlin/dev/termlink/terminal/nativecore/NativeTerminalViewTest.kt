@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.inputmethod.EditorInfo
 import dev.termlink.terminal.api.ArgbColor
 import dev.termlink.terminal.api.TerminalRenderCellV1
 import dev.termlink.terminal.api.TerminalRenderColorV1
@@ -36,6 +37,31 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class NativeTerminalViewTest {
+    @Test
+    fun imeCompositionCommitsOneCharacterExactlyOnce() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val bridge = FakeNativeBridge()
+        val engine = NativeTerminalEngine(TerminalSize(80, 24), bridge)
+        try {
+            engine.setReadOnly(false)
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            val input = view.onCreateInputConnection(EditorInfo())
+
+            assertTrue(input.setComposingText("1", 1))
+            assertTrue(input.commitText("1", 1))
+
+            assertEquals(1, bridge.inputV3Calls)
+            assertEquals("1", bridge.lastInputV3?.copyAssociatedText()?.decodeToString())
+
+            assertTrue(input.commitText("1", 1))
+            assertEquals(2, bridge.inputV3Calls)
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
     @Test
     fun detachedHistoryViewStopsItsWorkerAndCanRestartAfterReattachment() {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()

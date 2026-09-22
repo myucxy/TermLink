@@ -143,9 +143,18 @@ class JniNativeBridgeInstrumentedTest {
                 connection = view.onCreateInputConnection(EditorInfo()) as BaseInputConnection
             }
 
-            val composing = async(start = CoroutineStart.UNDISPATCHED) { engine.inputEvents.take(5).toList() }
             val editable = connection.editable
             assertNotNull(editable)
+
+            val singleCommit = async(start = CoroutineStart.UNDISPATCHED) { engine.inputEvents.first() }
+            instrumentation.runOnMainSync {
+                assertTrue(connection.setComposingText("1", 1))
+                assertTrue(connection.commitText("1", 1))
+            }
+            assertArrayEquals("1".encodeToByteArray(), withTimeoutOrNull(5_000) { singleCommit.await() })
+            assertEquals(null, withTimeoutOrNull(250) { engine.inputEvents.first() })
+
+            val composing = async(start = CoroutineStart.UNDISPATCHED) { engine.inputEvents.take(5).toList() }
             instrumentation.runOnMainSync {
                 assertTrue(connection.setComposingText("draft", 1))
                 assertEquals("draft", editable.toString())
