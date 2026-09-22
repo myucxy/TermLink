@@ -794,7 +794,7 @@ internal class DirectTransportSignalingClient(
         httpStatus: Int? = null,
     ) {
         if (closed.get()) return
-        val shouldRetry = retryable && attempt <= MAX_SIGNAL_RETRIES
+        val shouldRetry = retryable
         val active = synchronized(lock) {
             if (generation.get() != expectedGeneration) return
             val retiredGeneration = generation.incrementAndGet()
@@ -812,13 +812,7 @@ internal class DirectTransportSignalingClient(
             willRetry = shouldRetry,
             attempt = attempt,
         )
-        if (shouldRetry) scheduleRetry(attempt + 1) else if (retryable) {
-            mutableState.value = DirectTransportSignalingState.Fault(
-                DirectSignalingFault(DirectSignalingFaultCode.RETRY_EXHAUSTED, httpStatus),
-                willRetry = false,
-                attempt = attempt,
-            )
-        }
+        if (shouldRetry) scheduleRetry((attempt + 1).coerceAtMost(MAX_SIGNAL_RETRY_BACKOFF_ATTEMPT))
     }
 
     private fun scheduleRetry(nextAttempt: Int) {
@@ -1328,7 +1322,7 @@ internal class DirectTransportSignalingClient(
         internal const val MAX_QUEUED_SIGNAL_FRAMES = 32
         internal const val MAX_QUEUED_SIGNAL_BYTES = 512 * 1_024L
         internal const val MAX_HELLO_BYTES = 4 * 1_024
-        internal const val MAX_SIGNAL_RETRIES = 3
+        internal const val MAX_SIGNAL_RETRY_BACKOFF_ATTEMPT = 9
         private const val PROTOCOL_VERSION = 1
         private const val ID_BYTES = 16
         private const val SIGNAL_NONCE_BYTES = 12

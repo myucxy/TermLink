@@ -1052,6 +1052,36 @@ class DirectTransportSignalingClientTest {
     }
 
     @Test
+    fun retryableSignalFailuresContinueAfterInitialBurstWithoutTerminalFault() = runBlocking {
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest) = MockResponse().setResponseCode(503)
+        }
+        server.start()
+        val retryWaits = CopyOnWriteArrayList<Long>()
+        val fixture = fixture(
+            server,
+            enabled = true,
+            retryDelay = DirectSignalingRetryDelay { wait ->
+                retryWaits += wait
+                if (retryWaits.size >= 4) kotlinx.coroutines.awaitCancellation()
+            },
+        )
+        try {
+            assertTrue(fixture.client.startSignaling())
+            withTimeout(5_000) {
+                while (retryWaits.size < 4) delay(10)
+            }
+            val fault = fixture.client.state.value as DirectTransportSignalingState.Fault
+            assertEquals(DirectSignalingFaultCode.SIGNAL_CONNECT_FAILED, fault.fault.code)
+            assertTrue(fault.willRetry)
+        } finally {
+            fixture.close()
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun cancellingConfigRequestCancelsTheExactOkHttpCall() = runBlocking {
         val server = MockWebServer()
         server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))

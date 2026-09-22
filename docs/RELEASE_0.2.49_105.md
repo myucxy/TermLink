@@ -4,7 +4,7 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Source identity and scope
 
-- Release source commit: pending until the tested source and this pre-release record are committed and pushed.
+- Release source commit: `498949eb1cc8958e0f0dca630af12cbc138836c4`.
 - Android and Windows are in scope because both Direct runtimes changed. The Server remains on
   `docker.io/myucxy/termlink:v0.2.47`; no Server source changed, so no Docker image or Git tag is created.
 - Verified pre-release stable state: Android `0.2.48 (104)` and Windows `0.2.47 (103)`.
@@ -39,26 +39,41 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Production artifacts and AppShip
 
-- Production APK/Setup hashes, signer continuity, AppShip IDs, and final states are recorded only after the
-  immutable release-source commit is built and both wrapper-driven uploads complete.
-- Required Android signer SHA-256:
+- APK: `artifacts/release/0.2.49-105/TermLink-Android-0.2.49-105.apk`; size `38066218` bytes; SHA-256
+  `947f3fd2630b34dc75b3749e299761a6d6de998f172756d3efad3ae5b4c632b0`; signer SHA-256
   `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
-- Required Windows signer SHA-1:
-  `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`; this is the existing self-signed development certificate with
+- Setup: `artifacts/release/0.2.49-105/TermLink-Setup-0.2.49.105-x64.exe`; size `181291736` bytes; SHA-256
+  `ecec4f05e998b11fb34b3d32449b1be3c6ae1f28944c6e614a671ed76e5b5a15`; signer SHA-1
+  `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`. This is the existing self-signed development certificate with
   update continuity, not public-CA trust.
-- Planned state files:
+- Android AppShip release `b9e96460-8679-4019-a4cf-fd24e50e0b3e`, artifact
+  `d3276053-3563-48f0-960f-45d55fe0897b`; Windows release
+  `1f45bc26-17a7-4503-9f99-6605cf81e2ca`, artifact `b3dea17f-9ff2-4766-89a6-39a4b5b89dca`.
+  Both releases reached `published` and both artifacts reached `ready` through the repository wrapper.
+- Stable update checks returned `optional` for build 104 and `no_update` for build 105. Resumable state remains in
   `.appship/termlink-android-stable-0.2.49-build105-signature-approved.json` and
   `.appship/termlink-win64-stable-0.2.49-build105-signature-approved.json`.
 
 ## Live validation boundary
 
-- Upgrade the debug-signed emulator from the same source/version without uninstalling or clearing data; preserve
-  `appId`, `firstInstallTime`, login, device identity, and existing sessions.
-- Upgrade the local Windows installation in place using its registered install root. Remote Windows clients can
-  consume the published stable update without claiming silent installation.
-- A fresh `HOME-PC` session passes only with authoritative `LAN_DIRECT`; a fresh `HT-LPC-1326` session passes only
-  with authoritative `NAT_DIRECT`. `GATHERING`, `NEGOTIATING`, epoch allocation, or Relay success is not a Direct
-  pass. Relay fallback must remain lossless and must not create duplicate input or a History Gap.
+- The local Windows installation was upgraded in place at `D:\Dev\Tool\TermLink`; Tray, Agent, and SessionHost
+  report ProductVersion `0.2.49.105` and retain the approved signer. The debug-signed emulator was upgraded in
+  place with the same source/version Release behavior build; `appId=10224`, first install time
+  `2026-09-19 10:16:29`, login, device identity, and sessions were retained. This emulator build is not the
+  Production APK published to AppShip.
+- A fresh `HOME-PC` CMD session reached `Controlling` over Relay. `echo termlink_probe_0922` was applied once, and
+  after an Android process restart the authoritative Snapshot at sequence 59 restored completely with the command
+  and output still present. No duplicate input or new History Gap was observed on that fresh session.
+- One pre-existing `HOME-PC` session remains unavailable with `TL-H113`: Snapshot sequence 10 and event 11 restore,
+  but the Windows host returns `EVENT_RANGE_EMPTY` for required event 12. It was preserved for diagnosis rather
+  than deleted or treated as a Direct failure.
+- Android allocated new epochs for all three PCs. For `HOME-PC`, Windows 0.2.49 received the offer immediately and
+  entered `GATHERING`/`NEGOTIATING`, proving the responder-cooldown fix is active; neither side validated a candidate
+  pair and both fell back to Relay. `HT-LPC-1326` and `WIN10-20240606Q` remain on Windows 0.2.47.103, so they cannot
+  qualify the 0.2.49 responder fix.
+- No authoritative `LAN_DIRECT` or `NAT_DIRECT` carrier was observed. The Android emulator uses `10.0.2.15` behind
+  its host NAT and cannot provide a physical same-LAN result. Epoch allocation, signalling, and Relay success are
+  not recorded as Direct success.
 
 ## Rollback
 
