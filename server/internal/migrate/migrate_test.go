@@ -69,6 +69,9 @@ func TestEmbeddedMigrationsAreOrderedAndStable(t *testing.T) {
 	if got := items[29].checksum; got != "f5436500adb0b8f173d029c70f5aca6a9a9b5703c454f4d2edf564c57f1d9c76" {
 		t.Fatalf("immutable migration 30 checksum changed: %s", got)
 	}
+	if got := items[48].checksum; got != "16f3793d37c4a56dd22eaf416ef33eb0a5929a4770b11ecd242dab3fe04cc142" {
+		t.Fatalf("immutable migration 49 checksum changed: %s", got)
+	}
 	for _, item := range items {
 		if len(item.checksum) != 64 {
 			t.Fatalf("migration %d checksum length = %d", item.version, len(item.checksum))
