@@ -140,7 +140,7 @@ class SessionOpenFailureTest {
             ),
         )
         assertTrue(SessionOpenFailureCode.HISTORY_NOT_READY.retryable)
-        assertFalse(SessionOpenFailureCode.HISTORY_GAP.retryable)
+        assertTrue(SessionOpenFailureCode.HISTORY_GAP.retryable)
         assertFalse(SessionOpenFailureCode.entries.any { it.stableCode == "TL-H115" })
     }
 

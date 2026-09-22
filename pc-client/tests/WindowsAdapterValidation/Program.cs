@@ -41,6 +41,34 @@ Require(appShipStatus.Decision == DesktopUpdateDecision.NoUpdate &&
         appShipStatus.BuildNumber == 45 &&
         appShipStatus.ReleaseNotes == "AppShip adapter fixture",
     "The Windows desktop adapter did not parse the bounded AppShip result contract.");
+var appShipUpdate = WindowsDesktopOperations.ParseAppShipUpdate("""
+    {
+      "status":"optional",
+      "latest":{"versionName":"0.2.46","buildNumber":101,"releaseNotes":"Direct enabled"},
+      "artifact":{
+        "platform":"windows","fileKind":"exe","architecture":"x64","status":"ready",
+        "downloadEnabled":true,"originalFilename":"TermLink-Setup-0.2.46.101-x64.exe",
+        "sizeBytes":123,"expectedSizeBytes":123,
+        "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "signerFingerprint":"91ae60bc06d866628b8eb2c62f32bde9dab56466",
+        "downloadUrl":"https://appship.example/artifact/download"
+      }
+    }
+    """, 100);
+Require(appShipUpdate.Status.Decision == DesktopUpdateDecision.Optional &&
+        appShipUpdate.Status.BuildNumber == 101 && appShipUpdate.SizeBytes == 123 &&
+        appShipUpdate.DownloadUrl == "https://appship.example/artifact/download",
+    "The Avalonia Windows adapter did not retain the verified update contract.");
+RequireThrows<InvalidDataException>(() => WindowsDesktopOperations.ParseAppShipUpdate("""
+    {
+      "status":"optional","latest":{"versionName":"0.2.46","buildNumber":101},
+      "artifact":{"platform":"windows","fileKind":"exe","architecture":"x64","status":"ready",
+        "downloadEnabled":true,"originalFilename":"TermLink.exe","sizeBytes":1,"expectedSizeBytes":1,
+        "sha256":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "signerFingerprint":"91ae60bc06d866628b8eb2c62f32bde9dab56466","downloadUrl":"http://unsafe.example/x.exe"}
+    }
+    """, 100),
+    "The Avalonia Windows adapter accepted an unsafe update contract.");
 
 var root = Path.Combine(Path.GetTempPath(), "TermLink-WindowsAdapter-" + Guid.NewGuid().ToString("N"));
 var localData = Path.Combine(root, "local-app-data");
@@ -205,6 +233,13 @@ finally
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+static void RequireThrows<T>(Action action, string message) where T : Exception
+{
+    try { action(); }
+    catch (T) { return; }
+    throw new InvalidOperationException(message);
 }
 
 static int? FindAgentProcessId(string executablePath)

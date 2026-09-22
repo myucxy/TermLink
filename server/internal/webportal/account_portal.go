@@ -184,6 +184,16 @@ func (p *Portal) applyCachedPortalPresence(accountID uuid.UUID, data *userPortal
 			data.PCs[index].LastSeenAt = &seen
 		}
 	}
+	// The PCs table renders its own row slice; without this pass the page
+	// falls back to the stored heartbeat and shows a live agent offline.
+	for index := range data.PCRows {
+		seen, online := p.config.Presence.Online(accountID, data.PCRows[index].PC.DeviceID)
+		data.PCRows[index].PC.Online = online
+		if online {
+			seen = seen.UTC()
+			data.PCRows[index].PC.LastSeenAt = &seen
+		}
+	}
 }
 
 func normalizeUserPortalSection(section string) string {

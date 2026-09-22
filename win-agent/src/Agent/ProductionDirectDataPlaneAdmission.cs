@@ -94,6 +94,16 @@ namespace TermLink.Agent
         {
             var permitted = buildEnabled &&
                 ProductionDirectTransportSignalingClient.HasDirectDataCapabilities(config);
+            ObserveServerRoutingPermission(permitted);
+        }
+
+        internal void ObserveServerConfigUnavailable()
+        {
+            ObserveServerRoutingPermission(false);
+        }
+
+        private void ObserveServerRoutingPermission(bool permitted)
+        {
             lock (sync)
             {
                 if (serverRoutingPermitted == permitted) return;

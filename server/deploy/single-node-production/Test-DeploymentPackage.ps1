@@ -50,6 +50,11 @@ $helpText = $help -join "`n"
 Assert-Test ($LASTEXITCODE -eq 0 -and $helpText.Contains('termlink-deploy install') -and
     $helpText.Contains('termlink-deploy upgrade') -and $helpText.Contains('termlink-deploy doctor')) `
     'Deployment help did not render the command contract.'
+$removedRoutingOption = & $BashPath (Join-Path $packagePath 'termlink-deploy') `
+    config --disable-direct-routing 2>&1
+Assert-Test ($LASTEXITCODE -ne 0 -and
+    (($removedRoutingOption -join "`n").Contains('stored in PostgreSQL'))) `
+    'The retired deployment Direct routing flag did not fail with an actionable message.'
 
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $fixturePath = Join-Path $tempRoot ("termlink-single-node-policy-" + [Guid]::NewGuid().ToString('N'))

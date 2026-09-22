@@ -2253,7 +2253,7 @@ func adminNotice(value string) string {
 	case "human-verification-updated":
 		return bilingualPortalNotice("登录与注册人机验证设置已更新并立即生效。", "Login and registration human-verification settings were updated and are active immediately.")
 	case "transport-routing-updated":
-		return bilingualPortalNotice("直连数据面路由策略已更新：新连接将按当前策略生效。", "The direct data-plane routing policy was updated: new connections follow the current policy.")
+		return bilingualPortalNotice("网络传输策略已更新；自动模式用于新连接或重连后的设备，仅中转模式会让现有直连有界回退。", "The transport policy was updated: automatic mode applies to new or reconnected devices, while Relay-only mode retires existing Direct paths within a bounded interval.")
 	case "runtime-setting-updated":
 		return bilingualPortalNotice("运行时参数已保存并即时生效；重启后仍保持。", "The runtime setting was saved and is effective immediately; it persists across restarts.")
 	case "admin-route-updated":

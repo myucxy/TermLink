@@ -2,6 +2,7 @@ package dev.termlink.terminal.nativecore
 
 import android.view.KeyEvent
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.TerminalKittyKeyEventType
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -60,6 +61,60 @@ class NativeTerminalEngineTest {
             assertTrue(engine.submitPaste("paste"))
             assertEquals(NATIVE_INPUT_KIND_PASTE, bridge.lastInputV1?.kind)
             assertEquals(1, bridge.inputV1Calls)
+        } finally {
+            engine.dispose()
+        }
+    }
+
+    @Test
+    fun physicalKeyboardPreservesEventPhaseKeypadLocksAndRejectsUnsupportedInputSafely() {
+        val bridge = FakeNativeBridge()
+        val engine = NativeTerminalEngine(TerminalSize(80, 24), bridge)
+        try {
+            engine.setReadOnly(false)
+
+            assertTrue(engine.submitPhysicalKeyCode(
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                controlDown = false,
+                altDown = false,
+                shiftDown = false,
+                capsLock = true,
+                numLock = true,
+                eventType = TerminalKittyKeyEventType.REPEAT,
+            ))
+            assertEquals(117L, bridge.lastInputV3?.key)
+            assertEquals(NATIVE_KITTY_EVENT_REPEAT, bridge.lastInputV3?.kittyEventType)
+            assertEquals(
+                NATIVE_KITTY_MODIFIER_CAPS_LOCK or NATIVE_KITTY_MODIFIER_NUM_LOCK,
+                bridge.lastInputV3?.kittyModifiers,
+            )
+
+            assertTrue(engine.submitPhysicalKeyCode(
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                controlDown = false,
+                altDown = false,
+                shiftDown = false,
+                eventType = TerminalKittyKeyEventType.RELEASE,
+            ))
+            assertEquals(NATIVE_KITTY_EVENT_RELEASE, bridge.lastInputV3?.kittyEventType)
+
+            val calls = bridge.inputV3Calls
+            bridge.forcedInputV3Failure = NativeBridgeResult.Failure(
+                NativeTerminalStatus.UNSUPPORTED.code,
+            )
+            assertFalse(engine.submitKeyCode(
+                KeyEvent.KEYCODE_ENTER,
+                controlDown = false,
+                altDown = false,
+                shiftDown = true,
+            ))
+            bridge.forcedInputV3Failure = null
+            assertFalse(engine.submitText("\u0080"))
+            assertEquals(calls + 1, bridge.inputV3Calls)
+
+            assertTrue(engine.submitText("\u0001"))
+            assertEquals('a'.code, bridge.lastInputV3?.character)
+            assertEquals(NATIVE_KITTY_MODIFIER_CONTROL, bridge.lastInputV3?.kittyModifiers)
         } finally {
             engine.dispose()
         }

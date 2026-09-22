@@ -3,6 +3,91 @@
 本文用于每次 TermLink 正式版本的现场发布、故障恢复和最终复核。构建与签名门禁仍以
 [统一发布构建](RELEASE.md)为准；本文补充执行顺序和已经验证过的运行环境陷阱。
 
+## 每次发布的执行规则（Android / Windows / Docker）
+
+本节是发布检查单，不是固定版本的发布授权；只有用户明确要求对应平台上线时才执行提交、推送、
+上传或部署。每轮从实时线上状态重做检查，不把历史发布记录或本地构建产物当成线上现状。
+若某一门禁未通过，停止该平台的后续动作，记录已完成和未完成部分，不删除或改写已发布历史。
+
+1. **确定范围和版本**：只构建/发布本次实际修改及用户指定的平台。查询 AppShip 两个 stable 更新接口、
+   Docker Hub 已有 tag 和远端 Git tag；为要发布的平台选严格递增且未使用的三段 `Version` 和 build
+   `1..65535`（同批统一清单使用同一组）。不得以本文写下的旧版本或本地目录推断“最新”。
+2. **固定源码**：`git status -sb`、`git diff --check`，复核哪些现有用户修改进入发布；完成改动范围的测试、
+   必要的模拟器/真实产品链路及 Windows 安装器自动化验收。源码及预先写好的发布说明提交并推送后，确认 `HEAD`、
+   `origin/main` 是同一完整 commit，且工作树干净；如源码在测试后改变，重新运行受影响测试。
+   Windows ProductVersion、Docker OCI revision 和 Git tag 均必须绑定此 commit。制品和 `.appship/` 不提交。
+3. **核验凭据/证书**：按下表核对实际证书、有效期、用途和连续性指纹，秘密仅从受保护的本机凭据库、
+   `SecureString` 或受保护进程环境取得；不要在命令行参数、日志、文档、Git、截图或聊天中泄露密码/私钥。
+   缺失、过期或指纹变化时停止，不要重新生成 Android key、换 Windows PFX 或跳过 signer 检查。
+4. **计划、构建、复核**：用 `scripts/Build-Release.ps1 -Plan` 先看精确目标；用 `D:\Dev\Scripts\Ensure-DevEnv.ps1`
+   核验清单中的现有工具；从固定源码构建 Production APK/Setup（如需商店才加 AAB），独立运行
+   `release/Verify-LocalRelease.ps1` 验证 manifest、哈希、版本、证书连续性和 Windows RFC 3161 时间戳。
+   Production MSIX 尚不支持；`Build-Release.ps1 -ServerImage` 只产生本地 OCI tar，不是 Docker Hub 发布命令。
+5. **发布并验证**：Android/Windows 仅通过 `scripts/Publish-AppShipProduction.ps1` 顺序发布；每端必须有
+   已人工审核的签名、`published` release 和 `ready` artifact。Docker 首选经审核的 Git tag 工作流，
+   核对 amd64/arm64、OCI index digest、revision、Cosign 签名及三类 attestation。失败或网络受限时
+   保留原 AppShip 状态/镜像 tag；恢复同一操作，不移动 tag 或以降级结果冒充首选流程。
+6. **部署与回归**：只有用户明确要求部署时，先做 age 加密备份，再以不可变 `tag@sha256:index-digest`
+   无损升级单节点 Server；核对两个健康常驻容器、数据卷、migration、OIDC 和公网 `/readyz`。
+   对客户端做原地覆盖安装与登录、历史/会话/输入全链路验证；AppShip 旧 build 应为 `optional`，
+   新 build 应为 `no_update`。Direct 数据路由默认自动选择并保留 Relay 热备；异常时可在管理页切为
+   Relay-only，真实故障矩阵的结果必须单独记录，不能由单元测试代替。
+7. **留存证据**：写 `docs/RELEASE_<version>_<build>.md`，记录 commit、平台范围、文件 SHA-256、
+   signer、AppShip release/artifact ID、Docker index digest 和证明、部署健康及回滚路径；
+   明确区分“测试通过 / 构建成功 / 上传成功 / 部署验收成功”。
+
+每轮凭据来源与用途（以下指纹是**历史已发布 signer**，不是对当前密钥可用性的替代验证）：
+
+| 用途 | 现有来源与连续性门禁 | 使用规则 |
+| --- | --- | --- |
+| Android APK/AAB | `D:\Dev\Env\Android\keystores\nuanya-release.jks`，alias `nuanya-release`；Credential Manager `TermLink-Android-Keystore`；SHA-256 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b` | 用既有 keystore 和 SecureString；APK 至少 v2、唯一 signer；AAB 校验同一批准指纹。禁止生成新签名密钥或卸载旧 App 规避签名不兼容。 |
+| Windows Setup | `win-agent/secrets/TermLink.Development.CodeSigning.pfx`（本机 Git ignored）或同一证书的 `Cert:\CurrentUser\My` 私钥；SHA-1 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466` | 二选一：PFX+SecureString 或 `-WindowsCertificateThumbprint`；RFC 3161 `http://timestamp.acs.microsoft.com` 须显式 `-AllowHttpWindowsTimestamp`，并验证时间戳。当前是自签名开发证书，只能声明现有更新连续性，不能声称公开 CA 信任；公开 GA 换证须先设计旧客户端信任迁移。 |
+| AppShip | 受保护的 Credential Manager Generic 项 `TermLink-AppShip-release-manager`，地址 `https://appship.kget.cc:8910` | 运行时在内存构造 `PSCredential`，以实际凭据中的用户名/角色为准；不要把凭据 blob、口令放进脚本或输出。 |
+| Docker Hub/Cosign | GitHub Actions `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`（Docker Hub 最小权限 Access Token）；GitHub OIDC | GitHub secret 无法反查明文，遗失需在 Docker Hub 轮换后更新 secret；首选工作流为 keyless Cosign，不需要本地长期 Cosign 私钥。 |
+| 公网 HTTPS | 宿主机/云端外部反向代理管理的域名证书及私钥 | 核对证书链、域名、有效期和自动续期；TLS 私钥不打进 APK、Setup、Docker 镜像或仓库，保留 Host、`X-Forwarded-Proto: https`、WebSocket Upgrade。 |
+| 服务端备份 | 独立 age identity 的 public recipient `age1...` | 只把 recipient 配给 Server；私钥异机离线保管，升级前生成备份并演练恢复，不能复用发布签名或 TLS 私钥。 |
+
+可复用的客户端构建/校验模板（从仓库根执行；仅为示例，版本、在线指纹、证书有效性须当次核实）：
+
+```powershell
+$version = Read-Host 'New three-part version'
+$build = [int](Read-Host 'New build number')
+$androidPassword = Read-Host 'Android keystore password' -AsSecureString
+$windowsPassword = Read-Host 'Windows PFX password' -AsSecureString
+$androidSigner = 'f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b'
+$windowsSigner = '91AE60BC06D866628B8EB2C62F32BDE9DAB56466'
+$env:JAVA_HOME = 'D:\Dev\Env\Jdk\jdk-21'
+$env:ANDROID_HOME = 'D:\Dev\Env\Android\Sdk'
+$env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
+$env:GRADLE_USER_HOME = 'D:\Dev\Env\gradle\user-home'
+
+& .\scripts\Build-Release.ps1 -Version $version -BuildNumber $build `
+  -WindowsSetup -AndroidApk -ReleaseMode Production -Plan
+& .\scripts\Build-Release.ps1 -Version $version -BuildNumber $build `
+  -WindowsSetup -AndroidApk -ReleaseMode Production `
+  -DotNetPath 'D:\Dev\Env\dotnet-sdk-8.0.303\dotnet.exe' `
+  -WindowsCertificatePath '.\win-agent\secrets\TermLink.Development.CodeSigning.pfx' `
+  -WindowsCertificatePassword $windowsPassword `
+  -WindowsTimestampUrl 'http://timestamp.acs.microsoft.com' -AllowHttpWindowsTimestamp `
+  -ExpectedWindowsSignerSha1 $windowsSigner `
+  -AndroidSdkPath 'D:\Dev\Env\Android\Sdk' `
+  -AndroidKeystorePath 'D:\Dev\Env\Android\keystores\nuanya-release.jks' `
+  -AndroidKeystorePassword $androidPassword -AndroidKeyAlias 'nuanya-release' `
+  -ExpectedAndroidSignerSha256 $androidSigner
+& .\release\Verify-LocalRelease.ps1 `
+  -ReleaseDirectory ".\artifacts\release\$version-$build" `
+  -ManifestPath ".\artifacts\release\$version-$build\artifact-manifest.json" `
+  -ExpectedReleaseMode Production -AndroidSdkPath 'D:\Dev\Env\Android\Sdk' `
+  -ExpectedAndroidSignerSha256 $androidSigner `
+  -ExpectedWindowsSignerSha1 $windowsSigner -RequireWindowsTimestamp
+```
+
+若已导入**同一枚**带私钥的 Windows 证书到 `Cert:\CurrentUser\My` 且指纹匹配，构建时改用
+`-WindowsCertificateThumbprint $windowsSigner`，同时去掉 `-WindowsCertificatePath` 和
+`-WindowsCertificatePassword`；不允许混用两种签名来源。Android 和 Windows 分开发布时仅传所选
+构建目标及其签名参数；同一 manifest 同时含 APK/Setup 时 AppShip 两次调用都必须给双端指纹和 Android SDK。
+具体 AppShip 调用和无损部署命令见下文第 5、8 节，详细签名/上传参数见 [统一发布构建](RELEASE.md)。
+
 ## P6-P8 PC 统一发布资格
 
 便携 PC 制品使用 `release/unified-artifact-manifest.schema.json`，AppShip 映射固定在
@@ -25,10 +110,9 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 - 不通过卸载 Android App 解决签名不一致，否则会删除登录、设备身份和 Android Keystore 数据。
 - 不使用旧 `Start-ProductionAcceptance.ps1` 或它的 `-Reset` 路径做版本升级；当前
   `termlink-deploy` 不暴露 reset，禁止用 `docker compose down --volumes` 自行模拟。
-- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。Docker `latest`
-  标签仅作为便捷入口保留（compose 默认引用它），更新 `latest` 必须与对应版本
-  tag 同时推送，并在 `docs/RELEASE_*.md` 发布记录中登记 digest；生产/共享部署
-  一律引用 `TAG@sha256:DIGEST`，不依赖 `latest`。
+- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。当前 `.github/workflows/release.yml`
+  设置 `latest=false`，不会推送 `latest`；生产/共享部署一律引用 `TAG@sha256:DIGEST`，
+  不依赖已有的 `latest` 或本地缓存 tag。
 - 密码、Token、PFX/keystore 密码只能从 Credential Manager、`SecureString` 或受保护的进程环境读取，
   不进入命令参数、日志、manifest 或文档。
 - AppShip 失败时保留 `.appship/` 状态；Docker/AppShip draft 或状态不因失败而删除后重新创建。
@@ -37,16 +121,16 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 
 1. 用 `D:\Dev\Scripts\Ensure-DevEnv.ps1` 检查清单内的 JDK、Android SDK、.NET、Go、Git 等工具，
    使用 `D:\Dev\DEV_ENV_MANIFEST.json` 记录的探测路径，不临时安装到系统目录或用户目录。
-2. 运行改动范围对应的全量测试，再构建 Production APK/Setup 和统一 manifest。
-3. 独立运行 `release/Verify-LocalRelease.ps1`，记录哈希、版本、Android signer、Windows Authenticode 和
-   RFC 3161 时间戳结果。
-4. 只提交、推送源码和文档。确认 `origin/main` 指向计划发布的精确提交；编译产物保持 ignored。
-5. 通过 AppShip 仓库包装器发布 Android 与 Windows，并保留两个幂等状态文件。
-6. 发布并验证 Docker Hub 多架构镜像；记录 OCI index digest，部署时使用 `tag@digest`。
-7. 覆盖升级模拟器和 Windows 本机客户端；禁止为求省事清数据或改变安装根。
-8. 通过单节点部署入口无损升级，验证 `server`、`postgres`、数据库 migration、公网 `/readyz` 和
+2. 运行改动范围对应的全量测试，只提交、推送源码和文档；确认干净的 `HEAD` 与 `origin/main`
+   指向计划发布的精确提交。源码如有后续变动须补测；编译产物保持 ignored。
+3. 从该提交构建 Production APK/Setup 和统一 manifest；独立运行 `release/Verify-LocalRelease.ps1`，
+   记录哈希、版本、Android signer、Windows Authenticode 和 RFC 3161 时间戳结果。
+4. 通过 AppShip 仓库包装器发布 Android 与 Windows，并保留两个幂等状态文件。
+5. 发布并验证 Docker Hub 多架构镜像；记录 OCI index digest，部署时使用 `tag@digest`。
+6. 覆盖升级模拟器和 Windows 本机客户端；禁止为求省事清数据或改变安装根。
+7. 仅在本次要求部署时，通过单节点部署入口无损升级，验证 `server`、`postgres`、数据库 migration、公网 `/readyz` 和
    三个持久卷；`secrets-init` 只是一次性初始化任务，不计入常驻服务。
-9. 调用 AppShip 公开更新 API，验证上一 build 得到 `optional`、当前 build 得到 `no_update`。
+8. 调用 AppShip 公开更新 API，验证上一 build 得到 `optional`、当前 build 得到 `no_update`。
 
 ## 3. Android 发布与模拟器升级
 
@@ -67,6 +151,7 @@ $gradle = 'D:\Dev\Env\gradle\gradle-8.13-clean\bin\gradle.bat'
 
 ```powershell
 & .\release\Verify-LocalRelease.ps1 `
+  -ReleaseDirectory '.\artifacts\release\<version>-<build>' `
   -ManifestPath '.\artifacts\release\<version>-<build>\artifact-manifest.json' `
   -AndroidSdkPath 'D:\Dev\Env\Android\Sdk' `
   -ExpectedAndroidSignerSha256 '<64-hex>' `
@@ -133,31 +218,16 @@ if ($process.ExitCode -ne 0) { throw "TermLink Setup failed: $($process.ExitCode
   新 Tray 正常运行时调用反而永不返回。应使用 `-PassThru` 后调用安装器 `Process.WaitForExit(timeout)`，
   它只等待该 PID。
 
-完成后核对 `.termlink-install.json`、所有 `TermLink*.exe` 的 FileVersion/ProductVersion，并通过保留的
-Legacy 诊断入口读取独立 Agent 状态：
-
-```powershell
-$statusPath = Join-Path $env:TEMP 'termlink-installed-status.json'
-$diagnostic = Start-Process `
-  -FilePath (Join-Path $installRoot 'TermLink.Legacy.exe') `
-  -ArgumentList @('--status-json', $statusPath) `
-  -WindowStyle Hidden -PassThru
-if (-not $diagnostic.WaitForExit(30000)) { throw 'TermLink diagnostic timed out.' }
-if ($diagnostic.ExitCode -ne 0) { throw "TermLink diagnostic failed: $($diagnostic.ExitCode)" }
-$status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
-```
-
-Avalonia 主程序 `TermLink.exe` 不处理 `--status-json`，传入该参数只会打开 UI，不能作为 Agent 验收入口。
-`TermLink.Legacy.exe` 是 Windows GUI 子系统程序，PowerShell 的直接调用可能先于诊断文件落盘返回，因此必须按
-上例等待准确 PID 退出后再读取文件。要求 `$status.Success=true`、`$status.RemoteAccessEnabled=true`、
-`$status.Production.AccountLinked=true`、`$status.Production.RelayState=2`（Connected），且版本中的 revision
-是计划发布提交。
+完成后核对 `.termlink-install.json`、所有 `TermLink*.exe` 的 FileVersion/ProductVersion，并在 Avalonia
+主程序的设备/连接页面确认独立 Agent 已关联账号、远程访问已启用、Relay 已连接。旧
+`TermLink.Legacy.exe --status-json` 入口已随 WinForms 客户端移除，不能再作为验收命令；自动化验收使用
+`WindowsAdapterValidation` 的隔离控制管道，现场验收保留页面截图与 Agent 日志。
 
 ### 4.1 Avalonia Preview 发布
 
 P4 Preview 与正式版是两个独立更新域。构建时向统一发布脚本传
 `-WindowsUpdateChannel preview`，发布时向仓库包装器传 `-Channel preview`。必须核对安装后的
-`TermLink.Legacy.exe --update-config-json <path>` 返回：
+`TermLink.Platform.Windows.dll` 程序集元数据：
 
 ```json
 {
@@ -168,8 +238,8 @@ P4 Preview 与正式版是两个独立更新域。构建时向统一发布脚本
 
 Preview 只能发布到 `termlink-win64-preview/beta`，不得把同一产物上传至 `termlink-win64`。仓库脚本的
 产品轨道参数仍是 `preview`，它会显式映射到 AppShip 唯一支持的非稳定渠道 `beta`；稳定版继续使用
-`termlink-win64/stable`。P4 的一个 Preview 周期内，Avalonia 是 `TermLink.exe`，旧 WinForms 仅作为
-`TermLink.Legacy.exe` 回滚面保留；下一个阶段移除前必须先验证 Preview 更新与回滚统计。
+`termlink-win64/stable`。Avalonia 客户端直接执行 AppShip 检查、固定哈希/签名验证和 Setup 启动，
+不再依赖已移除的 WinForms 回滚面。
 从 0.1.32 等 P3 以前稳定版原地升级时，旧目录没有 `TermLink.Agent.exe` 属于正常布局；P4 安装器通过
 `.termlink-install.json`、`TermLink.exe` 和 `TermLink.SessionHost.exe` 三个归属锚点兼容识别。不能通过手工
 补一个空的 Agent 文件绕过旧安装器，也不能放宽到只看目录名。
@@ -276,7 +346,7 @@ Direct/NAT signalling 均由 `server` 内嵌处理。`secrets-init` 只在启动
 sudo ./server/deploy/single-node-production/termlink-deploy install \
   --domain termlink.example.com \
   --image docker.io/myucxy/termlink:<version>@sha256:<64-hex-index-digest> \
-  --disable-direct-routing
+  --data-dir /opt/termlink
 ```
 
 正式发布的自包含安装器会内嵌不可变镜像，正常安装可省略 `--image`；源码 checkout 仍必须显式提供。
@@ -293,33 +363,30 @@ age recipient 时会先创建加密备份。禁止为了升级执行 `docker com
 `postgres-data`、`postgres-secrets` 或 `server-secrets`。初始管理员密码只显示一次；非交互安装后使用
 `sudo /opt/termlink/termlink-deploy credentials` 领取。
 
-Direct probing/signalling 与 Direct 数据路由是两个门禁。部署文件始终允许前者，但
-`TERMLINK_DIRECT_ROUTING_PERMITTED` 默认且发布时必须保持 `false`。确定性前置测试可以运行：
+Direct probing/signalling 与 Direct 数据路由是两个门禁。部署文件启用前者；后者的权威值位于 PostgreSQL
+`direct_routing_policy`，旧 `TERMLINK_DIRECT_ROUTING_PERMITTED` 环境字段不能作为生效证据。没有保存过
+策略的新部署默认使用“自动选择（直连优先，Relay 热备）”；既有部署中管理员显式选择的 Relay-only
+继续生效。发布前运行确定性故障矩阵：
 
 ```powershell
 pwsh -NoProfile -File .\technical-validation\direct-e2e\Test-DirectFaultMatrix.ps1
 ```
 
-该模型测试不能代替真实网络。只有安装后的 Android、Windows、Server 已完成真实故障矩阵，确认
+该模型测试不能代替真实网络。发布记录必须如实标明真实网络覆盖；应在安装后的 Android、Windows、Server
+上完成真实故障矩阵，确认
 Relay→LAN→Relay、Relay→NAT→Relay、Direct socket/protocol/queue 故障、Relay 暂断、网络切换、锁屏恢复、
-长输出与 resize burst、两台 Android 并行均无重复、无 History Gap、无 Relay generation 非预期变化后，
-才具备启用资格。停止所有旧 Server 实例或确认其 Direct capability 不再刷新后，还必须从最后一次旧
-presence 刷新起等待至少 60 秒，让旧 presence 完全过期；等待期间新栈继续以 Relay-only 运行。两个条件
-缺一不可，不能因为确定性 16/16 通过就提前启用。
+长输出与 resize burst、两台 Android 并行均无重复、无 History Gap、无 Relay generation 非预期变化。
+若真实环境暂未覆盖，不能把模型测试写成实机通过；出现异常时由 `SUPER_ADMIN` 立即切为 Relay-only。
+从仍广告旧 Direct capability 的旧 Server 切换时，停止旧实例后至少等待 60 秒，使旧 presence 过期。
 
 验收构建打开 routing gate 后，Server config、Realtime Welcome、Transport Signalling Welcome 以及
 Android/Windows 两端必须同时包含 `direct_transport_data_v1` 和 `direct_session_cutover_v1`。只出现
 前者属于 legacy data-only 协商，必须验证仍停留在 Relay，不能计为 Direct 验收通过。
 
-全部门禁通过后才执行：
-
-```bash
-sudo /opt/termlink/termlink-deploy config --enable-direct-routing
-sudo /opt/termlink/termlink-deploy doctor
-```
-
-若任一真实场景失败，立即执行 `config --disable-direct-routing`；这只关闭 Direct 数据路由，不应关闭
-Relay、重启 Agent/SessionHost 或终止现有会话。
+在管理中心“连接与路由 → 网络传输策略”核对当前选择。策略权威存储在 PostgreSQL，不再由部署环境变量
+或 `termlink-deploy config --enable-direct-routing` 修改。若任一真实场景失败，立即在同一页面切换为
+“仅服务器中转（Relay Only）”；这只关闭 Direct 数据路由，不应关闭 Relay、重启 Agent/SessionHost
+或终止现有会话。修改后再执行 `sudo /opt/termlink/termlink-deploy doctor` 核对服务健康。
 
 升级后必须独立确认：
 

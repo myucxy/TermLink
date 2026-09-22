@@ -11,6 +11,8 @@ import dev.termlink.terminal.api.TerminalInputModifiers
 import dev.termlink.terminal.api.TerminalHostEffectFrameV2
 import dev.termlink.terminal.api.TerminalHostEffectKindV2
 import dev.termlink.terminal.api.TerminalKey
+import dev.termlink.terminal.api.TerminalKittyFunctionalKey
+import dev.termlink.terminal.api.TerminalKittyKeyEventType
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
 import dev.termlink.terminal.api.TerminalMouseInput
@@ -312,16 +314,28 @@ class NativeTerminalEngine(
         val payloads = ArrayList<ByteArray>()
         synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            text.codePoints().forEach { codePoint ->
-                payloads += when (codePoint) {
-                    '\n'.code, '\r'.code -> terminal.encodeKey(TerminalKey.ENTER)
-                    '\t'.code -> terminal.encodeKey(TerminalKey.TAB)
-                    '\b'.code, 0x7f -> terminal.encodeKey(TerminalKey.BACKSPACE)
-                    0x1b -> terminal.encodeKey(TerminalKey.ESCAPE)
-                    else -> terminal.encodeCommittedText(
-                        String(Character.toChars(codePoint)),
-                    )
-                }
+            val iterator = text.codePoints().iterator()
+            while (iterator.hasNext()) {
+                val codePoint = iterator.nextInt()
+                if (codePoint in 0x80..0x9f) return false
+                val payload = encodeInputOrNull {
+                    when (codePoint) {
+                        '\n'.code, '\r'.code -> terminal.encodeKey(TerminalKey.ENTER)
+                        '\t'.code -> terminal.encodeKey(TerminalKey.TAB)
+                        '\b'.code, 0x7f -> terminal.encodeKey(TerminalKey.BACKSPACE)
+                        0x1b -> terminal.encodeKey(TerminalKey.ESCAPE)
+                        in 0x00..0x1a -> terminal.encodeCharacter(
+                            codePoint = if (codePoint == 0) '@'.code else 'a'.code + codePoint - 1,
+                            modifiers = TerminalInputModifiers(control = true),
+                        )
+                        in 0x1c..0x1f -> terminal.encodeCharacter(
+                            codePoint = "\\]^_"[codePoint - 0x1c].code,
+                            modifiers = TerminalInputModifiers(control = true),
+                        )
+                        else -> terminal.encodeCommittedText(String(Character.toChars(codePoint)))
+                    }
+                } ?: return false
+                payloads += payload
             }
         }
         return emitPayloads(payloads)
@@ -336,7 +350,7 @@ class NativeTerminalEngine(
     ): Boolean {
         val payload = synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            terminal.encodeCharacter(
+            encodeInputOrNull { terminal.encodeCharacter(
                 codePoint = codePoint,
                 modifiers = TerminalInputModifiers(
                     control = controlDown,
@@ -344,7 +358,7 @@ class NativeTerminalEngine(
                     shift = shiftDown,
                 ),
                 shiftedCodePoint = shiftedCodePoint,
-            )
+            ) } ?: return false
         }
         return emitPayloads(listOf(payload))
     }
@@ -362,17 +376,65 @@ class NativeTerminalEngine(
         altDown: Boolean,
         shiftDown: Boolean,
     ): Boolean {
+        return submitPhysicalKeyCode(
+            keyCode = keyCode,
+            controlDown = controlDown,
+            altDown = altDown,
+            shiftDown = shiftDown,
+        )
+    }
+
+    internal fun submitPhysicalKeyCode(
+        keyCode: Int,
+        controlDown: Boolean,
+        altDown: Boolean,
+        shiftDown: Boolean,
+        capsLock: Boolean = false,
+        numLock: Boolean = false,
+        eventType: TerminalKittyKeyEventType = TerminalKittyKeyEventType.PRESS,
+    ): Boolean {
         val key = androidTerminalKey(keyCode) ?: return false
         val payload = synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            terminal.encodeKey(
+            encodeInputOrNull { terminal.encodeFunctionalKey(
                 key,
                 TerminalInputModifiers(
                     control = controlDown,
                     alt = altDown,
                     shift = shiftDown,
+                    capsLock = capsLock,
+                    numLock = numLock,
                 ),
-            )
+                eventType,
+            ) } ?: return false
+        }
+        return emitPayloads(listOf(payload))
+    }
+
+    internal fun submitPhysicalCodePoint(
+        codePoint: Int,
+        controlDown: Boolean,
+        altDown: Boolean,
+        shiftDown: Boolean,
+        capsLock: Boolean,
+        numLock: Boolean,
+        shiftedCodePoint: Int?,
+        eventType: TerminalKittyKeyEventType,
+    ): Boolean {
+        val payload = synchronized(lock) {
+            if (!canAcceptInputLocked()) return false
+            encodeInputOrNull { terminal.encodeCharacter(
+                codePoint = codePoint,
+                modifiers = TerminalInputModifiers(
+                    control = controlDown,
+                    alt = altDown,
+                    shift = shiftDown,
+                    capsLock = capsLock,
+                    numLock = numLock,
+                ),
+                shiftedCodePoint = shiftedCodePoint,
+                eventType = eventType,
+            ) } ?: return false
         }
         return emitPayloads(listOf(payload))
     }
@@ -644,6 +706,16 @@ class NativeTerminalEngine(
 
     private fun canAcceptInputLocked(): Boolean = !disposed && !readOnly && !failedClosed
 
+    private inline fun encodeInputOrNull(block: () -> ByteArray): ByteArray? = try {
+        block()
+    } catch (_: IllegalArgumentException) {
+        null
+    } catch (error: NativeTerminalException) {
+        if (error.status == NativeTerminalStatus.INVALID_ARGUMENT ||
+            error.status == NativeTerminalStatus.UNSUPPORTED
+        ) null else throw error
+    }
+
     private fun checkActive() {
         check(!disposed) { "Terminal engine is disposed" }
     }
@@ -687,23 +759,43 @@ private fun NativeTerminalException.isTemporaryPresentationFailure(): Boolean =
     status == NativeTerminalStatus.SNAPSHOT_NOT_ELIGIBLE ||
         status == NativeTerminalStatus.PRESENTATION_DEFERRED
 
-private fun androidTerminalKey(keyCode: Int): TerminalKey? = when (keyCode) {
-    KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> TerminalKey.ENTER
-    KeyEvent.KEYCODE_TAB -> TerminalKey.TAB
-    KeyEvent.KEYCODE_DEL -> TerminalKey.BACKSPACE
-    KeyEvent.KEYCODE_ESCAPE -> TerminalKey.ESCAPE
-    KeyEvent.KEYCODE_FORWARD_DEL -> TerminalKey.DELETE
-    KeyEvent.KEYCODE_INSERT -> TerminalKey.INSERT
-    KeyEvent.KEYCODE_MOVE_HOME -> TerminalKey.HOME
-    KeyEvent.KEYCODE_MOVE_END -> TerminalKey.END
-    KeyEvent.KEYCODE_PAGE_UP -> TerminalKey.PAGE_UP
-    KeyEvent.KEYCODE_PAGE_DOWN -> TerminalKey.PAGE_DOWN
-    KeyEvent.KEYCODE_DPAD_UP -> TerminalKey.ARROW_UP
-    KeyEvent.KEYCODE_DPAD_DOWN -> TerminalKey.ARROW_DOWN
-    KeyEvent.KEYCODE_DPAD_LEFT -> TerminalKey.ARROW_LEFT
-    KeyEvent.KEYCODE_DPAD_RIGHT -> TerminalKey.ARROW_RIGHT
+private fun androidTerminalKey(keyCode: Int): TerminalKittyFunctionalKey? = when (keyCode) {
+    KeyEvent.KEYCODE_ENTER -> TerminalKittyFunctionalKey.ENTER
+    KeyEvent.KEYCODE_NUMPAD_ENTER -> TerminalKittyFunctionalKey.KEYPAD_ENTER
+    KeyEvent.KEYCODE_TAB -> TerminalKittyFunctionalKey.TAB
+    KeyEvent.KEYCODE_DEL -> TerminalKittyFunctionalKey.BACKSPACE
+    KeyEvent.KEYCODE_ESCAPE -> TerminalKittyFunctionalKey.ESCAPE
+    KeyEvent.KEYCODE_FORWARD_DEL -> TerminalKittyFunctionalKey.DELETE
+    KeyEvent.KEYCODE_INSERT -> TerminalKittyFunctionalKey.INSERT
+    KeyEvent.KEYCODE_MOVE_HOME -> TerminalKittyFunctionalKey.HOME
+    KeyEvent.KEYCODE_MOVE_END -> TerminalKittyFunctionalKey.END
+    KeyEvent.KEYCODE_PAGE_UP -> TerminalKittyFunctionalKey.PAGE_UP
+    KeyEvent.KEYCODE_PAGE_DOWN -> TerminalKittyFunctionalKey.PAGE_DOWN
+    KeyEvent.KEYCODE_DPAD_UP -> TerminalKittyFunctionalKey.ARROW_UP
+    KeyEvent.KEYCODE_DPAD_DOWN -> TerminalKittyFunctionalKey.ARROW_DOWN
+    KeyEvent.KEYCODE_DPAD_LEFT -> TerminalKittyFunctionalKey.ARROW_LEFT
+    KeyEvent.KEYCODE_DPAD_RIGHT -> TerminalKittyFunctionalKey.ARROW_RIGHT
     in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 ->
-        TerminalKey.entries[TerminalKey.F1.ordinal + keyCode - KeyEvent.KEYCODE_F1]
+        TerminalKittyFunctionalKey.entries[
+            TerminalKittyFunctionalKey.F1.ordinal + keyCode - KeyEvent.KEYCODE_F1
+        ]
+    in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 ->
+        TerminalKittyFunctionalKey.entries[
+            TerminalKittyFunctionalKey.KEYPAD_0.ordinal + keyCode - KeyEvent.KEYCODE_NUMPAD_0
+        ]
+    KeyEvent.KEYCODE_NUMPAD_DOT -> TerminalKittyFunctionalKey.KEYPAD_DECIMAL
+    KeyEvent.KEYCODE_NUMPAD_DIVIDE -> TerminalKittyFunctionalKey.KEYPAD_DIVIDE
+    KeyEvent.KEYCODE_NUMPAD_MULTIPLY -> TerminalKittyFunctionalKey.KEYPAD_MULTIPLY
+    KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> TerminalKittyFunctionalKey.KEYPAD_SUBTRACT
+    KeyEvent.KEYCODE_NUMPAD_ADD -> TerminalKittyFunctionalKey.KEYPAD_ADD
+    KeyEvent.KEYCODE_NUMPAD_EQUALS -> TerminalKittyFunctionalKey.KEYPAD_EQUAL
+    KeyEvent.KEYCODE_NUMPAD_COMMA -> TerminalKittyFunctionalKey.KEYPAD_SEPARATOR
+    KeyEvent.KEYCODE_CAPS_LOCK -> TerminalKittyFunctionalKey.CAPS_LOCK
+    KeyEvent.KEYCODE_SCROLL_LOCK -> TerminalKittyFunctionalKey.SCROLL_LOCK
+    KeyEvent.KEYCODE_NUM_LOCK -> TerminalKittyFunctionalKey.NUM_LOCK
+    KeyEvent.KEYCODE_SYSRQ -> TerminalKittyFunctionalKey.PRINT_SCREEN
+    KeyEvent.KEYCODE_BREAK -> TerminalKittyFunctionalKey.PAUSE
+    KeyEvent.KEYCODE_MENU -> TerminalKittyFunctionalKey.MENU
     else -> null
 }
 

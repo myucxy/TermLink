@@ -458,6 +458,26 @@ func TestEnabledConfigAdvertisesProductionDataOnlyWhenExplicitlyPermitted(t *tes
 	}
 }
 
+func TestEnabledConfigUsesOneDynamicRoutingPolicySnapshot(t *testing.T) {
+	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{}}
+	service, err := NewRouteTicketServiceWithRouting(
+		resolver, make([]byte, ed25519.SeedSize), true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	service.SetRoutingPermittedOverride(func() bool {
+		reads++
+		return true
+	})
+
+	config := service.EnabledConfig(nil)
+	if reads != 1 || !config.DirectRoutingPermitted || len(config.Capabilities) != 5 {
+		t.Fatalf("routing reads=%d permitted=%t capabilities=%v", reads, config.DirectRoutingPermitted, config.Capabilities)
+	}
+}
+
 func TestConfigHandlerReturnsConfiguredSTUNAllowlist(t *testing.T) {
 	resolver := &memoryDeviceResolver{devices: map[uuid.UUID]map[uuid.UUID]store.DeviceRecord{}}
 	service, err := NewRouteTicketService(resolver, make([]byte, ed25519.SeedSize), "stun:one.test:3478")

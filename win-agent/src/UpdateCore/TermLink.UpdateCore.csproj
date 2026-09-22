@@ -9,6 +9,10 @@
          production publisher certificate here as UpdatePublisher.cer before
          building; it is embedded into the assembly and becomes the only
          update trust anchor for the deployed agent. -->
-    <EmbeddedResource Include="UpdatePublisher.cer" Condition="Exists('UpdatePublisher.cer')" />
+    <EmbeddedResource Include="UpdatePublisher.cer" Condition="'$(TermLinkUpdatePublisherCertificate)' == '' And Exists('UpdatePublisher.cer')" />
+    <EmbeddedResource Include="$(TermLinkUpdatePublisherCertificate)"
+                      Link="UpdatePublisher.cer"
+                      LogicalName="TermLink.UpdateCore.UpdatePublisher.cer"
+                      Condition="'$(TermLinkUpdatePublisherCertificate)' != '' And Exists('$(TermLinkUpdatePublisherCertificate)')" />
   </ItemGroup>
 </Project>

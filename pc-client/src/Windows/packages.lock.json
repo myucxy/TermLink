@@ -20,6 +20,9 @@
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
+      },
+      "termlink.updatecore": {
+        "type": "Project"
       }
     },
     "net8.0-windows7.0/linux-arm64": {},

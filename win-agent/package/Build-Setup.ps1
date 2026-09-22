@@ -173,8 +173,12 @@ try {
     $setupPublish = Join-Path $workRoot 'setup-publish'
     $dotnetArtifacts = Join-Path $workRoot 'dotnet-artifacts'
     $payloadZip = Join-Path $workRoot 'TermLink.payload.zip'
+    $publisherCertificatePath = Join-Path $workRoot 'TermLink.UpdatePublisher.cer'
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
+        [IO.File]::WriteAllBytes(
+            $publisherCertificatePath,
+            $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
         $null = & (Join-Path $projectRoot 'scripts\Build-TerminalCoreNative.ps1') `
             -CargoPath $CargoPath `
             -OutputDirectory $layout
@@ -208,6 +212,9 @@ try {
                 '-p:DebugSymbols=false',
                 '-p:DebugType=None',
                 '-p:PublishSingleFile=false',
+                "-p:TermLinkUpdateApplicationSlug=$updateApplicationSlug",
+                "-p:TermLinkUpdateChannel=$appShipUpdateChannel",
+                "-p:TermLinkUpdatePublisherCertificate=$publisherCertificatePath",
                 "-p:Version=$Version"
             )
         }
@@ -226,6 +233,7 @@ try {
             '-p:PublishSingleFile=true',
             '-p:IncludeNativeLibrariesForSelfExtract=true',
             '-p:EnableCompressionInSingleFile=true',
+            "-p:TermLinkUpdatePublisherCertificate=$publisherCertificatePath",
             "-p:Version=$Version"
         )
         Copy-Item -LiteralPath (Join-Path $updaterPublish 'TermLink.Updater.exe') `
@@ -303,6 +311,7 @@ try {
             '-p:PublishSingleFile=true',
             '-p:IncludeNativeLibrariesForSelfExtract=true',
             '-p:EnableCompressionInSingleFile=true',
+            "-p:TermLinkUpdatePublisherCertificate=$publisherCertificatePath",
             "-p:Version=$Version",
             "-p:PayloadPath=$payloadZip"
         )

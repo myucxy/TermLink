@@ -61,14 +61,17 @@ TERMLINK_POSTGRES_PASSWORD=URL_SAFE_DATABASE_PASSWORD
 人机验证和账户注销使用的密钥由数据库中的运行时主密钥派生，不需要额外挂载。
 首次部署的注册策略为关闭，管理员可在“注册与邀请码”页面启用公开注册或邀请码注册。
 
-Direct/NAT 信令可以在 Server 内部启用，但实际直连默认关闭：
+Direct/NAT 信令由部署级开关启用；数据路由策略由管理中心和 PostgreSQL
+`direct_routing_policy` 控制。未保存过策略时默认使用“自动选择（直连优先，Relay 热备）”，
+管理员显式选择 Relay-only 后该选择持续生效：
 
 ```text
 TERMLINK_DIRECT_TRANSPORT_ENABLED=true
 TERMLINK_DIRECT_ROUTING_PERMITTED=false
 ```
 
-Relay 始终是主链路和兜底链路。Direct 失败时不会影响 Relay 连接。
+`TERMLINK_DIRECT_ROUTING_PERMITTED` 仅为旧部署资产兼容字段，不再是路由权威。
+Relay 始终先建立并作为热备；Direct 不可用或失败时继续使用 Relay。
 
 在线状态由 Server 进程内 Presence 缓存维护：认证连接注册、WebSocket Pong 刷新，
 45 秒无心跳自动过期；同一设备的多条连接合并为一个在线设备。Realtime 和 NAT

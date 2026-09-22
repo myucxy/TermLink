@@ -6,7 +6,12 @@
     <RootNamespace>TermLink.Agent</RootNamespace>
     <DefineConstants>$(DefineConstants);TERMLINK_PRODUCTION_RUNTIME</DefineConstants>
     <Configurations>Debug;Release;DirectAcceptance</Configurations>
+    <TermLinkDirectDataPlaneEnabled Condition="'$(TermLinkDirectDataPlaneEnabled)' == '' And ('$(Configuration)' == 'Release' Or '$(Configuration)' == 'DirectAcceptance')">true</TermLinkDirectDataPlaneEnabled>
+    <TermLinkDirectDataPlaneEnabled Condition="'$(TermLinkDirectDataPlaneEnabled)' == ''">false</TermLinkDirectDataPlaneEnabled>
     <TermLinkDirectDataPlaneAcceptance Condition="'$(TermLinkDirectDataPlaneAcceptance)' == ''">false</TermLinkDirectDataPlaneAcceptance>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TermLinkDirectDataPlaneEnabled)' == 'true'">
+    <DefineConstants>$(DefineConstants);TERMLINK_DIRECT_DATA_PLANE</DefineConstants>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'DirectAcceptance' And '$(TermLinkDirectDataPlaneAcceptance)' == 'true'">
     <DefineConstants>$(DefineConstants);TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE</DefineConstants>
@@ -14,13 +19,22 @@
     <DebugType>portable</DebugType>
   </PropertyGroup>
   <ItemGroup>
+    <AssemblyMetadata Include="TermLink.DirectDataPlaneEnabled"
+                      Value="$(TermLinkDirectDataPlaneEnabled)" />
     <AssemblyMetadata Include="TermLink.DirectDataPlaneAcceptance"
                       Value="$(TermLinkDirectDataPlaneAcceptance)" />
   </ItemGroup>
   <Target Name="ValidateTermLinkDirectDataPlaneAcceptanceGate" BeforeTargets="CoreCompile">
     <PropertyGroup>
+      <_TermLinkDirectDataPlaneSymbolPresent>$([System.Text.RegularExpressions.Regex]::IsMatch('$(DefineConstants)', '(^|[;,\s])TERMLINK_DIRECT_DATA_PLANE($|[;,\s])'))</_TermLinkDirectDataPlaneSymbolPresent>
       <_TermLinkDirectDataPlaneAcceptanceSymbolPresent>$([System.Text.RegularExpressions.Regex]::IsMatch('$(DefineConstants)', '(^|[;,\s])TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE($|[;,\s])'))</_TermLinkDirectDataPlaneAcceptanceSymbolPresent>
     </PropertyGroup>
+    <Error Condition="'$(TermLinkDirectDataPlaneEnabled)' != 'true' And '$(TermLinkDirectDataPlaneEnabled)' != 'false'"
+           Text="TermLinkDirectDataPlaneEnabled must be exactly true or false." />
+    <Error Condition="'$(TermLinkDirectDataPlaneEnabled)' == 'true' And '$(Configuration)' != 'Release' And '$(Configuration)' != 'DirectAcceptance'"
+           Text="Direct data plane can only be compiled with Configuration=Release or DirectAcceptance." />
+    <Error Condition="'$(_TermLinkDirectDataPlaneSymbolPresent)' == 'True' And '$(TermLinkDirectDataPlaneEnabled)' != 'true'"
+           Text="TERMLINK_DIRECT_DATA_PLANE cannot be injected without the explicit build property." />
     <Error Condition="'$(TermLinkDirectDataPlaneAcceptance)' != 'true' And '$(TermLinkDirectDataPlaneAcceptance)' != 'false'"
            Text="TermLinkDirectDataPlaneAcceptance must be exactly true or false." />
     <Error Condition="'$(TermLinkDirectDataPlaneAcceptance)' == 'true' And '$(Configuration)' != 'DirectAcceptance'"

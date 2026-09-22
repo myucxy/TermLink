@@ -43,9 +43,10 @@ import okhttp3.OkHttpClient
 class ProductContractsTest {
     @Test
     fun directDataPlaneHelloCapabilitiesAreOptionalAndGatedTogether() {
-        assertEquals(emptySet<String>(), productRealtimeOptionalCapabilities(false))
+        assertEquals(setOf("host_history_v1"), productRealtimeOptionalCapabilities(false))
         assertEquals(
             setOf(
+                "host_history_v1",
                 "direct_session_cutover_v1",
                 "direct_transport_data_v1",
             ),
@@ -1307,6 +1308,23 @@ class ProductContractsTest {
         assertTrue((failure as RemoteFileTransferException).retryable)
         assertTrue(failure.message.orEmpty().contains("timed out"))
         assertTrue(failure.message.orEmpty().contains("超时"))
+    }
+
+    @Test
+    fun localFileTransferFailuresAreTerminalButCancellationIsPreserved() = runBlocking {
+        listOf(IOException("disk full"), SecurityException("permission denied")).forEach { source ->
+            val failure = runCatching {
+                localFileTransferStage<Unit> { throw source }
+            }.exceptionOrNull()
+            assertTrue(failure is RemoteFileTransferException)
+            assertFalse((failure as RemoteFileTransferException).retryable)
+            assertTrue(failure.cause === source)
+        }
+
+        val cancellation = CancellationException("cancelled")
+        assertTrue(runCatching {
+            localFileTransferStage<Unit> { throw cancellation }
+        }.exceptionOrNull() === cancellation)
     }
 
     @Test

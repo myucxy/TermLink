@@ -28,6 +28,8 @@ IMAGE=''
 HTTP_PORT=''
 PUBLIC_PORT=''
 BACKUP_RECIPIENT=''
+# Retained only so existing v2 managed config/Compose assets keep validating.
+# The Server does not use this as routing authority; PostgreSQL policy does.
 DIRECT_ROUTING_PERMITTED='false'
 RESTORE_ACTIVE=0
 TEMP_PATHS=()
@@ -90,8 +92,8 @@ Install/config options:
   --http-port PORT           Loopback origin port (default: 8080).
   --public-port PORT         External HTTPS port (default: 443).
   --backup-recipient VALUE   Native age recipient used by backup and upgrade.
-  --enable-direct-routing    Permit negotiated LAN/NAT Direct data routing.
-  --disable-direct-routing   Keep Direct probing available but route via Relay.
+  --enable-direct-routing    Removed; use the SUPER_ADMIN network policy page.
+  --disable-direct-routing   Removed; use the SUPER_ADMIN network policy page.
   --restore FILE             Restore this v4 archive during a fresh install.
   --identity FILE            age identity for --restore.
 
@@ -781,8 +783,7 @@ command_install() {
       --backup-recipient) recipient="${2:-}"; shift 2 ;;
       --restore) restore_input="${2:-}"; shift 2 ;;
       --identity) restore_identity="${2:-}"; shift 2 ;;
-      --enable-direct-routing) direct_routing=true; shift ;;
-      --disable-direct-routing) direct_routing=false; shift ;;
+      --enable-direct-routing|--disable-direct-routing) die 'Direct routing is stored in PostgreSQL; change Network Transport Policy in the SUPER_ADMIN console' ;;
       -h|--help) show_help; return ;;
       *) die "unknown install option: $1" ;;
     esac
@@ -980,8 +981,7 @@ command_config() {
       --public-port) new_public_port="${2:-}"; show_only=false; shift 2 ;;
       --backup-recipient) new_recipient="${2:-}"; show_only=false; shift 2 ;;
       --clear-backup-recipient) new_recipient=''; show_only=false; shift ;;
-      --enable-direct-routing) new_direct_routing=true; show_only=false; shift ;;
-      --disable-direct-routing) new_direct_routing=false; show_only=false; shift ;;
+      --enable-direct-routing|--disable-direct-routing) die 'Direct routing is stored in PostgreSQL; change Network Transport Policy in the SUPER_ADMIN console' ;;
       -h|--help) show_help; return ;;
       *) die "unknown config option: $1" ;;
     esac

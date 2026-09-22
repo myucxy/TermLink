@@ -48,6 +48,8 @@ data class TerminalInputModifiers(
     val alt: Boolean = false,
     val shift: Boolean = false,
     val meta: Boolean = false,
+    val capsLock: Boolean = false,
+    val numLock: Boolean = false,
 )
 
 sealed interface TerminalInput {

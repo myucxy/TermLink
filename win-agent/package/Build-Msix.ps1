@@ -180,7 +180,7 @@ try {
         $directNativeBuild = $directNativeBuild[0]
         $projects = @(
             'src\Agent\TermLink.Agent.csproj',
-            'src\SessionHost\TermLink.SessionHost.csproj',
+            'src\SessionHost\TermLink.SessionHost.csproj'
                     )
         foreach ($project in $projects) {
             Invoke-Tool -FilePath $candidate -Arguments @(

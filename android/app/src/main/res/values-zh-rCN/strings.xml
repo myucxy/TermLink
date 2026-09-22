@@ -124,6 +124,8 @@
     <string name="settings_screen_copy">控制 TermLink 显示在前台时是否允许屏幕自动超时。</string>
     <string name="settings_keep_screen_on">屏幕常亮</string>
     <string name="settings_keep_screen_on_copy">TermLink 位于前台时防止屏幕因超时自动熄灭，仍可手动关屏。</string>
+    <string name="settings_secure_screen">安全屏幕</string>
+    <string name="settings_secure_screen_copy">禁止在截图、最近任务缩略图和屏幕录制中显示终端内容。终端内容属于敏感信息，仅应在调试时临时关闭。</string>
     <string name="settings_terminal_title">终端显示</string>
     <string name="settings_terminal_copy">选择终端字体方案、字号、行间距和颜色。</string>
     <string name="settings_terminal_font_size">首选字体大小 %1$.0fsp</string>

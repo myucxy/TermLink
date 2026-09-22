@@ -308,6 +308,7 @@ namespace TermLink.Agent
         private static readonly TimeSpan MetadataUpsertCadence = TimeSpan.FromMilliseconds(250);
         private static readonly TimeSpan SessionMetadataHeartbeatInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan PCHeartbeatInterval = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan DirectRoutingPolicyRefreshInterval = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan RealtimeHandshakeTimeout = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan RealtimeSendTimeout = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan HostHistoryChunkAckTimeout = TimeSpan.FromSeconds(15);
@@ -320,11 +321,10 @@ namespace TermLink.Agent
         private const string TerminalCoreShadowEnvironment = "TERMLINK_ENABLE_TERMINAL_CORE_SHADOW";
         private const string DirectTransportShadowEnvironment =
             "TERMLINK_ENABLE_DIRECT_TRANSPORT_SHADOW";
-        // The production Direct data plane remains build-gated until the real
-        // cross-device matrix passes. Only the isolated DirectAcceptance build
-        // configuration defines this symbol; no runtime environment variable
-        // can enable or disable the data plane after compilation.
-#if TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE
+        // Release and isolated DirectAcceptance builds contain the data plane.
+        // Server capability and the portal-owned routing policy remain the
+        // runtime authority; no process environment variable can bypass them.
+#if TERMLINK_DIRECT_DATA_PLANE
         internal const bool DirectTransportDataPlaneBuildEnabled = true;
 #else
         internal const bool DirectTransportDataPlaneBuildEnabled = false;
@@ -505,6 +505,7 @@ namespace TermLink.Agent
         private int directAuthorityTransitioning;
         private readonly SemaphoreSlim statusRefreshGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim tokenRefreshGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim directConfigRefreshGate = new SemaphoreSlim(1, 1);
         private readonly object persistedHistoryCancellationSync = new object();
         private readonly ConcurrentDictionary<Guid, LeaseStatus> leaseStatuses = new ConcurrentDictionary<Guid, LeaseStatus>();
         // Direct input authorization is sender-bound. Keep it separate from
@@ -557,6 +558,7 @@ namespace TermLink.Agent
         private Task priorityHistoryWorker;
         private Task metadataWorker;
         private Task commonIngressWorker;
+        private Task directRoutingPolicyWorker;
         private ClientWebSocket socket;
         private ProductionHistoryUploader historyUploader;
         private ProductionFileOperationWorker fileOperationWorker;
@@ -986,6 +988,8 @@ namespace TermLink.Agent
                 NetworkChange.NetworkAddressChanged += networkAddressHandler;
                 worker = Task.Run(RunAsync);
                 StartDirectRuntimesSafely();
+                if (DirectTransportDataPlaneBuildEnabled && directSignaling != null)
+                    directRoutingPolicyWorker = Task.Run(DirectRoutingPolicyLoopAsync);
 #if TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE
                 directAcceptanceDiagnostics?.Start();
 #endif
@@ -1177,21 +1181,51 @@ namespace TermLink.Agent
             catch (Exception error) when (error is not OutOfMemoryException) { }
         }
 
+        private async Task DirectRoutingPolicyLoopAsync()
+        {
+            while (!cancellation.IsCancellationRequested)
+            {
+                await Task.Delay(DirectRoutingPolicyRefreshInterval, cancellation.Token)
+                    .ConfigureAwait(false);
+                var snapshot = directSignaling?.Snapshot;
+                if (snapshot?.State == ProductionDirectSignalingLaneState.Connected)
+                    await RefreshDirectServerConfigAsync(snapshot.Generation, cancellation.Token)
+                        .ConfigureAwait(false);
+            }
+        }
+
         private async Task RefreshDirectServerConfigAsync(
             long signalingGeneration,
             CancellationToken token)
         {
             if (directSignaling == null || signalingGeneration < 1) return;
+            var gateEntered = false;
             try
             {
+                await directConfigRefreshGate.WaitAsync(token).ConfigureAwait(false);
+                gateEntered = true;
                 var result = await directSignaling.FetchConfigAsync(token).ConfigureAwait(false);
                 if (result.Status != ProductionDirectSignalingCallStatus.Success ||
                     result.Value == null || directSignaling.Snapshot.Generation != signalingGeneration)
+                {
+                    directDataAdmission.ObserveServerConfigUnavailable();
                     return;
+                }
                 directDataAdmission.ObserveServerConfig(result.Value);
+                if (!result.Value.DirectRoutingPermitted)
+                    await RetireDirectAuthorityPeersAsync(
+                        SnapshotActiveDirectPeerIds(),
+                        "DIRECT_ROUTING_DISABLED").ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-            catch (Exception error) when (error is not OutOfMemoryException) { }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                directDataAdmission.ObserveServerConfigUnavailable();
+            }
+            finally
+            {
+                if (gateEntered) directConfigRefreshGate.Release();
+            }
         }
 
         private async Task<bool> PromoteDirectPeerAsync(
@@ -2748,6 +2782,17 @@ namespace TermLink.Agent
             }
             foreach (var peer in relayExactOutbox.Snapshot())
                 if (peer.PeerDeviceId != Guid.Empty) peers.Add(peer.PeerDeviceId);
+            return peers;
+        }
+
+        private HashSet<Guid> SnapshotActiveDirectPeerIds()
+        {
+            var peers = new HashSet<Guid>();
+            foreach (var route in directPeerRoutes.Snapshot())
+                if (route.AndroidDeviceId != Guid.Empty) peers.Add(route.AndroidDeviceId);
+            if (directDataRuntime != null)
+                foreach (var peer in directDataRuntime.Snapshot())
+                    if (peer.PeerDeviceId != Guid.Empty) peers.Add(peer.PeerDeviceId);
             return peers;
         }
 
@@ -8361,6 +8406,7 @@ namespace TermLink.Agent
             Task activePriorityHistoryWorker;
             Task activeMetadataWorker;
             Task activeCommonIngressWorker;
+            Task activeDirectRoutingPolicyWorker;
             Task activeStatusRefresh;
             Task activeDirectShadowCleanup;
             lock (lifecycleSync)
@@ -8370,6 +8416,7 @@ namespace TermLink.Agent
                 activePriorityHistoryWorker = priorityHistoryWorker;
                 activeMetadataWorker = metadataWorker;
                 activeCommonIngressWorker = commonIngressWorker;
+                activeDirectRoutingPolicyWorker = directRoutingPolicyWorker;
                 activeStatusRefresh = statusRefreshWorker;
                 activeDirectShadowCleanup = directShadowCleanupTask;
             }
@@ -8404,6 +8451,13 @@ namespace TermLink.Agent
             if (activeCommonIngressWorker != null)
             {
                 try { activeCommonIngressWorker.GetAwaiter().GetResult(); }
+                catch (AggregateException) { }
+                catch (OperationCanceledException) { }
+                catch (ObjectDisposedException) { }
+            }
+            if (activeDirectRoutingPolicyWorker != null)
+            {
+                try { activeDirectRoutingPolicyWorker.GetAwaiter().GetResult(); }
                 catch (AggregateException) { }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
@@ -8483,6 +8537,7 @@ namespace TermLink.Agent
             authorizedRecipientGate.Dispose();
             statusRefreshGate.Dispose();
             tokenRefreshGate.Dispose();
+            directConfigRefreshGate.Dispose();
             hostHistoryResponseGate.Dispose();
             directPeerRoutes.Dispose();
             connectionSupervisor.Dispose();

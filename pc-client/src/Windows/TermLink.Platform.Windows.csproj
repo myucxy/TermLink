@@ -3,7 +3,13 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>TermLink.Platform.Windows</AssemblyName>
     <RootNamespace>TermLink.Platform.Windows</RootNamespace>
+    <TermLinkUpdateApplicationSlug Condition="'$(TermLinkUpdateApplicationSlug)' == ''">termlink-win64</TermLinkUpdateApplicationSlug>
+    <TermLinkUpdateChannel Condition="'$(TermLinkUpdateChannel)' == ''">stable</TermLinkUpdateChannel>
   </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="TermLinkUpdateApplicationSlug" Value="$(TermLinkUpdateApplicationSlug)" />
+    <AssemblyMetadata Include="TermLinkUpdateChannel" Value="$(TermLinkUpdateChannel)" />
+  </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\..\win-agent\src\Common\WindowsTerminalIntegration.cs"
              Link="Common\WindowsTerminalIntegration.cs" />
@@ -12,6 +18,7 @@
     <ProjectReference Include="..\Presentation\TermLink.Presentation.csproj" />
     <ProjectReference Include="..\..\..\win-agent\src\AgentControl\TermLink.AgentControl.csproj"
                       AdditionalProperties="Configuration=$(Configuration)" />
+    <ProjectReference Include="..\..\..\win-agent\src\UpdateCore\TermLink.UpdateCore.csproj" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="TermLink.Platform.Windows.Validation" />

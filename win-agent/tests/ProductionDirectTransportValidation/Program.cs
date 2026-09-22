@@ -23,7 +23,7 @@ namespace TermLink.ProductionDirectTransport.Validation
     internal static class Program
     {
         private const uint StunMagicCookie = 0x2112A442;
-        private static bool expectDirectDataPlaneAcceptance;
+        private static bool expectDirectDataPlaneEnabled;
 
         private static async Task<int> Main(string[] args)
         {
@@ -41,10 +41,11 @@ namespace TermLink.ProductionDirectTransport.Validation
                     throw new ArgumentException(
                         "Unsupported validation argument: " + unsupportedArguments[0]);
                 }
-                expectDirectDataPlaneAcceptance = args.Any(value => string.Equals(
-                    value,
-                    "--expect-direct-data-plane-acceptance",
-                    StringComparison.Ordinal));
+#if TERMLINK_DIRECT_DATA_PLANE
+                expectDirectDataPlaneEnabled = true;
+#else
+                expectDirectDataPlaneEnabled = false;
+#endif
                 ValidateRelayFallbackAndFoundationBoundary();
                 ValidateFeatureAdvertisementDefaultsOff();
                 ValidateRealtimeCapabilityNegotiation();
@@ -141,7 +142,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             {
                 Environment.SetEnvironmentVariable(runtimeDataPlaneFlag, "true");
                 Require(ProductionAgentRuntime.DirectTransportDataPlaneBuildEnabled ==
-                        expectDirectDataPlaneAcceptance,
+                        expectDirectDataPlaneEnabled,
                     "A runtime environment variable changed the compile-time Direct data-plane gate.");
             }
             finally
@@ -168,8 +169,8 @@ namespace TermLink.ProductionDirectTransport.Validation
                     value?.Contains("direct", StringComparison.OrdinalIgnoreCase) == true),
                 "A Direct transport capability leaked into the Relay HELLO.");
             Require(ProductionAgentRuntime.DirectTransportDataPlaneBuildEnabled ==
-                    expectDirectDataPlaneAcceptance,
-                "The compiled Direct data-plane acceptance gate did not match the explicit test expectation.");
+                    expectDirectDataPlaneEnabled,
+                "The compiled Direct data-plane gate did not match the build configuration.");
 
             using var directHello = JsonDocument.Parse(
                 ProductionAgentRuntime.BuildHelloPayloadWithFeatures(
@@ -407,6 +408,13 @@ namespace TermLink.ProductionDirectTransport.Validation
                 directRoutingPermitted: false));
             Require(!gate.TryCapture(out _) && !gate.IsCurrent(third),
                 "Withdrawing the server routing gate retained Direct authorization.");
+
+            gate.ObserveServerConfig(config);
+            Require(gate.TryCapture(out var fourth) && gate.IsCurrent(fourth),
+                "Restoring the server routing gate did not restore admission.");
+            gate.ObserveServerConfigUnavailable();
+            Require(!gate.TryCapture(out _) && !gate.IsCurrent(fourth),
+                "An unavailable server policy retained Direct authorization.");
 
             var dataOnlyConfig = new ProductionDirectTransportServerConfig(
                 1,

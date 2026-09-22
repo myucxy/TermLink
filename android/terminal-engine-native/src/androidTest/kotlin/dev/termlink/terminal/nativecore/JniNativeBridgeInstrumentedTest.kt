@@ -30,6 +30,9 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.withTimeoutOrNull
 
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
@@ -124,25 +127,54 @@ class JniNativeBridgeInstrumentedTest {
     }
 
     @Test
-    fun nativeViewInputConnectionOwnsNonRecursiveEditableBuffer() {
+    fun nativeViewInputConnectionFlushesCompositionAndDeletesBothDirections() = kotlinx.coroutines.runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val engine = NativeTerminalEngine(TerminalSize(20, 2))
         lateinit var connection: BaseInputConnection
-        instrumentation.runOnMainSync {
-            val view = NativeTerminalView(
-                context = instrumentation.targetContext,
-                engine = null,
-                textSizeSp = 14f,
-                lineSpacingMultiplier = 1f,
-            )
-            connection = view.onCreateInputConnection(EditorInfo()) as BaseInputConnection
-        }
+        try {
+            engine.setReadOnly(false)
+            instrumentation.runOnMainSync {
+                val view = NativeTerminalView(
+                    context = instrumentation.targetContext,
+                    engine = engine,
+                    textSizeSp = 14f,
+                    lineSpacingMultiplier = 1f,
+                )
+                connection = view.onCreateInputConnection(EditorInfo()) as BaseInputConnection
+            }
 
-        val editable = connection.editable
-        assertNotNull(editable)
-        assertTrue(connection.setComposingText("draft", 1))
-        assertEquals("draft", editable.toString())
-        assertTrue(connection.finishComposingText())
-        assertEquals("", editable.toString())
+            val composing = async(start = CoroutineStart.UNDISPATCHED) { engine.inputEvents.take(5).toList() }
+            val editable = connection.editable
+            assertNotNull(editable)
+            instrumentation.runOnMainSync {
+                assertTrue(connection.setComposingText("draft", 1))
+                assertEquals("draft", editable.toString())
+                assertTrue(connection.finishComposingText())
+                assertEquals("", editable.toString())
+            }
+            val committed = withTimeoutOrNull(5_000) { composing.await() }
+            assertNotNull("finishComposingText must submit the committed text", committed)
+            assertArrayEquals("draft".encodeToByteArray(), committed!!.flatMap(ByteArray::toList).toByteArray())
+
+            val deletes = async(start = CoroutineStart.UNDISPATCHED) {
+                engine.inputEvents.take(3).toList()
+            }
+            instrumentation.runOnMainSync { assertTrue(connection.deleteSurroundingText(2, 1)) }
+            val deleted = withTimeoutOrNull(5_000) { deletes.await() }
+            assertNotNull("deleteSurroundingText must submit two backspaces and one forward delete", deleted)
+            assertEquals(
+                listOf(byteArrayOf(0x7f), byteArrayOf(0x7f), "\u001b[3~".encodeToByteArray())
+                    .map(ByteArray::toList),
+                deleted!!.map(ByteArray::toList),
+            )
+
+            val unexpected = async(start = CoroutineStart.UNDISPATCHED) { engine.inputEvents.first() }
+            instrumentation.runOnMainSync { assertTrue(connection.deleteSurroundingText(0, 0)) }
+            assertFalse(unexpected.isCompleted)
+            unexpected.cancelAndJoin()
+        } finally {
+            engine.dispose()
+        }
     }
 
     @Test

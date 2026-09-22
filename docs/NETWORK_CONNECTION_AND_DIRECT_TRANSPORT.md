@@ -22,19 +22,17 @@ Flow Control、Gap 或 Snapshot 规则。terminal-core/渲染器错误属于单�
 
 - 服务端只有显式设置 `TERMLINK_DIRECT_TRANSPORT_ENABLED=true` 才注册 transport config、ticket
   和 signalling 路由；未设置或为 `false` 时不广告能力。
-- Android Release 的 `TERMLINK_DIRECT_TRANSPORT_SHADOW` 固定为 `false`；只有本地 Debug 构建可用
-  `-PtermlinkEnableDirectTransportShadow=true` 做不切流的验证。
-- Windows signalling 和 native network-core 也必须由独立、默认关闭的运行时门禁创建。仅仅成功加载
+- Android/Windows Release 均包含 Direct 数据面，但只有服务端 transport capability 与管理页
+  “自动选择（直连优先，Relay 热备）”策略同时允许时才切流；Relay-only 会阻止新票据并退休旧路径。
+- Windows signalling 和 native network-core 仍由服务端能力与策略门禁创建。仅仅成功加载
   DLL、拿到 ticket、收到 candidate 或完成 UDP probe，都不得改变 Relay 路由。
 - 生产开关必须支持服务端紧急关闭。客户端观察到配置撤回、未知能力、票据失败或连续三次直连失败时，
   同步回到 `RELAY_ONLY`，而不是继续使用缓存的授权。
 
-当前落地状态是 **shadow foundation**：设备级 Relay supervisor、独立 signalling、票据、host/STUN
-candidate、认证 UDP probe、同 socket QUIC/TLS exporter、bounded FFI、terminal-core/renderer 故障隔离，
-以及多副本 signalling presence/route state 的独立 Valkey 共享背板已经有实现与自动测试。共享背板故障
-采用 fail-closed，仅关闭 Direct 能力，不能阻止 Relay 服务启动。应用数据切流、双向 barrier/receipt、
-Android/Windows 产品运行时完整接线和真实跨 NAT 矩阵仍是生产启用门禁，当前不得把功能描述为
-“已启用直连”。
+当前落地状态包含设备级 Relay supervisor、独立 signalling、票据、host/STUN candidate、认证 UDP
+probe、同 socket QUIC/TLS exporter、bounded FFI、双向 barrier/receipt、两端产品运行时接线，以及
+terminal-core/renderer 故障隔离。共享背板或 Direct 路径故障只关闭 Direct 能力，不能阻止 Relay
+服务启动。真实跨 NAT 矩阵仍是发布后的持续验收项，不能用自动化模型替代实机证据。
 
 Realtime WSS generation 只有在真实 socket connect/read/write/close 或已认证心跳探测失败时才
 允许替换。不可解析 protobuf、错误 Envelope 元数据/密文、单会话队列溢出、History/Snapshot

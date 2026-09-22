@@ -528,7 +528,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                 .GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>()
                 .SingleOrDefault(value => string.Equals(
                     value.Key,
-                    "TermLink.DirectDataPlaneAcceptance",
+                    "TermLink.DirectDataPlaneEnabled",
                     StringComparison.Ordinal));
             Require(metadata != null &&
                     bool.TryParse(metadata.Value, out var compiledAcceptance) &&
@@ -555,6 +555,13 @@ namespace TermLink.ProductionDirectTransport.Validation
                     "directShadowRuntime",
                     BindingFlags.Instance | BindingFlags.NonPublic) != null,
                 "ProductionAgentRuntime is missing its long-lived Relay/shared-signalling owners.");
+            Require(typeof(ProductionAgentRuntime).GetMethod(
+                    "DirectRoutingPolicyLoopAsync",
+                    BindingFlags.Instance | BindingFlags.NonPublic) != null &&
+                typeof(ProductionAgentRuntime).GetMethod(
+                    "SnapshotActiveDirectPeerIds",
+                    BindingFlags.Instance | BindingFlags.NonPublic) != null,
+                "Windows Direct routing policy is missing periodic refresh or bounded retirement.");
         }
 
         private static ProductionDirectDataIngressMetadata ParseMetadata(byte[] exact)

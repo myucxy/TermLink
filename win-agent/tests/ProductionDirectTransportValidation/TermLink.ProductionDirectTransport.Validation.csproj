@@ -4,6 +4,11 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>TermLink.ProductionDirectTransport.Validation</AssemblyName>
     <RootNamespace>TermLink.ProductionDirectTransport.Validation</RootNamespace>
+    <TermLinkDirectDataPlaneEnabled Condition="'$(TermLinkDirectDataPlaneEnabled)' == '' And ('$(Configuration)' == 'Release' Or '$(Configuration)' == 'DirectAcceptance')">true</TermLinkDirectDataPlaneEnabled>
+    <TermLinkDirectDataPlaneEnabled Condition="'$(TermLinkDirectDataPlaneEnabled)' == ''">false</TermLinkDirectDataPlaneEnabled>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TermLinkDirectDataPlaneEnabled)' == 'true'">
+    <DefineConstants>$(DefineConstants);TERMLINK_DIRECT_DATA_PLANE</DefineConstants>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'DirectAcceptance' And '$(TermLinkDirectDataPlaneAcceptance)' == 'true'">
     <DefineConstants>$(DefineConstants);TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE</DefineConstants>

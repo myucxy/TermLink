@@ -80,14 +80,14 @@
         </table></div>
         {{if .TransportRoutingConfigured}}{{if eq .Role "SUPER_ADMIN"}}
         <div class="admin-panel" style="margin-top:16px">
-          <div class="panel-heading"><div><p class="eyebrow">DIRECT TRANSPORT</p><h2>直连数据面路由</h2><p>开启后，已认证的 PC 与 Android 设备在 NAT 直连成功时直接承载数据流；关闭后全部流量回到 Relay（已建立的直连在下一票据到期时退出）。变更立即生效，无需重启。</p></div></div>
-          <p>当前状态：<span class="state-pill state-{{if .TransportRoutingPermitted}}TRUSTED{{else}}PENDING{{end}}">{{if .TransportRoutingPermitted}}已开启直连路由{{else}}仅 Relay 转发{{end}}</span></p>
+          <div class="panel-heading"><div><p class="eyebrow">DIRECT TRANSPORT</p><h2>网络传输策略</h2><p>自动模式让新连接或重连后的设备先用 Relay 建立稳定会话，再后台尝试直连；直连不可用或发生故障时继续使用 Relay。仅中转模式禁止新直连，并让已建立的直连在客户端检测后有界回退，无需重启。</p></div></div>
+          <p>当前状态：<span class="state-pill state-{{if .TransportRoutingPermitted}}TRUSTED{{else}}PENDING{{end}}">{{if .TransportRoutingPermitted}}自动选择（直连优先，Relay 热备）{{else}}仅服务器中转（Relay Only）{{end}}</span></p>
           <form method="post" action="{{.AdminBasePath}}/transport/routing">
             <input type="hidden" name="csrf" value="{{.CSRF}}">
             <input type="hidden" name="idempotency_key" value="{{actionKey .ActionNonce (printf "transport-routing:%t" .TransportRoutingPermitted)}}">
             <input type="hidden" name="reason" value="系统自动记录">
             <input type="hidden" name="routing_permitted" value="{{if .TransportRoutingPermitted}}false{{else}}true{{end}}">
-            <button class="button" type="submit">{{if .TransportRoutingPermitted}}关闭直连路由{{else}}开启直连路由{{end}}</button>
+            <button class="button" type="submit">{{if .TransportRoutingPermitted}}切换为仅服务器中转{{else}}切换为自动选择{{end}}</button>
           </form>
         </div>
         {{end}}{{end}}

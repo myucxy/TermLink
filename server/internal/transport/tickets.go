@@ -266,12 +266,13 @@ func (s *RouteTicketService) configHTTP(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *RouteTicketService) EnabledConfig(stunServers []string) EnabledDeviceConfig {
+	routingPermitted := s.routingPermittedNow()
 	capabilities := []string{
 		"direct_signaling_v1",
 		"direct_transport_shadow_v1",
 		"direct_transport_shadow_multipair_v2",
 	}
-	if s.routingPermittedNow() {
+	if routingPermitted {
 		capabilities = append(
 			capabilities,
 			"direct_transport_data_v1",
@@ -281,7 +282,7 @@ func (s *RouteTicketService) EnabledConfig(stunServers []string) EnabledDeviceCo
 	return EnabledDeviceConfig{
 		ProtocolVersion:        1,
 		Capabilities:           capabilities,
-		DirectRoutingPermitted: s.routingPermittedNow(),
+		DirectRoutingPermitted: routingPermitted,
 		TicketSigningKeys: []TicketSigningKey{{
 			KeyID: string(s.keyID), Algorithm: "Ed25519", PublicKey: base64.RawURLEncoding.EncodeToString(s.public),
 		}},
@@ -715,8 +716,13 @@ func appendBytesField(dst []byte, number protowire.Number, value []byte) []byte 
 // advances the path epoch and never changes the connection identity; shared
 // (multi-replica) state stores do not support renewal yet, so those
 // deployments answer with ErrDirectStateUnavailable and clients keep the
-// legacy reissue behavior.
+// legacy reissue behavior. A withdrawn routing policy denies renewal so a
+// stale client cannot keep a Direct path alive after the server switches to
+// Relay-only mode.
 func (s *RouteTicketService) Renew(ctx context.Context, principal auth.Principal, targetID, connectionID uuid.UUID, proof []byte) ([]byte, error) {
+	if !s.routingPermittedNow() {
+		return nil, ErrTransportDenied
+	}
 	if s.state != nil {
 		return nil, ErrDirectStateUnavailable
 	}

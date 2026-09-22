@@ -747,7 +747,8 @@
           "TermLink.AgentControl": "[1.0.0, )",
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )",
-          "TermLink.Presentation": "[1.0.0, )"
+          "TermLink.Presentation": "[1.0.0, )",
+          "TermLink.UpdateCore": "[1.0.0, )"
         }
       },
       "termlink.presentation": {
@@ -756,6 +757,9 @@
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
+      },
+      "termlink.updatecore": {
+        "type": "Project"
       }
     },
     "net8.0-windows7.0/linux-arm64": {

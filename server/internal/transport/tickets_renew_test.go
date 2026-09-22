@@ -36,6 +36,7 @@ func TestRenewExtendsSameConnectionAndEpoch(t *testing.T) {
 	key := connectionKey{accountID: account, connection: connection}
 	beforeExpiry := service.connections[key].expiresAt
 	beforeEpoch := service.connections[key].pathEpoch
+	service.clock = func() time.Time { return beforeExpiry.Add(-ticketTTL + time.Second) }
 
 	androidPrincipal := testPrincipal(account, android, "ANDROID")
 	if _, perr := parseSignedTicket(original, service.public, service.keyID); perr != nil {
@@ -108,5 +109,23 @@ func TestRenewRateLimitsPerConnection(t *testing.T) {
 	}
 	if _, err := service.Renew(context.Background(), androidPrincipal, pc, connection, original); err != ErrTransportRateLimited {
 		t.Fatalf("third renewal err=%v, want rate limited", err)
+	}
+}
+
+func TestRenewRejectsAfterRoutingPolicyIsDisabled(t *testing.T) {
+	account, pc, android := uuid.New(), uuid.New(), uuid.New()
+	service := newRenewTestService(t, account, pc, android)
+	pcPrincipal := testPrincipal(account, pc, "PC_AGENT")
+	connection := uuid.New()
+	original, err := service.Issue(context.Background(), pcPrincipal, android, connection)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	permitted := false
+	service.SetRoutingPermittedOverride(func() bool { return permitted })
+
+	androidPrincipal := testPrincipal(account, android, "ANDROID")
+	if _, err := service.Renew(context.Background(), androidPrincipal, pc, connection, original); err != ErrTransportDenied {
+		t.Fatalf("renew after routing disabled err=%v, want ErrTransportDenied", err)
 	}
 }

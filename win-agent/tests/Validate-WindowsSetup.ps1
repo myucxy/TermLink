@@ -153,7 +153,6 @@ try {
         'TermLink.Agent.exe',
         'TermLink.SessionHost.exe',
         'TermLink.exe',
-        'TermLink.Legacy.exe',
         'TermLink.Updater.exe',
         'TermLink.Agent.dll',
         'TermLink.TerminalCore.dll',
@@ -170,7 +169,6 @@ try {
     $expectedProductExecutables = @(
         'TermLink.Agent.exe',
         'TermLink.exe',
-        'TermLink.Legacy.exe',
         'TermLink.SessionHost.exe',
         'TermLink.Updater.exe'
     )
@@ -209,15 +207,22 @@ try {
     $trayAssemblyVersion = [Reflection.AssemblyName]::GetAssemblyName($trayAssemblyPath).Version.ToString()
     Assert-True ([string]::Equals($trayAssemblyVersion, $Version, [StringComparison]::Ordinal)) `
         "Installed Tray assembly version is '$trayAssemblyVersion', expected '$Version'."
-    $updateConfigPath = Join-Path $workRoot 'update-config.json'
-    Invoke-Setup -SetupPath (Join-Path $installRoot 'TermLink.Legacy.exe') -Arguments @(
-        '--update-config-json', $updateConfigPath)
-    $updateConfig = Get-Content -LiteralPath $updateConfigPath -Raw | ConvertFrom-Json
     $expectedUpdateSlug = if ($UpdateChannel -eq 'preview') { 'termlink-win64-preview' } else { 'termlink-win64' }
     $expectedAppShipChannel = if ($UpdateChannel -eq 'preview') { 'beta' } else { 'stable' }
-    Assert-True ([string]$updateConfig.application_slug -ceq $expectedUpdateSlug -and
-        [string]$updateConfig.channel -ceq $expectedAppShipChannel) `
-        'The installed rollback/update surface is not bound to the requested AppShip application and channel.'
+    $adapterAssembly = [Reflection.Assembly]::Load(
+        [IO.File]::ReadAllBytes((Join-Path $installRoot 'TermLink.Platform.Windows.dll')))
+    $adapterMetadata = @{}
+    foreach ($attribute in $adapterAssembly.GetCustomAttributes([Reflection.AssemblyMetadataAttribute], $false)) {
+        $adapterMetadata[$attribute.Key] = $attribute.Value
+    }
+    Assert-True ([string]$adapterMetadata.TermLinkUpdateApplicationSlug -ceq $expectedUpdateSlug -and
+        [string]$adapterMetadata.TermLinkUpdateChannel -ceq $expectedAppShipChannel) `
+        'The installed Avalonia update client is not bound to the requested AppShip application and channel.'
+    $updateCore = [Reflection.Assembly]::Load(
+        [IO.File]::ReadAllBytes((Join-Path $installRoot 'TermLink.UpdateCore.dll')))
+    Assert-True (@($updateCore.GetManifestResourceNames() | Where-Object {
+        $_ -ceq 'TermLink.UpdateCore.UpdatePublisher.cer'
+    }).Count -eq 1) 'The installed update client does not embed its publisher trust anchor.'
 
     Assert-True (Test-Path -LiteralPath $fragmentPath -PathType Leaf) `
         'The setup did not create the Windows Terminal fragment.'

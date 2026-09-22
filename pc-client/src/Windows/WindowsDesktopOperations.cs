@@ -1,7 +1,12 @@
 using System.Diagnostics;
+using System.Net;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using TermLink.Presentation;
+using TermLink.UpdateCore;
 using TermLink.WindowsIntegration;
 
 namespace TermLink.Platform.Windows;
@@ -14,6 +19,11 @@ namespace TermLink.Platform.Windows;
 public sealed class WindowsDesktopOperations : IDesktopOperations
 {
     private const long MaximumUpdateResultBytes = 64 * 1024;
+    private const long MaximumUpdateResponseBytes = 256 * 1024;
+    private const long MaximumUpdateArtifactBytes = 2L * 1024 * 1024 * 1024;
+    private const string PublicAppShipBaseUrl = "https://appship.kget.cc:8910";
+    private static readonly HttpClient UpdateClient = new(
+        new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromMinutes(30) };
     private readonly string installationRoot;
     private readonly string localApplicationData;
 
@@ -34,68 +44,234 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var rollbackUi = Path.Combine(installationRoot, "TermLink.Legacy.exe");
-        if (!File.Exists(rollbackUi))
-        {
-            throw new FileNotFoundException(
-                "Preview 更新组件尚未安装；请使用完整的 TermLink Preview 安装包。",
-                rollbackUi);
-        }
+        var update = await FetchUpdateAsync(cancellationToken).ConfigureAwait(false);
+        var status = update.Status;
+        if (!interactive || update.DownloadUrl is null ||
+            status.Decision is not (DesktopUpdateDecision.Optional or DesktopUpdateDecision.Required))
+            return status;
 
-        var resultDirectory = Path.Combine(localApplicationData, "TermLink", "UpdateChecks");
-        Directory.CreateDirectory(resultDirectory);
-        var resultPath = Path.Combine(resultDirectory, $"desktop-{Guid.NewGuid():N}.json");
-        var start = new ProcessStartInfo
+        var choice = MessageBox(
+            IntPtr.Zero,
+            $"发现 TermLink {status.VersionName}（build {status.BuildNumber}）。\n\n" +
+            "更新安装会关闭 TermLink 和受管终端会话，是否下载并打开已验证的安装程序？",
+            "TermLink 更新",
+            0x00000004u | 0x00000030u | 0x00000100u);
+        if (choice != 6) return status;
+
+        var setup = await DownloadAndVerifyUpdateAsync(update, cancellationToken).ConfigureAwait(false);
+        using var process = Process.Start(new ProcessStartInfo
         {
-            FileName = rollbackUi,
-            UseShellExecute = false,
-            WorkingDirectory = installationRoot,
+            FileName = setup,
+            WorkingDirectory = Path.GetDirectoryName(setup)!,
+            UseShellExecute = true,
+        }) ?? throw new InvalidOperationException("无法启动已验证的 TermLink 安装程序。");
+        return status with { Message = "已打开已验证的安装程序。" };
+    }
+
+    internal static UpdateCandidate ParseAppShipUpdate(string json, long currentBuild)
+    {
+        using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 12 });
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object) throw new InvalidDataException("更新服务返回格式无效。");
+        var rawStatus = String(root, "status")?.ToLowerInvariant();
+        var latest = Object(root, "latest");
+        var version = latest.HasValue ? String(latest.Value, "versionName") : null;
+        var build = latest.HasValue ? Integer(latest.Value, "buildNumber") : null;
+        var notes = latest.HasValue ? String(latest.Value, "releaseNotes") : null;
+        if (rawStatus is "no_update" or "current")
+        {
+            return new UpdateCandidate(
+                new DesktopUpdateStatus(DesktopUpdateDecision.NoUpdate, version, build, notes, "current"));
+        }
+        var decision = rawStatus switch
+        {
+            "optional" => DesktopUpdateDecision.Optional,
+            "required" => DesktopUpdateDecision.Required,
+            _ => throw new InvalidDataException("更新服务返回了未知状态。"),
         };
-        start.ArgumentList.Add("--check-update");
-        if (!interactive) start.ArgumentList.Add("--check-update-silent");
-        start.ArgumentList.Add("--check-update-result-json");
-        start.ArgumentList.Add(resultPath);
+        if (!build.HasValue || build.Value <= currentBuild)
+            throw new InvalidDataException("更新服务返回的 build 不是严格升级。");
+        var artifact = Object(root, "artifact") ?? throw new InvalidDataException("更新服务未返回安装包。");
+        RequireEqual(artifact, "platform", "windows");
+        RequireEqual(artifact, "fileKind", "exe");
+        RequireEqual(artifact, "architecture", "x64");
+        RequireEqual(artifact, "status", "ready");
+        if (artifact.TryGetProperty("downloadEnabled", out var enabled) && enabled.ValueKind != JsonValueKind.True)
+            throw new InvalidDataException("更新安装包不可下载。");
+        var size = Integer(artifact, "sizeBytes");
+        var expectedSize = Integer(artifact, "expectedSizeBytes");
+        if (!size.HasValue || size <= 0 || size > MaximumUpdateArtifactBytes ||
+            (expectedSize.HasValue && expectedSize != size))
+            throw new InvalidDataException("更新安装包大小无效。");
+        var sha256 = NormalizeHex(String(artifact, "sha256"));
+        var signer = NormalizeHex(String(artifact, "signerFingerprint"));
+        if (!IsHex(sha256, 64) || !IsHex(signer, 40))
+            throw new InvalidDataException("更新安装包哈希或签名指纹无效。");
+        var download = HttpsUri(String(artifact, "downloadUrl"));
+        var name = String(artifact, "originalFilename");
+        if (string.IsNullOrWhiteSpace(name) || !string.Equals(Path.GetExtension(name), ".exe", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("更新安装包不是 Windows EXE。");
+        return new UpdateCandidate(
+            new DesktopUpdateStatus(decision, version, build, notes, null),
+            download.AbsoluteUri, size.Value, sha256!, signer!);
+    }
+
+    private async Task<UpdateCandidate> FetchUpdateAsync(CancellationToken cancellationToken)
+    {
+        var endpoint = new Uri(HttpsUri(ConfiguredAppShipBaseUrl()),
+            $"api/v1/apps/{Metadata("TermLinkUpdateApplicationSlug", "termlink-win64")}/updates" +
+            $"?platform=windows&arch=x64&channel={Metadata("TermLinkUpdateChannel", "stable")}" +
+            $"&build={CurrentBuild()}");
+        using var response = await SendWithRedirectsAsync(endpoint, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException($"更新服务返回 HTTP {(int)response.StatusCode}。");
+        var json = Encoding.UTF8.GetString(await ReadBoundedAsync(
+            response, MaximumUpdateResponseBytes, cancellationToken).ConfigureAwait(false));
+        return ParseAppShipUpdate(json, CurrentBuild());
+    }
+
+    private async Task<string> DownloadAndVerifyUpdateAsync(
+        UpdateCandidate update,
+        CancellationToken cancellationToken)
+    {
+        var root = Path.Combine(localApplicationData, "TermLink", "Updates");
+        Directory.CreateDirectory(root);
+        var finalPath = Path.Combine(root,
+            $"TermLink-Setup-{update.Status.VersionName}-{update.Status.BuildNumber}-x64.exe");
+        var temporaryPath = Path.Combine(root, $".download-{Guid.NewGuid():N}.tmp");
         try
         {
-            using var process = Process.Start(start) ??
-                throw new InvalidOperationException("无法启动更新检查组件。");
-            if (interactive)
-            {
-                // The user-visible signed updater owns its lifecycle once it is
-                // shown. Never translate an Avalonia command cancellation into
-                // terminating a Setup process the user has already accepted.
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-            else
-            {
-                try
-                {
-                    await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    TryStopUpdateCheck(process);
-                    throw;
-                }
-            }
-            if (!File.Exists(resultPath))
-            {
-                throw new InvalidDataException(
-                    $"更新检查组件未返回结构化结果（退出码 {process.ExitCode}）。");
-            }
-            var info = new FileInfo(resultPath);
-            if (info.Length <= 0 || info.Length > MaximumUpdateResultBytes)
-                throw new InvalidDataException("更新检查组件返回的结果大小无效。");
-            var json = await File.ReadAllTextAsync(resultPath, Encoding.UTF8, cancellationToken)
+            using var response = await SendWithRedirectsAsync(HttpsUri(update.DownloadUrl), cancellationToken)
                 .ConfigureAwait(false);
-            return ParseUpdateStatus(json);
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength.HasValue &&
+                response.Content.Headers.ContentLength.Value != update.SizeBytes)
+                throw new InvalidDataException("下载长度与 AppShip 元数据不一致。");
+            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using var destination = new FileStream(
+                temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[128 * 1024];
+            long received = 0;
+            int count;
+            while ((count = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) != 0)
+            {
+                received = checked(received + count);
+                if (received > update.SizeBytes) throw new InvalidDataException("下载超过 AppShip 声明大小。");
+                await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+                hash.AppendData(buffer, 0, count);
+            }
+            await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (received != update.SizeBytes || !CryptographicOperations.FixedTimeEquals(
+                    hash.GetHashAndReset(), Convert.FromHexString(update.Sha256)))
+                throw new CryptographicException("下载内容与 AppShip SHA-256 不一致。");
+            var expectedSigner = WindowsUpdateSecurity.ResolveExpectedSignerThumbprint(installationRoot);
+            WindowsUpdateSecurity.ValidateAuthenticode(
+                temporaryPath, expectedSigner, update.SignerSha1, installationRoot);
+            File.Move(temporaryPath, finalPath, true);
+            return finalPath;
         }
         finally
         {
-            TryDeleteResult(resultPath);
+            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
     }
+
+    private static async Task<HttpResponseMessage> SendWithRedirectsAsync(Uri initial, CancellationToken token)
+    {
+        var current = initial;
+        for (var redirects = 0; ; redirects++)
+        {
+            var response = await UpdateClient.GetAsync(current, HttpCompletionOption.ResponseHeadersRead, token)
+                .ConfigureAwait(false);
+            if (response.StatusCode is not (HttpStatusCode.Moved or HttpStatusCode.Redirect or
+                HttpStatusCode.RedirectMethod or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect))
+                return response;
+            try
+            {
+                if (redirects >= 3 || response.Headers.Location is null)
+                    throw new HttpRequestException("更新请求重定向无效或过多。");
+                current = HttpsUri(response.Headers.Location.IsAbsoluteUri
+                    ? response.Headers.Location.AbsoluteUri
+                    : new Uri(current, response.Headers.Location).AbsoluteUri);
+            }
+            finally { response.Dispose(); }
+        }
+    }
+
+    private static async Task<byte[]> ReadBoundedAsync(
+        HttpResponseMessage response, long maximum, CancellationToken token)
+    {
+        if (response.Content.Headers.ContentLength > maximum)
+            throw new InvalidDataException("更新服务响应过大。");
+        await using var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+        using var output = new MemoryStream();
+        var buffer = new byte[16 * 1024];
+        int count;
+        while ((count = await input.ReadAsync(buffer, token).ConfigureAwait(false)) != 0)
+        {
+            if (output.Length + count > maximum) throw new InvalidDataException("更新服务响应过大。");
+            output.Write(buffer, 0, count);
+        }
+        return output.ToArray();
+    }
+
+    private static long CurrentBuild()
+    {
+        var version = Assembly.GetEntryAssembly()?.GetName().Version;
+        return version?.Revision >= 0 ? version.Revision : version?.Build ?? 0;
+    }
+
+    private static string ConfiguredAppShipBaseUrl() =>
+        (Environment.GetEnvironmentVariable("TERMLINK_APPSHIP_BASE_URL") ?? PublicAppShipBaseUrl).TrimEnd('/') + "/";
+
+    private static string Metadata(string key, string fallback) =>
+        typeof(WindowsDesktopOperations).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(value => string.Equals(value.Key, key, StringComparison.Ordinal))?.Value ?? fallback;
+
+    private static JsonElement? Object(JsonElement parent, string name) =>
+        parent.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Object ? value : null;
+    private static string? String(JsonElement parent, string name) =>
+        parent.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    private static long? Integer(JsonElement parent, string name) =>
+        parent.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : null;
+    private static void RequireEqual(JsonElement parent, string name, string expected)
+    {
+        if (!string.Equals(String(parent, name), expected, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"更新安装包字段 {name} 无效。");
+    }
+    private static Uri HttpsUri(string? value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
+            !string.IsNullOrEmpty(uri.UserInfo))
+            throw new InvalidDataException("更新地址必须是无内嵌凭据的 HTTPS URL。");
+        return uri;
+    }
+    private static string? NormalizeHex(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            if (char.IsWhiteSpace(character) || character is ':' or '-') continue;
+            normalized.Append(char.ToLowerInvariant(character));
+        }
+        return normalized.ToString();
+    }
+    private static bool IsHex(string? value, int length) => value?.Length == length && value.All(Uri.IsHexDigit);
+
+    internal sealed record UpdateCandidate(
+        DesktopUpdateStatus Status,
+        string? DownloadUrl = null,
+        long SizeBytes = 0,
+        string Sha256 = "",
+        string SignerSha1 = "");
+
+    [DllImport("user32.dll", EntryPoint = "MessageBoxW", CharSet = CharSet.Unicode)]
+    private static extern int MessageBox(IntPtr window, string text, string caption, uint type);
 
     public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken)
     {
@@ -214,26 +390,6 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
 
     private static string? NormalizeField(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-
-    private static void TryStopUpdateCheck(Process process)
-    {
-        try
-        {
-            if (!process.HasExited) process.Kill(entireProcessTree: true);
-        }
-        catch (InvalidOperationException) { }
-        catch (System.ComponentModel.Win32Exception) { }
-    }
-
-    private static void TryDeleteResult(string path)
-    {
-        try
-        {
-            if (File.Exists(path)) File.Delete(path);
-        }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
-    }
 
     private sealed class UpdateResultDocument
     {

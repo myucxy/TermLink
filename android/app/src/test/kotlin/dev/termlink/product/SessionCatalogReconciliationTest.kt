@@ -46,6 +46,36 @@ class SessionCatalogReconciliationTest {
     }
 
     @Test
+    fun historyGapAutoReopensOnlyAfterAnOnlineRunningTailAdvances() {
+        val previous = ProductSnapshot(
+            sessions = listOf(session(sessionA, lastOutputSequence = 4u)),
+            sessionOpenFailures = mapOf(
+                sessionA to SessionOpenFailure(SessionOpenFailureCode.HISTORY_GAP),
+            ),
+        )
+
+        assertEquals(
+            setOf(sessionA),
+            historyGapSessionsReadyForAutoReopen(
+                previous,
+                listOf(session(sessionA, lastOutputSequence = 5u)),
+            ),
+        )
+        assertTrue(historyGapSessionsReadyForAutoReopen(
+            previous,
+            listOf(session(sessionA, lastOutputSequence = 4u)),
+        ).isEmpty())
+        assertTrue(historyGapSessionsReadyForAutoReopen(
+            previous,
+            listOf(session(sessionA, state = SessionState.INTERRUPTED, lastOutputSequence = 5u)),
+        ).isEmpty())
+        assertTrue(historyGapSessionsReadyForAutoReopen(
+            previous.copy(sessionOpenFailures = emptyMap()),
+            listOf(session(sessionA, lastOutputSequence = 5u)),
+        ).isEmpty())
+    }
+
+    @Test
     fun removedSessionDisappearsWithEveryUuidScopedRuntimeOverlay() {
         val current = ProductSnapshot(
             sessions = listOf(session(sessionA), session(sessionB)),
@@ -326,6 +356,7 @@ class SessionCatalogReconciliationTest {
     private fun session(
         id: UUID,
         state: SessionState = SessionState.RUNNING,
+        lastOutputSequence: ULong = 0u,
     ) = SessionSummary(
         id = id,
         pcId = pcId,
@@ -334,7 +365,7 @@ class SessionCatalogReconciliationTest {
         state = state,
         columns = 80,
         rows = 24,
-        lastOutputSequence = 0u,
+        lastOutputSequence = lastOutputSequence,
         createdAt = Instant.EPOCH,
         endedAt = null,
         online = true,

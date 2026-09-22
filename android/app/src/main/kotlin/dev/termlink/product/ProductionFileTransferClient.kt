@@ -58,6 +58,20 @@ internal class RemoteFileTransferException(
     cause: Throwable? = null,
 ) : Exception(message, cause)
 
+internal suspend fun <T> localFileTransferStage(block: suspend () -> T): T = try {
+    block()
+} catch (error: CancellationException) {
+    throw error
+} catch (error: RemoteFileTransferException) {
+    throw error
+} catch (error: Throwable) {
+    throw RemoteFileTransferException(
+        "Local file transfer failed / 本地文件写入失败。",
+        retryable = false,
+        cause = error,
+    )
+}
+
 /** Storage-free E2EE receiver with durable contiguous-offset resume. */
 internal class ProductionFileTransferClient(
     rootUrl: String,
@@ -110,7 +124,9 @@ internal class ProductionFileTransferClient(
         var expected: RealtimeFileTransferDescriptor? = initialDescriptor
         val completionState = CompletionState(
             documentCommitted = initialDescriptor?.let {
-                cache.isDocumentCommitted(transferId, destination, it.sizeBytes, it.sha256)
+                localFileTransferStage {
+                    cache.isDocumentCommitted(transferId, destination, it.sizeBytes, it.sha256)
+                }
             } ?: false,
         )
         var retryDelay = 250L
@@ -244,15 +260,19 @@ internal class ProductionFileTransferClient(
                             }
                             expected = descriptor
                             if (!completionState.documentCommitted) {
-                                completionState.documentCommitted = cache.isDocumentCommitted(
-                                    transferId,
-                                    destination,
-                                    descriptor.sizeBytes,
-                                    descriptor.sha256,
-                                )
+                                completionState.documentCommitted = localFileTransferStage {
+                                    cache.isDocumentCommitted(
+                                        transferId,
+                                        destination,
+                                        descriptor.sizeBytes,
+                                        descriptor.sha256,
+                                    )
+                                }
                             }
-                            val committed = cache.committedOffset(transferId, descriptor.sizeBytes)
-                            onOffer(descriptor, committed)
+                            val committed = localFileTransferStage {
+                                cache.committedOffset(transferId, descriptor.sizeBytes)
+                            }
+                            localFileTransferStage { onOffer(descriptor, committed) }
                             sendPayload(
                                 connection.socket,
                                 pairwiseKey,
@@ -270,13 +290,15 @@ internal class ProductionFileTransferClient(
                             val chunk = opened.payload.chunk
                             val data = chunk.data.toByteArray()
                             try {
-                                val committed = cache.commitChunk(
-                                    transferId,
-                                    descriptor.sizeBytes,
-                                    chunk.offset,
-                                    data,
-                                )
-                                onProgress(committed.committedOffset)
+                                val committed = localFileTransferStage {
+                                    cache.commitChunk(
+                                        transferId,
+                                        descriptor.sizeBytes,
+                                        chunk.offset,
+                                        data,
+                                    )
+                                }
+                                localFileTransferStage { onProgress(committed.committedOffset) }
                                 if (committed.acknowledged) {
                                     sendPayload(
                                         connection.socket,
@@ -310,10 +332,13 @@ internal class ProductionFileTransferClient(
                             require(complete.sizeBytes == descriptor.sizeBytes &&
                                 MessageDigest.isEqual(complete.sha256.toByteArray(), descriptor.sha256)
                             ) { "File-transfer completion metadata changed" }
-                            onVerifying()
+                            localFileTransferStage { onVerifying() }
                             try {
-                                cache.verify(transferId, descriptor.sizeBytes, descriptor.sha256)
-                            } catch (error: IllegalArgumentException) {
+                                localFileTransferStage {
+                                    cache.verify(transferId, descriptor.sizeBytes, descriptor.sha256)
+                                }
+                            } catch (error: RemoteFileTransferException) {
+                                if (error.cause !is IllegalArgumentException) throw error
                                 sendPayload(
                                     connection.socket,
                                     pairwiseKey,
@@ -329,18 +354,20 @@ internal class ProductionFileTransferClient(
                                 throw error
                             }
                             if (!completionState.documentCommitted) {
-                                cache.copyToDocument(
-                                    transferId,
-                                    destination,
-                                    descriptor.sizeBytes,
-                                    onProgress,
-                                )
-                                cache.markDocumentCommitted(
-                                    transferId,
-                                    destination,
-                                    descriptor.sizeBytes,
-                                    descriptor.sha256,
-                                )
+                                localFileTransferStage {
+                                    cache.copyToDocument(
+                                        transferId,
+                                        destination,
+                                        descriptor.sizeBytes,
+                                        onProgress,
+                                    )
+                                    cache.markDocumentCommitted(
+                                        transferId,
+                                        destination,
+                                        descriptor.sizeBytes,
+                                        descriptor.sha256,
+                                    )
+                                }
                                 completionState.documentCommitted = true
                             }
                             sendPayload(

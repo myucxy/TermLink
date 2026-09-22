@@ -794,6 +794,8 @@ fn encode_kitty_legacy_character(
     }
     let resolved = if event.modifiers.shift {
         event.shifted_key.unwrap_or(character)
+    } else if event.modifiers.caps_lock && character.is_ascii_alphabetic() {
+        character.to_ascii_uppercase()
     } else {
         character
     };
@@ -2345,6 +2347,35 @@ mod tests {
             ),
             Ok(b"\x1b[120;256u".to_vec())
         );
+    }
+
+    #[test]
+    fn kitty_legacy_character_applies_caps_lock_without_losing_shift_cancellation() {
+        let caps = KittyModifiers {
+            caps_lock: true,
+            ..KittyModifiers::NONE
+        };
+        assert_eq!(
+            kitty_encode(
+                kitty_event(
+                    KittyKey::Character('a'),
+                    caps,
+                    KittyKeyEventType::Press,
+                    "",
+                ),
+                0,
+            ),
+            Ok(b"A".to_vec()),
+        );
+
+        let mut shifted = kitty_event(
+            KittyKey::Character('a'),
+            KittyModifiers { shift: true, ..caps },
+            KittyKeyEventType::Press,
+            "",
+        );
+        shifted.shifted_key = Some('a');
+        assert_eq!(kitty_encode(shifted, 0), Ok(b"a".to_vec()));
     }
 
     #[test]

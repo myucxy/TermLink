@@ -309,8 +309,8 @@ android {
         buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
         buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
         buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
-        buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "false")
-        buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", "false")
+        buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "true")
+        buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", "true")
     }
 
     buildFeatures {
@@ -338,8 +338,8 @@ android {
             buildConfigField("String", "TERMLINK_SERVER_URL", buildConfigString(publicTermLinkServerUrl))
             buildConfigField("boolean", "TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST", "false")
             buildConfigField("boolean", "TERMLINK_TERMINAL_SNAPSHOT_RUNTIME", "true")
-            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "false")
-            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", "false")
+            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_SHADOW", "true")
+            buildConfigField("boolean", "TERMLINK_DIRECT_TRANSPORT_DATA_PLANE", "true")
         }
     }
 

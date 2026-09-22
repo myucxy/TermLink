@@ -4,6 +4,7 @@ import dev.termlink.terminal.api.TerminalHostEffectFrameV2
 import dev.termlink.terminal.api.TerminalInputModifiers
 import dev.termlink.terminal.api.TerminalKittyFunctionalKey
 import dev.termlink.terminal.api.TerminalKittyKey
+import dev.termlink.terminal.api.TerminalKittyKeyEventType
 import dev.termlink.terminal.api.TerminalKittyKeyInput
 import dev.termlink.terminal.api.TerminalKittyModifiers
 import dev.termlink.terminal.api.TerminalKey
@@ -357,10 +358,19 @@ class NativeTerminalHandle private constructor(
     fun encodeKey(
         key: TerminalKey,
         modifiers: TerminalInputModifiers = TerminalInputModifiers(),
+        eventType: TerminalKittyKeyEventType = TerminalKittyKeyEventType.PRESS,
+    ): ByteArray = encodeFunctionalKey(kittyFunctionalKey(key), modifiers, eventType)
+
+    /** Encodes one mode-aware Kitty functional key through terminal-core Input V3. */
+    fun encodeFunctionalKey(
+        key: TerminalKittyFunctionalKey,
+        modifiers: TerminalInputModifiers = TerminalInputModifiers(),
+        eventType: TerminalKittyKeyEventType = TerminalKittyKeyEventType.PRESS,
     ): ByteArray = encodeKittyKey(
         TerminalKittyKeyInput(
-            key = TerminalKittyKey.Functional(kittyFunctionalKey(key)),
+            key = TerminalKittyKey.Functional(key),
             modifiers = kittyModifiers(modifiers),
+            eventType = eventType,
         ),
     )
 
@@ -369,6 +379,7 @@ class NativeTerminalHandle private constructor(
         codePoint: Int,
         modifiers: TerminalInputModifiers = TerminalInputModifiers(),
         shiftedCodePoint: Int? = null,
+        eventType: TerminalKittyKeyEventType = TerminalKittyKeyEventType.PRESS,
     ): ByteArray {
         require(
             Character.isValidCodePoint(codePoint) &&
@@ -379,6 +390,7 @@ class NativeTerminalHandle private constructor(
                 key = TerminalKittyKey.Character(codePoint),
                 modifiers = kittyModifiers(modifiers),
                 shiftedKey = shiftedCodePoint,
+                eventType = eventType,
             ),
         )
     }
@@ -636,6 +648,8 @@ class NativeTerminalHandle private constructor(
                 alt = modifiers.alt,
                 control = modifiers.control,
                 meta = modifiers.meta,
+                capsLock = modifiers.capsLock,
+                numLock = modifiers.numLock,
             )
 
         private fun kittyFunctionalKey(key: TerminalKey): TerminalKittyFunctionalKey = when (key) {

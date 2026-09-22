@@ -15,6 +15,7 @@ import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.ActionMode
 import android.view.GestureDetector
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
@@ -26,6 +27,7 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.OverScroller
 import dev.termlink.terminal.api.TerminalInputModifiers
+import dev.termlink.terminal.api.TerminalKittyKeyEventType
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
 import dev.termlink.terminal.api.TerminalMouseInput
@@ -65,6 +67,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG)
     private val shapePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val imeEditable = SpannableStringBuilder()
+    private var combiningAccent = 0
+    private val pressedCharacterKeys = HashMap<Int, Pair<Int, Int?>>()
     private val boundedLineSpacing = lineSpacingMultiplier.coerceIn(0.8f, 1.8f)
     private var textSizePixels = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_SP,
@@ -555,44 +559,104 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val eventType = if (event.repeatCount > 0) {
+            TerminalKittyKeyEventType.REPEAT
+        } else {
+            TerminalKittyKeyEventType.PRESS
+        }
+        return submitHardwareKey(keyCode, event, eventType) || super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean =
+        submitHardwareKey(keyCode, event, TerminalKittyKeyEventType.RELEASE) ||
+            super.onKeyUp(keyCode, event)
+
+    private fun submitHardwareKey(
+        keyCode: Int,
+        event: KeyEvent,
+        eventType: TerminalKittyKeyEventType,
+    ): Boolean {
         val owner = engine ?: return false
-        if (owner.submitKeyCode(
+        if (safeSubmit { owner.submitPhysicalKeyCode(
                 keyCode,
                 controlDown = event.isCtrlPressed,
                 altDown = event.isAltPressed,
                 shiftDown = event.isShiftPressed,
+                capsLock = event.isCapsLockOn,
+                numLock = event.isNumLockOn,
+                eventType = eventType,
             )
-        ) return true
+        }) return true
         val metaState = event.metaState
         val leftAltDown = metaState and KeyEvent.META_ALT_LEFT_ON != 0
         val rightAltDown = metaState and KeyEvent.META_ALT_RIGHT_ON != 0
         val terminalAltDown = leftAltDown || event.isAltPressed && !rightAltDown
         var effectiveMetaState = metaState and KeyEvent.META_CTRL_MASK.inv()
         if (!rightAltDown) effectiveMetaState = effectiveMetaState and KeyEvent.META_ALT_MASK.inv()
-        val resolvedCodePoint = event.getUnicodeChar(effectiveMetaState)
-        val unshiftedCodePoint = event.getUnicodeChar(
-            effectiveMetaState and KeyEvent.META_SHIFT_MASK.inv(),
+        if (eventType == TerminalKittyKeyEventType.RELEASE) {
+            pressedCharacterKeys.remove(keyCode)?.let { (codePoint, shiftedCodePoint) ->
+                return safeSubmit {
+                    owner.submitPhysicalCodePoint(
+                        codePoint, event.isCtrlPressed, terminalAltDown, event.isShiftPressed,
+                        event.isCapsLockOn, event.isNumLockOn, shiftedCodePoint, eventType,
+                    )
+                }
+            }
+        }
+        var resolvedCodePoint = event.getUnicodeChar(effectiveMetaState)
+        val baseCodePoint = event.getUnicodeChar(
+            effectiveMetaState and KeyEvent.META_SHIFT_MASK.inv() and KeyEvent.META_CAPS_LOCK_ON.inv(),
         )
+
+        if (resolvedCodePoint and KeyCharacterMap.COMBINING_ACCENT != 0) {
+            val accent = resolvedCodePoint and KeyCharacterMap.COMBINING_ACCENT_MASK
+            if (eventType == TerminalKittyKeyEventType.RELEASE) {
+                return combiningAccent == accent
+            } else {
+                if (combiningAccent != 0 && !safeSubmit {
+                        owner.submitPhysicalCodePoint(
+                            combiningAccent, false, terminalAltDown, false,
+                            event.isCapsLockOn, event.isNumLockOn, null, eventType,
+                        )
+                    }
+                ) return false
+                combiningAccent = accent
+                return true
+            }
+        } else if (combiningAccent != 0 && eventType != TerminalKittyKeyEventType.RELEASE) {
+            val combined = KeyCharacterMap.getDeadChar(combiningAccent, resolvedCodePoint)
+            if (combined > 0) resolvedCodePoint = combined
+            combiningAccent = 0
+        }
         val codePoint = when {
-            (event.isCtrlPressed || terminalAltDown || event.isShiftPressed) &&
-                unshiftedCodePoint > 0 -> unshiftedCodePoint
+            (event.isCtrlPressed || terminalAltDown || event.isShiftPressed || event.isCapsLockOn) &&
+                baseCodePoint > 0 -> baseCodePoint
             resolvedCodePoint > 0 -> resolvedCodePoint
             event.isCtrlPressed && keyCode in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z ->
                 'a'.code + keyCode - KeyEvent.KEYCODE_A
             else -> 0
         }
         return if (codePoint > 0 && !Character.isISOControl(codePoint)) {
-            owner.submitCodePoint(
+            val shiftedCodePoint = resolvedCodePoint.takeIf {
+                (event.isShiftPressed || event.isCapsLockOn) &&
+                    it > 0 && !Character.isISOControl(it)
+            }
+            safeSubmit { owner.submitPhysicalCodePoint(
                 codePoint = codePoint,
                 controlDown = event.isCtrlPressed,
                 altDown = terminalAltDown,
                 shiftDown = event.isShiftPressed,
-                shiftedCodePoint = resolvedCodePoint.takeIf {
-                    event.isShiftPressed && it > 0 && !Character.isISOControl(it)
-                },
-            )
+                capsLock = event.isCapsLockOn,
+                numLock = event.isNumLockOn,
+                shiftedCodePoint = shiftedCodePoint,
+                eventType = eventType,
+            ) }.also { accepted ->
+                if (accepted && eventType == TerminalKittyKeyEventType.PRESS) {
+                    pressedCharacterKeys[keyCode] = codePoint to shiftedCodePoint
+                }
+            }
         } else {
-            super.onKeyDown(keyCode, event)
+            false
         }
     }
 
@@ -626,46 +690,62 @@ internal class NativeTerminalView @JvmOverloads constructor(
             override fun getEditable(): Editable = imeEditable
 
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                imeEditable.clear()
                 if (text == null) return false
-                return try {
-                    engine?.submitText(text.toString()) == true
-                } catch (ignored: Exception) {
-                    // Input encoding must never crash the UI thread.
-                    false
-                }
+                if (!super.commitText(text, newCursorPosition)) return false
+                return flushImeEditable(text.toString())
             }
 
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                imeEditable.replace(0, imeEditable.length, text ?: "")
-                return true
+                return super.setComposingText(text, newCursorPosition)
             }
 
             override fun finishComposingText(): Boolean {
-                imeEditable.clear()
-                return super.finishComposingText()
+                val committed = imeEditable.toString()
+                if (!super.finishComposingText()) return false
+                return flushImeEditable(committed)
             }
 
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
-                sendBackspaces(beforeLength)
+            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                if (!super.deleteSurroundingText(beforeLength, afterLength)) return false
+                return sendDeletes(beforeLength, afterLength)
+            }
 
             override fun deleteSurroundingTextInCodePoints(
                 beforeLength: Int,
                 afterLength: Int,
-            ): Boolean = sendBackspaces(beforeLength)
+            ): Boolean {
+                if (!super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)) return false
+                return sendDeletes(beforeLength, afterLength)
+            }
 
-            override fun sendKeyEvent(event: KeyEvent): Boolean =
-                if (event.action == KeyEvent.ACTION_DOWN) onKeyDown(event.keyCode, event) else true
+            override fun sendKeyEvent(event: KeyEvent): Boolean = when (event.action) {
+                KeyEvent.ACTION_DOWN -> onKeyDown(event.keyCode, event)
+                KeyEvent.ACTION_UP -> onKeyUp(event.keyCode, event)
+                else -> false
+            }
 
             override fun performEditorAction(actionCode: Int): Boolean =
-                engine?.submitKeyCode(KeyEvent.KEYCODE_ENTER) == true
+                safeSubmit { engine?.submitKeyCode(KeyEvent.KEYCODE_ENTER) == true }
 
             override fun performPrivateCommand(action: String?, data: Bundle?): Boolean = false
 
-            private fun sendBackspaces(count: Int): Boolean {
+            private fun flushImeEditable(fallback: String): Boolean {
+                val text = imeEditable.toString().ifEmpty { fallback }
+                imeEditable.clear()
+                return text.isEmpty() || safeSubmit { engine?.submitText(text) == true }
+            }
+
+            private fun sendDeletes(beforeLength: Int, afterLength: Int): Boolean {
                 var accepted = true
-                repeat(count.coerceAtLeast(1)) {
-                    accepted = engine?.submitKeyCode(KeyEvent.KEYCODE_DEL) == true && accepted
+                repeat(beforeLength.coerceAtLeast(0)) {
+                    accepted = safeSubmit {
+                        engine?.submitKeyCode(KeyEvent.KEYCODE_DEL) == true
+                    } && accepted
+                }
+                repeat(afterLength.coerceAtLeast(0)) {
+                    accepted = safeSubmit {
+                        engine?.submitKeyCode(KeyEvent.KEYCODE_FORWARD_DEL) == true
+                    } && accepted
                 }
                 return accepted
             }
@@ -680,6 +760,12 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private fun showKeyboard() {
         context.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
             ?.showSoftInput(this, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    private inline fun safeSubmit(block: () -> Boolean): Boolean = try {
+        block()
+    } catch (_: Exception) {
+        false
     }
 
     private fun updateCellMetrics() {

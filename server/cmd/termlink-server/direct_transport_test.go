@@ -125,8 +125,14 @@ func TestDirectTransportRoutesAreAbsentUntilExplicitlyRegistered(t *testing.T) {
 	registerDirectTransportRoutes(mux,
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusCreated) }),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }),
 		failingSignal,
 	)
+	renew := httptest.NewRecorder()
+	mux.ServeHTTP(renew, httptest.NewRequest(http.MethodPost, "/v1/transport/tickets/renew", nil))
+	if renew.Code != http.StatusAccepted {
+		t.Fatalf("renew route status=%d, want 202", renew.Code)
+	}
 	signal := httptest.NewRecorder()
 	mux.ServeHTTP(signal, httptest.NewRequest(http.MethodGet, "/v1/transport/signals", nil))
 	if signal.Code != http.StatusServiceUnavailable {
