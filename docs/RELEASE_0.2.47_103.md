@@ -4,7 +4,8 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Source identity and scope
 
-- Release source commit: pending the reviewed source commit; `HEAD` and `origin/main` must match before build.
+- Release source commit: `3d794d75aff91912208b4ff3cefe36e31233c22f`; the Production clients and
+  Server image were built from this commit after `HEAD` and `origin/main` matched with a clean worktree.
 - Target clients: Android `0.2.47 (103)` and Windows `0.2.47.103` on AppShip stable.
 - Target Server image: `docker.io/myucxy/termlink:v0.2.47`, published for `linux/amd64` and `linux/arm64`.
 - Push immutable Git tag `v0.2.47` only to trigger the reviewed Docker Hub workflow. Do not create a GitHub
@@ -51,7 +52,7 @@ Date: 2026-09-22 (Asia/Shanghai)
 - Server `go test ./...`: passed.
 - Unified release parser, plan, signature, version, RFC 3161, production-manifest, AppShip gate, and strict-path
   checks: passed.
-- Production build, independent artifact verification, and AppShip publication: pending.
+- Production build, independent artifact verification, and AppShip publication: passed.
 
 ## Live validation boundary
 
@@ -88,14 +89,46 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Production artifacts and publication
 
-- Manifest, artifact hashes, version/signature evidence: pending Production build and independent verification.
-- Android AppShip `termlink-android/stable`: pending.
-- Windows AppShip `termlink-win64/stable`: pending.
-- Docker Hub `docker.io/myucxy/termlink:v0.2.47` index digest, `linux/amd64`/`linux/arm64` manifests, Cosign
-  signature, provenance, SPDX and CycloneDX attestations: pending.
-- Public update checks for build 102 (`optional`) and build 103 (`no_update`): pending.
-- Local Windows in-place upgrade and remote `HT-LPC-1326` update acceptance: pending. AppShip publication does
-  not imply silent installation on either machine.
+- Android APK: `TermLink-Android-0.2.47-103.apk`, SHA-256
+  `2b08bfb45a5d31cf7e3853b9f86333fceac50cab363e92f33156075b5fe0f5a4`; version `0.2.47 (103)`, APK v2,
+  single signer SHA-256 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
+- Windows Setup: `TermLink-Setup-0.2.47.103-x64.exe`, SHA-256
+  `1ef7549215dfd360012eb46551a05cdbf03d0cfd9aca76aa24a8518b75521ae3`; ProductVersion
+  `0.2.47.103+3d794d75aff91912208b4ff3cefe36e31233c22f`, signer SHA-1
+  `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`, valid RFC 3161 timestamp, and all 17 payload binaries verified.
+- Android AppShip `termlink-android/stable`: application `4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`, release
+  `4ba4b9b8-6175-4efe-b833-be97d7c76519`, artifact `cac10648-acea-461a-a55b-8acaf0c08471`, `published/ready`.
+- Windows AppShip `termlink-win64/stable`: application `0ae760b3-294e-48e8-a793-95d162f685e2`, release
+  `4699888c-8d5f-419d-8fe7-3d3d2a19a60c`, artifact `21154676-03ef-4cb4-af8a-3baff1fd5b5a`, `published/ready`.
+- Public update checks passed: both clients return `optional` for build 102 and `no_update` for build 103.
+- Git tag `v0.2.47` is immutable and resolves to the release source commit. The preferred private GitHub workflow
+  did not produce a Docker Hub tag during the observed release window, so the documented pinned-BuildKit fallback
+  published `docker.io/myucxy/termlink:v0.2.47` with OCI index digest
+  `sha256:67aac2fd50d24f3466028cabdbe8ca1bc82c43acccfa7fd134c3265f2fafd125`.
+- Registry verification passed for `linux/amd64` manifest
+  `sha256:6fb27acad124ba5c8013810fa63418723810b1e0dbd101007cd21925cd6790d5` and `linux/arm64` manifest
+  `sha256:93caf34083be775cac24ae462239210901b22745d7e132db7dd9dcf84e52bcd3`; both carry the exact release
+  version, revision, source and created labels, plus SPDX and SLSA provenance attestations. This is a degraded
+  publication: it has no GitHub OIDC/Cosign signature and no independent CycloneDX attestation.
+- The Android Debug app was covered in place with the same source/version; `appId=10224` and
+  `firstInstallTime=2026-09-19 10:16:29` were preserved, and its cold start produced no AndroidRuntime fatal error.
+- Local Windows was upgraded in place under `D:\Dev\Tool\TermLink`; the main app, Agent, SessionHost and Updater
+  all report `0.2.47.103+3d794d75aff91912208b4ff3cefe36e31233c22f` with valid signatures. Remote
+  `HT-LPC-1326` update acceptance remains pending; AppShip publication does not imply silent installation.
+
+## Local Server deployment
+
+- Before upgrade, a PostgreSQL custom dump was encrypted with Windows DPAPI CurrentUser and round-trip verified.
+  The encrypted recovery point is `artifacts/backups/termlink-local-pre-v0.2.47-20260922T104903Z.dump.dpapi`,
+  SHA-256 `a16c2c802a7f0146e8cc1362a3da9dfd08437607c064b835e42667f83d8733cc`; plaintext staging was removed.
+  This local fallback is not an off-host age backup and is recoverable only by the same Windows user profile.
+- `termlink-local` now runs the exact tag and index digest above. Only the Server container was recreated;
+  PostgreSQL container `8523967489edd14355fdaa771b86a5fdeb03ccc8992063c29dd8465b4ebf5413` and volume
+  `termlink-local_postgres-data` were preserved.
+- Exactly one Server and one PostgreSQL container are running and healthy. OCI revision is the release commit,
+  schema migration is 50 (the source maximum), and the `direct_routing_policy` table exists.
+- Loopback `/healthz`, `/readyz`, embedded OIDC discovery and public
+  `https://termlink2.kget.cc:8910/readyz` all returned HTTP 200 after upgrade.
 
 ## Rollback
 
@@ -103,5 +136,8 @@ Date: 2026-09-22 (Asia/Shanghai)
   field validation fails.
 - The Server tag and digest are immutable. Do not move `v0.2.47`; a Server rollback must pin the previous
   verified `v0.2.46@sha256:...` digest, and a repaired image requires a new version tag.
+- The local pre-upgrade Server image remains available as content ID
+  `sha256:f5971f9dac62cbdeaf89529ac5c608ec4d96176770e2a7681ac68ba7fd258625`; preserve the PostgreSQL volume and
+  use the verified DPAPI backup if a database restore is required.
 - Switch Direct routing to Relay-only if field validation is unstable; do not downgrade the Server or delete
   client data. A client rollback requires publishing a strictly newer, correctly signed build.
