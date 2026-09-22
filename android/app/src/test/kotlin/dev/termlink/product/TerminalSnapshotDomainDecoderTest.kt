@@ -2,8 +2,6 @@ package dev.termlink.product
 
 import dev.termlink.crypto.TerminalSnapshotCrypto
 import dev.termlink.protocol.realtime.v1.TerminalSnapshotV1
-import java.net.URI
-import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -56,29 +54,12 @@ class TerminalSnapshotDomainDecoderTest {
     }
 
     @Test
-    fun firstTranscriptGetStopsBeforeTheFirstVisiblePrimaryLine() {
+    fun firstTranscriptCursorStopsBeforeTheFirstVisiblePrimaryLine() {
         val wire = sharedVectorSnapshot()
-        val sessionId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val beforeLineId = TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
 
-        val path = transcriptHistoryRequestPath(
-            sessionId = sessionId,
-            snapshotSequence = wire.snapshotSeq.toULong(),
-            beforeLineId = beforeLineId,
-        )
-        val uri = URI("https://example.test$path")
-        val queryParts = uri.rawQuery.split('&')
-        val query = queryParts
-            .associate { value -> value.substringBefore('=') to value.substringAfter('=') }
-
-        assertEquals("/v1/sessions/$sessionId/history", uri.rawPath)
-        assertEquals(4, queryParts.size)
-        assertEquals(setOf("kind", "as_of_snapshot_seq", "before_line_id", "limit"), query.keys)
-        assertEquals("transcript", query["kind"])
-        assertEquals(wire.snapshotSeq.toString(), query["as_of_snapshot_seq"])
-        assertEquals(wire.primaryScreen.visibleRowsList.first().lineId.toString(), query["before_line_id"])
-        assertEquals("1", query["limit"])
-        assertTrue(wire.nextTranscriptLineId.toString() != query["before_line_id"])
+        assertEquals(wire.primaryScreen.visibleRowsList.first().lineId.toULong(), beforeLineId)
+        assertTrue(wire.nextTranscriptLineId.toULong() != beforeLineId)
     }
 
     private fun sharedVectorSnapshot(): TerminalSnapshotV1 {

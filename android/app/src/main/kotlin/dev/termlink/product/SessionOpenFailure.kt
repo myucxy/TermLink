@@ -54,6 +54,7 @@ enum class SessionOpenFailureCode(
     UNSUPPORTED_TERMINAL_CAPABILITY("TL-H122", false, R.string.terminal_error_unsupported_terminal_capability, R.string.terminal_error_action_update),
     HISTORY_CORE_REBUILD_FAILED("TL-H123", true, R.string.terminal_error_history_core_rebuild_failed, R.string.terminal_error_action_retry),
     GAP_RECOVERY_REQUIRED("TL-H124", true, R.string.terminal_error_gap_recovery_required, R.string.terminal_error_action_wait_history),
+    HOST_HISTORY_REQUIRED("TL-H125", false, R.string.terminal_error_host_history_required, R.string.terminal_error_action_update),
     REALTIME_CONNECTION("TL-R001", true, R.string.terminal_error_realtime_connection, R.string.terminal_error_action_check_network),
     CONTROL_LEASE_HELD("TL-C001", true, R.string.terminal_error_control_lease, R.string.terminal_error_action_wait_lease),
     UNKNOWN("TL-X001", true, R.string.terminal_error_unknown, R.string.terminal_error_action_retry),

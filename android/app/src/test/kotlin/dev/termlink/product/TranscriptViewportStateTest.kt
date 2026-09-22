@@ -11,14 +11,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -113,67 +108,6 @@ class TranscriptViewportStateTest {
     }
 
     @Test
-    fun expectedTranscriptPageWaitsForSnapshotFirstPublicationToCatchUp() = runBlocking {
-        var fetches = 0
-        val pauses = mutableListOf<Long>()
-
-        val selected = awaitExpectedTranscriptPage(
-            retryDelaysMillis = listOf(10L, 20L, 30L),
-            pause = { pauses.add(it); Unit },
-        ) {
-            fetches += 1
-            if (fetches == 3) TranscriptSelection.ReadyPage("page", false, null)
-            else TranscriptSelection.Pending
-        }
-
-        assertEquals(TranscriptSelection.ReadyPage("page", false, null), selected)
-        assertEquals(3, fetches)
-        assertEquals(listOf(10L, 20L), pauses)
-    }
-
-    @Test
-    fun defaultTranscriptPublicationPollPlanCoversTheFullReadinessWindow() {
-        assertTrue(
-            TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS.sum() >
-                TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS,
-        )
-    }
-
-    @Test
-    fun pendingTranscriptStopsAtItsAbsoluteReadinessDeadline() = runBlocking {
-        var fetches = 0
-
-        val selected = awaitExpectedTranscriptPage<String>(
-            retryDelaysMillis = listOf(5_000L),
-            readinessTimeoutMillis = 20L,
-            pause = { delay(it) },
-        ) {
-            fetches += 1
-            TranscriptSelection.Pending
-        }
-
-        assertEquals(TranscriptSelection.Pending, selected)
-        assertEquals(1, fetches)
-    }
-
-    @Test
-    fun callerCancellationIsNotConvertedIntoTranscriptPending() {
-        assertThrows(TimeoutCancellationException::class.java) {
-            runBlocking {
-                withTimeout(20L) {
-                    awaitExpectedTranscriptPage<String>(
-                        retryDelaysMillis = listOf(5_000L),
-                        readinessTimeoutMillis = 5_000L,
-                        pause = { delay(it) },
-                    ) {
-                        TranscriptSelection.Pending
-                    }
-                }
-            }
-        }
-    }
-
-    @Test
     fun pendingTranscriptCanRebaseOnlyToANewerDurablyRenderedSnapshot() {
         val objectId = UUID.randomUUID()
         val consumed = mergeTranscriptPage(
@@ -205,61 +139,17 @@ class TranscriptViewportStateTest {
     }
 
     @Test
-    fun readyEmptyTranscriptEndsImmediatelyEvenAboveLineOne() = runBlocking {
-        var fetches = 0
-        val pauses = mutableListOf<Long>()
-
-        val selected = awaitExpectedTranscriptPage<String>(
-            retryDelaysMillis = listOf(10L, 20L),
-            pause = { pauses.add(it); Unit },
-        ) {
-            fetches += 1
-            TranscriptSelection.Complete
-        }
-
-        assertEquals(TranscriptSelection.Complete, selected)
-        assertEquals(1, fetches)
-        assertTrue(pauses.isEmpty())
-    }
-
-    @Test
-    fun parserDistinguishesPendingCompleteAndLegacyPublicationResponses() {
-        val pending = parseTranscriptSelectorResponse(
-            response("\"ready\":false,\"items\":[],\"has_more\":false,\"next_cursor\":null"), 80u, 1001u,
-        )
-        val complete = parseTranscriptSelectorResponse(
-            response("\"ready\":true,\"items\":[],\"has_more\":false,\"next_cursor\":null"), 80u, 1001u,
-        )
-        val legacyPending = parseTranscriptSelectorResponse(
-            response("\"items\":[],\"has_more\":false,\"next_cursor\":null"), 80u, 1001u,
-        )
-        val legacyComplete = parseTranscriptSelectorResponse(
-            response("\"items\":[],\"has_more\":false,\"next_cursor\":null"), 80u, 1u,
-        )
-        val legacyPage = parseTranscriptSelectorResponse(
-            response("\"items\":[{}],\"has_more\":true,\"next_cursor\":\"signed-next\""), 80u, 1001u,
-        )
-
-        assertEquals(TranscriptSelection.Pending, pending)
-        assertEquals(TranscriptSelection.Complete, complete)
-        assertEquals(TranscriptSelection.Pending, legacyPending)
-        assertEquals(TranscriptSelection.Complete, legacyComplete)
-        assertTrue(legacyPage is TranscriptSelection.ReadyPage)
-        assertEquals("signed-next", (legacyPage as TranscriptSelection.ReadyPage).nextCursor)
-    }
-
-    @Test
-    fun fivePagesUseOneExplicitSelectorThenOnlyOpaqueCursorRequests() {
+    fun fivePagesAdvanceOnlyThroughThePreviousOpaqueCursor() {
         val sessionId = UUID.randomUUID()
         var viewport = TranscriptViewportState(sessionId, 50u, 1001u)
         val ranges = listOf(825L to 1000L, 625L to 824L, 425L to 624L, 225L to 424L, 25L to 224L)
         val cursors = listOf("signed/825=", "signed/625=", "signed/425=", "signed/225=")
-        val requests = mutableListOf<String>()
+        val requestedCursors = mutableListOf<String?>()
 
         ranges.forEachIndexed { index, (first, last) ->
             val requestedBefore = viewport.nextBeforeLineId!!
             val requestedCursor = viewport.nextCursor
-            requests += transcriptHistoryRequestPath(sessionId, 50u, requestedBefore, requestedCursor)
+            requestedCursors += requestedCursor
             val hasMore = index < ranges.lastIndex
             viewport = mergeTranscriptPage(
                 viewport = viewport,
@@ -272,13 +162,7 @@ class TranscriptViewportStateTest {
             )
         }
 
-        assertTrue(requests.first().contains("kind=transcript&as_of_snapshot_seq=50&before_line_id=1001"))
-        requests.drop(1).forEachIndexed { index, request ->
-            assertTrue(request.contains("cursor=signed%2F${listOf(825, 625, 425, 225)[index]}%3D"))
-            assertFalse(request.contains("kind="))
-            assertFalse(request.contains("before_line_id="))
-            assertFalse(request.contains("as_of_snapshot_seq="))
-        }
+        assertEquals(listOf(null, "signed/825=", "signed/625=", "signed/425=", "signed/225="), requestedCursors)
         assertEquals(listOf(25L, 225L, 425L, 625L, 825L), viewport.pages.map { it.firstLineId })
         assertFalse(viewport.hasMoreBefore)
     }
@@ -326,18 +210,7 @@ class TranscriptViewportStateTest {
     }
 
     @Test
-    fun inconsistentOuterContractAndPlaintextReplayAreRejected() {
-        assertThrows(IllegalArgumentException::class.java) {
-            parseTranscriptSelectorResponse(
-                response("\"ready\":true,\"items\":[{}],\"has_more\":true,\"next_cursor\":null"), 80u, 61u,
-            )
-        }
-        assertThrows(IllegalArgumentException::class.java) {
-            parseTranscriptSelectorResponse(
-                response("\"ready\":false,\"items\":[{}],\"has_more\":false,\"next_cursor\":null"), 80u, 61u,
-            )
-        }
-
+    fun inconsistentHostTranscriptMetadataAndPlaintextReplayAreRejected() {
         val objectId = UUID.randomUUID()
         val initial = TranscriptViewportState(UUID.randomUUID(), 80u, 61u)
         assertThrows(IllegalArgumentException::class.java) {
@@ -391,10 +264,6 @@ class TranscriptViewportStateTest {
         Unit
     }
 
-    private fun response(fields: String) = Json.parseToJsonElement(
-        """{"as_of_snapshot_seq":80,$fields}""",
-    ).jsonObject
-
     private fun metadata(ciphertext: ByteArray): TranscriptPageMetadata {
         val sessionId = UUID.randomUUID()
         return TranscriptPageMetadata(
@@ -404,7 +273,7 @@ class TranscriptViewportStateTest {
             requestBeforeLineId = 61u,
             firstLineId = 41u,
             lastLineId = 60u,
-            objectKey = "server/$sessionId/transcript/object",
+            objectKey = "host-history-v1/$sessionId/transcript/object",
             keyId = "transcript-v1:key:00000001",
             ciphertextSha256 = MessageDigest.getInstance("SHA-256").digest(ciphertext),
             sizeBytes = ciphertext.size.toLong(),

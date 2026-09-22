@@ -105,14 +105,6 @@ class ProductSessionDeletionTest {
     }
 
     @Test
-    fun legacyHistoryRefreshTreatsOnlyRemovedOrUnavailableCatalogAsEmpty() {
-        assertTrue(legacyHistoryCatalogUnavailable(TermLinkApiException(426, "UPGRADE_REQUIRED", null)))
-        assertFalse(legacyHistoryCatalogUnavailable(TermLinkApiException(503, "UNAVAILABLE", null)))
-        assertFalse(legacyHistoryCatalogUnavailable(TermLinkApiException(401, "UNAUTHORIZED", null)))
-        assertFalse(legacyHistoryCatalogUnavailable(TermLinkApiException(500, "FAILED", null)))
-    }
-
-    @Test
     fun successfulRemoteDeleteCleansOnlyTheSelectedSessionState() = runBlocking {
         val target = session()
         val retained = session()

@@ -76,19 +76,14 @@ import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalInput
 import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalEngineFailureDiagnostics
-import dev.termlink.terminal.api.PreparedTerminalCheckpoint
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.nativecore.NativeTerminalEngine
-import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.io.IOException
 import java.io.Closeable
 import java.time.Instant
-import java.net.URI
-import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.security.MessageDigest
-import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -382,6 +377,9 @@ internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set
             add(DIRECT_TRANSPORT_DATA_CAPABILITY)
         }
     }
+
+internal fun hasHostHistoryAuthority(capabilities: Set<String>): Boolean =
+    PcCapabilityIds.HOST_HISTORY_V1 in capabilities
 
 /** Only a rejected refresh credential terminates an established sign-in. */
 internal fun isAuthenticationRefreshRejection(error: Throwable): Boolean =
@@ -965,8 +963,6 @@ internal class ProductionProductRepository(
     @Volatile private var realtimeMultiplexerOwner: RealtimeAuthenticationOwner? = null
     @Volatile private var directCoordinator: ProductionDirectDeviceCoordinator? = null
     @Volatile private var directCarrierProjectionJob: Job? = null
-    private val historyEngines = ConcurrentHashMap<UUID, TermuxTerminalEngine>()
-    private val historyDownloads = ConcurrentHashMap<UUID, HistoryDownloadRequest>()
     private val transcriptLoads = ConcurrentHashMap<TranscriptLoadKey, Deferred<Unit>>()
     private val deletedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
     private val newlyLaunchedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
@@ -1181,7 +1177,6 @@ internal class ProductionProductRepository(
             var retiredIdentity: DeviceKeyVault.StoredIdentity? = null
             authenticationStateMutationLock.withLock {
                 if (authenticationLifecycle.isCurrent(generation) && !closed) {
-                    closeHistoryEngines()
                     clearRoomCache()
                     authenticationLifecycle.runIfCurrent(generation, predicate = { !closed }) {
                         retiredIdentity = storedIdentity
@@ -1584,7 +1579,6 @@ internal class ProductionProductRepository(
             if (!authenticationLifecycle.isCurrent(authenticationGeneration) || closed) {
                 false
             } else {
-                closeHistoryEngines()
                 clearRoomCache()
                 authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
                     retiredIdentity = storedIdentity
@@ -1996,6 +1990,9 @@ internal class ProductionProductRepository(
             throw sessionOpenException(SessionOpenFailureCode.SESSION_ENDED)
         }
         if (!summary.online) throw sessionOpenException(SessionOpenFailureCode.SESSION_OFFLINE)
+        if (!hasHostHistoryAuthority(pc.capabilities)) {
+            throw sessionOpenException(SessionOpenFailureCode.HOST_HISTORY_REQUIRED)
+        }
         freshAccessToken(expectedGeneration = authenticationGeneration)
         val bootstrapStarted = authenticationLifecycle.runIfCurrent(
             authenticationGeneration,
@@ -2032,24 +2029,23 @@ internal class ProductionProductRepository(
         // delivery. This keeps JNI and protobuf work off Main without allowing
         // bootstrap and live frames to race each other.
         val sessionDispatcher = Dispatchers.Default.limitedParallelism(1)
-        // Start only the device-scoped handshake while REST chooses/restores a
-        // checkpoint. The bounded session endpoint is still registered after
-        // bootstrap so realtime ciphertext cannot overflow an unconsumed queue.
+        // Start only the device-scoped handshake while the Windows host
+        // chooses and serves a checkpoint. The bounded session endpoint is
+        // still registered after bootstrap so realtime ciphertext cannot
+        // overflow an unconsumed queue.
         val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
         realtime.multiplexer.warmConnect()
         var hostHistoryClient: ProductionRealtimeSessionClient? = null
         val restoredHistory = try {
-            if (PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities) {
-                hostHistoryClient = createHostHistoryBootstrapClient(
-                    session = summary,
-                    pc = pc,
-                    pcDevice = pcDevice,
-                    stored = stored,
-                    engine = engine,
-                    realtime = realtime,
-                    sessionDispatcher = sessionDispatcher,
-                ).also(ProductionRealtimeSessionClient::start)
-            }
+            hostHistoryClient = createHostHistoryBootstrapClient(
+                session = summary,
+                pc = pc,
+                pcDevice = pcDevice,
+                stored = stored,
+                engine = engine,
+                realtime = realtime,
+                sessionDispatcher = sessionDispatcher,
+            ).also(ProductionRealtimeSessionClient::start)
             withContext(sessionDispatcher) {
                 restoreLiveHistory(
                     session = summary,
@@ -2059,7 +2055,7 @@ internal class ProductionProductRepository(
                     engine = engine,
                     authenticationGeneration = authenticationGeneration,
                     allowFreshReplayFromZero = sessionId in newlyLaunchedSessionIds,
-                    hostHistoryClient = hostHistoryClient,
+                    hostHistoryClient = requireNotNull(hostHistoryClient),
                 )
             }
         } catch (error: CancellationException) {
@@ -2444,8 +2440,8 @@ internal class ProductionProductRepository(
         authentication: AuthenticationStateCapture,
     ) {
         require(session.state == SessionState.EXITED) { "Read-only history requires an ended session" }
-        if (PcCapabilityIds.HOST_HISTORY_V1 !in pc.capabilities) {
-            throw sessionOpenException(SessionOpenFailureCode.SESSION_ENDED)
+        if (!hasHostHistoryAuthority(pc.capabilities)) {
+            throw sessionOpenException(SessionOpenFailureCode.HOST_HISTORY_REQUIRED)
         }
         if (!pc.online) throw sessionOpenException(SessionOpenFailureCode.SESSION_OFFLINE)
         val authenticationGeneration = authentication.authenticationGeneration
@@ -2501,7 +2497,7 @@ internal class ProductionProductRepository(
                     stored = stored,
                     engine = engine,
                     authenticationGeneration = authenticationGeneration,
-                    hostHistoryClient = historyClient,
+                    hostHistoryClient = requireNotNull(historyClient),
                 )
             }
         } catch (error: CancellationException) {
@@ -2680,7 +2676,7 @@ internal class ProductionProductRepository(
     override fun terminalEngine(sessionId: UUID): TerminalViewportEngine? =
         liveSessions[sessionId]?.engine ?: readOnlySessionEngines[sessionId]
 
-    override fun historyEngine(historyObjectId: UUID): TerminalViewportEngine? = historyEngines[historyObjectId]
+    override fun historyEngine(historyObjectId: UUID): TerminalViewportEngine? = null
 
     override suspend fun loadTranscriptBefore(sessionId: UUID) {
         check(!closed) { "Repository is closed" }
@@ -2757,8 +2753,6 @@ internal class ProductionProductRepository(
         val product = mutableSnapshot.value
         val session = product.sessions.firstOrNull { it.id == sessionId }
             ?: error("The selected session is unavailable")
-        val pc = product.pcs.firstOrNull { it.id == session.pcId }
-            ?: error("The selected Windows PC is unavailable")
         require(session.online) { "Only an online session can be closed" }
 
         // Opening is idempotent and registers this exact UUID on the shared
@@ -2767,7 +2761,7 @@ internal class ProductionProductRepository(
         openSession(sessionId)
         val live = liveSessions[sessionId] ?: error("The selected session is no longer available")
         live.client.requestTermination(
-            awaitAcknowledgement = PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities,
+            awaitAcknowledgement = true,
         )
 
         // The encrypted realtime request intentionally contains no server-
@@ -2800,8 +2794,8 @@ internal class ProductionProductRepository(
         withAuthenticatedApi { api, authenticationGeneration ->
             // A refresh that began before this request must publish before the
             // deletion, never resurrect the deleted session afterward. The
-            // lifecycle lock also prevents an open/replay from installing a
-            // new client or history engine between server success and cleanup.
+            // lifecycle lock also prevents an open from installing a new
+            // client or renderer between server success and cleanup.
             refreshStateLock.withLock {
                 sessionLifecycleLanes.withLock(sessionId) {
                     val product = mutableSnapshot.value
@@ -2812,37 +2806,33 @@ internal class ProductionProductRepository(
                     require(!session.online || session.state == SessionState.EXITED) {
                         "Close an online session before deleting it"
                     }
-                    if (PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities) {
-                        val pcDevice = product.devices.firstOrNull {
-                            it.id == pc.deviceId &&
-                                it.type.isPcAgent() &&
-                                it.trustState == DeviceTrustState.TRUSTED
-                        } ?: error("Windows PC 不受信任 / The selected Windows PC is not trusted")
-                        check(pc.online) {
-                            "Windows PC 已离线，本地主机会话历史未删除 / The Windows PC is offline; its local session history was not deleted"
-                        }
-                        check(pcDevice.exchangePublicKey.size == 32) {
-                            "Windows PC 缺少有效加密密钥 / The selected Windows PC has no valid encryption key"
-                        }
-                        deleteHostHistorySessionAfterTermination(
-                            terminateRemote = {
-                                terminateInactiveHostHistorySession(
-                                    session = session,
-                                    pc = pc,
-                                    pcDevice = pcDevice,
-                                    stored = identity(),
-                                    authenticationGeneration = authenticationGeneration,
-                                )
-                            },
-                            deleteRemote = { api.delete("/v1/sessions/$sessionId") },
-                            deleteLocal = { deleteLocalSession(sessionId) },
-                        )
-                    } else {
-                        deleteSessionAfterRemoteSuccess(
-                            deleteRemote = { api.delete("/v1/sessions/$sessionId") },
-                            deleteLocal = { deleteLocalSession(sessionId) },
-                        )
+                    check(hasHostHistoryAuthority(pc.capabilities)) {
+                        "Windows Agent upgrade required: host_history_v1 is unavailable"
                     }
+                    val pcDevice = product.devices.firstOrNull {
+                        it.id == pc.deviceId &&
+                            it.type.isPcAgent() &&
+                            it.trustState == DeviceTrustState.TRUSTED
+                    } ?: error("Windows PC 不受信任 / The selected Windows PC is not trusted")
+                    check(pc.online) {
+                        "Windows PC 已离线，本地主机会话历史未删除 / The Windows PC is offline; its local session history was not deleted"
+                    }
+                    check(pcDevice.exchangePublicKey.size == 32) {
+                        "Windows PC 缺少有效加密密钥 / The selected Windows PC has no valid encryption key"
+                    }
+                    deleteHostHistorySessionAfterTermination(
+                        terminateRemote = {
+                            terminateInactiveHostHistorySession(
+                                session = session,
+                                pc = pc,
+                                pcDevice = pcDevice,
+                                stored = identity(),
+                                authenticationGeneration = authenticationGeneration,
+                            )
+                        },
+                        deleteRemote = { api.delete("/v1/sessions/$sessionId") },
+                        deleteLocal = { deleteLocalSession(sessionId) },
+                    )
                 }
             }
         }
@@ -2984,34 +2974,8 @@ internal class ProductionProductRepository(
         check(accepted) { "Request control before sending input" }
     }
 
-    override suspend fun replayHistory(entry: HistoryEntry): Unit = sessionLifecycleLanes.withLock(entry.sessionId) {
-        require(entry.historyObject.kind == HistoryObject.Kind.CHUNK) { "This history object cannot be replayed by this client" }
-        val download = historyDownloads[entry.historyObject.id] ?: error("Refresh history before replaying this object")
-        val product = mutableSnapshot.value
-        val session = product.sessions.firstOrNull { it.id == entry.sessionId } ?: error("The history session is unavailable")
-        val pc = product.pcs.firstOrNull { it.id == session.pcId } ?: error("The history PC is unavailable")
-        val pcDevice = product.devices.firstOrNull {
-            it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
-        } ?: error("The history PC is not trusted")
-        val stored = identity()
-        val historyEpoch = historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)
-        require(historyEpoch != null && historyEpoch <= pc.keyEpoch) {
-            "The selected history key is not available on this device"
-        }
-        val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
-
-        val engine = historyEngines.getOrPut(entry.historyObject.id) { TermuxTerminalEngine() }
-        engine.setReadOnly(true)
-        engine.clear()
-        engine.resize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1))
-        chunk.eventsList.forEach { event ->
-            applyHistoryEvent(engine, event)
-        }
-        mutableSnapshot.value = mutableSnapshot.value.copy(
-            replayedHistoryObjectIds = mutableSnapshot.value.replayedHistoryObjectIds + entry.historyObject.id,
-        )
-        appendActivity(context.getString(R.string.activity_history_replayed), entry.sessionLabel, Severity.SUCCESS)
-    }
+    override suspend fun replayHistory(entry: HistoryEntry): Unit =
+        throw sessionOpenException(SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY)
 
     override suspend fun browseRemoteDirectory(
         pcId: UUID,
@@ -3666,17 +3630,10 @@ internal class ProductionProductRepository(
         // Room transaction. UUIDs are never reused, so the fence is permanent
         // for this repository lifetime.
         deletedSessionIds += sessionId
-        val historyObjectIds = mutableSnapshot.value.history.asSequence()
-            .filter { it.sessionId == sessionId }
-            .mapTo(mutableSetOf()) { it.historyObject.id }
         val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
         live?.closeAndJoin()
         val readOnly = synchronized(liveSessionLock) { readOnlySessionEngines.remove(sessionId) }
         readOnly?.dispose()
-        historyObjectIds.forEach { objectId ->
-            historyEngines.remove(objectId)?.dispose()
-            historyDownloads.remove(objectId)
-        }
         historyRepository.deleteSession(sessionId)
         mutableSnapshot.update { snapshot -> snapshot.withoutSession(sessionId) }
     }
@@ -3745,39 +3702,11 @@ internal class ProductionProductRepository(
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         sessions.forEach { historyRepository.upsertSession(it) }
         val storedIdentity = identity()
-        val ownDeviceId = storedIdentity.deviceId
         val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, sessions, storedIdentity)
-        val refreshedDownloads = mutableMapOf<UUID, HistoryDownloadRequest>()
-        val historyEntries = sessions.flatMap { session ->
-            val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@flatMap emptyList()
-            // Host-owned history has no server catalog. Snapshot, transcript,
-            // and event pages are selected only over the active E2EE session.
-            if (PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities) return@flatMap emptyList()
-            val response = try {
-                api.get(sessionChunkHistoryRequestPath(session.id)).jsonObject
-            } catch (error: TermLinkApiException) {
-                if (legacyHistoryCatalogUnavailable(error)) return@flatMap emptyList()
-                throw error
-            }
-            boundedChunkHistoryItems(response).mapNotNull { item ->
-                val keyId = item.requiredString("key_id")
-                val historyEpoch = historyKeyEpoch(ownDeviceId, keyId)
-                if (!item.requiredString("kind").equals("chunk", ignoreCase = true) ||
-                    historyEpoch == null || historyEpoch > pc.keyEpoch
-                ) {
-                    return@mapNotNull null
-                }
-                val parsed = item.toHistoryObject(session.id)
-                val request = item.getValue("download").jsonObject.toHistoryDownloadRequest()
-                refreshedDownloads[parsed.id] = request
-                val pcName = pcs.firstOrNull { it.id == session.pcId }?.name ?: "Windows PC"
-                HistoryEntry(session.id, "$pcName | ${session.shellType}", parsed, item.optionalInstant("created_at"))
-            }
-        }
-        historyDownloads.clear()
-        historyDownloads.putAll(refreshedDownloads)
+        // Terminal history has no Server catalog. It is opened from the
+        // owning Windows Agent through host_history_v1 on the session screen.
+        val historyEntries = emptyList<HistoryEntry>()
         rotateLiveSessionKeys(devices, pcs, sessions)
-        closeHistoryEnginesExcept(historyEntries.mapTo(mutableSetOf()) { it.historyObject.id })
         val trustedPcIds = pcs.asSequence()
             .filter { pc ->
                 devices.any { device ->
@@ -4363,7 +4292,6 @@ internal class ProductionProductRepository(
         } catch (_: RevokedDeviceIdentityException) {
             // Re-authentication is the explicit user action that allows an
             // installation whose device key was revoked to enroll a fresh key.
-            closeHistoryEngines()
             clearRoomCache()
             billing.reset()
             resetRevokedDeviceIdentity(nextScope)
@@ -4403,7 +4331,6 @@ internal class ProductionProductRepository(
             val accountChanged = previousScope != null && previousScope != nextScope
             if (accountChanged) {
                 requireCurrentAuthentication(authenticationGeneration)
-                closeHistoryEngines()
                 clearRoomCache()
                 requireCurrentAuthentication(authenticationGeneration)
                 billing.reset()
@@ -4463,7 +4390,6 @@ internal class ProductionProductRepository(
         }
         if (retired != null) closeRetiredRealtimeRuntimeAndJoin(retired)
         requireCurrentAuthentication(authenticationGeneration)
-        closeHistoryEngines()
         billing.reset()
         clearRoomCache()
         val published = authenticationLifecycle.runIfCurrent(
@@ -4801,8 +4727,8 @@ internal class ProductionProductRepository(
 
     /**
      * Unknown realtime key IDs trigger this narrow authoritative refresh. It
-     * intentionally avoids account, billing, and history endpoints so an
-     * unavailable history object store cannot block an epoch transition.
+     * intentionally avoids account and billing endpoints so unrelated
+     * services cannot block an epoch transition.
      */
     private suspend fun refreshLiveKeyMetadata(): Unit = keyMetadataRefreshLock.withLock {
         withAuthenticatedApi { api, authenticationGeneration ->
@@ -5006,7 +4932,10 @@ internal class ProductionProductRepository(
             } ?: error("The transcript PC is not a trusted device")
             val authentication = captureAuthenticationState()
             val stored = identity(authentication.accountScope)
-            if (PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities) {
+            if (!hasHostHistoryAuthority(pc.capabilities)) {
+                throw sessionOpenException(SessionOpenFailureCode.HOST_HISTORY_REQUIRED)
+            }
+            run {
                 val live = liveSessions[key.sessionId]
                 if (live != null) {
                     loadHostTranscriptPage(
@@ -5044,115 +4973,6 @@ internal class ProductionProductRepository(
                     }
                 }
                 return
-            }
-            // Always fetch the authenticated selector before consulting Room.
-            // The ciphertext may be reusable, but the server response owns the
-            // fixed-revision continuation cursor and publication readiness.
-            val selection = awaitExpectedTranscriptPage {
-                latestTranscriptPage(key, session, stored.deviceId, pc.keyEpoch)
-            }
-            if (selection === TranscriptSelection.Pending || selection === TranscriptSelection.Complete) {
-                val liveAck = mutableSnapshot.value.liveAcknowledgements[key.sessionId] ?: 0u
-                val newerAnchor = if (remainingAnchorRebases > 0) {
-                    latestPublishedTranscriptAnchor(
-                        key = key,
-                        session = session,
-                        pc = pc,
-                        pcDevice = pcDevice,
-                        stored = stored,
-                        durableLiveAcknowledgement = liveAck,
-                    )
-                } else {
-                    null
-                }
-                val rebased = newerAnchor?.let { anchor ->
-                    rebaseTranscriptViewportToNewerAnchor(
-                        viewport = selected,
-                        newSnapshotSequence = anchor.snapshotSequence,
-                        newInitialBeforeLineId = anchor.beforeLineId,
-                        durableLiveAcknowledgement = liveAck,
-                    )
-                }
-                if (rebased != null) {
-                    mutableSnapshot.update { currentProduct ->
-                        val current = currentProduct.transcriptViewports[key.sessionId]
-                        if (!current.matches(key)) currentProduct else currentProduct.copy(
-                            transcriptViewports = currentProduct.transcriptViewports +
-                                (key.sessionId to rebased),
-                        )
-                    }
-                    val installed = mutableSnapshot.value.transcriptViewports[key.sessionId]
-                    if (installed?.snapshotAnchorSequence == rebased.snapshotAnchorSequence &&
-                        installed.viewportGeneration == rebased.viewportGeneration
-                    ) {
-                        loadTranscriptPage(
-                            TranscriptLoadKey(
-                                sessionId = key.sessionId,
-                                snapshotSequence = rebased.snapshotAnchorSequence,
-                                beforeLineId = requireNotNull(rebased.nextBeforeLineId),
-                                cursor = null,
-                                viewportGeneration = rebased.viewportGeneration,
-                            ),
-                            remainingAnchorRebases - 1,
-                        )
-                        return
-                    }
-                }
-                if (selection === TranscriptSelection.Complete) {
-                    finishEmptyTranscriptPage(key)
-                    return
-                }
-                error("The expected terminal transcript page is not available yet")
-            }
-            val ready = selection as TranscriptSelection.ReadyPage<TranscriptDownloadDescriptor>
-            validateTranscriptDescriptorNotLoaded(selected, ready.value.metadata)
-            val cached = historyRepository.transcriptPageForCursor(
-                key.sessionId,
-                key.snapshotSequence,
-                key.beforeLineId,
-            )
-            val encrypted = reuseOrLoadTranscriptCiphertext(cached, ready.value.metadata) {
-                val sealed = withContext(Dispatchers.IO) {
-                    downloadTranscript(ready.value.download, ready.value.metadata)
-                }
-                try {
-                    historyRepository.putTranscriptPage(
-                        sessionId = key.sessionId,
-                        snapshotSequence = key.snapshotSequence,
-                        requestBeforeLineId = key.beforeLineId,
-                        firstLineId = ready.value.metadata.firstLineId,
-                        lastLineId = ready.value.metadata.lastLineId,
-                        objectKey = ready.value.metadata.objectKey,
-                        keyId = ready.value.metadata.keyId,
-                        ciphertext = sealed,
-                        id = ready.value.metadata.id,
-                        ciphertextSha256 = ready.value.metadata.ciphertextSha256,
-                    )
-                    EncryptedTranscriptPage(ready.value.metadata.copyDigest(), sealed.copyOf())
-                } finally {
-                    sealed.fill(0)
-                }
-            }
-            val page = try {
-                openTranscriptPage(session, pc, pcDevice, stored, encrypted)
-            } finally {
-                encrypted.ciphertext.fill(0)
-            }
-            mutableSnapshot.update { currentProduct ->
-                val current = currentProduct.transcriptViewports[key.sessionId]
-                if (!current.matches(key)) currentProduct else currentProduct.copy(
-                    transcriptViewports = currentProduct.transcriptViewports + (
-                        key.sessionId to mergeTranscriptPage(
-                            viewport = requireNotNull(current),
-                            requestedBeforeLineId = key.beforeLineId,
-                            requestedCursor = key.cursor,
-                            objectId = ready.value.metadata.id,
-                            outerHasMore = ready.hasMore,
-                            outerNextCursor = ready.nextCursor,
-                            page = page,
-                        )
-                    ),
-                )
             }
         } catch (error: CancellationException) {
             throw error
@@ -5368,80 +5188,6 @@ internal class ProductionProductRepository(
         this != null && sessionId == key.sessionId && snapshotAnchorSequence == key.snapshotSequence &&
             nextBeforeLineId == key.beforeLineId && nextCursor == key.cursor &&
             viewportGeneration == key.viewportGeneration
-
-    private suspend fun latestTranscriptPage(
-        key: TranscriptLoadKey,
-        session: SessionSummary,
-        recipientDeviceId: UUID,
-        authoritativeKeyEpoch: Long,
-    ): TranscriptSelection<TranscriptDownloadDescriptor> = withApi { api ->
-        val response = api.get(
-            transcriptHistoryRequestPath(session.id, key.snapshotSequence, key.beforeLineId, key.cursor),
-        ).jsonObject
-        when (val selected = parseTranscriptSelectorResponse(response, key.snapshotSequence, key.beforeLineId)) {
-            TranscriptSelection.Pending -> TranscriptSelection.Pending
-            TranscriptSelection.Complete -> TranscriptSelection.Complete
-            is TranscriptSelection.ReadyPage -> TranscriptSelection.ReadyPage(
-                value = selected.value.toTranscriptDownloadDescriptor(
-                    session = session,
-                    recipientDeviceId = recipientDeviceId,
-                    expectedSnapshotSequence = key.snapshotSequence,
-                    requestBeforeLineId = key.beforeLineId,
-                    authoritativeKeyEpoch = authoritativeKeyEpoch,
-                ),
-                hasMore = selected.hasMore,
-                nextCursor = selected.nextCursor,
-            )
-        }
-    }
-
-    private suspend fun latestPublishedTranscriptAnchor(
-        key: TranscriptLoadKey,
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        durableLiveAcknowledgement: ULong,
-    ): TranscriptAnchor? {
-        val descriptor = latestTerminalSnapshot(session, stored, pc.keyEpoch)?.snapshot ?: return null
-        val metadata = descriptor.metadata
-        val sequence = requireNotNull(metadata.snapshotSequence)
-        if (sequence <= key.snapshotSequence || sequence > durableLiveAcknowledgement) return null
-        val cached = historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
-            value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
-                MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
-        }
-        val sealedObject = cached?.ciphertext ?: withContext(Dispatchers.IO) {
-            downloadHistory(descriptor.download, metadata)
-        }
-        try {
-            if (cached == null) {
-                historyRepository.putSnapshot(
-                    sessionId = session.id,
-                    snapshotSequence = sequence,
-                    rows = descriptor.rows,
-                    columns = descriptor.columns,
-                    objectKey = metadata.objectKey,
-                    keyId = metadata.keyId,
-                    formatName = requireNotNull(metadata.formatName),
-                    formatVersion = requireNotNull(metadata.formatVersion),
-                    ciphertext = sealedObject,
-                    id = metadata.id,
-                    ciphertextSha256 = metadata.ciphertextSha256,
-                )
-            }
-            return openTerminalTranscriptAnchor(
-                session = session,
-                pc = pc,
-                pcDevice = pcDevice,
-                stored = stored,
-                descriptor = descriptor,
-                sealedObject = sealedObject,
-            )
-        } finally {
-            sealedObject.fill(0)
-        }
-    }
 
     private suspend fun openTerminalTranscriptAnchor(
         session: SessionSummary,
@@ -5918,17 +5664,6 @@ internal class ProductionProductRepository(
         if (!invalidated) return
     }
 
-    private fun closeHistoryEnginesExcept(retained: Set<UUID>) {
-        historyEngines.keys.filterNot(retained::contains).forEach { objectId -> historyEngines.remove(objectId)?.dispose() }
-    }
-
-    private fun closeHistoryEngines() {
-        historyEngines.values.toList().forEach(TermuxTerminalEngine::dispose)
-        historyEngines.clear()
-        historyDownloads.clear()
-        mutableSnapshot.value = mutableSnapshot.value.copy(replayedHistoryObjectIds = emptySet())
-    }
-
     override fun close() {
         if (closed) return
         closed = true
@@ -5943,7 +5678,6 @@ internal class ProductionProductRepository(
         closeLiveSessions()
         realtimeRuntimeScope.cancel()
         directCoordinatorRuntimeScope.cancel()
-        closeHistoryEngines()
         val closingDownloadJobs = remoteDownloadJobs.values.toList()
         closingDownloadJobs.forEach(Job::cancel)
         // Repository shutdown pauses active transfers. Their .part files and
@@ -5981,28 +5715,10 @@ internal class ProductionProductRepository(
 
     private data class ClientConfiguration(val issuer: Uri, val clientId: String, val redirectUri: Uri)
 
-    private data class HistoryDownloadRequest(
-        val url: String,
-        val method: String,
-        val headers: Map<String, List<String>>,
-    )
-
     private data class SnapshotDownloadDescriptor(
         val metadata: HistoryObject,
         val rows: Int,
         val columns: Int,
-        val download: HistoryDownloadRequest,
-    )
-
-    private data class TerminalSnapshotReadinessObservation(
-        val lastOutputSequence: ULong,
-        val snapshot: SnapshotDownloadDescriptor?,
-        val failure: SessionOpenFailure? = null,
-    )
-
-    private data class TranscriptDownloadDescriptor(
-        val metadata: TranscriptPageMetadata,
-        val download: HistoryDownloadRequest,
     )
 
     private data class TranscriptLoadKey(
@@ -6016,11 +5732,6 @@ internal class ProductionProductRepository(
     private data class TranscriptAnchor(
         val snapshotSequence: ULong,
         val beforeLineId: ULong,
-    )
-
-    private data class PreparedTerminalSnapshot(
-        val checkpoint: PreparedTerminalCheckpoint,
-        val transcriptAnchor: TranscriptAnchor,
     )
 
     private class LiveProductSession(
@@ -6391,193 +6102,6 @@ internal class ProductionProductRepository(
         channelProducts = getValue("channel_products").jsonObject.mapValues { it.value.jsonPrimitive.content },
     )
 
-    private fun JsonObject.toHistoryObject(sessionId: UUID): HistoryObject {
-        val id = UUID.fromString(requiredString("id"))
-        val start = getValue("start_seq").jsonPrimitive.long.toULong()
-        val end = getValue("end_seq").jsonPrimitive.long.toULong()
-        require(start > 0u && end >= start) { "Invalid history sequence range" }
-        val digest = Base64.getUrlDecoder().decode(requiredString("ciphertext_sha256"))
-        require(digest.size == 32) { "Invalid history digest" }
-        return HistoryObject(
-            id = id,
-            kind = HistoryObject.Kind.CHUNK,
-            objectKey = "server/${sessionId}/chunk/$id",
-            keyId = requiredString("key_id"),
-            ciphertextSha256 = digest,
-            sizeBytes = getValue("size_bytes").jsonPrimitive.long,
-            startSequence = start,
-            endSequence = end,
-            snapshotSequence = null,
-            formatName = null,
-            formatVersion = null,
-        )
-    }
-
-    private fun JsonObject.toSnapshotDownloadDescriptor(
-        session: SessionSummary,
-        recipientDeviceId: UUID,
-        authoritativeKeyEpoch: Long,
-    ): SnapshotDownloadDescriptor {
-        require(requiredString("kind").equals("snapshot", ignoreCase = true)) {
-            "History selector returned a non-snapshot object"
-        }
-        val id = UUID.fromString(requiredString("id"))
-        val sequenceValue = getValue("snapshot_seq").jsonPrimitive.long
-        require(sequenceValue > 0) { "Snapshot sequence must be positive" }
-        val sequence = sequenceValue.toULong()
-        require(sequence <= session.lastOutputSequence) {
-            "Snapshot sequence is outside the resumable session range"
-        }
-        val rows = getValue("rows").jsonPrimitive.int
-        val columns = getValue("columns").jsonPrimitive.int
-        require(rows in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_ROWS) { "Snapshot rows are out of bounds" }
-        require(columns in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_COLUMNS) { "Snapshot columns are out of bounds" }
-        val sizeBytes = getValue("size_bytes").jsonPrimitive.long
-        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_CORE_SNAPSHOT_BYTES) { "Snapshot size is out of bounds" }
-        val formatName = requiredString("format_name")
-        val formatVersion = getValue("format_version").jsonPrimitive.int
-        require(formatName == HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT && formatVersion == 2) {
-            "Snapshot format is unsupported"
-        }
-        val keyId = requiredString("key_id")
-        val keyEpoch = requireNotNull(terminalCoreSnapshotKeyEpoch(recipientDeviceId, keyId)) {
-            "Snapshot key ID is not for this device"
-        }
-        require(keyEpoch <= authoritativeKeyEpoch) { "Snapshot key epoch is newer than the authoritative PC epoch" }
-        val digest = Base64.getUrlDecoder().decode(requiredString("ciphertext_sha256"))
-        require(digest.size == 32) { "Invalid snapshot digest" }
-        return SnapshotDownloadDescriptor(
-            metadata = HistoryObject(
-                id = id,
-                kind = HistoryObject.Kind.SNAPSHOT,
-                objectKey = "server/${session.id}/snapshot/$id",
-                keyId = keyId,
-                ciphertextSha256 = digest,
-                sizeBytes = sizeBytes,
-                startSequence = null,
-                endSequence = null,
-                snapshotSequence = sequence,
-                formatName = formatName,
-                formatVersion = formatVersion,
-            ),
-            rows = rows,
-            columns = columns,
-            download = getValue("download").jsonObject.toHistoryDownloadRequest(),
-        )
-    }
-
-    private fun JsonObject.toTranscriptDownloadDescriptor(
-        session: SessionSummary,
-        recipientDeviceId: UUID,
-        expectedSnapshotSequence: ULong,
-        requestBeforeLineId: ULong,
-        authoritativeKeyEpoch: Long,
-    ): TranscriptDownloadDescriptor {
-        require(requiredString("kind").equals("transcript", ignoreCase = true)) {
-            "History selector returned a non-transcript object"
-        }
-        val id = UUID.fromString(requiredString("id"))
-        val anchorValue = getValue("as_of_snapshot_seq").jsonPrimitive.long
-        require(anchorValue > 0 && anchorValue.toULong() == expectedSnapshotSequence) {
-            "Transcript snapshot anchor changed"
-        }
-        require(expectedSnapshotSequence <= session.lastOutputSequence) {
-            "Transcript snapshot anchor is newer than the authoritative session"
-        }
-        val firstValue = getValue("first_line_id").jsonPrimitive.long
-        val lastValue = getValue("last_line_id").jsonPrimitive.long
-        require(firstValue > 0 && lastValue >= firstValue && lastValue.toULong() < requestBeforeLineId) {
-            "Transcript line range is invalid for its exclusive cursor"
-        }
-        val sizeBytes = getValue("size_bytes").jsonPrimitive.long
-        require(sizeBytes in 1..HistoryRepository.MAX_TERMINAL_TRANSCRIPT_BYTES) {
-            "Transcript size is out of bounds"
-        }
-        val formatName = requiredString("format_name")
-        val formatVersion = getValue("format_version").jsonPrimitive.int
-        require(formatName == HistoryRepository.TERMINAL_TRANSCRIPT_FORMAT && formatVersion == 1) {
-            "Transcript format is unsupported"
-        }
-        val keyId = requiredString("key_id")
-        val keyEpoch = requireNotNull(transcriptKeyEpoch(recipientDeviceId, keyId)) {
-            "Transcript key ID is not for this device"
-        }
-        require(keyEpoch <= authoritativeKeyEpoch) {
-            "Transcript key epoch is newer than the authoritative PC epoch"
-        }
-        val digest = Base64.getUrlDecoder().decode(requiredString("ciphertext_sha256"))
-        require(digest.size == HistoryRepository.SHA256_BYTES) { "Invalid transcript digest" }
-        return TranscriptDownloadDescriptor(
-            metadata = TranscriptPageMetadata(
-                id = id,
-                sessionId = session.id,
-                snapshotSequence = expectedSnapshotSequence,
-                requestBeforeLineId = requestBeforeLineId,
-                firstLineId = firstValue.toULong(),
-                lastLineId = lastValue.toULong(),
-                objectKey = "server/${session.id}/transcript/$id",
-                keyId = keyId,
-                ciphertextSha256 = digest,
-                sizeBytes = sizeBytes,
-                formatName = formatName,
-                formatVersion = formatVersion,
-            ),
-            download = getValue("download").jsonObject.toHistoryDownloadRequest(),
-        )
-    }
-
-    private fun JsonObject.toHistoryDownloadRequest(): HistoryDownloadRequest {
-        val uri = URI(requiredString("url"))
-        require(historyDownloadUriAllowed(uri, BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST)) {
-            "History downloads must use HTTPS outside an explicit local debug build"
-        }
-        val method = requiredString("method").uppercase()
-        require(method == "GET") { "History download method must be GET" }
-        val headers = get("headers")?.jsonObject?.mapValues { (_, value) ->
-            value.jsonArray.map { it.jsonPrimitive.content }
-        }.orEmpty()
-        return HistoryDownloadRequest(uri.toString(), method, headers)
-    }
-
-    private fun downloadHistory(request: HistoryDownloadRequest, metadata: HistoryObject): ByteArray {
-        val builder = Request.Builder().url(request.url).get()
-        request.headers.forEach { (name, values) ->
-            if (!name.equals("host", ignoreCase = true)) values.forEach { builder.addHeader(name, it) }
-        }
-        http.newCall(builder.build()).execute().use { response ->
-            check(response.isSuccessful) { "History download returned HTTP ${response.code}" }
-            val bytes = response.body?.bytes() ?: error("History download was empty")
-            require(bytes.size.toLong() == metadata.sizeBytes) { "History download size mismatch" }
-            require(MessageDigest.isEqual(MessageDigest.getInstance("SHA-256").digest(bytes), metadata.ciphertextSha256)) {
-                "History download integrity check failed"
-            }
-            return bytes
-        }
-    }
-
-    private fun downloadTranscript(
-        request: HistoryDownloadRequest,
-        metadata: TranscriptPageMetadata,
-    ): ByteArray {
-        val builder = Request.Builder().url(request.url).get()
-        request.headers.forEach { (name, values) ->
-            if (!name.equals("host", ignoreCase = true)) values.forEach { builder.addHeader(name, it) }
-        }
-        http.newCall(builder.build()).execute().use { response ->
-            check(response.isSuccessful) { "Transcript download returned HTTP ${response.code}" }
-            val declaredLength = response.body?.contentLength() ?: -1L
-            require(declaredLength < 0 || declaredLength == metadata.sizeBytes) {
-                "Transcript download size mismatch"
-            }
-            val bytes = response.body?.bytes() ?: error("Transcript download was empty")
-            require(bytes.size.toLong() == metadata.sizeBytes) { "Transcript download size mismatch" }
-            require(MessageDigest.isEqual(HistoryRepository.sha256(bytes), metadata.ciphertextSha256)) {
-                "Transcript download integrity check failed"
-            }
-            return bytes
-        }
-    }
-
     private suspend fun openNativeTerminalSnapshot(
         session: SessionSummary,
         pc: PcSummary,
@@ -6632,7 +6156,7 @@ internal class ProductionProductRepository(
         stored: DeviceKeyVault.StoredIdentity,
         engine: NativeTerminalEngine,
         authenticationGeneration: Long,
-        hostHistoryClient: ProductionRealtimeSessionClient? = null,
+        hostHistoryClient: ProductionRealtimeSessionClient,
     ): RestoredLiveHistory? {
         val bound = try {
             historyRepository.rendererCheckpointState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
@@ -6715,55 +6239,23 @@ internal class ProductionProductRepository(
                         if (currentTail <= restored) {
                             throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
                         }
-                        val requiredTarget = maxOf(
-                            restored + 1uL,
-                            bound.durableAcknowledgement,
-                        )
                         val progress = try {
-                            if (hostHistoryClient != null) {
-                                replayHostHistoryRange(
-                                    client = hostHistoryClient,
-                                    session = session,
-                                    pc = pc,
-                                    pcDevice = pcDevice,
-                                    stored = stored,
-                                    engine = engine,
-                                    afterSequence = restored,
-                                    throughSequence = currentTail,
-                                    initialLocalInputEpoch = localInputEpoch,
-                                ).also { value ->
-                                    if (!snapshotSuffixReplayTargetIsBounded(
-                                            snapshotSequence = bound.snapshotSequence,
-                                            replayTarget = value.restoredThrough,
-                                        )
-                                    ) throw SnapshotSuffixReplayLimitExceededException()
-                                }
-                            } else {
-                                val replayTarget = cacheStreamedHistoryRange(
-                                    session = session,
-                                    pc = pc,
-                                    stored = stored,
-                                    authenticationGeneration = authenticationGeneration,
-                                    minimumTarget = requiredTarget,
-                                    stopAfterSequence = restored,
-                                    validateTargetBeforeCaching = { target ->
-                                        if (!snapshotSuffixReplayTargetIsBounded(
-                                            snapshotSequence = bound.snapshotSequence,
-                                            replayTarget = target,
-                                        )
-                                        ) throw SnapshotSuffixReplayLimitExceededException()
-                                    },
-                                )
-                                replayCachedHistoryRange(
-                                    session = session,
-                                    pc = pc,
-                                    pcDevice = pcDevice,
-                                    stored = stored,
-                                    engine = engine,
-                                    afterSequence = restored,
-                                    throughSequence = replayTarget,
-                                    initialLocalInputEpoch = localInputEpoch,
-                                )
+                            replayHostHistoryRange(
+                                client = hostHistoryClient,
+                                session = session,
+                                pc = pc,
+                                pcDevice = pcDevice,
+                                stored = stored,
+                                engine = engine,
+                                afterSequence = restored,
+                                throughSequence = currentTail,
+                                initialLocalInputEpoch = localInputEpoch,
+                            ).also { value ->
+                                if (!snapshotSuffixReplayTargetIsBounded(
+                                        snapshotSequence = bound.snapshotSequence,
+                                        replayTarget = value.restoredThrough,
+                                    )
+                                ) throw SnapshotSuffixReplayLimitExceededException()
                             }
                         } catch (_: SnapshotSuffixReplayLimitExceededException) {
                             resetAbandonedSnapshotRenderer(session, engine)
@@ -6877,7 +6369,7 @@ internal class ProductionProductRepository(
         authenticationGeneration: Long,
         expectedRendererGeneration: Long,
         descriptor: SnapshotDownloadDescriptor,
-        hostHistoryClient: ProductionRealtimeSessionClient? = null,
+        hostHistoryClient: ProductionRealtimeSessionClient,
     ): RestoredLiveHistory? {
         val restoreAttempt = HOST_HISTORY_RESTORE_ATTEMPTS.incrementAndGet()
         var restoreStage = "cache_lookup"
@@ -6886,38 +6378,20 @@ internal class ProductionProductRepository(
         logHostSnapshotRestore(
             restoreAttempt,
             "started",
-            "snapshot_seq=$sequence expected_generation=$expectedRendererGeneration host_history=${hostHistoryClient != null}",
+            "snapshot_seq=$sequence expected_generation=$expectedRendererGeneration host_history=true",
         )
-        val cached = historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
+        val cached = requireNotNull(historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
             value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
                 MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
-        }
-        restoreStage = if (cached == null) "snapshot_download" else "snapshot_cache_read"
-        val sealedObject = cached?.ciphertext ?: withContext(Dispatchers.IO) {
-            downloadHistory(descriptor.download, metadata)
-        }
+        }) { "Host Snapshot was not cached before installation" }
+        restoreStage = "snapshot_cache_read"
+        val sealedObject = cached.ciphertext
         try {
             logHostSnapshotRestore(
                 restoreAttempt,
                 "snapshot_cached",
-                "snapshot_seq=$sequence cache_hit=${cached != null} sealed_bytes=${sealedObject.size}",
+                "snapshot_seq=$sequence cache_hit=true sealed_bytes=${sealedObject.size}",
             )
-            if (cached == null) {
-                restoreStage = "snapshot_cache_write"
-                historyRepository.putSnapshot(
-                    sessionId = session.id,
-                    snapshotSequence = sequence,
-                    rows = descriptor.rows,
-                    columns = descriptor.columns,
-                    objectKey = metadata.objectKey,
-                    keyId = metadata.keyId,
-                    formatName = requireNotNull(metadata.formatName),
-                    formatVersion = requireNotNull(metadata.formatVersion),
-                    ciphertext = sealedObject,
-                    id = metadata.id,
-                    ciphertextSha256 = metadata.ciphertextSha256,
-                )
-            }
             restoreStage = "snapshot_decrypt"
             val opened = openNativeTerminalSnapshot(
                 session,
@@ -6956,41 +6430,21 @@ internal class ProductionProductRepository(
                 }
                 return withContext(NonCancellable) {
                     restoreStage = "cursor_read"
-                    val hostCursor = if (hostHistoryClient != null) {
-                        requireNotNull(
-                            historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION),
-                        ).also { cursor ->
-                            check(cursor.rendererGeneration == expectedRendererGeneration) {
-                                "Host renderer generation changed before checkpoint installation"
-                            }
+                    val hostCursor = requireNotNull(
+                        historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION),
+                    ).also { cursor ->
+                        check(cursor.rendererGeneration == expectedRendererGeneration) {
+                            "Host renderer generation changed before checkpoint installation"
                         }
-                    } else {
-                        null
                     }
-                    val legacyBound = if (hostHistoryClient == null) {
-                        historyRepository.bindRendererCheckpoint(
-                            sessionId = session.id,
-                            direction = LIVE_OUTPUT_ACK_DIRECTION,
-                            expectedRendererGeneration = expectedRendererGeneration,
-                            snapshotId = metadata.id,
-                            snapshotSequence = sequence,
-                            ciphertextSha256 = metadata.ciphertextSha256,
-                        )
-                    } else {
-                        null
-                    }
-                    val replayTarget = hostCursor?.let {
-                        restorableSessionEventTail(confirmedTail, it.sequence)
-                    } ?: requireNotNull(legacyBound).durableAcknowledgement
+                    val replayTarget = restorableSessionEventTail(confirmedTail, hostCursor.sequence)
                     logHostSnapshotRestore(
                         restoreAttempt,
                         "authority_confirmed",
                         "snapshot_seq=$sequence output_tail=$confirmedTail " +
-                            "durable_ack=${hostCursor?.sequence ?: replayTarget} replay_target=$replayTarget",
+                            "durable_ack=${hostCursor.sequence} replay_target=$replayTarget",
                     )
-                    if (hostHistoryClient != null &&
-                        !snapshotSuffixReplayTargetIsBounded(sequence, replayTarget)
-                    ) {
+                    if (!snapshotSuffixReplayTargetIsBounded(sequence, replayTarget)) {
                         throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
                     }
                     restoreStage = "checkpoint_install"
@@ -7013,12 +6467,10 @@ internal class ProductionProductRepository(
                     var restoredThrough = installed.sequence.toULong()
                     var localInputEpoch = opened.observedLocalInputEpoch.toLong()
                     if (restoredThrough < replayTarget) {
-                        val client = hostHistoryClient
-                            ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_REPLAY)
                         restoreStage = "suffix_replay"
                         val progress = try {
                             val progress = replayHostHistoryRange(
-                                client = client,
+                                client = hostHistoryClient,
                                 session = session,
                                 pc = pc,
                                 pcDevice = pcDevice,
@@ -7048,19 +6500,15 @@ internal class ProductionProductRepository(
                     )
                     restoreStage = "checkpoint_bind"
                     val bound = try {
-                        if (hostHistoryClient != null) {
-                            historyRepository.bindHostRendererCheckpoint(
-                                sessionId = session.id,
-                                direction = LIVE_OUTPUT_ACK_DIRECTION,
-                                expectedRendererGeneration = expectedRendererGeneration,
-                                snapshotId = metadata.id,
-                                snapshotSequence = sequence,
-                                renderedThroughSequence = restoredThrough,
-                                ciphertextSha256 = metadata.ciphertextSha256,
-                            )
-                        } else {
-                            requireNotNull(legacyBound)
-                        }
+                        historyRepository.bindHostRendererCheckpoint(
+                            sessionId = session.id,
+                            direction = LIVE_OUTPUT_ACK_DIRECTION,
+                            expectedRendererGeneration = expectedRendererGeneration,
+                            snapshotId = metadata.id,
+                            snapshotSequence = sequence,
+                            renderedThroughSequence = restoredThrough,
+                            ciphertextSha256 = metadata.ciphertextSha256,
+                        )
                     } catch (error: CancellationException) {
                         throw error
                     } catch (error: Exception) {
@@ -7107,242 +6555,6 @@ internal class ProductionProductRepository(
             throw error
         } finally {
             sealedObject.fill(0)
-        }
-    }
-
-    private suspend fun prepareTerminalSnapshot(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        engine: TermuxTerminalEngine,
-        metadata: HistoryObject,
-        rows: Int,
-        columns: Int,
-        sealedObject: ByteArray,
-    ) = withContext(Dispatchers.Default) {
-        val sequence = requireNotNull(metadata.snapshotSequence) { "Snapshot sequence is missing" }
-        require(metadata.kind == HistoryObject.Kind.SNAPSHOT) { "History object is not a terminal snapshot" }
-        if (metadata.formatName != HistoryRepository.TERMINAL_SNAPSHOT_FORMAT || metadata.formatVersion != 1) {
-            throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT)
-        }
-        val keyEpoch = snapshotKeyEpoch(stored.deviceId, metadata.keyId)
-            ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_RECIPIENT)
-        if (keyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
-        val pairwise = SessionCrypto.derivePairwiseKey(
-            stored.identity.exchange.privateKey,
-            pcDevice.exchangePublicKey,
-            pc.deviceId,
-            stored.deviceId,
-            keyEpoch,
-        )
-        try {
-            val wire = try {
-                TerminalSnapshotCrypto.openSnapshot(
-                    pairwiseKey = pairwise,
-                    sealedObject = sealedObject,
-                    expectedSessionId = session.id,
-                    expectedPcDeviceId = pc.deviceId,
-                    expectedRecipientDeviceId = stored.deviceId,
-                    expectedKeyEpoch = keyEpoch,
-                    expectedKeyId = metadata.keyId,
-                    expectedSnapshotSequence = sequence,
-                    expectedColumns = columns,
-                    expectedRows = rows,
-                )
-            } catch (error: Exception) {
-                throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
-            }
-            val initialBeforeLineId = try {
-                TerminalSnapshotCrypto.initialTranscriptBeforeLineId(wire)
-            } catch (error: Exception) {
-                throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT, error)
-            }
-            val decoded = try {
-                TerminalSnapshotDomainDecoder.decode(wire)
-            } catch (error: Exception) {
-                throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT, error)
-            }
-            val checkpoint = try {
-                engine.prepareSnapshot(decoded)
-            } catch (error: Exception) {
-                throw sessionOpenException(SessionOpenFailureCode.TERMINAL_RENDERER, error)
-            }
-            PreparedTerminalSnapshot(
-                checkpoint = checkpoint,
-                transcriptAnchor = TranscriptAnchor(
-                    snapshotSequence = decoded.sequence.toULong(),
-                    beforeLineId = initialBeforeLineId,
-                ),
-            )
-        } finally {
-            pairwise.fill(0)
-        }
-    }
-
-    private suspend fun restoreBoundTerminalCheckpoint(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        engine: TermuxTerminalEngine,
-    ): RestoredLiveHistory? {
-        val checkpoint = try {
-            historyRepository.rendererCheckpointState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Exception) {
-            // A broken binding must block opening rather than silently reset
-            // the durable cursor and trigger a replay from sequence zero.
-            throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
-        } ?: return null
-        if (!snapshotMatchesDurableAcknowledgement(
-                snapshotSequence = checkpoint.snapshotSequence,
-                durableAcknowledgement = checkpoint.durableAcknowledgement,
-            )
-        ) {
-            checkpoint.snapshot.ciphertext.fill(0)
-            return null
-        }
-        val currentTail = try {
-            latestAuthoritativeSessionTail(session)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            null
-        } ?: return null
-        if (!snapshotHasBoundedLiveSuffix(checkpoint.snapshotSequence, currentTail)) return null
-        val prepared = prepareTerminalSnapshot(
-            session,
-            pc,
-            pcDevice,
-            stored,
-            engine,
-            checkpoint.snapshot.metadata,
-            checkpoint.snapshotRows,
-            checkpoint.snapshotColumns,
-            checkpoint.snapshot.ciphertext,
-        )
-        val confirmedTail = latestAuthoritativeSessionTail(session) ?: return null
-        if (!snapshotHasBoundedLiveSuffix(checkpoint.snapshotSequence, confirmedTail)) return null
-        return withContext(NonCancellable) {
-            val bound = checkpoint
-            try {
-                val installed = engine.installPrepared(prepared.checkpoint)
-                check(installed.sequence.toULong() == bound.snapshotSequence &&
-                    installed.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
-                ) { "Installed renderer checkpoint does not match its durable binding" }
-                RestoredLiveHistory(
-                    rendererState = RendererBootstrapState.ExactCheckpoint(
-                        sequence = installed.sequence,
-                        rendererGeneration = bound.rendererGeneration,
-                        snapshotId = bound.snapshot.metadata.id,
-                        ciphertextSha256 = bound.snapshot.metadata.ciphertextSha256,
-                        snapshotSequence = bound.snapshotSequence.toLong(),
-                    ),
-                    localInputEpoch = installed.projection.observedLocalInputEpoch,
-                    transcriptAnchor = prepared.transcriptAnchor,
-                    durableAcknowledgement = bound.snapshotSequence,
-                    bootstrapSource = ProductBootstrapSource.BOUND_SNAPSHOT,
-                )
-            } catch (error: Exception) {
-                throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_INSTALL)
-            }
-        }
-    }
-
-    private suspend fun latestTerminalSnapshot(
-        initialSession: SessionSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        authoritativeKeyEpoch: Long,
-        minimumSnapshotSequence: ULong = 0uL,
-        expectedAuthenticationGeneration: Long? = null,
-    ): TerminalSnapshotReadinessObservation? {
-        return withAuthenticatedApi(
-            httpClient = terminalSnapshotReadinessHttp,
-            expectedGeneration = expectedAuthenticationGeneration,
-        ) { api, _ ->
-            // The session list can become visible before its final snapshot is
-            // committed. Refresh only this PC's authoritative session metadata
-            // on every bounded readiness attempt, including when the first
-            // session observation still reported sequence zero.
-            val session = ProductResponseParser.itemObjects(
-                api.get(authoritativeSessionCatalogPath(initialSession.pcId)).jsonObject,
-            ).map { it.toSession() }
-                .singleOrNull { it.id == initialSession.id }
-                ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
-            var observedFailure: SessionOpenFailure? = null
-            val descriptor = if (session.lastOutputSequence == 0uL) {
-                null
-            } else {
-                try {
-                    val response = api.get(
-                        "/v1/sessions/${session.id}/history" +
-                            "?kind=snapshot&format_name=${HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT}&limit=1",
-                    ).jsonObject
-                    val items = ProductResponseParser.itemObjects(response)
-                    require(items.size <= 1) { "Latest snapshot selector returned more than one object" }
-                    val candidate = items.singleOrNull()?.toSnapshotDownloadDescriptor(
-                        session,
-                        stored.deviceId,
-                        authoritativeKeyEpoch,
-                    )
-                    candidate?.takeIf { value ->
-                        // A near-tail Snapshot opens immediately and realtime
-                        // fills only its small bounded suffix. A genuinely old
-                        // Snapshot is rejected so opening can never degrade to
-                        // an unbounded prefix replay.
-                        val candidateSequence = requireNotNull(value.metadata.snapshotSequence)
-                        val current = candidateSequence >= minimumSnapshotSequence &&
-                            candidateSequence <= session.lastOutputSequence && snapshotHasBoundedLiveSuffix(
-                            snapshotSequence = candidateSequence,
-                            currentSessionSequence = session.lastOutputSequence,
-                        )
-                        if (!current) observedFailure = SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_STALE)
-                        current
-                    }
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    // Preserve the independently verified current tail even if
-                    // object metadata is temporarily unavailable. That latch is
-                    // what prevents a stale catalog value of zero from causing a
-                    // full realtime replay.
-                    if (BuildConfig.DEBUG) {
-                        val failure = classifySessionOpenException(
-                            error,
-                            SessionFailureStage.SNAPSHOT_METADATA,
-                        ).failure.code.stableCode
-                        Log.e("TermLinkTailFirst", "Snapshot metadata readiness failed [$failure]")
-                    }
-                    observedFailure = classifySessionOpenException(
-                        error,
-                        SessionFailureStage.SNAPSHOT_METADATA,
-                    ).failure
-                    null
-                }
-            }
-            if (descriptor == null) {
-                observedFailure = when (session.snapshotStatus) {
-                    "UNSUPPORTED" -> SessionOpenFailure(
-                        SessionOpenFailureCode.SNAPSHOT_UNSUPPORTED,
-                        diagnosticCode = session.snapshotReasonCode,
-                    )
-                    "FAILED" -> SessionOpenFailure(
-                        SessionOpenFailureCode.SNAPSHOT_PRODUCTION_FAILED,
-                        diagnosticCode = session.snapshotReasonCode,
-                    )
-                    else -> observedFailure
-                }
-            }
-            if (BuildConfig.DEBUG) {
-                Log.d(
-                    "TermLinkTailFirst",
-                    "Snapshot readiness tail=${session.lastOutputSequence} " +
-                        "candidate=${descriptor?.metadata?.snapshotSequence ?: 0uL}",
-                )
-            }
-            TerminalSnapshotReadinessObservation(session.lastOutputSequence, descriptor, observedFailure)
         }
     }
 
@@ -7394,176 +6606,6 @@ internal class ProductionProductRepository(
         return tail
     }
 
-    /**
-     * Reads only the newest, recipient-filtered Chunk catalog pages needed by
-     * tail recovery. The server orders this selector newest first, so walking
-     * the entire catalog would turn the availability fallback into the same
-     * unbounded cold start it is intended to avoid.
-     */
-    private suspend fun latestBoundedTailReplayCatalog(
-        session: SessionSummary,
-        pc: PcSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        authoritativeTail: ULong,
-    ): List<HistoryEntry> = withApi(terminalSnapshotReadinessHttp) { api ->
-        val entries = mutableListOf<HistoryEntry>()
-        val downloads = mutableMapOf<UUID, HistoryDownloadRequest>()
-        val objectIds = mutableSetOf<UUID>()
-        val consumedCursors = mutableSetOf<String>()
-        var cursor: String? = null
-        var pageCount = 0
-        while (true) {
-            require(pageCount < TERMINAL_TAIL_REPLAY_MAX_CATALOG_PAGES)
-            val response = api.get(sessionChunkHistoryRequestPath(session.id, cursor)).jsonObject
-            val items = boundedChunkHistoryItems(response)
-            for (item in items) {
-                val keyId = item.requiredString("key_id")
-                val historyEpoch = historyKeyEpoch(stored.deviceId, keyId)
-                require(historyEpoch != null && historyEpoch <= pc.keyEpoch) {
-                    "Chunk history key is not valid for the current recipient epoch"
-                }
-                val parsed = item.toHistoryObject(session.id)
-                require(objectIds.add(parsed.id)) { "Chunk history paging repeated an object" }
-                val download = item.getValue("download").jsonObject.toHistoryDownloadRequest()
-                downloads[parsed.id] = download
-                entries += HistoryEntry(
-                    sessionId = session.id,
-                    sessionLabel = "${pc.name} | ${session.shellType}",
-                    historyObject = parsed,
-                    createdAt = item.optionalInstant("created_at"),
-                )
-            }
-            pageCount++
-            val hasMore = response.getValue("has_more").jsonPrimitive.booleanOrNull
-                ?: error("Chunk history has_more must be a boolean")
-            if (!hasMore) break
-            val selection = boundedTailReplaySelection(
-                entries,
-                authoritativeTail,
-                HistoryEntry::historySequenceRange,
-            )
-            if (selection.readiness == BoundedEventReplayReadiness.READY &&
-                selection.eventCount >= TERMINAL_BOUNDED_REPLAY_MAX_EVENTS
-            ) break
-            if (pageCount >= TERMINAL_TAIL_REPLAY_MAX_CATALOG_PAGES) break
-            val next = response["next_cursor"]?.jsonPrimitive?.contentOrNull
-                ?.takeIf(String::isNotBlank)
-                ?: error("Chunk history page omitted its continuation cursor")
-            require(consumedCursors.add(next)) { "Chunk history cursor loop detected" }
-            cursor = next
-        }
-        historyDownloads.putAll(downloads)
-        entries
-    }
-
-    /**
-     * Caches one immutable, contiguous CHUNK range while holding at most one
-     * catalog page and one encrypted object in memory. The server's signed
-     * cursor fixes one catalog revision; [stopAfterSequence] lets a catch-up
-     * pass stop at the durable boundary from the preceding pass.
-     *
-     * The returned target may be newer than [minimumTarget] when output and
-     * durable history advanced between the authoritative-tail read and the
-     * first catalog request. That is safe because every admitted sequence is
-     * still authenticated, contiguous, and later rendered before its ACK.
-     */
-    private suspend fun cacheStreamedHistoryRange(
-        session: SessionSummary,
-        pc: PcSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        authenticationGeneration: Long,
-        minimumTarget: ULong,
-        stopAfterSequence: ULong,
-        validateTargetBeforeCaching: (ULong) -> Unit = {},
-    ): ULong = withAuthenticatedApi(
-        httpClient = terminalSnapshotReadinessHttp,
-        expectedGeneration = authenticationGeneration,
-    ) { api, _ ->
-        require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
-
-        val firstResponse = awaitStreamedHistoryCatalogHead(
-            minimumTarget = minimumTarget,
-            loadPage = { api.get(sessionChunkHistoryRequestPath(session.id)).jsonObject },
-            newestEndSequence = { response ->
-                boundedChunkHistoryItems(response)
-                    .firstOrNull()
-                    ?.toHistoryObject(session.id)
-                    ?.endSequence
-            },
-        )
-
-        cacheContiguousHistoryRange(
-            minimumTarget = minimumTarget,
-            stopAfterSequence = stopAfterSequence,
-            firstPage = firstResponse.toStreamedHistoryCatalogPage(),
-            loadNextPage = { cursor ->
-                api.get(sessionChunkHistoryRequestPath(session.id, cursor))
-                    .jsonObject
-                    .toStreamedHistoryCatalogPage()
-            },
-            sequenceRange = { item ->
-                val metadata = item.toHistoryObject(session.id)
-                val start = metadata.startSequence
-                val end = metadata.endSequence
-                if (start == null || end == null) null else HistorySequenceRange(start, end)
-            },
-            validateTargetBeforeCaching = validateTargetBeforeCaching,
-            cacheCandidate = { item ->
-                val metadata = item.toHistoryObject(session.id)
-                val historyEpoch = historyKeyEpoch(stored.deviceId, metadata.keyId)
-                if (historyEpoch == null || historyEpoch > pc.keyEpoch) {
-                    throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
-                }
-                cacheRemoteHistoryChunk(
-                    sessionId = session.id,
-                    metadata = metadata,
-                    download = item.getValue("download").jsonObject.toHistoryDownloadRequest(),
-                )
-            },
-        )
-    }
-
-    private suspend fun cacheRemoteHistoryChunk(
-        sessionId: UUID,
-        metadata: HistoryObject,
-        download: HistoryDownloadRequest,
-    ) = withContext(Dispatchers.IO) {
-        val cached = historyRepository.getHistoryObject(metadata.id)
-        if (cached != null) {
-            try {
-                val existing = cached.metadata
-                require(existing.kind == HistoryObject.Kind.CHUNK &&
-                    existing.id == metadata.id &&
-                    existing.startSequence == metadata.startSequence &&
-                    existing.endSequence == metadata.endSequence &&
-                    existing.objectKey == metadata.objectKey &&
-                    existing.keyId == metadata.keyId &&
-                    existing.sizeBytes == metadata.sizeBytes &&
-                    MessageDigest.isEqual(existing.ciphertextSha256, metadata.ciphertextSha256)
-                ) { "Cached event chunk metadata changed" }
-            } finally {
-                cached.ciphertext.fill(0)
-            }
-            return@withContext
-        }
-
-        val sealedObject = downloadHistory(download, metadata)
-        try {
-            historyRepository.putEventChunk(
-                sessionId = sessionId,
-                startSequence = requireNotNull(metadata.startSequence),
-                endSequence = requireNotNull(metadata.endSequence),
-                objectKey = metadata.objectKey,
-                keyId = metadata.keyId,
-                ciphertext = sealedObject,
-                id = metadata.id,
-                ciphertextSha256 = metadata.ciphertextSha256,
-            )
-        } finally {
-            sealedObject.fill(0)
-        }
-    }
-
     private data class StreamedReplayProgress(
         val restoredThrough: ULong,
         val localInputEpoch: Long,
@@ -7610,9 +6652,6 @@ internal class ProductionProductRepository(
             metadata = metadata,
             rows = value.rows,
             columns = value.columns,
-            // The snapshot was cached above. This descriptor preserves the
-            // existing bind/install path without introducing an HTTP fallback.
-            download = HistoryDownloadRequest("host-history-v1", "GET", emptyMap()),
         )
     }
 
@@ -7764,250 +6803,6 @@ internal class ProductionProductRepository(
     private fun hostHistoryObjectKey(sessionId: UUID, objectId: UUID): String =
         "host-history-v1/${sessionId.toString().lowercase()}/${objectId.toString().lowercase()}"
 
-    /** Replays cached ciphertext one immutable CHUNK at a time. */
-    private suspend fun replayCachedHistoryRange(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        engine: TerminalEngine,
-        afterSequence: ULong,
-        throughSequence: ULong,
-        initialLocalInputEpoch: Long,
-    ): StreamedReplayProgress {
-        require(throughSequence > afterSequence) { "Streamed history replay must advance" }
-        var expected = afterSequence + 1uL
-        var localInputEpoch = initialLocalInputEpoch
-        while (expected <= throughSequence) {
-            currentCoroutineContext().ensureActive()
-            val encrypted = historyRepository.eventChunkContaining(session.id, expected)
-                ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            val metadata = encrypted.metadata
-            val start = metadata.startSequence
-                ?: run {
-                    encrypted.ciphertext.fill(0)
-                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-                }
-            val end = metadata.endSequence
-                ?: run {
-                    encrypted.ciphertext.fill(0)
-                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-                }
-            if (start > expected || end < expected || end > throughSequence) {
-                encrypted.ciphertext.fill(0)
-                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            }
-            val chunk = try {
-                openCachedHistoryChunk(session, pc, pcDevice, stored, encrypted)
-            } finally {
-                encrypted.ciphertext.fill(0)
-            }
-            localInputEpoch = applyContiguousHistoryChunkSuffix(
-                startSequence = start,
-                endSequence = end,
-                nextSequence = expected,
-                events = chunk.eventsList,
-                eventSequence = { it.seq.toULong() },
-                initialLocalInputEpoch = localInputEpoch,
-                applyEvent = { event -> applyHistoryEvent(engine, event) },
-            )
-            expected = end + 1uL
-            yield()
-        }
-        return StreamedReplayProgress(throughSequence, localInputEpoch)
-    }
-
-    private suspend fun openCachedHistoryChunk(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        encrypted: EncryptedHistoryObject,
-    ): HistoryChunkV1 = withContext(Dispatchers.Default) {
-        val metadata = encrypted.metadata
-        val start = requireNotNull(metadata.startSequence)
-        val end = requireNotNull(metadata.endSequence)
-        val historyEpoch = historyKeyEpoch(stored.deviceId, metadata.keyId)
-            ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
-        if (historyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
-        val pairwise = SessionCrypto.derivePairwiseKey(
-            stored.identity.exchange.privateKey,
-            pcDevice.exchangePublicKey,
-            pc.deviceId,
-            stored.deviceId,
-            historyEpoch,
-        )
-        try {
-            HistoryCrypto.open(
-                pairwise,
-                encrypted.ciphertext,
-                session.id,
-                pc.deviceId,
-                stored.deviceId,
-                historyEpoch,
-                metadata.keyId,
-                start,
-                end,
-            )
-        } finally {
-            pairwise.fill(0)
-        }
-    }
-
-    /** Returns null only when no durable binding was changed and the caller may use full replay. */
-    private suspend fun restoreRemoteTerminalSnapshot(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        engine: TermuxTerminalEngine,
-        expectedRendererGeneration: Long,
-        descriptor: SnapshotDownloadDescriptor,
-        onFailure: (SessionOpenFailure) -> Unit,
-    ): RestoredLiveHistory? {
-        val metadata = descriptor.metadata
-        val sequence = requireNotNull(metadata.snapshotSequence)
-        val cached = try {
-            historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
-                value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
-                    MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
-            }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            null
-        }
-        return prepareBindInstallSnapshot(
-            loadAndCache = {
-                try {
-                    val sealedObject = cached?.ciphertext ?: try {
-                        withContext(Dispatchers.IO) {
-                            downloadHistory(descriptor.download, metadata)
-                        }
-                    } catch (error: Exception) {
-                        throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_DOWNLOAD)
-                    }
-                    if (cached == null) {
-                        try {
-                            historyRepository.putSnapshot(
-                                sessionId = session.id,
-                                snapshotSequence = sequence,
-                                rows = descriptor.rows,
-                                columns = descriptor.columns,
-                                objectKey = metadata.objectKey,
-                                keyId = metadata.keyId,
-                                formatName = requireNotNull(metadata.formatName),
-                                formatVersion = requireNotNull(metadata.formatVersion),
-                                ciphertext = sealedObject,
-                                id = metadata.id,
-                                ciphertextSha256 = metadata.ciphertextSha256,
-                            )
-                        } catch (error: Exception) {
-                            throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
-                        }
-                    }
-                    sealedObject
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    if (BuildConfig.DEBUG) {
-                        val failure = classifySessionOpenException(
-                            error,
-                            SessionFailureStage.SNAPSHOT_DOWNLOAD,
-                        ).failure.code.stableCode
-                        Log.e("TermLinkTailFirst", "Snapshot download/cache failed [$failure]")
-                    }
-                    throw error
-                }
-            },
-            prepare = { sealedObject ->
-                try {
-                    prepareTerminalSnapshot(
-                        session,
-                        pc,
-                        pcDevice,
-                        stored,
-                        engine,
-                        metadata,
-                        descriptor.rows,
-                        descriptor.columns,
-                        sealedObject,
-                    )
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    if (BuildConfig.DEBUG) {
-                        val failure = classifySessionOpenException(
-                            error,
-                            SessionFailureStage.SNAPSHOT_PREPARE,
-                        ).failure.code.stableCode
-                        Log.e(
-                            "TermLinkTailFirst",
-                            "Snapshot decrypt/prepare failed [$failure] ${safeSnapshotFailureLocation(error)}",
-                        )
-                    }
-                    throw error
-                }
-            },
-            preparedIsCurrent = {
-                val currentTail = latestAuthoritativeSessionTail(session)
-                val current = currentTail != null && snapshotHasBoundedLiveSuffix(sequence, currentTail)
-                if (BuildConfig.DEBUG && !current) {
-                    Log.d(
-                        "TermLinkTailFirst",
-                        "Snapshot drifted before bind snapshot=$sequence tail=${currentTail ?: 0uL}",
-                    )
-                }
-                if (!current) onFailure(SessionOpenFailure(SessionOpenFailureCode.SNAPSHOT_STALE))
-                current
-            },
-            bind = {
-                try {
-                    historyRepository.bindRendererCheckpoint(
-                        sessionId = session.id,
-                        direction = LIVE_OUTPUT_ACK_DIRECTION,
-                        expectedRendererGeneration = expectedRendererGeneration,
-                        snapshotId = metadata.id,
-                        snapshotSequence = sequence,
-                        ciphertextSha256 = metadata.ciphertextSha256,
-                    )
-                } catch (error: Exception) {
-                    throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
-                }
-            },
-            installAndMap = { prepared, bound ->
-                val installed = try {
-                    engine.installPrepared(prepared.checkpoint).also { value ->
-                        check(value.sequence.toULong() == bound.snapshotSequence &&
-                            value.size == TerminalSize(bound.snapshotColumns, bound.snapshotRows)
-                        ) { "Installed renderer checkpoint does not match the bound snapshot" }
-                    }
-                } catch (error: Exception) {
-                    throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_INSTALL, error)
-                }
-                RestoredLiveHistory(
-                    rendererState = RendererBootstrapState.ExactCheckpoint(
-                        sequence = installed.sequence,
-                        rendererGeneration = bound.rendererGeneration,
-                        snapshotId = metadata.id,
-                        ciphertextSha256 = metadata.ciphertextSha256,
-                        snapshotSequence = bound.snapshotSequence.toLong(),
-                    ),
-                    localInputEpoch = installed.projection.observedLocalInputEpoch,
-                    transcriptAnchor = prepared.transcriptAnchor,
-                    durableAcknowledgement = bound.durableAcknowledgement,
-                    bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
-                )
-            },
-            onLoadFailure = { error ->
-                onFailure(classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_DOWNLOAD).failure)
-            },
-            onPrepareFailure = { error ->
-                onFailure(classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE).failure)
-            },
-        )
-    }
-
     /**
      * Installs an exact Snapshot when available. Otherwise it renders a
      * bounded, contiguous recent Chunk suffix ending at an authoritative tail
@@ -8023,7 +6818,7 @@ internal class ProductionProductRepository(
         engine: NativeTerminalEngine,
         authenticationGeneration: Long,
         allowFreshReplayFromZero: Boolean = false,
-        hostHistoryClient: ProductionRealtimeSessionClient? = null,
+        hostHistoryClient: ProductionRealtimeSessionClient,
     ): RestoredLiveHistory {
         val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
             ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
@@ -8047,10 +6842,8 @@ internal class ProductionProductRepository(
             BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
             pc.capabilities,
         )
-        // Prefer terminal-core's canonical Snapshot V2 and wait through the
-        // normal Agent -> object store -> catalog publication window.  CHUNK
-        // replay remains the compatibility/availability fallback and stays
-        // unbounded in total session length (TL-H115).
+        // Prefer terminal-core's canonical Snapshot V2 from the Windows host.
+        // Host event-range replay is the only availability fallback.
         restoreReplaceableBoundOrRemoteCheckpoint(
             negotiated = terminalSnapshotNegotiated,
             restoreBound = {
@@ -8066,60 +6859,17 @@ internal class ProductionProductRepository(
             },
             abandonRenderer = { resetAbandonedSnapshotRenderer(session, engine) },
             restoreRemote = {
-                if (hostHistoryClient != null) {
-                    val hostSnapshot = awaitHostHistoryReady {
-                        hostHistoryClient.requestLatestHostSnapshot()
-                    } ?: return@restoreReplaceableBoundOrRemoteCheckpoint null
-                    try {
-                        val descriptor = cacheHostSnapshot(
-                            session = session,
-                            pc = pc,
-                            stored = stored,
-                            value = hostSnapshot,
-                        )
-                        return@restoreReplaceableBoundOrRemoteCheckpoint restoreRemoteNativeTerminalSnapshot(
-                            session = session,
-                            pc = pc,
-                            pcDevice = pcDevice,
-                            stored = stored,
-                            engine = engine,
-                            authenticationGeneration = authenticationGeneration,
-                            expectedRendererGeneration = cursor.rendererGeneration,
-                            descriptor = descriptor,
-                            hostHistoryClient = hostHistoryClient,
-                        )
-                    } finally {
-                        hostSnapshot.destroy()
-                    }
-                }
-                val readiness = awaitTerminalSnapshotReadiness(
-                    latestObservation = {
-                        latestTerminalSnapshot(
-                            session,
-                            stored,
-                            pc.keyEpoch,
-                            minimumSnapshotSequence = cursor.sequence,
-                            expectedAuthenticationGeneration = authenticationGeneration,
-                        )
-                    },
-                    snapshotOf = TerminalSnapshotReadinessObservation::snapshot,
-                    lastOutputSequenceOf = TerminalSnapshotReadinessObservation::lastOutputSequence,
-                    failureOf = TerminalSnapshotReadinessObservation::failure,
-                    retryDelaysMillis = TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS,
-                    timeoutMillis = TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS,
-                    ensureObservationContext = {
-                        requireCurrentAuthentication(authenticationGeneration)
-                    },
-                    observationFailure = { error ->
-                        classifySessionOpenException(
-                            error,
-                            SessionFailureStage.SNAPSHOT_METADATA,
-                        ).failure
-                    },
-                )
-                val descriptor = readiness.snapshot
-                if (descriptor != null) {
-                    restoreRemoteNativeTerminalSnapshot(
+                val hostSnapshot = awaitHostHistoryReady {
+                    hostHistoryClient.requestLatestHostSnapshot()
+                } ?: return@restoreReplaceableBoundOrRemoteCheckpoint null
+                try {
+                    val descriptor = cacheHostSnapshot(
+                        session = session,
+                        pc = pc,
+                        stored = stored,
+                        value = hostSnapshot,
+                    )
+                    return@restoreReplaceableBoundOrRemoteCheckpoint restoreRemoteNativeTerminalSnapshot(
                         session = session,
                         pc = pc,
                         pcDevice = pcDevice,
@@ -8128,19 +6878,10 @@ internal class ProductionProductRepository(
                         authenticationGeneration = authenticationGeneration,
                         expectedRendererGeneration = cursor.rendererGeneration,
                         descriptor = descriptor,
+                        hostHistoryClient = hostHistoryClient,
                     )
-                } else {
-                    // ACK zero can still use the complete Chunk compatibility
-                    // path below. A positive durable ACK cannot safely rewind
-                    // to zero, so retain the latest actionable Snapshot error.
-                    if (terminalSnapshotReadinessBlocksChunkFallback(
-                            cursor.sequence,
-                            readiness.failure,
-                        )
-                    ) {
-                        throwTerminalSnapshotReadinessFailureUnlessUnsupported(readiness.failure)
-                    }
-                    null
+                } finally {
+                    hostSnapshot.destroy()
                 }
             },
         )?.let { return it }
@@ -8178,45 +6919,17 @@ internal class ProductionProductRepository(
         var localInputEpoch = 0L
         return try {
             while (true) {
-                val progress = if (hostHistoryClient != null) {
-                    replayHostHistoryRange(
-                        client = hostHistoryClient,
-                        session = session,
-                        pc = pc,
-                        pcDevice = pcDevice,
-                        stored = stored,
-                        engine = engine,
-                        afterSequence = restored,
-                        throughSequence = initialTail,
-                        initialLocalInputEpoch = localInputEpoch,
-                    )
-                } else {
-                    val replayTarget = cacheStreamedHistoryRange(
-                        session = session,
-                        pc = pc,
-                        stored = stored,
-                        authenticationGeneration = authenticationGeneration,
-                        // Restore every newly durable prefix immediately instead
-                        // of waiting for the catalog to catch the authoritative
-                        // tail in one step. This keeps both memory and latency
-                        // bounded independently of the total session length.
-                        minimumTarget = restored + 1uL,
-                        stopAfterSequence = restored,
-                    )
-                    if (replayTarget > Long.MAX_VALUE.toULong()) {
-                        throw sessionOpenException(SessionOpenFailureCode.HISTORY_REPLAY)
-                    }
-                    replayCachedHistoryRange(
-                        session = session,
-                        pc = pc,
-                        pcDevice = pcDevice,
-                        stored = stored,
-                        engine = engine,
-                        afterSequence = restored,
-                        throughSequence = replayTarget,
-                        initialLocalInputEpoch = localInputEpoch,
-                    )
-                }
+                val progress = replayHostHistoryRange(
+                    client = hostHistoryClient,
+                    session = session,
+                    pc = pc,
+                    pcDevice = pcDevice,
+                    stored = stored,
+                    engine = engine,
+                    afterSequence = restored,
+                    throughSequence = initialTail,
+                    initialLocalInputEpoch = localInputEpoch,
+                )
                 restored = progress.restoredThrough
                 localInputEpoch = progress.localInputEpoch
 
@@ -8257,67 +6970,6 @@ internal class ProductionProductRepository(
         }
     }
 
-    private suspend fun openHistoryChunk(
-        entry: HistoryEntry,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        download: HistoryDownloadRequest,
-    ): HistoryChunkV1 = withContext(Dispatchers.IO) {
-        val metadata = entry.historyObject
-        val start = requireNotNull(metadata.startSequence) { "History start sequence is missing" }
-        val end = requireNotNull(metadata.endSequence) { "History end sequence is missing" }
-        val cached = try {
-            historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
-                MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
-            }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            null
-        }
-        val sealedObject = cached?.ciphertext ?: downloadHistory(download, metadata)
-        val historyEpoch = requireNotNull(historyKeyEpoch(stored.deviceId, metadata.keyId)) {
-            "History key ID is not for this device"
-        }
-        require(historyEpoch <= pc.keyEpoch) { "History key epoch is newer than the authoritative PC epoch" }
-        val pairwise = SessionCrypto.derivePairwiseKey(
-            stored.identity.exchange.privateKey,
-            pcDevice.exchangePublicKey,
-            pc.deviceId,
-            stored.deviceId,
-            historyEpoch,
-        )
-        try {
-            if (cached == null) {
-                historyRepository.putEventChunk(
-                    sessionId = entry.sessionId,
-                    startSequence = start,
-                    endSequence = end,
-                    objectKey = metadata.objectKey,
-                    keyId = metadata.keyId,
-                    ciphertext = sealedObject,
-                    id = metadata.id,
-                    ciphertextSha256 = metadata.ciphertextSha256,
-                )
-            }
-            HistoryCrypto.open(
-                pairwise,
-                sealedObject,
-                entry.sessionId,
-                pc.deviceId,
-                stored.deviceId,
-                historyEpoch,
-                metadata.keyId,
-                start,
-                end,
-            )
-        } finally {
-            pairwise.fill(0)
-            sealedObject.fill(0)
-        }
-    }
-
     private suspend fun recoverLiveHistoryGap(
         sessionId: UUID,
         live: LiveProductSession,
@@ -8333,87 +6985,39 @@ internal class ProductionProductRepository(
                 refresh()
                 if (liveSessions[sessionId] !== live) return
                 val product = mutableSnapshot.value
-                val session = product.sessions.firstOrNull { it.id == sessionId } ?: return
-                val pc = product.pcs.firstOrNull { it.id == session.pcId } ?: return
-                val pcDevice = product.devices.firstOrNull {
-                    it.id == pc.deviceId &&
-                        it.type.isPcAgent() &&
-                        it.trustState == DeviceTrustState.TRUSTED
-                } ?: return
-                val activeGap = live.client.sessionState.value as? RemoteSessionState.HistoryGap ?: return
-                if (PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities ||
-                    !fullPrefixReplayCanPreserveDurableAcknowledgement(
-                        activeGap.lastAckedSequence.toULong(),
-                    )
-                ) {
-                    // Host history can rebuild from a Snapshot without
-                    // materializing a complete prefix in Android memory. A
-                    // legacy raw-prefix recovery must also reopen whenever it
-                    // would regress the durable ACK.
-                    scope.launch {
-                        sessionLifecycleLanes.withLock(sessionId) {
-                            try {
-                                // Teardown is a same-session durable-write barrier:
-                                // the retired ACK worker must finish before the new
-                                // Snapshot bootstrap reads and reuses its cursor generation.
-                                retireExactIncarnationAndThen(
-                                    expected = live,
-                                    removeExact = { expected ->
-                                        synchronized(liveSessionLock) {
-                                            liveSessions.remove(sessionId, expected)
-                                        }
-                                    },
-                                    closeAndJoin = LiveProductSession::closeAndJoin,
-                                    afterRetired = { openSessionLocked(sessionId) },
-                                )
-                            } catch (error: CancellationException) {
-                                throw error
-                            } catch (error: Throwable) {
-                                val classified = classifySessionOpenException(
-                                    error,
-                                    SessionFailureStage.HISTORY_REPLAY,
-                                )
-                                observeBootstrapFailure(sessionId, classified.failure)
-                            }
-                        }
-                    }
-                    return
-                }
-                val missingEnd = activeGap.receivedSequence - 1
-                val recovery = if (missingEnd > 0) {
-                    loadLiveHistoryEvents(
-                        session,
-                        pc,
-                        pcDevice,
-                        live.authenticationOwner.storedIdentity,
-                        missingEnd,
-                    )
-                } else {
-                    null
-                }
-                if (recovery != null) {
-                    try {
-                        val recovered = live.client.recoverFromHistory(
-                            recovery.events,
-                            recovery.localInputEpoch,
-                            activeGap,
-                        )
-                        appendActivity(
-                            context.getString(R.string.activity_history_gap_recovered),
-                            context.getString(R.string.activity_history_gap_recovered_detail, recovered),
-                            Severity.SUCCESS,
-                        )
-                        return
-                    } finally {
-                        recovery.events.forEach { event ->
-                            if (event is RemoteSessionEvent.Output) event.bytes.fill(0)
+                if (product.sessions.none { it.id == sessionId }) return
+                scope.launch {
+                    sessionLifecycleLanes.withLock(sessionId) {
+                        try {
+                            // Teardown is a same-session durable-write barrier:
+                            // the retired ACK worker must finish before the new
+                            // host Snapshot bootstrap reads its cursor generation.
+                            retireExactIncarnationAndThen(
+                                expected = live,
+                                removeExact = { expected ->
+                                    synchronized(liveSessionLock) {
+                                        liveSessions.remove(sessionId, expected)
+                                    }
+                                },
+                                closeAndJoin = LiveProductSession::closeAndJoin,
+                                afterRetired = { openSessionLocked(sessionId) },
+                            )
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            val classified = classifySessionOpenException(
+                                error,
+                                SessionFailureStage.HISTORY_REPLAY,
+                            )
+                            observeBootstrapFailure(sessionId, classified.failure)
                         }
                     }
                 }
+                return
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
-                // The encrypted history upload can lag the realtime stream.
+                // Host history publication can lag the realtime stream.
                 // Keep the renderer read-only and retry with bounded backoff.
             }
             delay(HISTORY_RECOVERY_DELAYS_MILLIS[retry.coerceAtMost(HISTORY_RECOVERY_DELAYS_MILLIS.lastIndex)])
@@ -8475,64 +7079,6 @@ internal class ProductionProductRepository(
                 }
             }
         }
-    }
-
-    private suspend fun loadLiveHistoryEvents(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        throughSequence: Long,
-    ): LoadedLiveHistory? = withContext(Dispatchers.Default) {
-        require(throughSequence > 0) { "History recovery sequence must be positive" }
-        val through = throughSequence.toULong()
-        val candidates = mutableSnapshot.value.history
-            .asSequence()
-            .filter { entry ->
-                entry.sessionId == session.id &&
-                    entry.historyObject.kind == HistoryObject.Kind.CHUNK &&
-                    historyKeyEpoch(stored.deviceId, entry.historyObject.keyId)?.let { it <= pc.keyEpoch } == true
-            }
-            .sortedWith(
-                compareBy<HistoryEntry> { it.historyObject.startSequence ?: ULong.MAX_VALUE }
-                    .thenBy { it.historyObject.endSequence ?: ULong.MAX_VALUE },
-            )
-            .toList()
-        var expected = 1uL
-        var localInputEpoch = 0L
-        val events = mutableListOf<RemoteSessionEvent>()
-        try {
-            while (expected <= through) {
-                val entry = candidates.firstOrNull { it.historyObject.startSequence == expected }
-                if (entry == null) {
-                    wipeHistoryEvents(events)
-                    return@withContext null
-                }
-                val download = historyDownloads[entry.historyObject.id]
-                if (download == null) {
-                    wipeHistoryEvents(events)
-                    return@withContext null
-                }
-                val chunk = openHistoryChunk(entry, pc, pcDevice, stored, download)
-                for (event in chunk.eventsList) {
-                    val sequence = event.seq.toULong()
-                    check(sequence == expected) { "History recovery is not contiguous" }
-                    if (sequence > through) break
-                    val decoded = decodeHistoryEvent(event)
-                    events += decoded.event
-                    localInputEpoch = maxOf(localInputEpoch, decoded.localInputEpoch)
-                    expected++
-                }
-                if (expected <= through && expected <= requireNotNull(entry.historyObject.endSequence)) {
-                    wipeHistoryEvents(events)
-                    return@withContext null
-                }
-            }
-        } catch (error: Exception) {
-            wipeHistoryEvents(events)
-            throw error
-        }
-        LoadedLiveHistory(events, localInputEpoch)
     }
 
     private fun decodeHistoryEvent(event: HistoryEventV1): DecodedHistoryEvent {
@@ -8625,15 +7171,6 @@ internal class ProductionProductRepository(
         return epoch.takeIf { HistoryCrypto.keyId(recipientDeviceId, it) == keyId }
     }
 
-    private fun snapshotKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
-        val prefix = "snapshot-v1:${recipientDeviceId.toString().replace("-", "")}:"
-        if (!keyId.startsWith(prefix)) return null
-        val encoded = keyId.removePrefix(prefix)
-        if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
-        val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
-        return epoch.takeIf { TerminalSnapshotCrypto.snapshotKeyId(recipientDeviceId, it) == keyId }
-    }
-
     private fun terminalCoreSnapshotKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
         val prefix = "terminal-core-snapshot-v2:${recipientDeviceId.toString().replace("-", "")}:"
         if (!keyId.startsWith(prefix)) return null
@@ -8650,12 +7187,6 @@ internal class ProductionProductRepository(
         if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
         val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
         return epoch.takeIf { TerminalSnapshotCrypto.transcriptKeyId(recipientDeviceId, it) == keyId }
-    }
-
-    private fun wipeHistoryEvents(events: List<RemoteSessionEvent>) {
-        events.forEach { event ->
-            if (event is RemoteSessionEvent.Output) event.bytes.fill(0)
-        }
     }
 
     private suspend fun applyHistoryEvent(engine: TerminalEngine, event: HistoryEventV1): Long {
@@ -8709,11 +7240,6 @@ internal class ProductionProductRepository(
         val transcriptAnchor: TranscriptAnchor? = null,
         val durableAcknowledgement: ULong = 0u,
         val bootstrapSource: ProductBootstrapSource = ProductBootstrapSource.EMPTY,
-    )
-
-    private data class LoadedLiveHistory(
-        val events: List<RemoteSessionEvent>,
-        val localInputEpoch: Long,
     )
 
     private data class DecodedHistoryEvent(
@@ -8780,144 +7306,6 @@ internal suspend fun clearProductRoomCache(historyRepository: HistoryRepository)
 internal fun authoritativeSessionCatalogPath(pcId: UUID): String =
     "/v1/pcs/$pcId/sessions?include_ended=true"
 
-internal const val SESSION_CHUNK_HISTORY_PAGE_LIMIT = 50
-
-internal fun sessionChunkHistoryRequestPath(sessionId: UUID, cursor: String? = null): String =
-    if (cursor == null) {
-        "/v1/sessions/$sessionId/history?kind=chunk&limit=$SESSION_CHUNK_HISTORY_PAGE_LIMIT"
-    } else {
-        require(cursor.isNotBlank()) { "Chunk history cursor must not be blank" }
-        val encoded = URLEncoder.encode(cursor, StandardCharsets.UTF_8.name())
-        "/v1/sessions/$sessionId/history?cursor=$encoded&limit=$SESSION_CHUNK_HISTORY_PAGE_LIMIT"
-    }
-
-internal fun boundedChunkHistoryItems(response: JsonObject): List<JsonObject> =
-    ProductResponseParser.itemObjects(response).also { items ->
-        require(items.size <= SESSION_CHUNK_HISTORY_PAGE_LIMIT) {
-            "Chunk history page exceeded the requested limit"
-        }
-        require(items.all { item ->
-            item["kind"]?.jsonPrimitive?.contentOrNull.equals("chunk", ignoreCase = true)
-        }) { "Chunk history selector returned a non-chunk object" }
-    }
-
-internal data class StreamedHistoryCatalogPage<Candidate>(
-    val items: List<Candidate>,
-    val hasMore: Boolean,
-    val nextCursor: String?,
-)
-
-/**
- * Waits for a durable catalog head without imposing an event, elapsed-time, or
- * progress-stall limit. A producer can remain healthy while a slow encrypted
- * batch is being persisted and committed; cancellation is the only local stop
- * condition until the requested durable prefix becomes visible.
- */
-internal suspend fun <Page> awaitStreamedHistoryCatalogHead(
-    minimumTarget: ULong,
-    loadPage: suspend () -> Page,
-    newestEndSequence: (Page) -> ULong?,
-    pollMillis: Long = TERMINAL_STREAMED_REPLAY_READINESS_POLL_MILLIS,
-    pause: suspend (Long) -> Unit = { delay(it) },
-): Page {
-    require(minimumTarget > 0uL) { "Streamed history target must be positive" }
-    require(pollMillis >= 0L) { "Streamed history poll delay must not be negative" }
-
-    while (true) {
-        currentCoroutineContext().ensureActive()
-        val page = loadPage()
-        val newestEnd = newestEndSequence(page)
-        if (newestEnd != null && newestEnd >= minimumTarget) return page
-        pause(pollMillis)
-    }
-}
-
-private fun JsonObject.toStreamedHistoryCatalogPage(): StreamedHistoryCatalogPage<JsonObject> =
-    StreamedHistoryCatalogPage(
-        items = boundedChunkHistoryItems(this),
-        hasMore = getValue("has_more").jsonPrimitive.booleanOrNull
-            ?: error("Chunk history has_more must be a boolean"),
-        nextCursor = this["next_cursor"]?.jsonPrimitive?.contentOrNull,
-    )
-
-/**
- * Walks one immutable newest-to-oldest catalog revision and persists every
- * candidate needed to reach [stopAfterSequence]. The algorithm retains only
- * the current bounded page and candidate; neither the number of pages nor the
- * total event count is a failure condition.
- */
-internal suspend fun <Candidate> cacheContiguousHistoryRange(
-    minimumTarget: ULong,
-    stopAfterSequence: ULong,
-    firstPage: StreamedHistoryCatalogPage<Candidate>,
-    loadNextPage: suspend (String) -> StreamedHistoryCatalogPage<Candidate>,
-    sequenceRange: (Candidate) -> HistorySequenceRange?,
-    validateTargetBeforeCaching: (ULong) -> Unit = {},
-    cacheCandidate: suspend (Candidate) -> Unit,
-): ULong {
-    require(minimumTarget > stopAfterSequence) { "Streamed history target must advance" }
-    var page = firstPage
-    var previousCursor: String? = null
-    var target: ULong? = null
-    var expectedEnd: ULong? = null
-
-    while (true) {
-        currentCoroutineContext().ensureActive()
-        if (page.items.isEmpty()) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-        for (candidate in page.items) {
-            currentCoroutineContext().ensureActive()
-            val range = sequenceRange(candidate)
-                ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            if (range.start == 0uL || range.endInclusive < range.start) {
-                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            }
-            if (target == null) {
-                if (range.endInclusive < minimumTarget) {
-                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-                }
-                // A bounded Snapshot suffix supplies its immutable-catalog
-                // ceiling here. Rejecting before the first cache callback keeps
-                // both network work and Room writes inside the advertised cap.
-                validateTargetBeforeCaching(range.endInclusive)
-                target = range.endInclusive
-                expectedEnd = range.endInclusive
-            }
-            val expected = requireNotNull(expectedEnd)
-            if (expected <= stopAfterSequence) {
-                // The catalog is newest-to-oldest. Reaching the Snapshot
-                // boundary is not enough to return yet: another item on this
-                // page (or the first item on the next page) could overlap the
-                // same boundary. Accept only after observing an item wholly at
-                // or before the anchor, or the immutable catalog ending.
-                if (range.endInclusive > stopAfterSequence) {
-                    throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-                }
-                return requireNotNull(target)
-            }
-            val requiredBoundary = stopAfterSequence + 1uL
-            if (range.endInclusive != expected) {
-                throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-            }
-            cacheCandidate(candidate)
-            expectedEnd = if (range.start <= requiredBoundary) {
-                stopAfterSequence
-            } else {
-                range.start - 1uL
-            }
-        }
-        if (expectedEnd == stopAfterSequence && !page.hasMore) return requireNotNull(target)
-        if (!page.hasMore) throw sessionOpenException(SessionOpenFailureCode.HISTORY_GAP)
-        val next = page.nextCursor?.takeIf(String::isNotBlank)
-            ?: error("Chunk history page omitted its continuation cursor")
-        if (next == previousCursor) error("Chunk history cursor did not advance")
-        previousCursor = next
-        page = loadNextPage(next)
-        yield()
-    }
-}
-
-internal data class HistorySequenceRange(val start: ULong, val endInclusive: ULong)
-
 /**
  * Validates the complete immutable Chunk while applying only the suffix after
  * an already-installed Snapshot. Validating the skipped prefix preserves the
@@ -8956,320 +7344,6 @@ internal suspend fun <Event> applyContiguousHistoryChunkSuffix(
     return localInputEpoch
 }
 
-internal data class BoundedEventReplayCatalogObservation<Candidate>(
-    val authoritativeTail: ULong,
-    val candidates: List<Candidate>,
-)
-
-internal data class BoundedEventReplayCatalogResult<Candidate>(
-    val target: ULong,
-    val candidates: List<Candidate>,
-    val readiness: BoundedEventReplayReadiness,
-)
-
-internal data class BoundedTailReplaySelection<Candidate>(
-    val target: ULong,
-    val start: ULong? = null,
-    val candidates: List<Candidate> = emptyList(),
-    val eventCount: Int = 0,
-    val readiness: BoundedEventReplayReadiness,
-)
-
-internal data class BoundedTailReplayCatalogObservation<Candidate>(
-    val authoritativeTail: ULong,
-    val candidates: List<Candidate>,
-)
-
-internal enum class BoundedEventReplayReadiness {
-    READY,
-    NOT_YET_COMPLETE,
-    GAP,
-    LIMIT_EXCEEDED,
-}
-
-private fun HistoryEntry.historySequenceRange(): HistorySequenceRange? {
-    val start = historyObject.startSequence ?: return null
-    val end = historyObject.endSequence ?: return null
-    return HistorySequenceRange(start, end)
-}
-
-/**
- * Selects a whole-Chunk suffix ending exactly at [authoritativeTail]. Older
- * chunks are added only while the resulting window remains bounded. A gap or
- * overlap inside the selected suffix is rejected; history before its start is
- * deliberately outside the TailWindow contract.
- */
-internal fun <Candidate> boundedTailReplaySelection(
-    candidates: List<Candidate>,
-    authoritativeTail: ULong,
-    sequenceRange: (Candidate) -> HistorySequenceRange?,
-    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
-): BoundedTailReplaySelection<Candidate> {
-    require(authoritativeTail > 0uL) { "Tail replay target must be positive" }
-    require(maximumEvents > 0) { "Tail replay event limit must be positive" }
-    if (candidates.isEmpty()) {
-        return BoundedTailReplaySelection(
-            target = authoritativeTail,
-            readiness = BoundedEventReplayReadiness.NOT_YET_COMPLETE,
-        )
-    }
-    val ranged = candidates.map { candidate ->
-        val range = sequenceRange(candidate) ?: return BoundedTailReplaySelection(
-            target = authoritativeTail,
-            readiness = BoundedEventReplayReadiness.GAP,
-        )
-        if (range.start == 0uL || range.endInclusive < range.start) {
-            return BoundedTailReplaySelection(
-                target = authoritativeTail,
-                readiness = BoundedEventReplayReadiness.GAP,
-            )
-        }
-        candidate to range
-    }.sortedWith(
-        compareBy<Pair<Candidate, HistorySequenceRange>> { it.second.start }
-            .thenBy { it.second.endInclusive },
-    )
-    val newest = ranged.last()
-    if (newest.second.endInclusive != authoritativeTail) {
-        // The independently published directory may trail the session row, or
-        // the row may have advanced while this catalog page was in flight.
-        return BoundedTailReplaySelection(
-            target = authoritativeTail,
-            readiness = BoundedEventReplayReadiness.NOT_YET_COMPLETE,
-        )
-    }
-
-    fun eventCount(range: HistorySequenceRange): ULong =
-        range.endInclusive - range.start + 1uL
-
-    var selectedIndex = ranged.lastIndex
-    var selectedCount = eventCount(newest.second)
-    if (selectedCount > maximumEvents.toULong()) {
-        return BoundedTailReplaySelection(
-            target = authoritativeTail,
-            readiness = BoundedEventReplayReadiness.LIMIT_EXCEEDED,
-        )
-    }
-    while (selectedIndex > 0) {
-        val older = ranged[selectedIndex - 1].second
-        val current = ranged[selectedIndex].second
-        val olderCount = eventCount(older)
-        // An overlap reaches into the window we already selected and is
-        // ambiguous even when the older object would exceed the size budget.
-        if (older.endInclusive >= current.start) {
-            return BoundedTailReplaySelection(
-                target = authoritativeTail,
-                readiness = BoundedEventReplayReadiness.GAP,
-            )
-        }
-        if (olderCount > maximumEvents.toULong() - selectedCount) break
-        if (older.endInclusive == ULong.MAX_VALUE || older.endInclusive + 1uL != current.start) {
-            return BoundedTailReplaySelection(
-                target = authoritativeTail,
-                readiness = BoundedEventReplayReadiness.GAP,
-            )
-        }
-        selectedCount += olderCount
-        selectedIndex--
-    }
-    val selected = ranged.subList(selectedIndex, ranged.size)
-    return BoundedTailReplaySelection(
-        target = authoritativeTail,
-        start = selected.first().second.start,
-        candidates = selected.map { it.first },
-        eventCount = selectedCount.toInt(),
-        readiness = BoundedEventReplayReadiness.READY,
-    )
-}
-
-/**
- * Waits for the newest Chunk directory to catch the authoritative session
- * watermark. Cancellation remains caller-owned; transient metadata errors and
- * temporary publication gaps are retried only inside the supplied deadline.
- */
-internal suspend fun <Candidate> awaitBoundedTailReplayCatalog(
-    initialTarget: ULong,
-    latestObservation: suspend () -> BoundedTailReplayCatalogObservation<Candidate>,
-    sequenceRange: (Candidate) -> HistorySequenceRange?,
-    retryDelaysMillis: List<Long>,
-    timeoutMillis: Long,
-    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
-    pause: suspend (Long) -> Unit = { delay(it) },
-    onObservationFailure: (Exception) -> Unit = {},
-): BoundedTailReplaySelection<Candidate> {
-    require(initialTarget > 0uL) { "Tail replay target must be positive" }
-    require(retryDelaysMillis.all { it >= 0L }) { "Tail readiness delays must not be negative" }
-    require(timeoutMillis > 0L) { "Tail readiness timeout must be positive" }
-
-    var result = BoundedTailReplaySelection<Candidate>(
-        target = initialTarget,
-        readiness = BoundedEventReplayReadiness.NOT_YET_COMPLETE,
-    )
-    val settled = withTimeoutOrNull(timeoutMillis) {
-        for (attempt in 0..retryDelaysMillis.size) {
-            val observation = try {
-                latestObservation()
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                onObservationFailure(error)
-                null
-            }
-            if (observation != null) {
-                val target = maxOf(result.target, observation.authoritativeTail)
-                result = boundedTailReplaySelection(
-                    observation.candidates,
-                    target,
-                    sequenceRange,
-                    maximumEvents,
-                )
-                if (result.readiness == BoundedEventReplayReadiness.READY ||
-                    result.readiness == BoundedEventReplayReadiness.LIMIT_EXCEEDED
-                ) return@withTimeoutOrNull result
-            }
-            if (attempt < retryDelaysMillis.size) pause(retryDelaysMillis[attempt])
-        }
-        null
-    }
-    return settled ?: result
-}
-
-/**
- * Proves that raw replay can start at 1 and reach [throughSequence] without a
- * missing or overlapping event. The event ceiling matches the Windows
- * realtime flow window and prevents a Snapshot failure from turning into an
- * unbounded cold-start replay.
- */
-internal fun boundedEventReplayReadiness(
-    ranges: List<HistorySequenceRange>,
-    throughSequence: ULong,
-    maximumEvents: Int = TERMINAL_BOUNDED_REPLAY_MAX_EVENTS,
-): BoundedEventReplayReadiness {
-    require(throughSequence > 0uL) { "Bounded replay target must be positive" }
-    require(maximumEvents > 0) { "Bounded replay event limit must be positive" }
-    if (throughSequence > maximumEvents.toULong()) {
-        return BoundedEventReplayReadiness.LIMIT_EXCEEDED
-    }
-    if (ranges.isEmpty()) return BoundedEventReplayReadiness.NOT_YET_COMPLETE
-    var expected = 1uL
-    var coveredTarget = false
-    for (range in ranges.sortedWith(compareBy(HistorySequenceRange::start).thenBy(HistorySequenceRange::endInclusive))) {
-        // Events after the authoritative Output tail are not part of this
-        // bootstrap. Once the target is covered, a later range beginning at or
-        // before the target can only be a duplicate/overlap and must fail
-        // closed; a range beginning after it is irrelevant to this replay.
-        if (coveredTarget) {
-            if (range.start <= throughSequence) return BoundedEventReplayReadiness.GAP
-            break
-        }
-        if (range.start == 0uL || range.endInclusive < range.start || range.start != expected) {
-            return BoundedEventReplayReadiness.GAP
-        }
-        if (range.endInclusive >= throughSequence) {
-            coveredTarget = true
-        } else {
-            expected = range.endInclusive + 1uL
-        }
-    }
-    return if (coveredTarget) {
-        BoundedEventReplayReadiness.READY
-    } else {
-        BoundedEventReplayReadiness.NOT_YET_COMPLETE
-    }
-}
-
-/**
- * Polls the independently published Chunk catalog until it proves a complete
- * prefix through the latest tail observed before that catalog read. A caller
- * may supply a shorter timeout to share one absolute bootstrap deadline with
- * Snapshot readiness. Metadata failures remain retryable inside that window;
- * caller cancellation is never converted into a readiness result.
- */
-internal suspend fun <Candidate> awaitBoundedEventReplayCatalog(
-    initialTarget: ULong,
-    initialCandidates: List<Candidate>,
-    sequenceRange: (Candidate) -> HistorySequenceRange?,
-    latestObservation: suspend () -> BoundedEventReplayCatalogObservation<Candidate>,
-    retryDelaysMillis: List<Long>,
-    timeoutMillis: Long,
-    pause: suspend (Long) -> Unit = { delay(it) },
-    onObservationFailure: (Exception) -> Unit = {},
-): BoundedEventReplayCatalogResult<Candidate> {
-    require(initialTarget > 0uL) { "Bounded replay target must be positive" }
-    require(retryDelaysMillis.all { it >= 0L }) { "Chunk readiness delays must not be negative" }
-    require(timeoutMillis > 0L) { "Chunk readiness timeout must be positive" }
-
-    var result = BoundedEventReplayCatalogResult(
-        target = initialTarget,
-        candidates = initialCandidates,
-        readiness = boundedEventReplayReadiness(initialCandidates.mapNotNull(sequenceRange), initialTarget),
-    )
-    if (result.readiness == BoundedEventReplayReadiness.READY ||
-        result.readiness == BoundedEventReplayReadiness.LIMIT_EXCEEDED
-    ) return result
-
-    val settled = withTimeoutOrNull(timeoutMillis) {
-        for (attempt in 0..retryDelaysMillis.size) {
-            val observation = try {
-                latestObservation()
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                onObservationFailure(error)
-                null
-            }
-            if (observation != null) {
-                val target = maxOf(result.target, observation.authoritativeTail)
-                val readiness = boundedEventReplayReadiness(
-                    observation.candidates.mapNotNull(sequenceRange),
-                    target,
-                )
-                result = BoundedEventReplayCatalogResult(target, observation.candidates, readiness)
-                if (readiness == BoundedEventReplayReadiness.READY ||
-                    readiness == BoundedEventReplayReadiness.LIMIT_EXCEEDED
-                ) {
-                    return@withTimeoutOrNull result
-                }
-            }
-            if (attempt < retryDelaysMillis.size) pause(retryDelaysMillis[attempt])
-        }
-        null
-    }
-    return settled ?: result
-}
-
-/** True only when realtime can continuously replay the suffix after a full prefix restore. */
-internal fun fullPrefixHasBoundedRealtimeSuffix(
-    restoredThroughSequence: ULong,
-    authoritativeTail: ULong,
-    maximumSuffixEvents: Int = TERMINAL_SNAPSHOT_MAX_LIVE_SUFFIX_EVENTS,
-): Boolean {
-    require(maximumSuffixEvents > 0) { "Realtime suffix limit must be positive" }
-    return restoredThroughSequence > 0uL &&
-        restoredThroughSequence <= authoritativeTail &&
-        authoritativeTail - restoredThroughSequence <= maximumSuffixEvents.toULong()
-}
-
-internal enum class FullPrefixRealtimeSuffixValidation {
-    READY,
-    UNAVAILABLE,
-    OUTSIDE_WINDOW,
-}
-
-/** Re-reads the tail after replay so validation cannot accidentally use its old target. */
-internal suspend fun validateFullPrefixRealtimeSuffix(
-    restoredThroughSequence: ULong,
-    latestAuthoritativeTail: suspend () -> ULong?,
-): FullPrefixRealtimeSuffixValidation {
-    val authoritativeTail = latestAuthoritativeTail()
-        ?: return FullPrefixRealtimeSuffixValidation.UNAVAILABLE
-    return if (fullPrefixHasBoundedRealtimeSuffix(restoredThroughSequence, authoritativeTail)) {
-        FullPrefixRealtimeSuffixValidation.READY
-    } else {
-        FullPrefixRealtimeSuffixValidation.OUTSIDE_WINDOW
-    }
-}
-
 internal fun tailReplayHasBoundedRealtimeSuffix(
     restoredThroughSequence: ULong,
     authoritativeTail: ULong,
@@ -9281,109 +7355,7 @@ internal fun tailReplayHasBoundedRealtimeSuffix(
         authoritativeTail - restoredThroughSequence <= maximumSuffixEvents.toULong()
 }
 
-/** Re-reads the authority after TailWindow rendering and before its first ACK. */
-internal suspend fun validateTailReplayRealtimeSuffix(
-    restoredThroughSequence: ULong,
-    latestAuthoritativeTail: suspend () -> ULong?,
-): FullPrefixRealtimeSuffixValidation {
-    val authoritativeTail = latestAuthoritativeTail()
-        ?: return FullPrefixRealtimeSuffixValidation.UNAVAILABLE
-    return if (tailReplayHasBoundedRealtimeSuffix(restoredThroughSequence, authoritativeTail)) {
-        FullPrefixRealtimeSuffixValidation.READY
-    } else {
-        FullPrefixRealtimeSuffixValidation.OUTSIDE_WINDOW
-    }
-}
-
 internal const val TERMINAL_BOUNDED_REPLAY_MAX_EVENTS = 4096
-internal const val TERMINAL_BOUNDED_REPLAY_MAX_CATALOG_PAGES =
-    TERMINAL_BOUNDED_REPLAY_MAX_EVENTS / SESSION_CHUNK_HISTORY_PAGE_LIMIT + 2
-internal const val TERMINAL_TAIL_REPLAY_MAX_CATALOG_PAGES = 2
-internal const val TERMINAL_TAIL_REPLAY_READINESS_TIMEOUT_MILLIS = 15_000L
-internal const val TERMINAL_STREAMED_REPLAY_READINESS_TIMEOUT_MILLIS = 15_000L
-internal const val TERMINAL_STREAMED_REPLAY_READINESS_POLL_MILLIS = 250L
-
-internal fun transcriptHistoryRequestPath(
-    sessionId: UUID,
-    snapshotSequence: ULong,
-    beforeLineId: ULong,
-    cursor: String? = null,
-): String = if (cursor == null) {
-    "/v1/sessions/$sessionId/history" +
-        "?kind=transcript&as_of_snapshot_seq=$snapshotSequence" +
-        "&before_line_id=$beforeLineId&limit=1"
-} else {
-    require(cursor.isNotBlank()) { "Transcript cursor must not be blank" }
-    val encoded = URLEncoder.encode(cursor, StandardCharsets.UTF_8.name())
-    "/v1/sessions/$sessionId/history?cursor=$encoded&limit=1"
-}
-
-/** Tri-state transcript publication result. No ciphertext is touched while [Pending]. */
-internal sealed interface TranscriptSelection<out Value> {
-    data object Pending : TranscriptSelection<Nothing>
-    data object Complete : TranscriptSelection<Nothing>
-    data class ReadyPage<Value>(
-        val value: Value,
-        val hasMore: Boolean,
-        val nextCursor: String?,
-    ) : TranscriptSelection<Value>
-}
-
-/**
- * Parses the outer authenticated paging contract before any object download.
- * `ready` is optional only for rolling compatibility with the previous server.
- */
-internal fun parseTranscriptSelectorResponse(
-    response: JsonObject,
-    expectedSnapshotSequence: ULong,
-    requestBeforeLineId: ULong,
-): TranscriptSelection<JsonObject> {
-    val anchorPrimitive = response.getValue("as_of_snapshot_seq").jsonPrimitive
-    require(!anchorPrimitive.isString) { "Transcript selector anchor must be an integer" }
-    val anchorValue = anchorPrimitive.long
-    require(anchorValue > 0 && anchorValue.toULong() == expectedSnapshotSequence) {
-        "Transcript selector changed its snapshot anchor"
-    }
-    val items = ProductResponseParser.itemObjects(response)
-    require(items.size <= 1) { "Transcript selector returned more than one object" }
-    val hasMorePrimitive = response.getValue("has_more").jsonPrimitive
-    require(!hasMorePrimitive.isString) { "Transcript selector has_more must be a boolean" }
-    val hasMore = hasMorePrimitive.booleanOrNull
-        ?: error("Transcript selector has_more must be a boolean")
-    val nextCursor = when (val element = response["next_cursor"]) {
-        null, JsonNull -> null
-        else -> element.jsonPrimitive.also {
-            require(it.isString) { "Transcript selector cursor must be a string or null" }
-        }.contentOrNull?.also {
-            require(it.isNotBlank()) { "Transcript selector cursor must not be blank" }
-        } ?: error("Transcript selector cursor must be a string or null")
-    }
-    require(hasMore == (nextCursor != null)) {
-        "Transcript selector continuation contract is inconsistent"
-    }
-
-    val explicitReady = response["ready"]?.let { element ->
-        val primitive = element.jsonPrimitive
-        require(!primitive.isString) { "Transcript selector ready must be a boolean" }
-        requireNotNull(primitive.booleanOrNull) { "Transcript selector ready must be a boolean" }
-    }
-    val ready = explicitReady ?: when {
-        items.isNotEmpty() -> true
-        requestBeforeLineId > 1uL -> false
-        else -> true
-    }
-    if (!ready) {
-        require(items.isEmpty() && !hasMore) {
-            "Pending transcript publication must not expose a page or cursor"
-        }
-        return TranscriptSelection.Pending
-    }
-    if (items.isEmpty()) {
-        require(!hasMore) { "Completed empty transcript publication cannot have another page" }
-        return TranscriptSelection.Complete
-    }
-    return TranscriptSelection.ReadyPage(items.single(), hasMore, nextCursor)
-}
 
 internal fun mergeTranscriptPage(
     viewport: TranscriptViewportState,
@@ -9510,32 +7482,6 @@ internal suspend fun <Key> awaitCoalescedTranscriptLoad(
     shared.await()
 }
 
-/**
- * A committed Snapshot is intentionally published before its bulk Transcript.
- * Retry only an explicit server/compatibility [TranscriptSelection.Pending].
- * A ready empty response is authoritative completion for its fixed Snapshot
- * anchor even when its line cursor is greater than one. The caller may still
- * move to a newer durably acknowledged Snapshot before ending pagination.
- */
-internal suspend fun <Page> awaitExpectedTranscriptPage(
-    retryDelaysMillis: List<Long> = TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS,
-    readinessTimeoutMillis: Long = TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS,
-    pause: suspend (Long) -> Unit = { delay(it) },
-    fetch: suspend () -> TranscriptSelection<Page>,
-): TranscriptSelection<Page> {
-    require(retryDelaysMillis.all { it >= 0L }) { "Transcript retry delays must not be negative" }
-    require(readinessTimeoutMillis > 0L) { "Transcript readiness timeout must be positive" }
-    val settled = withTimeoutOrNull(readinessTimeoutMillis) {
-        for (attempt in 0..retryDelaysMillis.size) {
-            val selected = fetch()
-            if (selected !== TranscriptSelection.Pending) return@withTimeoutOrNull selected
-            if (attempt < retryDelaysMillis.size) pause(retryDelaysMillis[attempt])
-        }
-        TranscriptSelection.Pending
-    }
-    return settled ?: TranscriptSelection.Pending
-}
-
 internal fun validateTranscriptDescriptorNotLoaded(
     viewport: TranscriptViewportState,
     metadata: TranscriptPageMetadata,
@@ -9596,10 +7542,6 @@ internal suspend fun deleteHostHistorySessionAfterTermination(
     deleteSessionAfterRemoteSuccess(deleteRemote, deleteLocal)
 }
 
-/** HTTP 426 permanently identifies the removed legacy server-owned history catalog. */
-internal fun legacyHistoryCatalogUnavailable(error: TermLinkApiException): Boolean =
-    error.status == 426
-
 /**
  * Waits for the Windows Agent's authoritative EXITED publication before
  * permanently deleting a user-closed session.  Only SESSION_ACTIVE is
@@ -9632,11 +7574,6 @@ internal suspend fun deleteClosedSessionAfterTermination(
 
 internal val SESSION_TERMINATION_DELETE_RETRY_DELAYS_MILLIS: List<Long> =
     listOf(250L, 250L, 500L, 500L, 1_000L, 1_000L, 1_000L, 2_000L, 2_000L, 2_000L, 2_000L)
-
-internal fun historyDownloadUriAllowed(uri: URI, allowCleartextForLocalTest: Boolean): Boolean {
-    val scheme = uri.scheme?.lowercase()
-    return scheme == "https" || allowCleartextForLocalTest && scheme == "http"
-}
 
 /** Runs snapshot bootstrap only when the complete product path is explicitly enabled. */
 internal suspend fun <Remote, Restored> restoreSnapshotWhenEnabled(
@@ -9696,7 +7633,7 @@ internal fun snapshotCanResumeThroughDurableAcknowledgement(
 ): Boolean = snapshotSequence <= durableAcknowledgement
 
 /**
- * REST exposes the last output sequence, while the durable renderer ACK also
+ * The Server session catalog exposes the last output sequence, while the durable renderer ACK also
  * covers ordered non-output events such as title, lease, and lifecycle frames.
  * A previously committed ACK is therefore a valid lower bound for the Host
  * History event range even when it is newer than the catalog output cursor.
@@ -9705,11 +7642,6 @@ internal fun restorableSessionEventTail(
     authoritativeOutputTail: ULong,
     durableAcknowledgement: ULong,
 ): ULong = maxOf(authoritativeOutputTail, durableAcknowledgement)
-
-internal fun snapshotMatchesDurableAcknowledgement(
-    snapshotSequence: ULong,
-    durableAcknowledgement: ULong,
-): Boolean = snapshotSequence == durableAcknowledgement
 
 internal fun snapshotSuffixRestoreReady(
     restoredThroughSequence: ULong,
@@ -9947,7 +7879,7 @@ internal fun shouldReplaceLiveSessionForOpen(
 /**
  * Bounded to 30 seconds in total. A remotely launched Windows shell can spend
  * up to 30 seconds registering with the Agent before its first Snapshot enters
- * the Agent -> object store -> history-index pipeline. Keeping a second bounded
+ * the Windows Agent's local history pipeline. Keeping a second bounded
  * window here prevents a new session from being classified as TL-H113 while
  * that normal startup pipeline is still settling.
  * The retry schedule extends beyond the absolute deadline so a fast empty
@@ -9962,16 +7894,6 @@ internal val TERMINAL_SNAPSHOT_READINESS_RETRY_DELAYS_MILLIS =
 internal const val TERMINAL_SNAPSHOT_READINESS_TIMEOUT_MILLIS = 30_000L
 internal const val TERMINAL_SNAPSHOT_READINESS_REQUEST_TIMEOUT_MILLIS = 5_000L
 internal const val TRANSCRIPT_PAGE_LOAD_FAILED_CODE = "TRANSCRIPT_PAGE_LOAD_FAILED"
-internal const val TRANSCRIPT_PUBLICATION_READINESS_TIMEOUT_MILLIS =
-    TERMINAL_STREAMED_REPLAY_READINESS_TIMEOUT_MILLIS
-// The schedule deliberately extends beyond the absolute deadline. This keeps
-// polling until the full readiness window expires without allowing a slow
-// selector request or an unexpectedly fast test pause to make the wait unbounded.
-internal val TRANSCRIPT_PUBLICATION_RETRY_DELAYS_MILLIS = listOf(
-    100L, 200L, 400L, 800L, 1_000L,
-    1_500L, 1_500L, 1_500L, 1_500L, 1_500L,
-    1_500L, 1_500L, 1_500L, 1_500L,
-)
 internal const val MAX_TRANSCRIPT_ANCHOR_REBASES = 8
 // Matches one Windows realtime flow-control window. This lets an active
 // terminal advance during Snapshot publication without permitting a large

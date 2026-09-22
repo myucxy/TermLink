@@ -19,6 +19,11 @@ import org.junit.Test
 
 class TailFirstE2EDebugContractTest {
     @Test
+    fun debugEnablesAuthoritativeHostSnapshotRecovery() {
+        assertTrue(BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME)
+    }
+
+    @Test
     fun directDataPlaneCanRunOnlyInAnIsolatedPrivateNetworkDebugBuild() {
         if (!BuildConfig.TERMLINK_DIRECT_TRANSPORT_DATA_PLANE) return
         val host = URI(BuildConfig.TERMLINK_SERVER_URL).host.lowercase()

@@ -199,9 +199,9 @@ val debugAllowsCleartextLocalTest = debugServerUri.scheme.equals("http", ignoreC
     requestedDebugServerUrl != null &&
     isLocalTestHost(debugServerUri.host)
 val debugTerminalSnapshotRuntime = providers.gradleProperty("termlinkEnableTerminalSnapshotRuntime")
-    // The portable V1 importer is an explicit experiment until its native
-    // TerminalCore equivalence and durable fallback gates are complete.
-    .orElse("false")
+    // Snapshot V2 is the host-history authority. Debug must match Release by
+    // default so an existing positive ACK can recover from the Windows Agent.
+    .orElse("true")
     .get()
     .toBooleanStrictOrNull()
     ?: throw GradleException("termlinkEnableTerminalSnapshotRuntime must be true or false")

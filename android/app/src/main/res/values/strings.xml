@@ -91,7 +91,7 @@
     <string name="page_devices_subtitle">Windows PCs and terminal sessions in this account.</string>
     <string name="page_sessions_subtitle">Per-PC sessions and the live terminal stream.</string>
     <string name="page_activity_subtitle">Recent device-local actions; this is not a server audit.</string>
-    <string name="page_history_subtitle">Encrypted history objects returned by the server.</string>
+    <string name="page_history_subtitle">History is opened from the online Windows PC on the session screen.</string>
     <string name="page_membership_subtitle">Entitlement and quotas returned by the server catalog.</string>
     <string name="page_settings_subtitle">Connection and local safety defaults.</string>
     <string name="page_trusted_devices_subtitle">Review access state without exposing key identifiers.</string>
@@ -179,7 +179,7 @@
     <string name="activity_authentication_expired">Authentication expired</string>
     <string name="activity_history_gap_recovered">History gap recovered</string>
     <string name="activity_history_gap_recovered_detail">Encrypted replay restored through ACK %1$d.</string>
-    <string name="server_history_empty_copy">History is available only when the server returns encrypted chunks or snapshots.</string>
+    <string name="server_history_empty_copy">History is available from an online Windows PC on the session screen.</string>
     <string name="server_devices_empty_copy">No online Windows PCs are currently available for this account.</string>
     <string name="server_device_trust_copy">Device trust and pending requests are server data.</string>
     <string name="pc_routing_status">%3$s · Agent %1$s · remote routing %2$s</string>
@@ -245,6 +245,7 @@
     <string name="terminal_error_native_core_unavailable">The packaged terminal-core library is unavailable or does not match this app build.</string>
     <string name="terminal_error_native_renderer_failed_closed">terminal-core rejected terminal state and stopped this renderer generation to prevent incorrect output.</string>
     <string name="terminal_error_unsupported_terminal_capability">This terminal capability is not supported by the installed Android and Windows terminal-core versions.</string>
+    <string name="terminal_error_host_history_required">This Windows Agent does not support the required host_history_v1 history protocol. Upgrade the Windows client to open this session.</string>
     <string name="terminal_error_history_core_rebuild_failed">terminal-core could not rebuild the live terminal from the verified continuous encrypted history.</string>
     <string name="terminal_error_gap_recovery_required">The live terminal detected a missing ordered event and requires a complete encrypted-history rebuild.</string>
     <string name="terminal_error_realtime_connection">The realtime session channel could not be established.</string>
