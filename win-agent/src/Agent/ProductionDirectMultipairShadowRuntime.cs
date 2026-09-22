@@ -288,7 +288,8 @@ namespace TermLink.Agent
                         LocalBind = gather.LocalBind,
                         AdvertisedLocalAddress = gather.AdvertisedLocalAddress,
                         NetworkCost = 0,
-                        CandidateExpiresAtMilliseconds = attempt.Ticket.Ticket.ExpiresAtMs,
+                        CandidateExpiresAtMilliseconds = Math.Min(attempt.Ticket.Ticket.ExpiresAtMs,
+                            clockMilliseconds() + 60_000),
                         StunServers = gather.StunServers,
                         GatherTimeoutMilliseconds = 1_500
                     }) != ProductionDirectNativeCommandResult.Accepted)

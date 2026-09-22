@@ -606,6 +606,7 @@ class ProductionDirectMultipairV4RuntimeTest {
         var committedPair: DirectNativeCandidatePairV4? = null
 
         override fun gather(request: DirectNativeGatherRequestV4): DirectNativeResultV4<Unit> {
+            assertEquals(clock + 60_000L, request.candidateExpiresAtMillis)
             gatherCalls++
             gather = request
             events += opaqueEvent(DirectNativeEventKindV4.IDENTITY_READY, ByteArray(96) { 0x22 })

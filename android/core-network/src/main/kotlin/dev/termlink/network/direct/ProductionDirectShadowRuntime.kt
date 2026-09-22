@@ -59,10 +59,8 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.security.Signature
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Future
@@ -72,7 +70,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import java.security.spec.X509EncodedKeySpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -593,10 +590,9 @@ private class AndroidProductionDirectShadowPlatform(
             val native = DirectNativeSocketAddress(address.address, endpoint.second)
             if (native !in resolved) resolved += native
         }
-        val wildcard = if (current.advertisedAddress is Inet4Address) ByteArray(4) else ByteArray(16)
         PreparedDirectGather(
             networkHandle = current.handle,
-            localBind = DirectNativeSocketAddress(wildcard, 0),
+            localBind = DirectNativeSocketAddress(current.advertisedAddress.address, 0),
             advertisedAddress = current.advertisedAddress.address.copyOf(),
             stunServers = resolved,
         )
@@ -1127,11 +1123,19 @@ class ProductionDirectShadowRuntime internal constructor(
                     localBind = prepared.localBind.toV4(),
                     advertisedLocalIp = prepared.advertisedAddress,
                     networkCost = 0,
-                    candidateExpiresAtMillis = created.ticket.expiresAtMs,
+                    candidateExpiresAtMillis = minOf(created.ticket.expiresAtMs, clockMillis() + 60_000L),
                     stunServers = prepared.stunServers.map(DirectNativeSocketAddress::toV4),
                     gatherTimeoutMillis = GATHER_TIMEOUT_MILLIS,
                 )
-                if (native.gather(gather) !is DirectNativeResultV4.Success) {
+                val gatherResult = native.gather(gather)
+                if (gatherResult !is DirectNativeResultV4.Success) {
+                    if (gatherResult is DirectNativeResultV4.Failure &&
+                        Log.isLoggable(DIRECT_SHADOW_DIAGNOSTIC_LOG_TAG, Log.VERBOSE)
+                    ) Log.i(
+                        DIRECT_SHADOW_DIAGNOSTIC_LOG_TAG,
+                        "native_v4_gather_failed reason=${gatherResult.relayOnly.reason} " +
+                            "native_status=${gatherResult.nativeStatus ?: 0}",
+                    )
                     throw DirectAttemptFailure("DIRECT_NATIVE_V4_GATHER_FAILED")
                 }
                 publishAttempt(created, ProductionDirectShadowState.GATHERING)
@@ -3341,20 +3345,7 @@ internal fun <T> selectNextProductionDirectPeer(
 }
 
 internal fun verifyEd25519(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean =
-    runCatching {
-        if (publicKey.size != 32 || signature.size != 64) return@runCatching false
-        val encoded = ED25519_SPKI_PREFIX + publicKey
-        try {
-            val key = KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(encoded))
-            Signature.getInstance("Ed25519").run {
-                initVerify(key)
-                update(message)
-                verify(signature)
-            }
-        } finally {
-            encoded.fill(0)
-        }
-    }.getOrDefault(false)
+    DeviceIdentity.verify(publicKey, message, signature)
 
 private fun sha256(value: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(value)
 
@@ -3370,6 +3361,3 @@ private fun uuidFromBytes(value: ByteArray): UUID {
 }
 
 private val NIL_UUID = UUID(0L, 0L)
-private val ED25519_SPKI_PREFIX = byteArrayOf(
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-)

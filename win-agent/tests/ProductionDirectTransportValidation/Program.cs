@@ -1194,7 +1194,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                 ConnectionId = ByteString.CopyFrom(GuidBytes(connection)),
                 PathEpoch = 7,
                 IssuedAtMs = new DateTimeOffset(now).ToUnixTimeMilliseconds(),
-                ExpiresAtMs = new DateTimeOffset(now.AddMinutes(2)).ToUnixTimeMilliseconds(),
+                ExpiresAtMs = new DateTimeOffset(now.AddMinutes(20)).ToUnixTimeMilliseconds(),
                 ServerNonce = ByteString.CopyFrom(RandomNumberGenerator.GetBytes(16)),
                 ServerSigningKeyId = ByteString.CopyFrom(keyId)
             };
@@ -1210,6 +1210,12 @@ namespace TermLink.ProductionDirectTransport.Validation
                 local,
                 peer,
                 now);
+            var overlongTicket = ticket.Clone();
+            overlongTicket.ExpiresAtMs++;
+            RequireThrows<InvalidDataException>(
+                () => ProductionDirectTransportCrypto.ValidateTicket(
+                    overlongTicket, server.SigningPublicKey, keyId, local, peer, now),
+                "A direct ticket longer than 20 minutes was accepted.");
             var tamperedTicket = ticket.Clone();
             tamperedTicket.PathEpoch++;
             RequireThrows<CryptographicException>(

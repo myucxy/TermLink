@@ -64,7 +64,7 @@ namespace TermLink.Agent
                 ticket.AllowedCarriers.Distinct().Count() != ticket.AllowedCarriers.Count ||
                 ticket.IssuedAtMs <= 0 || ticket.ExpiresAtMs <= 0 ||
                 ticket.IssuedAtMs > ticket.ExpiresAtMs ||
-                ticket.ExpiresAtMs - ticket.IssuedAtMs > TimeSpan.FromMinutes(2).TotalMilliseconds ||
+                ticket.ExpiresAtMs - ticket.IssuedAtMs > TimeSpan.FromMinutes(20).TotalMilliseconds ||
                 now < ticket.IssuedAtMs - TimeSpan.FromSeconds(30).TotalMilliseconds ||
                 now > ticket.ExpiresAtMs + TimeSpan.FromSeconds(30).TotalMilliseconds)
             {

@@ -1,5 +1,6 @@
 package dev.termlink.network.direct
 
+import android.util.Log
 import com.google.protobuf.ByteString
 import com.google.protobuf.InvalidProtocolBufferException
 import dev.termlink.crypto.DeviceIdentity
@@ -906,42 +907,54 @@ internal class DirectTransportSignalingClient(
         connectionId: UUID,
         config: DirectTransportServerConfig,
     ): ValidatedDirectPathTicket {
-        val response = JSON.parseToJsonElement(rawResponse.decodeToString()) as? JsonObject
-            ?: error("ticket response must be object")
-        response.requireExactKeys(TICKET_RESPONSE_KEYS)
-        require(response.requiredInt("protocol_version") == PROTOCOL_VERSION)
-        val wire = response.requiredString("ticket_protobuf").decodeBase64UrlStrict()
-        require(wire.size in MIN_TICKET_BYTES..MAX_TICKET_BYTES)
-        val ticket = DirectPathTicketV1.parseFrom(wire)
-        require(wire.contentEquals(canonicalTicket(ticket).toByteArray())) {
-            "ticket protobuf is not canonical"
+        var stage = "response_schema"
+        try {
+            val response = JSON.parseToJsonElement(rawResponse.decodeToString()) as? JsonObject
+                ?: error("ticket response must be object")
+            response.requireExactKeys(TICKET_RESPONSE_KEYS)
+            require(response.requiredInt("protocol_version") == PROTOCOL_VERSION)
+            stage = "wire"
+            val wire = response.requiredString("ticket_protobuf").decodeBase64UrlStrict()
+            require(wire.size in MIN_TICKET_BYTES..MAX_TICKET_BYTES)
+            val ticket = DirectPathTicketV1.parseFrom(wire)
+            require(wire.contentEquals(canonicalTicket(ticket).toByteArray())) {
+                "ticket protobuf is not canonical"
+            }
+            stage = "binding"
+            require(ticket.formatVersion == PROTOCOL_VERSION)
+            require(ticket.ticketId.isNonZeroId() && ticket.accountId.isNonZeroId())
+            require(ticket.initiatorDeviceId.matches(deviceId.toBytes()))
+            require(ticket.responderDeviceId.matches(targetDeviceId.toBytes()))
+            require(ticket.connectionId.matches(connectionId.toBytes()))
+            require(ticket.pathEpoch in 1..Long.MAX_VALUE)
+            require(ticket.serverNonce.size() == ID_BYTES)
+            require(ticket.serverSignature.size() == ED25519_SIGNATURE_BYTES)
+            require(ticket.allowedCarriersList == listOf(DirectCarrierV1.DIRECT_CARRIER_V1_UDP_QUIC))
+            val keyId = ticket.serverSigningKeyId.decodeUtf8Strict()
+            val signingKey = config.ticketSigningKeys[keyId] ?: error("ticket key is not pinned")
+            stage = "lifetime"
+            val now = clockMillis()
+            require(ticket.issuedAtMs > 0 && ticket.expiresAtMs > ticket.issuedAtMs)
+            require(ticket.expiresAtMs - ticket.issuedAtMs <= MAX_TICKET_LIFETIME_MILLIS)
+            require(ticket.issuedAtMs <= safeAdd(now, MAX_TICKET_CLOCK_SKEW_MILLIS))
+            require(now < ticket.expiresAtMs)
+            stage = "signature"
+            val claims = canonicalTicket(ticket).toBuilder().clearServerSignature().build().toByteArray()
+            val signed = TICKET_SIGNATURE_DOMAIN + claims
+            require(
+                ticketSignatureVerifier.verify(
+                    signingKey.publicKey.copyOf(),
+                    signed,
+                    ticket.serverSignature.toByteArray(),
+                ),
+            ) { "ticket signature rejected" }
+            return ValidatedDirectPathTicket(ticket, wire)
+        } catch (failure: Exception) {
+            if (Log.isLoggable(DIRECT_DIAGNOSTIC_LOG_TAG, Log.VERBOSE)) {
+                Log.i(DIRECT_DIAGNOSTIC_LOG_TAG, "ticket_validation_failed stage=$stage")
+            }
+            throw failure
         }
-        require(ticket.formatVersion == PROTOCOL_VERSION)
-        require(ticket.ticketId.isNonZeroId() && ticket.accountId.isNonZeroId())
-        require(ticket.initiatorDeviceId.matches(deviceId.toBytes()))
-        require(ticket.responderDeviceId.matches(targetDeviceId.toBytes()))
-        require(ticket.connectionId.matches(connectionId.toBytes()))
-        require(ticket.pathEpoch in 1..Long.MAX_VALUE)
-        require(ticket.serverNonce.size() == ID_BYTES)
-        require(ticket.serverSignature.size() == ED25519_SIGNATURE_BYTES)
-        require(ticket.allowedCarriersList == listOf(DirectCarrierV1.DIRECT_CARRIER_V1_UDP_QUIC))
-        val keyId = ticket.serverSigningKeyId.decodeUtf8Strict()
-        val signingKey = config.ticketSigningKeys[keyId] ?: error("ticket key is not pinned")
-        val now = clockMillis()
-        require(ticket.issuedAtMs > 0 && ticket.expiresAtMs > ticket.issuedAtMs)
-        require(ticket.expiresAtMs - ticket.issuedAtMs <= MAX_TICKET_LIFETIME_MILLIS)
-        require(ticket.issuedAtMs <= safeAdd(now, MAX_TICKET_CLOCK_SKEW_MILLIS))
-        require(now < ticket.expiresAtMs)
-        val claims = canonicalTicket(ticket).toBuilder().clearServerSignature().build().toByteArray()
-        val signed = TICKET_SIGNATURE_DOMAIN + claims
-        require(
-            ticketSignatureVerifier.verify(
-                signingKey.publicKey.copyOf(),
-                signed,
-                ticket.serverSignature.toByteArray(),
-            ),
-        ) { "ticket signature rejected" }
-        return ValidatedDirectPathTicket(ticket, wire)
     }
 
     private fun validateSignal(
@@ -1303,6 +1316,7 @@ internal class DirectTransportSignalingClient(
         internal const val RENEW_PATH = "/v1/transport/tickets/renew"
         internal const val SIGNAL_PATH = "/v1/transport/signals"
         internal const val SIGNAL_SUBPROTOCOL = "termlink.transport.v1"
+        private const val DIRECT_DIAGNOSTIC_LOG_TAG = "TermLinkDirectShadow"
         /** Client Hello protocol request; this value never authorizes application-data routing. */
         internal const val DIRECT_TRANSPORT_CAPABILITY = "direct_transport_v1"
         internal const val DIRECT_SIGNALING_CAPABILITY = "direct_signaling_v1"
@@ -1323,7 +1337,8 @@ internal class DirectTransportSignalingClient(
         private const val MAX_KEY_ID_BYTES = 64
         private const val MAX_SIGNAL_CLOCK_SKEW_MILLIS = 30_000L
         private const val MAX_TICKET_CLOCK_SKEW_MILLIS = 30_000L
-        private const val MAX_TICKET_LIFETIME_MILLIS = 120_000L
+        // One renewable generation; keep aligned with the server and native wire contract.
+        private const val MAX_TICKET_LIFETIME_MILLIS = 20 * 60 * 1_000L
         private const val MIN_TICKET_BYTES = 128
         private const val MAX_TICKET_BYTES = 2_048
         private const val ED25519_SIGNATURE_BYTES = 64

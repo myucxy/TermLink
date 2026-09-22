@@ -820,11 +820,19 @@ class DirectTransportSignalingClientTest {
         val validTicket = signing.ticket(deviceId, targetId, connectionId, now)
         val tamperedTicket = validTicket.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
         val wrongConnectionTicket = signing.ticket(deviceId, targetId, UUID.randomUUID(), now)
-        val expiredTicket = signing.ticket(deviceId, targetId, connectionId, now - 120_001)
+        val expiredTicket = signing.ticket(deviceId, targetId, connectionId, now - 1_200_001)
+        val overlongTicket = signing.ticket(
+            deviceId,
+            targetId,
+            connectionId,
+            now,
+            lifetimeMillis = 1_200_001,
+        )
         server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(validTicket)))
         server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(tamperedTicket)))
         server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(wrongConnectionTicket)))
         server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(expiredTicket)))
+        server.enqueue(MockResponse().setResponseCode(201).setBody(ticketResponse(overlongTicket)))
         server.start()
         val fixture = fixture(server, enabled = true, deviceId = deviceId)
         val config = parsedConfig(signing)
@@ -852,7 +860,7 @@ class DirectTransportSignalingClientTest {
                 DirectSignalingFaultCode.TICKET_REJECTED,
                 (rejected as DirectSignalingCallResult.Fault).fault.code,
             )
-            repeat(2) {
+            repeat(3) {
                 val strictRejection = fixture.client.issueTicket(targetId, connectionId, config)
                 assertEquals(
                     DirectSignalingFaultCode.TICKET_REJECTED,
@@ -1340,7 +1348,13 @@ class DirectTransportSignalingClientTest {
         val publicKey: ByteArray = privateKey.generatePublicKey().encoded
         val keyId = "direct-v1-test"
 
-        fun ticket(initiator: UUID, responder: UUID, connection: UUID, now: Long): ByteArray {
+        fun ticket(
+            initiator: UUID,
+            responder: UUID,
+            connection: UUID,
+            now: Long,
+            lifetimeMillis: Long = 20 * 60 * 1_000L,
+        ): ByteArray {
             val claims = DirectPathTicketV1.newBuilder()
                 .setFormatVersion(1)
                 .setTicketId(ByteString.copyFrom(UUID.randomUUID().bytes()))
@@ -1350,7 +1364,7 @@ class DirectTransportSignalingClientTest {
                 .setConnectionId(ByteString.copyFrom(connection.bytes()))
                 .setPathEpoch(1)
                 .setIssuedAtMs(now)
-                .setExpiresAtMs(now + 120_000)
+                .setExpiresAtMs(now + lifetimeMillis)
                 .addAllowedCarriers(DirectCarrierV1.DIRECT_CARRIER_V1_UDP_QUIC)
                 .setServerNonce(ByteString.copyFrom(ByteArray(16) { 0x33 }))
                 .setServerSigningKeyId(ByteString.copyFromUtf8(keyId))

@@ -76,6 +76,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             await WaitUntilAsync(() => runtime.Snapshot.State == ProductionDirectShadowState.ShadowReadyNotRouted,
                 TimeSpan.FromSeconds(5)).ConfigureAwait(false);
             Require(native.BeginCalls == 1 && native.AppendCalls == 1 && native.CommitCalls == 1 &&
+                    native.CandidateExpiresAtMilliseconds == now.ToUnixTimeMilliseconds() + 60_000 &&
                     native.SignatureVerified &&
                     native.KeysVerified && native.CommittedRank == 5 && !runtime.Snapshot.DirectRoutingPermitted &&
                     directSupervisor.Snapshot().State == ProductionDirectPathState.ShadowReadyNotRouted &&
@@ -835,6 +836,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             public int CommitCalls { get; private set; }
             public int DisposeCalls { get; private set; }
             public uint CommittedRank { get; private set; }
+            public long CandidateExpiresAtMilliseconds { get; private set; }
             public bool KeysVerified { get; private set; }
             public bool SignatureVerified { get; private set; }
             public bool PairDelivered { get; private set; }
@@ -846,6 +848,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             public ProductionDirectNativeCommandResult Gather(ProductionDirectGatherRequestV4 request)
             {
                 epoch = request.Epoch; attempt = request.AttemptId;
+                CandidateExpiresAtMilliseconds = request.CandidateExpiresAtMilliseconds;
                 events.Enqueue(Event(ProductionDirectNativeEventKindV4.IdentityReady,
                     opaque: Encoding.ASCII.GetBytes("pc-v4-certificate")));
                 localHost = new ProductionDirectCandidateV4
