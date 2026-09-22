@@ -787,7 +787,6 @@ class ProductionDirectShadowRuntime internal constructor(
     private var active: Attempt? = null
     private var attemptJob: Job? = null
     private var retryJob: Job? = null
-    private var retryAttempt = 0
     private val mutableSnapshot = MutableStateFlow(
         ProductionDirectShadowSnapshot(
             state = if (enabled) ProductionDirectShadowState.WAITING_FOR_RELAY
@@ -863,7 +862,6 @@ class ProductionDirectShadowRuntime internal constructor(
                 currentEpochs[deviceId] != keyEpoch
             }
             peerGeneration = nextGeneration(peerGeneration)
-            retryAttempt = 0
             current = active
             active = null
             currentJob = attemptJob
@@ -969,7 +967,6 @@ class ProductionDirectShadowRuntime internal constructor(
             network = captured
             networkGeneration = nextGeneration(networkGeneration)
             promotedPeerEpochs.clear()
-            retryAttempt = 0
             current = active
             active = null
             currentJob = attemptJob
@@ -995,7 +992,6 @@ class ProductionDirectShadowRuntime internal constructor(
         synchronized(lock) {
             if (relayGeneration == connectedGeneration) return true
             relayGeneration = connectedGeneration
-            retryAttempt = 0
             current = active
             active = null
             currentJob = attemptJob
@@ -1034,8 +1030,7 @@ class ProductionDirectShadowRuntime internal constructor(
         job.invokeOnCompletion {
             val shouldWake = synchronized(lock) {
                 if (attemptJob === job) attemptJob = null
-                !closed.get() && started && active == null && retryJob?.isActive != true &&
-                    retryAttempt < MAX_RUNTIME_RETRIES
+                !closed.get() && started && active == null && retryJob?.isActive != true
             }
             // A gate transition may have been observed while this job was still
             // active. Re-arm after exact completion so that conflated wake-up is
@@ -1276,7 +1271,6 @@ class ProductionDirectShadowRuntime internal constructor(
             if (active === attempt && gateStillCurrentLocked(attempt.gate)) {
                 promotedPeerEpochs[attempt.peer.deviceId] = attempt.peer.keyEpoch
                 active = null
-                retryAttempt = 0
                 publishGateStateLocked()
             }
         }
@@ -1987,7 +1981,6 @@ class ProductionDirectShadowRuntime internal constructor(
         if (!attempt.shadowReady.compareAndSet(false, true)) {
             throw DirectAttemptFailure("DIRECT_V4_SHADOW_READY_DUPLICATE")
         }
-        synchronized(lock) { retryAttempt = 0 }
         if (productionHandoffConsumer == null) {
             attempt.releaseNegotiationSecrets()
             runCatching(attempt.signaling::close)
@@ -2363,7 +2356,6 @@ class ProductionDirectShadowRuntime internal constructor(
                         event.payload.all { it == 0.toByte() }
                     ) throw DirectAttemptFailure("DIRECT_SHADOW_READY_REJECTED")
                     attempt.shadowReady.set(true)
-                    synchronized(lock) { retryAttempt = 0 }
                     attempt.releaseNegotiationSecrets()
                     runCatching(attempt.signaling::close)
                     publishAttempt(attempt, ProductionDirectShadowState.SHADOW_READY_NOT_ROUTED)
@@ -2889,10 +2881,7 @@ class ProductionDirectShadowRuntime internal constructor(
 
     private fun scheduleRetry() {
         synchronized(lock) {
-            if (closed.get() || retryJob?.isActive == true || !started ||
-                retryAttempt >= MAX_RUNTIME_RETRIES
-            ) return
-            retryAttempt++
+            if (closed.get() || retryJob?.isActive == true || !started) return
             retryJob = scope.launch {
                 retryDelay.await(RETRY_COOLDOWN_MILLIS)
                 synchronized(lock) { retryJob = null }
@@ -3310,7 +3299,6 @@ class ProductionDirectShadowRuntime internal constructor(
         const val POLL_INTERVAL_MILLIS = 10L
         const val MAX_NATIVE_EVENTS_PER_POLL = 16
         const val MAX_INCOMING_SIGNALS = 32
-        const val MAX_RUNTIME_RETRIES = 3
         const val CANDIDATE_ID_BYTES = 16
         const val MAX_CANDIDATE_PAIRS = 32
         const val MAX_SIGNAL_CANDIDATES = 8

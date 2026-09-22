@@ -95,7 +95,7 @@ class ProductionDirectShadowRuntimeTest {
     }
 
     @Test
-    fun exhaustedRetryBudgetDoesNotRearmTheAttemptLoop() = runTest {
+    fun retryLoopContinuesBeyondFormerAttemptBudget() = runTest {
         val identity = DeviceIdentity.generate(FixedSecureRandom())
         val attempts = AtomicInteger()
         val runtime = ProductionDirectShadowRuntime(
@@ -121,16 +121,16 @@ class ProductionDirectShadowRuntimeTest {
         try {
             arm(runtime, callerPeer, relayGeneration = 1)
             runCurrent()
-            repeat(3) {
+            repeat(4) {
                 advanceTimeBy(30_000)
                 runCurrent()
             }
 
-            assertEquals(4, attempts.get())
+            assertEquals(5, attempts.get())
             assertEquals("DIRECT_SHADOW_FAILED", runtime.snapshot.value.reasonCode)
-            advanceTimeBy(300_000)
+            advanceTimeBy(30_000)
             runCurrent()
-            assertEquals(4, attempts.get())
+            assertEquals(6, attempts.get())
         } finally {
             callerPeer.close()
             runtime.closeAndJoin()
