@@ -44,6 +44,7 @@ namespace TermLink.Agent
         private readonly object sync = new();
         private readonly CancellationTokenSource lifetime = new();
         private readonly SemaphoreSlim wake = new(0, 1);
+        private CancellationTokenSource retryDelayCancellation;
         private SignalingLane lane;
         private long laneGeneration;
         private Task worker;
@@ -123,7 +124,10 @@ namespace TermLink.Agent
                 return false;
             SignalingLane current;
             lock (sync) current = lane;
-            return current?.Incoming.Writer.TryWrite(envelope.Clone()) == true;
+            var accepted = current?.Incoming.Writer.TryWrite(envelope.Clone()) == true;
+            if (accepted && envelope.SignalType == TransportSignalTypeV1.PathOffer)
+                InterruptRetryDelay();
+            return accepted;
         }
 
         public bool Start()
@@ -202,8 +206,25 @@ namespace TermLink.Agent
                 }
                 if (!token.IsCancellationRequested && RelayConnected() && !HandoffActive())
                 {
-                    try { await delay(RetryDelay, token).ConfigureAwait(false); }
+                    using var retry = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    var pendingSignal = false;
+                    lock (sync)
+                    {
+                        retryDelayCancellation = retry;
+                        pendingSignal = lane?.Incoming.Reader.TryPeek(out _) == true;
+                    }
+                    try
+                    {
+                        if (!pendingSignal) await delay(RetryDelay, retry.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested) { }
                     catch (OperationCanceledException) { break; }
+                    finally
+                    {
+                        lock (sync)
+                            if (ReferenceEquals(retryDelayCancellation, retry))
+                                retryDelayCancellation = null;
+                    }
                     Wake();
                 }
             }
@@ -1262,7 +1283,16 @@ namespace TermLink.Agent
                     ? "NONE"
                     : ProductionDirectTransportDiagnostics.CandidateType(selected.Initiator.Kind));
         }
-        private void Wake() { try { wake.Release(); } catch (SemaphoreFullException) { } catch (ObjectDisposedException) { } }
+        private void Wake()
+        {
+            try { wake.Release(); } catch (SemaphoreFullException) { } catch (ObjectDisposedException) { }
+        }
+        private void InterruptRetryDelay()
+        {
+            CancellationTokenSource retry;
+            lock (sync) retry = retryDelayCancellation;
+            try { retry?.Cancel(); } catch (ObjectDisposedException) { }
+        }
 
         public async ValueTask DisposeAsync()
         {

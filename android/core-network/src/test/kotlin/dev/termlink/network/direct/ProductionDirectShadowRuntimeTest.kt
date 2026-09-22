@@ -94,6 +94,50 @@ class ProductionDirectShadowRuntimeTest {
         }
     }
 
+    @Test
+    fun exhaustedRetryBudgetDoesNotRearmTheAttemptLoop() = runTest {
+        val identity = DeviceIdentity.generate(FixedSecureRandom())
+        val attempts = AtomicInteger()
+        val runtime = ProductionDirectShadowRuntime(
+            enabled = true,
+            authenticationGeneration = AUTH_GENERATION,
+            localDeviceId = androidId,
+            identity = identity,
+            relayEvents = emptyFlow<ProductionRealtimeSessionConnectionEvent>(),
+            signalingFactory = { _ ->
+                attempts.incrementAndGet()
+                throw IllegalStateException("injected signaling failure")
+            },
+            nativeFactory = { FakeNative() },
+            platform = FakePlatform(),
+            parentScope = this,
+            clockMillis = { now },
+            random = FixedSecureRandom(),
+            pollDelay = ProductionDirectShadowDelay { kotlinx.coroutines.delay(it) },
+            retryDelay = ProductionDirectShadowDelay { kotlinx.coroutines.delay(it) },
+            uuidSource = DeterministicUuids(),
+        )
+        val callerPeer = peer()
+        try {
+            arm(runtime, callerPeer, relayGeneration = 1)
+            runCurrent()
+            repeat(3) {
+                advanceTimeBy(30_000)
+                runCurrent()
+            }
+
+            assertEquals(4, attempts.get())
+            assertEquals("DIRECT_SHADOW_FAILED", runtime.snapshot.value.reasonCode)
+            advanceTimeBy(300_000)
+            runCurrent()
+            assertEquals(4, attempts.get())
+        } finally {
+            callerPeer.close()
+            runtime.closeAndJoin()
+            identity.destroy()
+        }
+    }
+
     private val androidId = UUID.fromString("10111213-1415-4617-9819-1a1b1c1d1e1f")
     private val pcId = UUID.fromString("20212223-2425-4627-a829-2a2b2c2d2e2f")
     private val pairwise = ByteArray(32) { (it + 1).toByte() }

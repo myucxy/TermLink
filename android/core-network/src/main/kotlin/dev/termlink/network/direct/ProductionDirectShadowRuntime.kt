@@ -1034,7 +1034,8 @@ class ProductionDirectShadowRuntime internal constructor(
         job.invokeOnCompletion {
             val shouldWake = synchronized(lock) {
                 if (attemptJob === job) attemptJob = null
-                !closed.get() && started && active == null && retryJob?.isActive != true
+                !closed.get() && started && active == null && retryJob?.isActive != true &&
+                    retryAttempt < MAX_RUNTIME_RETRIES
             }
             // A gate transition may have been observed while this job was still
             // active. Re-arm after exact completion so that conflated wake-up is

@@ -4,7 +4,7 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Source identity and scope
 
-- Release source commit: recorded after the release-source commit is fixed and pushed.
+- Release source commit: `59eb495140ac0fc23e6e7934b4bb5a499ae4cb11`.
 - This is an Android-only release. Windows remains on `0.2.47 (103)` and the Server remains on
   `docker.io/myucxy/termlink:v0.2.47`; neither is rebuilt or republished because neither source changed.
 - AppShip stable before release: Android and Windows are both `0.2.47 (103)`.
@@ -41,18 +41,30 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Production artifact and AppShip
 
-- Production APK manifest, size, SHA-256, signer continuity, AppShip release/artifact IDs, and final
-  `published/ready` state are recorded after build and publication.
-- Required signer SHA-256 remains
-  `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
+- APK: `artifacts/release/0.2.48-104/TermLink-Android-0.2.48-104.apk`.
+- Size: `38066222` bytes.
+- SHA-256: `5d02e0245c149c33c89cefef792730623c4068d41590b5312dfecf4a4f89ed7f`.
+- Signer SHA-256: `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
+- AppShip application: `termlink-android`; release
+  `291617b8-e92d-4fc2-bdd0-83fce37b9c1f`; artifact
+  `72c7cf62-8c39-4a2f-9812-c4190c05ab42`.
+- Final state: release `published`, artifact `ready`; build 103 returned `optional` and build 104
+  returned `no_update`.
 - Resumable state path:
   `.appship/termlink-android-stable-0.2.48-build104-signature-approved.json`.
 
 ## Live validation boundary
 
-- The signed Production APK must pass independent verification before AppShip publication.
-- The debug-signed emulator is upgraded in place without clearing app data, changing `appId`, or changing
-  `firstInstallTime`.
+- The signed Production APK passed independent manifest, version, size, SHA-256, v2 signer-count, and signer
+  continuity verification before AppShip publication.
+- The debug-signed emulator was upgraded in place without clearing app data: `appId=10224` and
+  `firstInstallTime=2026-09-19 10:16:29` remained unchanged; login and the existing `HOME-PC` and
+  `HT-LPC-1326` sessions were preserved.
+- Server authority epochs advanced across all three PCs after the fix: `HT-LPC-1326` 476→477,
+  `WIN10-20240606Q` 2→3, and `HOME-PC` 1→2. This proves peer-selection progress, not Direct success.
+- `HOME-PC` received an Android offer and entered `GATHERING`/`NEGOTIATING`, then fell back through
+  `DIRECT_ATTEMPT_TIMEOUT`; Relay remained usable. Follow-up analysis found a separate Windows responder
+  cooldown delay and Android exhausted-retry busy loop, deferred to the next release.
 - A fresh `HOME-PC` session passes only after an authoritative `LAN_DIRECT` carrier is observed. A fresh
   `HT-LPC-1326` session passes only after an authoritative `NAT_DIRECT` carrier is observed.
 - `GATHERING`, `NEGOTIATING`, path-epoch allocation, or a usable Relay session is not a Direct pass. Direct

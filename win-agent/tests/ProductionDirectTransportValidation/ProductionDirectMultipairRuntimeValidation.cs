@@ -124,6 +124,8 @@ namespace TermLink.ProductionDirectTransport.Validation
                 "The runtime diagnostic writer did not finish before cleanup.");
             try { Directory.Delete(diagnosticRoot, true); }
             catch { }
+            await ValidateOfferInterruptsRetryCooldownAsync(pc, android, pcIdentity, androidIdentity,
+                serverIdentity, pairwise, now).ConfigureAwait(false);
             await ValidatePrematureFinalPlanFailsClosedAsync(
                 pcIdentity, androidIdentity, serverIdentity, pairwise, now).ConfigureAwait(false);
             CryptographicOperations.ZeroMemory(pairwise);
@@ -133,6 +135,59 @@ namespace TermLink.ProductionDirectTransport.Validation
             await ValidateUnsupportedCapabilityFailsClosedAsync(pc, pcIdentity, android,
                 androidIdentity, serverIdentity, now).ConfigureAwait(false);
             await ValidatePromotionNetworkRaceAndLateCallbacksAsync().ConfigureAwait(false);
+        }
+
+        private static async Task ValidateOfferInterruptsRetryCooldownAsync(Guid pc, Guid android,
+            DeviceIdentity pcIdentity, DeviceIdentity androidIdentity, DeviceIdentity serverIdentity,
+            byte[] pairwise, DateTimeOffset now)
+        {
+            var config = Config(serverIdentity.SigningPublicKey);
+            var ticket = Ticket(now, serverIdentity, Guid.NewGuid(), android, pc, Guid.NewGuid());
+            await using var signaling = new FakeSignaling(pc, pcIdentity, config,
+                now.ToUnixTimeMilliseconds());
+            var native = new FakeNativeV4(pcIdentity.SigningPublicKey, pairwise);
+            var peerCalls = 0;
+            var supervisor = new ProductionDirectTransportSupervisor(() => now.UtcDateTime);
+            supervisor.ObserveRelayConnected(true);
+            await using var runtime = new ProductionDirectMultipairShadowRuntime(
+                true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, supervisor,
+                () => throw new InvalidOperationException("Shared signaling must not use its factory."),
+                _ => Task.FromResult<IReadOnlyList<ProductionDirectPeerAuthorization>>(
+                    Interlocked.Increment(ref peerCalls) == 1
+                        ? Array.Empty<ProductionDirectPeerAuthorization>()
+                        : new[] { new ProductionDirectPeerAuthorization(
+                            android, pairwise, androidIdentity.SigningPublicKey, 1) }),
+                nativeFactory: () => native,
+                platform: new FakePlatform(),
+                delay: ShortDelay,
+                clockMilliseconds: () => now.ToUnixTimeMilliseconds(),
+                nativeCapability: () => true,
+                sharedSignaling: signaling);
+            signaling.Dispatcher = runtime.TryDispatchPrePromotionSignal;
+            Require(runtime.Start(), "The cooldown validation runtime did not start.");
+            runtime.ObserveRelayConnected(true, 1);
+            await WaitUntilAsync(() => runtime.Snapshot.ReasonCode == "DIRECT_NO_AUTHORIZED_PEER",
+                TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+
+            var offer = new TransportSignalPayloadV1
+            {
+                FormatVersion = 1,
+                PathOffer = new DirectPathOfferV1
+                {
+                    Ticket = ticket.Clone(),
+                    QuicCertificateSha256 = ByteString.CopyFrom(SHA256.HashData(
+                        Encoding.ASCII.GetBytes("cooldown-certificate"))),
+                    GatheringComplete = true
+                }
+            };
+            offer.PathOffer.Candidates.Add(Candidate(Guid.NewGuid(), "192.168.80.20", 42_000,
+                ticket.ExpiresAtMs, 2_000_000_000));
+            signaling.Inject(Encrypt(pairwise, ticket, android, pc,
+                TransportSignalTypeV1.PathOffer, 1, 0, now.ToUnixTimeMilliseconds(), offer));
+            var answer = await signaling.ReadOutboundAsync().WaitAsync(TimeSpan.FromSeconds(5))
+                .ConfigureAwait(false);
+            Require(answer.SignalType == TransportSignalTypeV1.PathAnswer && peerCalls >= 2,
+                "An inbound offer did not interrupt the responder retry cooldown.");
         }
 
         private static async Task ValidatePromotionNetworkRaceAndLateCallbacksAsync()
