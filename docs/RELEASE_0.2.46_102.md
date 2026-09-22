@@ -93,6 +93,23 @@ Date: 2026-09-22 (Asia/Shanghai)
   attestations **remain unverified**. A Git tag alone is not proof that a Docker image was published.
   A documentation/workflow follow-up removes the unused GitHub Packages write permission for
   future tags; the immutable `v0.2.46` source tag is not moved.
-- Local Docker Server: still on the older `termlink-server:local` image; the immutable Docker Hub
-  image has not been verified and this local Server has **not** been upgraded. Its migration, volume
-  preservation and routing-default deployment checks remain pending.
+- Local Docker Server: unused images were pruned from 400 to 16 without deleting volumes or the
+  database. A local `linux/amd64` image was rebuilt as `docker.io/myucxy/termlink:v0.2.46` from
+  follow-up commit `70a30ea236d01842794e2c6164379cc01a8af090`; image ID
+  `sha256:f5971f9dac62cbdeaf89529ac5c608ec4d96176770e2a7681ac68ba7fd258625`.
+  This local rebuild is not evidence of the unverified remote multi-architecture Docker Hub image.
+- The first local rebuild correctly rejected the existing database because release source had
+  changed the comment bytes of already-applied migration 49. Commit `70a30ea` restores its original
+  checksum `16f3793d37c4a56dd22eaf416ef33eb0a5929a4770b11ecd242dab3fe04cc142`
+  and adds a regression assertion; `go test ./...` and a real migration probe passed. The database
+  checksum table was not modified or bypassed.
+- Before upgrade, a PostgreSQL custom-format backup was written to the ignored local path
+  `.appship/backups/termlink-pre-v0.2.46-20260922-134027.dump` (21,452,665 bytes, SHA-256
+  `64c7ae662d2ea26cf6a8d94d2d88699e0711f4e1a995be9aa1fe2100254ef167`) and validated with
+  `pg_restore --list`.
+- The local Compose Server and PostgreSQL are healthy, PostgreSQL container and
+  `termlink-local_postgres-data` volume were preserved, schema migration is 50, and the routing
+  policy has no explicit row so the automatic Direct-preferred/Relay-fallback default applies.
+  `TERMLINK_PUBLIC_URL` is `https://termlink2.kget.cc:8910`; loopback and external health/readiness
+  return 200 and OIDC issuer is `https://termlink2.kget.cc:8910/realms/termlink`. TLS presents
+  `CN=*.kget.cc`, valid through 2026-11-21.
