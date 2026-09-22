@@ -851,6 +851,10 @@ class ProductionDirectShadowRuntime internal constructor(
                 owned.forEach(ProductionDirectAuthorizedPeer::close)
                 return false
             }
+            if (sameProductionDirectPeerAuthorities(peers, owned)) {
+                owned.forEach(ProductionDirectAuthorizedPeer::close)
+                return true
+            }
             retired = peers
             peers = owned
             peerSelectionCursor = 0
@@ -3342,6 +3346,18 @@ internal fun <T> selectNextProductionDirectPeer(
         }
     }
     return null
+}
+
+private fun sameProductionDirectPeerAuthorities(
+    left: List<ProductionDirectAuthorizedPeer>,
+    right: List<ProductionDirectAuthorizedPeer>,
+): Boolean = left.size == right.size && left.indices.all { index ->
+    val first = left[index]
+    val second = right[index]
+    first.deviceId == second.deviceId && first.keyEpoch == second.keyEpoch &&
+        first.keyIdBytes.contentEquals(second.keyIdBytes) &&
+        MessageDigest.isEqual(first.pairwiseKey, second.pairwiseKey) &&
+        first.signingPublicKey.contentEquals(second.signingPublicKey)
 }
 
 internal fun verifyEd25519(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean =

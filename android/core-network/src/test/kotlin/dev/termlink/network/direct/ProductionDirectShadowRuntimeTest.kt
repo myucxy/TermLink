@@ -65,6 +65,35 @@ class ProductionDirectShadowRuntimeTest {
         assertEquals("first", wrapped.value)
         assertEquals(null, selectNextProductionDirectPeer(peers, 2) { false })
     }
+
+    @Test
+    fun unchangedPeerRefreshDoesNotRetireActiveAttempt() = runTest {
+        val identity = DeviceIdentity.generate(FixedSecureRandom())
+        val native = FakeNative(holdBeforeShadowReady = true)
+        val signaling = FakeSignaling(now, androidId, pcId, pairwise)
+        val runtime = runtime(this, identity, signaling, native, FakePlatform())
+        val initial = peer()
+        val refreshed = peer()
+        try {
+            arm(runtime, initial, relayGeneration = 1)
+            advanceTimeBy(100)
+            runCurrent()
+            assertEquals(ProductionDirectShadowState.NEGOTIATING, runtime.snapshot.value.state)
+
+            assertTrue(runtime.replaceAuthorizedPeers(AUTH_GENERATION, listOf(refreshed)))
+            runCurrent()
+
+            assertEquals(ProductionDirectShadowState.NEGOTIATING, runtime.snapshot.value.state)
+            assertEquals(0, native.cancelCalls)
+            assertEquals(1, signaling.offers)
+        } finally {
+            initial.close()
+            refreshed.close()
+            runtime.closeAndJoin()
+            identity.destroy()
+        }
+    }
+
     private val androidId = UUID.fromString("10111213-1415-4617-9819-1a1b1c1d1e1f")
     private val pcId = UUID.fromString("20212223-2425-4627-a829-2a2b2c2d2e2f")
     private val pairwise = ByteArray(32) { (it + 1).toByte() }

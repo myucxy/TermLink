@@ -56,11 +56,20 @@ Date: 2026-09-22 (Asia/Shanghai)
 
 ## Live validation boundary
 
-- The Android emulator now reaches Direct `GATHERING` and `NEGOTIATING`, proving Android Network capture,
-  UDP socket creation/binding, host-candidate generation, and signaling candidate upload.
-- No authoritative `LAN_DIRECT` or `NAT_DIRECT` carrier has yet been observed. Physical LAN and cross-NAT
-  production socket validation remains pending until the remote Windows client `HT-LPC-1326` upgrades to this
-  release. Unit, instrumentation, and shadow-state evidence must not be reported as a Direct carrier pass.
+- With Android, `HOME-PC`, and `HT-LPC-1326` all on `0.2.47 (103)`, fresh sessions to both Windows Agents
+  remained on Relay. No authoritative `LAN_DIRECT` or `NAT_DIRECT` carrier was observed; Relay stayed usable.
+- Android repeatedly reached Direct `GATHERING` and `NEGOTIATING`, but every attempt retained
+  `selected_pair_rank=0` and returned to `RELAY_ONLY`. The Server allocated new path epochs only for the
+  Android/`HT-LPC-1326` pair; no Android/`HOME-PC` epoch was created. After enabling the existing redacted
+  Windows diagnostic and restarting only the local client, `HOME-PC` reported `DIRECT_NO_AUTHORIZED_PEER`
+  during initial authority warm-up and then repeated `DIRECT_OFFER_TIMEOUT`.
+- Source and timing evidence identified a client scheduling defect: the two-second session-catalog poll calls
+  `refreshDirectAuthorizedPeers` even when peer authority is unchanged, and `replaceAuthorizedPeers` always
+  resets `peerSelectionCursor` to zero and retires the active attempt. Because `HT-LPC-1326` sorts first by
+  device ID, it is repeatedly selected while later peers, including `HOME-PC`, are starved. LAN/NAT validation
+  is blocked until unchanged peer refreshes become idempotent and a newer Android build is field-tested.
+- `GATHERING`, `NEGOTIATING`, ticket allocation, and a working Relay session are not Direct carrier passes.
+  The emulator also runs behind the Android emulator NAT, so it cannot provide physical same-Wi-Fi LAN proof.
 - Relay remains the stable fallback and the Server's Relay-only strategy remains the operational rollback.
 - The emulator's debug-signed app was upgraded in place from `0.2.46 (102)` to `0.2.47 (103)` without changing
   `appId=10224` or `firstInstallTime=2026-09-19 10:16:29`; the retained logged-in session opened without a crash.
