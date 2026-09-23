@@ -4,7 +4,8 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 ## Source identity and scope
 
-- Release source commit: pending until the tested client changes and this pre-release record are committed and pushed.
+- Release source commit: `73de5f79af19fa712d81835aa378e76218cab924`; the production artifacts were built
+  from this commit, and `HEAD` matched `origin/main` with a clean tracked worktree before publishing.
 - Android and Windows clients only. Server and Docker sources did not change and are not rebuilt or published.
 - AppShip stable before release: Android `0.2.51 (107)`, Windows `0.2.49 (105)`. The shared version
   `0.2.52 (108)` is strictly newer than both.
@@ -48,12 +49,20 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 ## Production artifacts and AppShip
 
-- Production artifact hashes, signer verification, AppShip IDs, and public update decisions are recorded after the
-  release-source commit is built and both repository-wrapped publishes finish.
+- Android APK: `TermLink-Android-0.2.52-108.apk`, 38,087,666 bytes, SHA-256
+  `37ee624e8e4f42ebd5ba15aad96e29c44cb77e5b015bcb61cd3ba4f125f8ab3a`. AppShip application
+  `4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`, release `d96c39dc-a2f7-4183-bc66-b4eb20fc2f64`, artifact
+  `82b7d5a1-d00d-4704-94f7-2e81c0b04ecd`; release is `published` and artifact is `ready`.
+- Windows Setup: `TermLink-Setup-0.2.52.108-x64.exe`, 181,294,816 bytes, SHA-256
+  `cac6ac199025eccba73b8f3e479ee25700bfb550a86b26e815030748e89a0e31`. AppShip application
+  `0ae760b3-294e-48e8-a793-95d162f685e2`, release `c15e3d14-ac0b-4836-a5b0-5e211913ce77`, artifact
+  `b7b12120-4aea-4542-b11b-a699d7f1a956`; release is `published` and artifact is `ready`.
+- Public update verification: Android build 107 and Windows build 105 return `optional` for `0.2.52 (108)` with a
+  ready artifact; Android and Windows build 108 both return `no_update`.
 - Android signer SHA-256: `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
 - Windows signer SHA-1: `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`; the existing self-signed continuity
   certificate is not represented as public-CA trust.
-- Planned AppShip state files:
+- Preserved AppShip state files:
   `.appship/termlink-android-stable-0.2.52-build108-signature-approved.json` and
   `.appship/termlink-win64-stable-0.2.52-build108-signature-approved.json`.
 
