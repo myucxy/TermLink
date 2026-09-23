@@ -279,6 +279,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private bool accountStateKnown;
     private bool hasAvailableUpdate;
     private string availableUpdateText = string.Empty;
+    private bool updateProgressVisible;
+    private double updateProgressPercent;
+    private string updateProgressText = string.Empty;
+    private CancellationTokenSource? updateDownloadCancellation;
     private Task? updatePolling;
 
     public MainWindowViewModel(
@@ -423,6 +427,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             pendingConfirmation?.TrySetResult(false);
             return Task.CompletedTask;
         });
+        CancelUpdateDownloadCommand = new AsyncCommand((_, _) =>
+        {
+            try { Volatile.Read(ref updateDownloadCancellation)?.Cancel(); }
+            catch (ObjectDisposedException) { }
+            return Task.CompletedTask;
+        });
         stateStore.Changed += StateChanged;
     }
 
@@ -461,6 +471,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand DismissNoticeCommand { get; }
     public AsyncCommand ConfirmPendingActionCommand { get; }
     public AsyncCommand CancelPendingActionCommand { get; }
+    public AsyncCommand CancelUpdateDownloadCommand { get; }
     public IReadOnlyCollection<PageViewModel> Pages => pages.Values;
     public PageViewModel CurrentPage { get => currentPage; private set => SetProperty(ref currentPage, value); }
     public bool IsConnectionPageSelected => IsDevicesPageSelected;
@@ -551,6 +562,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
     public string AvailableUpdateText { get => availableUpdateText; private set => SetProperty(ref availableUpdateText, value); }
     public string UpdateActionText => HasAvailableUpdate ? PresentationText.StartUpdate : PresentationText.CheckUpdates;
+    public bool UpdateProgressVisible { get => updateProgressVisible; private set => SetProperty(ref updateProgressVisible, value); }
+    public double UpdateProgressPercent { get => updateProgressPercent; private set => SetProperty(ref updateProgressPercent, value); }
+    public string UpdateProgressText { get => updateProgressText; private set => SetProperty(ref updateProgressText, value); }
 
     public void Start()
     {
@@ -834,6 +848,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var entered = false;
+        CancellationTokenSource? downloadCancellation = null;
         try
         {
             await updateCheckLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -844,8 +859,21 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                     () => ShowNotice(UiNoticeSeverity.Info, PresentationText.CheckingUpdates, string.Empty),
                     cancellationToken);
             }
+            if (interactive)
+            {
+                downloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                Volatile.Write(ref updateDownloadCancellation, downloadCancellation);
+            }
+            var progress = interactive
+                ? new Progress<DesktopUpdateProgress>(value =>
+                    _ = dispatcher.InvokeAsync(() => ApplyUpdateProgress(value), CancellationToken.None))
+                : null;
             var status = await RequireDesktopOperations()
-                .CheckForUpdatesAsync(interactive, cancellationToken)
+                .CheckForUpdatesAsync(
+                    install: interactive,
+                    confirm: interactive ? ConfirmUpdateAsync : null,
+                    progress,
+                    downloadCancellation?.Token ?? cancellationToken)
                 .ConfigureAwait(false);
             await dispatcher.InvokeAsync(() =>
             {
@@ -867,6 +895,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             // App shutdown or command cancellation owns this outcome.
         }
+        catch (OperationCanceledException) when (downloadCancellation?.IsCancellationRequested == true)
+        {
+            await dispatcher.InvokeAsync(
+                () => ShowNotice(UiNoticeSeverity.Info, PresentationText.UpdateDownloadCanceled, string.Empty),
+                CancellationToken.None);
+        }
         catch (Exception error)
         {
             var failure = LocalizeFailure(ErrorCode(error), error.Message);
@@ -885,8 +919,48 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         }
         finally
         {
+            Volatile.Write(ref updateDownloadCancellation, null);
+            downloadCancellation?.Dispose();
+            await dispatcher.InvokeAsync(() =>
+            {
+                UpdateProgressVisible = false;
+                UpdateProgressPercent = 0;
+                UpdateProgressText = string.Empty;
+            }, CancellationToken.None);
             if (entered) updateCheckLock.Release();
         }
+    }
+
+    private async ValueTask<bool> ConfirmUpdateAsync(
+        DesktopUpdateStatus status,
+        CancellationToken cancellationToken)
+    {
+        Task<bool>? confirmation = null;
+        await dispatcher.InvokeAsync(() =>
+        {
+            ApplyUpdateStatus(status);
+            confirmation = RequestConfirmationAsync(
+                PresentationText.ConfirmUpdateTitle,
+                PresentationText.ConfirmUpdateDetail(status),
+                cancellationToken);
+        }, cancellationToken);
+        if (!await confirmation!.ConfigureAwait(false)) return false;
+        await dispatcher.InvokeAsync(() =>
+        {
+            UpdateProgressPercent = 0;
+            UpdateProgressText = PresentationText.UpdateDownloadProgress(0, 0);
+            UpdateProgressVisible = true;
+        }, cancellationToken);
+        return true;
+    }
+
+    private void ApplyUpdateProgress(DesktopUpdateProgress progress)
+    {
+        if (!UpdateProgressVisible) return;
+        UpdateProgressPercent = progress.TotalBytes <= 0
+            ? 0
+            : Math.Clamp(progress.BytesReceived * 100d / progress.TotalBytes, 0, 100);
+        UpdateProgressText = PresentationText.UpdateDownloadProgress(progress.BytesReceived, progress.TotalBytes);
     }
 
     private async Task PollForUpdatesAsync(CancellationToken cancellationToken)
@@ -1303,6 +1377,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         lifetimeCancellation.Cancel();
+        try { Volatile.Read(ref updateDownloadCancellation)?.Cancel(); }
+        catch (ObjectDisposedException) { }
         pendingConfirmation?.TrySetResult(false);
         stateStore.Changed -= StateChanged;
         if (updatePolling is not null)

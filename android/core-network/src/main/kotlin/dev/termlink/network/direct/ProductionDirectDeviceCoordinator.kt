@@ -31,6 +31,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 
+/** Server-authoritative Direct routing policy exposed to the product UI. */
+enum class ProductionDirectRoutingPolicy {
+    UNKNOWN,
+    AUTO,
+    RELAY_ONLY,
+}
+
 /** Public, redacted carrier state. It grants no session/control authority. */
 enum class ProductionDirectCarrier {
     RELAY,
@@ -70,6 +77,11 @@ class ProductionDirectDeviceCoordinator(
     private val closed = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
     private val serverRoutingPermitted = AtomicBoolean(false)
+    private val mutableRoutingPolicy = MutableStateFlow(ProductionDirectRoutingPolicy.UNKNOWN)
+    val routingPolicy: StateFlow<ProductionDirectRoutingPolicy> = mutableRoutingPolicy.asStateFlow()
+    val networkCheckResults: StateFlow<Map<UUID, ProductionDirectNetworkCheckResult>> by lazy {
+        shadowRuntime.networkCheckResults
+    }
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
     private val sessions = ConcurrentHashMap<UUID, LiveSession>()
@@ -214,10 +226,12 @@ class ProductionDirectDeviceCoordinator(
             dispatcher.routingPermission.collect { permission ->
                 when (permission) {
                     ProductionDirectRoutingPermission.PERMITTED -> {
+                        mutableRoutingPolicy.value = ProductionDirectRoutingPolicy.AUTO
                         serverRoutingPermitted.set(true)
                         shadowRuntime.observeProductionRoutingPermitted(authenticationGeneration, true)
                     }
                     ProductionDirectRoutingPermission.FORBIDDEN -> {
+                        mutableRoutingPolicy.value = ProductionDirectRoutingPolicy.RELAY_ONLY
                         synchronized(networkLock) {
                             serverRoutingPermitted.set(false)
                             networkScopedGate = null
@@ -230,6 +244,7 @@ class ProductionDirectDeviceCoordinator(
                     // An unknown server state blocks new promotions without
                     // tearing down an already committed Direct path.
                     ProductionDirectRoutingPermission.UNKNOWN -> {
+                        mutableRoutingPolicy.value = ProductionDirectRoutingPolicy.UNKNOWN
                         synchronized(networkLock) {
                             serverRoutingPermitted.set(false)
                             networkScopedGate = null
@@ -240,7 +255,6 @@ class ProductionDirectDeviceCoordinator(
         }
         routingRefreshJob = scope.launch(start = CoroutineStart.LAZY) {
             while (!closed.get()) {
-                delay(ROUTING_PERMISSION_REFRESH_MILLIS)
                 try {
                     dispatcher.refreshRoutingPermission()
                 } catch (cancelled: CancellationException) {
@@ -249,6 +263,7 @@ class ProductionDirectDeviceCoordinator(
                     // refreshRoutingPermission publishes UNKNOWN for transport failures;
                     // the Relay and committed Direct peers remain independently owned.
                 }
+                delay(ROUTING_PERMISSION_REFRESH_MILLIS)
             }
         }
         signalingGenerationJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -315,6 +330,18 @@ class ProductionDirectDeviceCoordinator(
             dataRuntime.networkChanged()
         }
         return shadowRuntime.observeNetwork(expectedAuthenticationGeneration, network)
+    }
+
+    /** Re-runs the existing Direct discovery for one peer without changing the Relay route. */
+    fun requestNetworkCheck(peerDeviceId: UUID, kind: ProductionDirectNetworkCheckKind): Boolean {
+        if (closed.get() || mutableRoutingPolicy.value != ProductionDirectRoutingPolicy.AUTO) return false
+        if (!shadowRuntime.requestNetworkCheck(authenticationGeneration, peerDeviceId, kind)) return false
+        dataRuntime.retirePeer(
+            peerDeviceId,
+            ProductionDirectPeerRetirementReason.DIRECT_FAILURE,
+        )
+        forgetPromotedPeer(peerDeviceId)
+        return true
     }
 
     fun registerLiveSession(

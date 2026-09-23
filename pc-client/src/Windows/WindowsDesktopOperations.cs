@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Net;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -40,25 +39,21 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
     public static WindowsDesktopOperations CreateDefault() => new(AppContext.BaseDirectory);
 
     public async ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
-        bool interactive,
+        bool install,
+        Func<DesktopUpdateStatus, CancellationToken, ValueTask<bool>>? confirm,
+        IProgress<DesktopUpdateProgress>? progress,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var update = await FetchUpdateAsync(cancellationToken).ConfigureAwait(false);
         var status = update.Status;
-        if (!interactive || update.DownloadUrl is null ||
+        if (!install || update.DownloadUrl is null ||
             status.Decision is not (DesktopUpdateDecision.Optional or DesktopUpdateDecision.Required))
             return status;
+        if (confirm is null || !await confirm(status, cancellationToken).ConfigureAwait(false))
+            return status;
 
-        var choice = MessageBox(
-            IntPtr.Zero,
-            $"发现 TermLink {status.VersionName}（build {status.BuildNumber}）。\n\n" +
-            "更新安装会关闭 TermLink 和受管终端会话，是否下载并打开已验证的安装程序？",
-            "TermLink 更新",
-            0x00000004u | 0x00000030u | 0x00000100u);
-        if (choice != 6) return status;
-
-        var setup = await DownloadAndVerifyUpdateAsync(update, cancellationToken).ConfigureAwait(false);
+        var setup = await DownloadAndVerifyUpdateAsync(update, progress, cancellationToken).ConfigureAwait(false);
         using var process = Process.Start(new ProcessStartInfo
         {
             FileName = setup,
@@ -132,6 +127,7 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
 
     private async Task<string> DownloadAndVerifyUpdateAsync(
         UpdateCandidate update,
+        IProgress<DesktopUpdateProgress>? progress,
         CancellationToken cancellationToken)
     {
         var root = Path.Combine(localApplicationData, "TermLink", "Updates");
@@ -141,6 +137,7 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         var temporaryPath = Path.Combine(root, $".download-{Guid.NewGuid():N}.tmp");
         try
         {
+            progress?.Report(new DesktopUpdateProgress(0, update.SizeBytes));
             using var response = await SendWithRedirectsAsync(HttpsUri(update.DownloadUrl), cancellationToken)
                 .ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
@@ -161,6 +158,7 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
                 if (received > update.SizeBytes) throw new InvalidDataException("下载超过 AppShip 声明大小。");
                 await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
                 hash.AppendData(buffer, 0, count);
+                progress?.Report(new DesktopUpdateProgress(received, update.SizeBytes));
             }
             await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
             if (received != update.SizeBytes || !CryptographicOperations.FixedTimeEquals(
@@ -269,9 +267,6 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         long SizeBytes = 0,
         string Sha256 = "",
         string SignerSha1 = "");
-
-    [DllImport("user32.dll", EntryPoint = "MessageBoxW", CharSet = CharSet.Unicode)]
-    private static extern int MessageBox(IntPtr window, string text, string caption, uint type);
 
     public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken)
     {

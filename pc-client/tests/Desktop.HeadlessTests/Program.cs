@@ -114,6 +114,9 @@ public static class Program
         var sidebarUsername = RequireControl<TextBlock>(window, "SidebarUsernameText");
         var sidebarAvatarInitial = RequireControl<TextBlock>(window, "SidebarAvatarInitialText");
         var aboutUpdateAction = RequireControl<Button>(window, "AboutUpdateActionButton");
+        var confirmationOverlay = RequireControl<Control>(window, "ConfirmationOverlay");
+        var updateProgressOverlay = RequireControl<Control>(window, "UpdateProgressOverlay");
+        var cancelUpdateDownload = RequireControl<Button>(window, "CancelUpdateDownloadButton");
         var configureTerminalIntegration = RequireControl<Button>(window, "ConfigureTerminalIntegrationButton");
         var terminalIntegrationEditor = RequireControl<Control>(window, "TerminalIntegrationEditor");
         var terminalAddNoLogo = RequireControl<CheckBox>(window, "TerminalAddNoLogoCheckBox");
@@ -253,12 +256,28 @@ public static class Program
             "New version fixture",
             "fixture update available");
         viewModel.CheckForUpdatesCommand.Execute(null);
-        await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
+        await WaitForAsync(() => viewModel.ConfirmationVisible,
+            "An available update did not open the main-window confirmation overlay.");
         Dispatcher.UIThread.RunJobs();
-        Require(viewModel.HasAvailableUpdate && sidebarUpdateButton.IsVisible &&
+        Require(confirmationOverlay.IsVisible && viewModel.HasAvailableUpdate && sidebarUpdateButton.IsVisible &&
                 viewModel.UpdateActionText == PresentationText.StartUpdate &&
                 Equals(aboutUpdateAction.Content, PresentationText.StartUpdate),
-            "An available update did not create the sidebar entry or switch the About action to Start update.");
+            "An available update was not confirmed inside the main window.");
+        viewModel.ConfirmPendingActionCommand.Execute(null);
+        await DrainCommandAsync(viewModel.ConfirmPendingActionCommand);
+        await WaitForAsync(
+            () => desktopOperations.InstallRequested && viewModel.UpdateProgressVisible &&
+                  viewModel.UpdateProgressPercent == 50,
+            "A confirmed update did not expose live download progress.");
+        Require(updateProgressOverlay.IsVisible && cancelUpdateDownload.IsVisible &&
+                viewModel.UpdateProgressText.Contains("50%", StringComparison.Ordinal) &&
+                viewModel.UpdateProgressText.Contains("5.0 MB", StringComparison.Ordinal),
+            "The update progress overlay did not render progress and cancellation inside the main window.");
+        cancelUpdateDownload.Command!.Execute(null);
+        await DrainCommandAsync(viewModel.CancelUpdateDownloadCommand);
+        await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
+        Require(desktopOperations.InstallCanceled && !viewModel.UpdateProgressVisible,
+            "Cancelling the main-window update progress did not cancel and close the download.");
         viewModel.Navigate("devices");
         viewModel.OpenAboutUpdatesCommand.Execute(null);
         await DrainCommandAsync(viewModel.OpenAboutUpdatesCommand);
@@ -584,6 +603,8 @@ public static class Program
     private sealed class FixtureDesktopOperations : IDesktopOperations
     {
         public bool FailUpdateChecks { get; set; }
+        public bool InstallRequested { get; private set; }
+        public bool InstallCanceled { get; private set; }
         private int checkCount;
         public int CheckCount => Volatile.Read(ref checkCount);
         public (bool AddNoLogo, bool AddNoProfile)? ConfiguredTerminalSettings { get; private set; }
@@ -594,14 +615,29 @@ public static class Program
             "AppShip release fixture",
             "fixture is current");
 
-        public ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
-            bool interactive,
+        public async ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
+            bool install,
+            Func<DesktopUpdateStatus, CancellationToken, ValueTask<bool>>? confirm,
+            IProgress<DesktopUpdateProgress>? progress,
             CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref checkCount);
-            return FailUpdateChecks
-                ? ValueTask.FromException<DesktopUpdateStatus>(new InvalidOperationException("operation fixture"))
-                : ValueTask.FromResult(Status);
+            if (FailUpdateChecks) throw new InvalidOperationException("operation fixture");
+            if (!install || Status.Decision is not (DesktopUpdateDecision.Optional or DesktopUpdateDecision.Required))
+                return Status;
+            if (confirm is null || !await confirm(Status, cancellationToken)) return Status;
+            InstallRequested = true;
+            progress?.Report(new DesktopUpdateProgress(5 * 1024 * 1024, 10 * 1024 * 1024));
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                InstallCanceled = true;
+                throw;
+            }
+            return Status;
         }
         public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken) =>
             ValueTask.FromException<string>(new UnauthorizedAccessException("Access to path is denied"));

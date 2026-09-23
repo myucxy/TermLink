@@ -148,6 +148,17 @@ public static class PresentationText
     public static string Configure => Pick("配置", "Configure");
     public static string CheckUpdates => Pick("检查更新", "Check for updates");
     public static string StartUpdate => Pick("开始更新", "Start update");
+    public static string ConfirmUpdateTitle => Pick("下载 TermLink 更新", "Download TermLink update");
+    public static string ConfirmUpdateDetail(DesktopUpdateStatus status) => Pick(
+        $"将下载 {UpdateVersion(status.VersionName, status.BuildNumber)}。下载完成并通过 SHA-256 与发布者签名验证后，将打开安装程序；安装会关闭 TermLink 和受管终端会话。继续吗？",
+        $"TermLink will download {UpdateVersion(status.VersionName, status.BuildNumber)}. After SHA-256 and publisher-signature verification, the installer will open and close TermLink and managed terminal sessions. Continue?");
+    public static string DownloadingUpdate => Pick("正在下载更新", "Downloading update");
+    public static string UpdateDownloadCanceled => Pick("已取消更新下载。", "The update download was cancelled.");
+    public static string UpdateDownloadProgress(long received, long total)
+    {
+        var percent = total <= 0 ? 0 : Math.Clamp(received * 100d / total, 0, 100);
+        return $"{percent:F0}% · {received / 1048576d:F1} MB / {total / 1048576d:F1} MB";
+    }
     public static string AccountLoading => Pick("正在读取账户…", "Loading account…");
     public static string Delete => Pick("删除", "Delete");
     public static string General => Pick("常规", "General");

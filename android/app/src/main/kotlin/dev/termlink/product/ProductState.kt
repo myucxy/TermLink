@@ -149,6 +149,25 @@ enum class PcCarrierState {
     NAT_DIRECT,
 }
 
+/** Server-authoritative policy controlling whether Direct diagnostics are useful. */
+enum class DirectRoutingPolicy {
+    UNKNOWN,
+    AUTO,
+    RELAY_ONLY,
+}
+
+enum class DirectNetworkCheckStatus {
+    UNKNOWN,
+    CHECKING,
+    AVAILABLE,
+    NOT_ESTABLISHED,
+}
+
+data class DirectNetworkCheckState(
+    val lan: DirectNetworkCheckStatus = DirectNetworkCheckStatus.UNKNOWN,
+    val nat: DirectNetworkCheckStatus = DirectNetworkCheckStatus.UNKNOWN,
+)
+
 /** User-facing app chrome theme. Terminal colors intentionally remain independent. */
 enum class ProductThemePreference(val wireValue: String) {
     SYSTEM("system"),
@@ -889,6 +908,8 @@ data class ProductSnapshot(
     val pcCarrierStates: Map<UUID, PcCarrierState> = emptyMap(),
     /** Exact active-session carrier; missing and late-unlisted sessions are Relay. */
     val sessionCarrierStates: Map<UUID, PcCarrierState> = emptyMap(),
+    val directRoutingPolicy: DirectRoutingPolicy = DirectRoutingPolicy.UNKNOWN,
+    val directNetworkChecks: Map<UUID, DirectNetworkCheckState> = emptyMap(),
     val sessions: List<SessionSummary> = emptyList(),
     val remoteFileBrowser: RemoteFileBrowserState = RemoteFileBrowserState(),
     val remoteDownloads: List<RemoteDownloadRecord> = emptyList(),
@@ -1013,6 +1034,8 @@ interface ProductRepository : Closeable {
         error("Remote Agent updates are unavailable")
     suspend fun requestControl(sessionId: UUID)
     suspend fun releaseControl(sessionId: UUID)
+    /** Re-runs the existing Direct discovery for the session's target PC. */
+    suspend fun requestNetworkCheck(sessionId: UUID, kind: DirectNetworkCheckKind) = Unit
     /** Release all active server control leases while keeping read-only viewing alive. */
     suspend fun releaseAllControlLeases() = Unit
     /** Lists one Windows directory page. An empty path requests the drive roots. */
@@ -1052,6 +1075,11 @@ interface ProductRepository : Closeable {
     fun clearTranscript(sessionId: UUID)
 }
 
+enum class DirectNetworkCheckKind {
+    LAN,
+    NAT,
+}
+
 /**
  * The product launcher starts in a truthful state when no account/endpoint has
  * been configured. It does not manufacture devices or a demo entitlement.
@@ -1079,6 +1107,7 @@ class UnavailableProductRepository : ProductRepository {
     override suspend fun revokeDevice(deviceId: UUID) = unavailable()
     override suspend fun requestControl(sessionId: UUID) = unavailable()
     override suspend fun releaseControl(sessionId: UUID) = unavailable()
+    override suspend fun requestNetworkCheck(sessionId: UUID, kind: DirectNetworkCheckKind) = unavailable()
     override suspend fun browseRemoteDirectory(
         pcId: UUID,
         pcName: String,

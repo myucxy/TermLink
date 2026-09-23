@@ -486,7 +486,7 @@
       </Grid>
     </Grid>
 
-    <Border Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding ConfirmationVisible}" ZIndex="100">
+    <Border x:Name="ConfirmationOverlay" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding ConfirmationVisible}" ZIndex="100">
       <Border Classes="card" Width="460" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="24">
         <StackPanel Spacing="16">
           <StackPanel Spacing="6">
@@ -497,6 +497,19 @@
             <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelPendingActionCommand}" />
             <Button Classes="danger" Content="{x:Static text:PresentationText.ConfirmAction}" Command="{Binding ConfirmPendingActionCommand}" />
           </StackPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
+    <Border x:Name="UpdateProgressOverlay" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding UpdateProgressVisible}" ZIndex="105">
+      <Border Classes="card" Width="460" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="24">
+        <StackPanel Spacing="16">
+          <StackPanel Spacing="6">
+            <TextBlock Text="{x:Static text:PresentationText.DownloadingUpdate}" FontSize="20" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding UpdateProgressText}" Classes="muted" />
+          </StackPanel>
+          <ProgressBar Minimum="0" Maximum="100" Value="{Binding UpdateProgressPercent}" Height="8" AutomationProperties.Name="更新下载进度" />
+          <Button x:Name="CancelUpdateDownloadButton" Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelUpdateDownloadCommand}" HorizontalAlignment="Right" />
         </StackPanel>
       </Border>
     </Border>

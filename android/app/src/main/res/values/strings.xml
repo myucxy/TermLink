@@ -206,6 +206,17 @@
     <string name="terminal_live_state">Live</string>
     <string name="terminal_reconnecting">Reconnecting</string>
     <string name="terminal_read_only">Read only</string>
+    <string name="session_connection_menu_title">Connection and control</string>
+    <string name="session_request_control">Request control</string>
+    <string name="session_release_control">Release control</string>
+    <string name="session_check_lan">Test LAN (%1$s)</string>
+    <string name="session_check_nat">Test NAT (%1$s)</string>
+    <string name="session_network_checking">checking</string>
+    <string name="session_network_available">available</string>
+    <string name="session_network_not_established">not established</string>
+    <string name="session_network_unverified">not verified</string>
+    <string name="session_direct_relay_only">Direct disabled by server; Relay only</string>
+    <string name="session_direct_policy_loading">Reading server transport policy…</string>
     <string name="terminal_history_gap">History gap</string>
     <string name="terminal_exited">Exited</string>
     <string name="terminal_history_loading">Loading earlier output…</string>

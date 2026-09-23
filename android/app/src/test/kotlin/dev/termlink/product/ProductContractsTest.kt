@@ -8,6 +8,9 @@ import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.network.direct.ProductionDirectCarrier
+import dev.termlink.network.direct.ProductionDirectNetworkCheckKind
+import dev.termlink.network.direct.ProductionDirectNetworkCheckResult
+import dev.termlink.network.direct.ProductionDirectRoutingPolicy
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
@@ -64,6 +67,40 @@ class ProductContractsTest {
         assertEquals(PcCarrierState.NEGOTIATING_DIRECT, ProductionDirectCarrier.NEGOTIATING.toPcCarrierState())
         assertEquals(PcCarrierState.LAN_DIRECT, ProductionDirectCarrier.LAN_DIRECT.toPcCarrierState())
         assertEquals(PcCarrierState.NAT_DIRECT, ProductionDirectCarrier.NAT_DIRECT.toPcCarrierState())
+    }
+
+    @Test
+    fun serverDirectPolicyAndForcedCheckResultsMapWithoutLeakingDeviceIdsIntoUiKeys() {
+        val deviceId = UUID.randomUUID()
+        val pcId = UUID.randomUUID()
+        assertEquals(DirectRoutingPolicy.AUTO, ProductionDirectRoutingPolicy.AUTO.toProductPolicy())
+        assertEquals(
+            DirectRoutingPolicy.RELAY_ONLY,
+            ProductionDirectRoutingPolicy.RELAY_ONLY.toProductPolicy(),
+        )
+
+        val lan = emptyMap<UUID, DirectNetworkCheckState>().mergeNetworkChecks(
+            mapOf(
+                deviceId to ProductionDirectNetworkCheckResult(
+                    ProductionDirectNetworkCheckKind.LAN,
+                    available = true,
+                ),
+            ),
+            mapOf(deviceId to pcId),
+        )
+        val both = lan.mergeNetworkChecks(
+            mapOf(
+                deviceId to ProductionDirectNetworkCheckResult(
+                    ProductionDirectNetworkCheckKind.NAT,
+                    available = false,
+                ),
+            ),
+            mapOf(deviceId to pcId),
+        )
+
+        assertEquals(DirectNetworkCheckStatus.AVAILABLE, both.getValue(pcId).lan)
+        assertEquals(DirectNetworkCheckStatus.NOT_ESTABLISHED, both.getValue(pcId).nat)
+        assertFalse(deviceId in both)
     }
 
     @Test

@@ -149,7 +149,11 @@ public sealed partial class App : Application
         var openItem = new NativeMenuItem { Header = PresentationText.OpenTermLink };
         openItem.Click += (_, _) => ShowMainWindow();
         var updateItem = new NativeMenuItem { Header = PresentationText.CheckUpdates };
-        updateItem.Click += (_, _) => mainWindowViewModel?.CheckForUpdatesCommand.Execute(null);
+        updateItem.Click += (_, _) =>
+        {
+            ShowMainWindow();
+            mainWindowViewModel?.CheckForUpdatesCommand.Execute(null);
+        };
         var diagnosticsItem = new NativeMenuItem { Header = PresentationText.Diagnostics };
         diagnosticsItem.Click += (_, _) =>
         {

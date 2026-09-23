@@ -127,6 +127,8 @@ public sealed record DesktopUpdateStatus(
     string? ReleaseNotes,
     string? Message);
 
+public sealed record DesktopUpdateProgress(long BytesReceived, long TotalBytes);
+
 public sealed record DesktopTerminalIntegrationSettings(
     bool AddNoLogo,
     bool AddNoProfile,
@@ -139,7 +141,11 @@ public sealed record DesktopTerminalIntegrationSettings(
 /// </summary>
 public interface IDesktopOperations
 {
-    ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(bool interactive, CancellationToken cancellationToken);
+    ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
+        bool install,
+        Func<DesktopUpdateStatus, CancellationToken, ValueTask<bool>>? confirm,
+        IProgress<DesktopUpdateProgress>? progress,
+        CancellationToken cancellationToken);
     ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken);
     ValueTask<DesktopTerminalIntegrationSettings> GetTerminalIntegrationSettingsAsync(
         CancellationToken cancellationToken);

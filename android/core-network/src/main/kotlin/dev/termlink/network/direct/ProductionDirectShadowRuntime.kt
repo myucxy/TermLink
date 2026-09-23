@@ -131,6 +131,27 @@ enum class ProductionDirectShadowDiagnosticCandidateKind {
     SRFLX,
 }
 
+enum class ProductionDirectNetworkCheckKind {
+    LAN,
+    NAT,
+}
+
+data class ProductionDirectNetworkCheckResult(
+    val kind: ProductionDirectNetworkCheckKind,
+    val available: Boolean,
+)
+
+internal fun ProductionDirectNetworkCheckKind.acceptsPair(
+    local: DirectCandidateKindV1,
+    remote: DirectCandidateKindV1,
+    sameLan: Boolean,
+): Boolean = when (this) {
+    ProductionDirectNetworkCheckKind.LAN -> sameLan
+    ProductionDirectNetworkCheckKind.NAT ->
+        local == DirectCandidateKindV1.DIRECT_CANDIDATE_KIND_V1_SERVER_REFLEXIVE ||
+            remote == DirectCandidateKindV1.DIRECT_CANDIDATE_KIND_V1_SERVER_REFLEXIVE
+}
+
 /**
  * Redacted, bounded Direct-shadow diagnostics that are safe to render or include in support logs.
  *
@@ -782,6 +803,10 @@ class ProductionDirectShadowRuntime internal constructor(
     private var peerGeneration = 0L
     private var peers: List<ProductionDirectAuthorizedPeer> = emptyList()
     private var peerSelectionCursor = 0
+    private val pendingNetworkChecks = LinkedHashMap<UUID, ProductionDirectNetworkCheckKind>()
+    private val mutableNetworkCheckResults = MutableStateFlow<Map<UUID, ProductionDirectNetworkCheckResult>>(emptyMap())
+    val networkCheckResults: StateFlow<Map<UUID, ProductionDirectNetworkCheckResult>> =
+        mutableNetworkCheckResults.asStateFlow()
     /** Peers already handed to v5; retained across Relay reconnect generations. */
     private val promotedPeerEpochs = LinkedHashMap<UUID, Long>()
     private var active: Attempt? = null
@@ -887,6 +912,30 @@ class ProductionDirectShadowRuntime internal constructor(
         return removed
     }
 
+    internal fun requestNetworkCheck(
+        expectedAuthenticationGeneration: Long,
+        peerDeviceId: UUID,
+        kind: ProductionDirectNetworkCheckKind,
+    ): Boolean {
+        if (expectedAuthenticationGeneration != authenticationGeneration || closed.get()) return false
+        val current: Attempt?
+        val currentJob: Job?
+        synchronized(lock) {
+            if (peers.none { it.deviceId == peerDeviceId }) return false
+            if (peerDeviceId in pendingNetworkChecks) return false
+            pendingNetworkChecks[peerDeviceId] = kind
+            promotedPeerEpochs.remove(peerDeviceId)
+            current = active?.takeIf { it.peer.deviceId == peerDeviceId }
+            if (current != null) active = null
+            currentJob = if (current != null) attemptJob else null
+            publishGateStateLocked()
+        }
+        current?.retire("DIRECT_ATTEMPT_RETIRED", networkChanged = false)
+        currentJob?.cancel()
+        wake.trySend(Unit)
+        return true
+    }
+
     /** Retires only the active discovery attempt matching a rejected bounded-lane frame. */
     internal fun observeSignalLaneOverflow(
         expectedAuthenticationGeneration: Long,
@@ -967,6 +1016,8 @@ class ProductionDirectShadowRuntime internal constructor(
             network = captured
             networkGeneration = nextGeneration(networkGeneration)
             promotedPeerEpochs.clear()
+            pendingNetworkChecks.clear()
+            mutableNetworkCheckResults.value = emptyMap()
             current = active
             active = null
             currentJob = attemptJob
@@ -1068,6 +1119,11 @@ class ProductionDirectShadowRuntime internal constructor(
             }
             val useMultipairV2 = availableNativeV4 != null && signaling.multipairV2Active &&
                 DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY in config.capabilities
+            if (gate.networkCheckKind != null && !useMultipairV2) {
+                completeNetworkCheck(gate, available = false)
+                publishIfCurrent(gate, ProductionDirectShadowState.RELAY_ONLY, "DIRECT_NETWORK_CHECK_UNSUPPORTED")
+                return
+            }
             if (!useMultipairV2) {
                 runCatching { availableNativeV4?.close() }
                 availableNativeV4 = null
@@ -1142,8 +1198,17 @@ class ProductionDirectShadowRuntime internal constructor(
                 withTimeout(attemptTimeoutMillis(created)) {
                     driveAttemptV4(created, native)
                 }
-                if (created.shadowReady.get() && productionHandoffConsumer != null) {
-                    promoteReadyV4(created, native)
+                if (created.shadowReady.get()) {
+                    if (created.gate.networkCheckKind != null) {
+                        // A forced check proves one candidate class only. It never promotes that
+                        // diagnostic path into session traffic; normal automatic discovery resumes.
+                        completeNetworkCheck(created, available = true)
+                        created.retire("DIRECT_ATTEMPT_RETIRED", networkChanged = false)
+                        synchronized(lock) { if (active === created) active = null }
+                        wake.trySend(Unit)
+                    } else if (productionHandoffConsumer != null) {
+                        promoteReadyV4(created, native)
+                    }
                 }
             } else {
                 val native = nativeFactory()
@@ -1181,6 +1246,14 @@ class ProductionDirectShadowRuntime internal constructor(
             publishFailureIfCurrent(gate, "DIRECT_SHADOW_FAILED")
             scheduleRetry()
         } finally {
+            attempt?.let { candidate ->
+                if (candidate.gate.networkCheckKind != null && !candidate.networkCheckCompleted) {
+                    completeNetworkCheck(candidate, available = false)
+                }
+            }
+            if (attempt == null && gate.networkCheckKind != null) {
+                completeNetworkCheck(gate, available = false)
+            }
             if (attempt == null) {
                 runCatching { availableNativeV4?.close() }
                 runCatching(signaling::close)
@@ -1687,7 +1760,13 @@ class ProductionDirectShadowRuntime internal constructor(
         val ordered = selectCandidatePairs(
             attempt.localCandidatesV4.map(::candidateToSignalV4),
             attempt.remoteCandidatesV4,
-        )
+        ).filter { pair ->
+            attempt.gate.networkCheckKind?.acceptsPair(
+                pair.local.wire.kind,
+                pair.remote.wire.kind,
+                pair.isSameLanHostPair(),
+            ) ?: true
+        }
         if (ordered.isEmpty()) {
             if (attempt.localGatheringCompleteV4 && attempt.remoteGatheringCompleteV4) {
                 throw DirectAttemptFailure("DIRECT_V4_CANDIDATE_PAIR_UNAVAILABLE")
@@ -2900,7 +2979,12 @@ class ProductionDirectShadowRuntime internal constructor(
             publishGateStateLocked()
             return null
         }
-        val selection = selectNextProductionDirectPeer(peers, peerSelectionCursor) { peer ->
+        val requestedPeer = pendingNetworkChecks.keys.firstOrNull()?.let { requestedId ->
+            peers.firstOrNull { it.deviceId == requestedId }
+        }
+        val selection = requestedPeer?.let {
+            ProductionDirectPeerSelection(it, peerSelectionCursor)
+        } ?: selectNextProductionDirectPeer(peers, peerSelectionCursor) { peer ->
             promotedPeerEpochs[peer.deviceId] != peer.keyEpoch
         }
         val selectedPeer = selection?.value
@@ -2916,6 +3000,7 @@ class ProductionDirectShadowRuntime internal constructor(
             network = selectedNetwork,
             peerGeneration = peerGeneration,
             peer = selectedPeer.ownedCopy(),
+            networkCheckKind = pendingNetworkChecks[selectedPeer.deviceId],
         )
     }
 
@@ -2948,6 +3033,20 @@ class ProductionDirectShadowRuntime internal constructor(
             attemptId = active?.attemptId,
             peerDeviceId = active?.peer?.deviceId,
         ), active)
+    }
+
+    private fun completeNetworkCheck(attempt: Attempt, available: Boolean) =
+        completeNetworkCheck(attempt.gate, available).also { attempt.networkCheckCompleted = true }
+
+    private fun completeNetworkCheck(gate: Gate, available: Boolean) {
+        val kind = gate.networkCheckKind ?: return
+        synchronized(lock) {
+            if (pendingNetworkChecks[gate.peer.deviceId] != kind) return
+            pendingNetworkChecks.remove(gate.peer.deviceId)
+            mutableNetworkCheckResults.value = mutableNetworkCheckResults.value +
+                (gate.peer.deviceId to ProductionDirectNetworkCheckResult(kind, available))
+        }
+        wake.trySend(Unit)
     }
 
     private fun snapshotFor(
@@ -3132,6 +3231,7 @@ class ProductionDirectShadowRuntime internal constructor(
         var localPathBindingV4 = ByteArray(0)
         var remotePathBindingV4 = ByteArray(0)
         var nominationRequestV4: DirectNativeCommitNominationRequestV4? = null
+        var networkCheckCompleted = false
 
         fun retire(reason: String, networkChanged: Boolean) {
             if (!retired.compareAndSet(false, true)) return
@@ -3257,6 +3357,7 @@ class ProductionDirectShadowRuntime internal constructor(
         val network: CapturedDirectNetwork,
         val peerGeneration: Long,
         val peer: ProductionDirectAuthorizedPeer,
+        val networkCheckKind: ProductionDirectNetworkCheckKind?,
     )
 
     private class DirectAttemptFailure(val reason: String) : IllegalStateException(reason)

@@ -1544,6 +1544,12 @@ fun ProductApp(
                             }
                         }
                     },
+                    onReleaseControl = { sessionId ->
+                        runOperation { repository.releaseControl(sessionId) }
+                    },
+                    onRequestNetworkCheck = { sessionId, kind ->
+                        runOperation { repository.requestNetworkCheck(sessionId, kind) }
+                    },
                     onLoadTranscript = { sessionId ->
                         scope.launch { runSessionOperation { repository.loadTranscriptBefore(sessionId) } }
                     },
@@ -1679,6 +1685,7 @@ fun ProductApp(
                     terminalInputResumeRegistry = terminalInputResumeRegistry,
                     onStopSessionRequested = { pendingStopSessionId = it },
                     onDeleteSessionRequested = { pendingDeleteSessionId = it },
+                    directRoutingPolicy = snapshot.directRoutingPolicy,
                     terminalPreferences = terminalPreferences,
                     onTerminalPreferencesChanged = onTerminalPreferencesChanged,
                     shortcutPreferences = shortcutPreferences,
@@ -3123,6 +3130,8 @@ private fun ProductContent(
     onSessionSelected: (java.util.UUID) -> Boolean,
     onCloseSessionTab: (java.util.UUID) -> Unit,
     onOpenSession: suspend (java.util.UUID) -> Unit,
+    onReleaseControl: (java.util.UUID) -> Unit,
+    onRequestNetworkCheck: (java.util.UUID, DirectNetworkCheckKind) -> Unit,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
     terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
@@ -3168,6 +3177,7 @@ private fun ProductContent(
     terminalInputResumeRegistry: TerminalInputResumeRegistry,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
+    directRoutingPolicy: DirectRoutingPolicy,
     onReplay: (HistoryEntry) -> Unit,
 ) {
     val remotePcId = selectedRemotePcId?.let { value ->
@@ -3291,6 +3301,9 @@ private fun ProductContent(
             onStopSessionRequested = onStopSessionRequested,
             onDeleteSessionRequested = onDeleteSessionRequested,
             onOpenSession = onOpenSession,
+            onReleaseControl = onReleaseControl,
+            onRequestNetworkCheck = onRequestNetworkCheck,
+            directRoutingPolicy = directRoutingPolicy,
             onLoadTranscript = onLoadTranscript,
             onClearTranscript = onClearTranscript,
             terminalEngine = terminalEngine,
@@ -3893,6 +3906,9 @@ private fun SessionsPage(
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
     onOpenSession: suspend (java.util.UUID) -> Unit,
+    onReleaseControl: (java.util.UUID) -> Unit,
+    onRequestNetworkCheck: (java.util.UUID, DirectNetworkCheckKind) -> Unit,
+    directRoutingPolicy: DirectRoutingPolicy,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
     terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
@@ -4022,6 +4038,11 @@ private fun SessionsPage(
                         pcLabel = pcLabel(selected),
                         carrier = snapshot.carrierForSession(selected),
                         sessionOnline = selected.online,
+                        directRoutingPolicy = directRoutingPolicy,
+                        networkCheckState = snapshot.directNetworkChecks[selected.pcId],
+                        onRequestControl = { sessionOpenScope.launch { onOpenSession(selected.id) } },
+                        onReleaseControl = { onReleaseControl(selected.id) },
+                        onRequestNetworkCheck = { kind -> onRequestNetworkCheck(selected.id, kind) },
                         onTerminalAction = onTerminalAction,
                         onTerminalCustomShortcut = onTerminalCustomShortcut,
                         onPasteRequested = onPasteRequested,
@@ -4069,6 +4090,13 @@ private fun SessionsPage(
                     onRetryOpen = { sessionId ->
                         sessionOpenScope.launch { onOpenSession(sessionId) }
                     },
+                    directRoutingPolicy = directRoutingPolicy,
+                    networkCheckStates = snapshot.directNetworkChecks,
+                    onRequestControl = { sessionId ->
+                        sessionOpenScope.launch { onOpenSession(sessionId) }
+                    },
+                    onReleaseControl = onReleaseControl,
+                    onRequestNetworkCheck = onRequestNetworkCheck,
                     terminalPreferences = terminalPreferences,
                     shortcutPreferences = shortcutPreferences,
                     modifier = Modifier.weight(1f),
@@ -4101,6 +4129,11 @@ private fun MobileSessionContent(
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
     onRetryOpen: (java.util.UUID) -> Unit,
+    directRoutingPolicy: DirectRoutingPolicy,
+    networkCheckStates: Map<java.util.UUID, DirectNetworkCheckState>,
+    onRequestControl: (java.util.UUID) -> Unit,
+    onReleaseControl: (java.util.UUID) -> Unit,
+    onRequestNetworkCheck: (java.util.UUID, DirectNetworkCheckKind) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
@@ -4143,6 +4176,11 @@ private fun MobileSessionContent(
                 sessionCarrierStates = sessionCarrierStates,
             ),
             sessionOnline = session.online,
+            directRoutingPolicy = directRoutingPolicy,
+            networkCheckState = networkCheckStates[session.pcId],
+            onRequestControl = { onRequestControl(session.id) },
+            onReleaseControl = { onReleaseControl(session.id) },
+            onRequestNetworkCheck = { kind -> onRequestNetworkCheck(session.id, kind) },
             onTerminalAction = onTerminalAction,
             onTerminalCustomShortcut = onTerminalCustomShortcut,
             onPasteRequested = onPasteRequested,
@@ -4476,6 +4514,11 @@ private fun SessionDetail(
     pcLabel: String,
     carrier: PcCarrierState,
     sessionOnline: Boolean,
+    directRoutingPolicy: DirectRoutingPolicy,
+    networkCheckState: DirectNetworkCheckState?,
+    onRequestControl: () -> Unit,
+    onReleaseControl: () -> Unit,
+    onRequestNetworkCheck: (DirectNetworkCheckKind) -> Unit,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
     onPasteRequested: (java.util.UUID) -> Unit,
@@ -4526,13 +4569,17 @@ private fun SessionDetail(
                         maxLines = 1,
                         softWrap = false,
                     )
-                    Text(
-                        statusLabel,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
+                    SessionConnectionStatusMenu(
+                        statusLabel = statusLabel,
+                        remoteState = remoteState,
+                        sessionOnline = sessionOnline,
+                        carrier = carrier,
+                        directRoutingPolicy = directRoutingPolicy,
+                        networkCheckState = networkCheckState,
+                        onRequestControl = onRequestControl,
+                        onReleaseControl = onReleaseControl,
+                        onRequestNetworkCheck = onRequestNetworkCheck,
                     )
-                    PcCarrierIcon(carrier = carrier)
                 }
             }
             Box(
@@ -4568,6 +4615,119 @@ private fun SessionDetail(
         }
     }
 }
+
+@Composable
+private fun SessionConnectionStatusMenu(
+    statusLabel: String,
+    remoteState: RemoteSessionState?,
+    sessionOnline: Boolean,
+    carrier: PcCarrierState,
+    directRoutingPolicy: DirectRoutingPolicy,
+    onRequestControl: () -> Unit,
+    onReleaseControl: () -> Unit,
+    onRequestNetworkCheck: (DirectNetworkCheckKind) -> Unit,
+    networkCheckState: DirectNetworkCheckState?,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
+    val canReleaseControl = remoteState is RemoteSessionState.Controlling
+    val canCheckNetwork = sessionOnline && directRoutingPolicy == DirectRoutingPolicy.AUTO &&
+        networkCheckState?.lan != DirectNetworkCheckStatus.CHECKING &&
+        networkCheckState?.nat != DirectNetworkCheckStatus.CHECKING
+    Box {
+        Row(
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .clickable { expanded = true }
+                .semantics { contentDescription = statusLabel },
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                statusLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+            PcCarrierIcon(carrier = carrier)
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            Text(
+                stringResource(R.string.session_connection_menu_title),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+            )
+            if (canRequestControl) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.session_request_control)) },
+                    onClick = { expanded = false; onRequestControl() },
+                )
+            }
+            if (canReleaseControl) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.session_release_control)) },
+                    onClick = { expanded = false; onReleaseControl() },
+                )
+            }
+            DropdownMenuItem(
+                text = { Text(stringResource(carrier.labelResource())) },
+                onClick = {},
+                enabled = false,
+            )
+            when (directRoutingPolicy) {
+                DirectRoutingPolicy.AUTO -> {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    R.string.session_check_lan,
+                                    networkCheckState?.lan.localizedLabel(),
+                                ),
+                            )
+                        },
+                        onClick = { expanded = false; onRequestNetworkCheck(DirectNetworkCheckKind.LAN) },
+                        enabled = canCheckNetwork,
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    R.string.session_check_nat,
+                                    networkCheckState?.nat.localizedLabel(),
+                                ),
+                            )
+                        },
+                        onClick = { expanded = false; onRequestNetworkCheck(DirectNetworkCheckKind.NAT) },
+                        enabled = canCheckNetwork,
+                    )
+                }
+                DirectRoutingPolicy.RELAY_ONLY -> DropdownMenuItem(
+                    text = { Text(stringResource(R.string.session_direct_relay_only)) },
+                    onClick = {},
+                    enabled = false,
+                )
+                DirectRoutingPolicy.UNKNOWN -> DropdownMenuItem(
+                    text = { Text(stringResource(R.string.session_direct_policy_loading)) },
+                    onClick = {},
+                    enabled = false,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DirectNetworkCheckStatus?.localizedLabel(): String = stringResource(
+    when (this) {
+        DirectNetworkCheckStatus.CHECKING -> R.string.session_network_checking
+        DirectNetworkCheckStatus.AVAILABLE -> R.string.session_network_available
+        DirectNetworkCheckStatus.NOT_ESTABLISHED -> R.string.session_network_not_established
+        DirectNetworkCheckStatus.UNKNOWN, null -> R.string.session_network_unverified
+    },
+)
 
 @Composable
 private fun PcCarrierIcon(carrier: PcCarrierState) {

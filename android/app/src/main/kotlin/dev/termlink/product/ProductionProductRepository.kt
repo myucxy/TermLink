@@ -45,6 +45,9 @@ import dev.termlink.network.direct.ProductionDirectAuthorizedPeer
 import dev.termlink.network.direct.ProductionDirectCarrier
 import dev.termlink.network.direct.ProductionDirectDeviceCoordinator
 import dev.termlink.network.direct.ProductionDirectLiveSessionRegistration
+import dev.termlink.network.direct.ProductionDirectNetworkCheckKind
+import dev.termlink.network.direct.ProductionDirectRoutingPolicy
+import dev.termlink.network.direct.ProductionDirectNetworkCheckResult
 import dev.termlink.network.production.AccessTokenProvider
 import dev.termlink.network.production.ControlRequestSupersededException
 import dev.termlink.network.production.InputSequenceProvider
@@ -354,6 +357,42 @@ internal fun ProductionDirectCarrier.toPcCarrierState(): PcCarrierState = when (
     ProductionDirectCarrier.NEGOTIATING -> PcCarrierState.NEGOTIATING_DIRECT
     ProductionDirectCarrier.LAN_DIRECT -> PcCarrierState.LAN_DIRECT
     ProductionDirectCarrier.NAT_DIRECT -> PcCarrierState.NAT_DIRECT
+}
+
+internal fun ProductionDirectRoutingPolicy.toProductPolicy(): DirectRoutingPolicy = when (this) {
+    ProductionDirectRoutingPolicy.UNKNOWN -> DirectRoutingPolicy.UNKNOWN
+    ProductionDirectRoutingPolicy.AUTO -> DirectRoutingPolicy.AUTO
+    ProductionDirectRoutingPolicy.RELAY_ONLY -> DirectRoutingPolicy.RELAY_ONLY
+}
+
+private data class DirectProjection(
+    val pcCarriers: Map<UUID, ProductionDirectCarrier>,
+    val sessionCarriers: Map<UUID, ProductionDirectCarrier>,
+    val routingPolicy: ProductionDirectRoutingPolicy,
+    val networkChecks: Map<UUID, ProductionDirectNetworkCheckResult>,
+)
+
+internal fun Map<UUID, DirectNetworkCheckState>.mergeNetworkChecks(
+    results: Map<UUID, ProductionDirectNetworkCheckResult>,
+    pcIdByDeviceId: Map<UUID, UUID>,
+): Map<UUID, DirectNetworkCheckState> {
+    if (results.isEmpty()) return this
+    val merged = toMutableMap()
+    results.forEach { (deviceId, result) ->
+        val pcId = pcIdByDeviceId[deviceId] ?: return@forEach
+        val current = merged[pcId] ?: DirectNetworkCheckState()
+        merged[pcId] = when (result.kind) {
+            ProductionDirectNetworkCheckKind.LAN -> current.copy(
+                lan = if (result.available) DirectNetworkCheckStatus.AVAILABLE
+                else DirectNetworkCheckStatus.NOT_ESTABLISHED,
+            )
+            ProductionDirectNetworkCheckKind.NAT -> current.copy(
+                nat = if (result.available) DirectNetworkCheckStatus.AVAILABLE
+                else DirectNetworkCheckStatus.NOT_ESTABLISHED,
+            )
+        }
+    }
+    return merged
 }
 
 private const val DIRECT_SESSION_CUTOVER_CAPABILITY = "direct_session_cutover_v1"
@@ -903,6 +942,7 @@ internal class ProductionProductRepository(
         }
         if (transition != RealtimeNetworkObservationTransition.UNCHANGED) {
             realtimeNetworkAvailableCount.incrementAndGet()
+            mutableSnapshot.update { it.copy(directNetworkChecks = emptyMap()) }
         }
         if (transition == RealtimeNetworkObservationTransition.RECONNECTED || consumePendingForeground) {
             realtimeNetworkReconnectCount.incrementAndGet()
@@ -939,6 +979,7 @@ internal class ProductionProductRepository(
                 }
             }
             if (removed) observeDirectCoordinatorNetwork(null)
+            if (removed) mutableSnapshot.update { it.copy(directNetworkChecks = emptyMap()) }
         }
     }
 
@@ -1876,6 +1917,43 @@ internal class ProductionProductRepository(
             context.getString(R.string.activity_session_detail, sessionId),
             Severity.INFO,
         )
+    }
+
+    override suspend fun requestNetworkCheck(sessionId: UUID, kind: DirectNetworkCheckKind) {
+        val session = snapshot.value.sessions.firstOrNull { it.id == sessionId }
+            ?: error("Session is not available")
+        if (!session.online) return
+        val pcDeviceId = snapshot.value.pcs.firstOrNull { it.id == session.pcId }?.deviceId
+            ?: return
+        val coordinator = synchronized(liveSessionLock) { directCoordinator }
+            ?: return
+        mutableSnapshot.update { snapshot ->
+            val current = snapshot.directNetworkChecks[session.pcId] ?: DirectNetworkCheckState()
+            snapshot.copy(
+                directNetworkChecks = snapshot.directNetworkChecks + (session.pcId to when (kind) {
+                    DirectNetworkCheckKind.LAN -> current.copy(lan = DirectNetworkCheckStatus.CHECKING)
+                    DirectNetworkCheckKind.NAT -> current.copy(nat = DirectNetworkCheckStatus.CHECKING)
+                }),
+            )
+        }
+        val accepted = coordinator.requestNetworkCheck(
+            pcDeviceId,
+            when (kind) {
+                DirectNetworkCheckKind.LAN -> ProductionDirectNetworkCheckKind.LAN
+                DirectNetworkCheckKind.NAT -> ProductionDirectNetworkCheckKind.NAT
+            },
+        )
+        if (!accepted) {
+            mutableSnapshot.update { snapshot ->
+                val current = snapshot.directNetworkChecks[session.pcId] ?: DirectNetworkCheckState()
+                snapshot.copy(
+                    directNetworkChecks = snapshot.directNetworkChecks + (session.pcId to when (kind) {
+                        DirectNetworkCheckKind.LAN -> current.copy(lan = DirectNetworkCheckStatus.NOT_ESTABLISHED)
+                        DirectNetworkCheckKind.NAT -> current.copy(nat = DirectNetworkCheckStatus.NOT_ESTABLISHED)
+                    }),
+                )
+            }
+        }
     }
 
     override suspend fun releaseAllControlLeases() {
@@ -5512,10 +5590,18 @@ internal class ProductionProductRepository(
                 dataPlaneEnabled = BuildConfig.TERMLINK_DIRECT_TRANSPORT_DATA_PLANE,
             )
             val carrierProjectionCandidate = directCoordinatorRuntimeScope.launch(start = CoroutineStart.LAZY) {
-                combine(directCandidate.carriers, directCandidate.sessionCarriers) {
-                        pcCarriers, sessionCarriers ->
-                    pcCarriers to sessionCarriers
-                }.collect { (pcCarriers, sessionCarriers) ->
+                combine(
+                    directCandidate.carriers,
+                    directCandidate.sessionCarriers,
+                    directCandidate.routingPolicy,
+                    directCandidate.networkCheckResults,
+                ) { pcCarriers, sessionCarriers, routingPolicy, networkChecks ->
+                    DirectProjection(pcCarriers, sessionCarriers, routingPolicy, networkChecks)
+                }.collect { projection ->
+                    val pcCarriers = projection.pcCarriers
+                    val sessionCarriers = projection.sessionCarriers
+                    val routingPolicy = projection.routingPolicy
+                    val networkChecks = projection.networkChecks
                     authenticationLifecycle.runIfCurrent(
                         owner.authenticationGeneration,
                         predicate = {
@@ -5544,6 +5630,15 @@ internal class ProductionProductRepository(
                                     snapshot.pcs,
                                     snapshot.sessions,
                                 ),
+                                directRoutingPolicy = routingPolicy.toProductPolicy(),
+                                directNetworkChecks = if (routingPolicy == ProductionDirectRoutingPolicy.AUTO) {
+                                    snapshot.directNetworkChecks.mergeNetworkChecks(
+                                        networkChecks,
+                                        snapshot.pcs.associate { it.deviceId to it.id },
+                                    )
+                                } else {
+                                    emptyMap()
+                                },
                             )
                         }
                     }

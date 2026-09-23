@@ -50,6 +50,19 @@ class ProductionDirectShadowRuntimeTest {
     private val now = 1_900_000_000_000L
 
     @Test
+    fun forcedNetworkChecksAcceptOnlyTheirCandidateClass() {
+        val host = DirectCandidateKindV1.DIRECT_CANDIDATE_KIND_V1_HOST
+        val srflx = DirectCandidateKindV1.DIRECT_CANDIDATE_KIND_V1_SERVER_REFLEXIVE
+
+        assertTrue(ProductionDirectNetworkCheckKind.LAN.acceptsPair(host, host, sameLan = true))
+        assertFalse(ProductionDirectNetworkCheckKind.LAN.acceptsPair(host, host, sameLan = false))
+        assertFalse(ProductionDirectNetworkCheckKind.LAN.acceptsPair(srflx, srflx, sameLan = false))
+        assertFalse(ProductionDirectNetworkCheckKind.NAT.acceptsPair(host, host, sameLan = true))
+        assertTrue(ProductionDirectNetworkCheckKind.NAT.acceptsPair(host, srflx, sameLan = false))
+        assertTrue(ProductionDirectNetworkCheckKind.NAT.acceptsPair(srflx, srflx, sameLan = false))
+    }
+
+    @Test
     fun peerSelectionIsBoundedRoundRobinAndSkipsIneligiblePeers() {
         val peers = listOf("first", "second", "third")
         val first = requireNotNull(selectNextProductionDirectPeer(peers, 0) { it != "third" })
