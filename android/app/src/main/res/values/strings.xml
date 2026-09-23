@@ -209,8 +209,9 @@
     <string name="session_connection_menu_title">Connection and control</string>
     <string name="session_request_control">Request control</string>
     <string name="session_release_control">Release control</string>
-    <string name="session_check_lan">Test LAN (%1$s)</string>
-    <string name="session_check_nat">Test NAT (%1$s)</string>
+    <string name="session_network_checks_title">Network checks</string>
+    <string name="session_check_lan">Test LAN</string>
+    <string name="session_check_nat">Test NAT</string>
     <string name="session_network_checking">checking</string>
     <string name="session_network_available">available</string>
     <string name="session_network_not_established">not established</string>

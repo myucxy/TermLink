@@ -1911,7 +1911,7 @@ internal class ProductionProductRepository(
     override suspend fun releaseControl(sessionId: UUID) {
         val live = liveSessions[sessionId] ?: error("Open the session before releasing control")
         freshAccessToken()
-        live.client.releaseControl()
+        live.client.releaseControl("control released by user")
         appendActivity(
             context.getString(R.string.activity_control_released),
             context.getString(R.string.activity_session_detail, sessionId),

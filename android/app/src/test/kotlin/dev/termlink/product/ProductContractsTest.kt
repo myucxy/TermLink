@@ -487,6 +487,25 @@ class ProductContractsTest {
     }
 
     @Test
+    fun explicitlyReleasedControlStaysReadOnlyUntilRequestedFromTheMenu() {
+        for (foregroundGeneration in listOf(1L, 2L)) {
+            assertEquals(
+                null,
+                sessionControlRequestEffectKey(
+                    foreground = true,
+                    foregroundGeneration = foregroundGeneration,
+                    online = true,
+                    remoteState = RemoteSessionState.ReadOnly(41, "control released by user"),
+                ),
+            )
+        }
+        assertEquals(
+            SessionControlRequestTrigger.FOREGROUND_RESUME,
+            sessionControlRequestTrigger(true, true, RemoteSessionState.ReadOnly(41, "control released")),
+        )
+    }
+
+    @Test
     fun failedBootstrapRetryReplacesOnlyTheInvalidInstalledClient() {
         val failed = RemoteSessionState.Reconnecting(
             lastAckedSequence = 40,

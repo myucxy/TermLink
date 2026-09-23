@@ -1018,7 +1018,7 @@ class ProductionRealtimeSessionClient(
         sendEncrypted(MessageType.HOST_HISTORY_CONTROL, payload)
     }
 
-    suspend fun releaseControl() {
+    suspend fun releaseControl(reason: String = "control released") {
         val current = controlArbitrationMutex.withLock {
             controlGeneration++
             restoreControlAfterReconnect = false
@@ -1031,7 +1031,7 @@ class ProductionRealtimeSessionClient(
         }
         controlArbitrationMutex.withLock {
             val active = session.state.value as? RemoteSessionState.Controlling
-            if (active?.leaseId == current.leaseId) session.revokeControl("control released")
+            if (active?.leaseId == current.leaseId) session.revokeControl(reason)
         }
     }
 

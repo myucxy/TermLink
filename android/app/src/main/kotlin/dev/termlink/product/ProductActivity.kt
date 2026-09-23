@@ -175,6 +175,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.text.font.FontFamily
@@ -4629,6 +4631,7 @@ private fun SessionConnectionStatusMenu(
     networkCheckState: DirectNetworkCheckState?,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    val menuTitle = stringResource(R.string.session_connection_menu_title)
     val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
     val canReleaseControl = remoteState is RemoteSessionState.Controlling
     val canCheckNetwork = sessionOnline && directRoutingPolicy == DirectRoutingPolicy.AUTO &&
@@ -4637,8 +4640,8 @@ private fun SessionConnectionStatusMenu(
     Box {
         Row(
             modifier = Modifier
-                .heightIn(min = 48.dp)
-                .clickable { expanded = true }
+                // Keep the original header height; clickable expands the touch target without layout space.
+                .clickable(role = Role.Button, onClickLabel = menuTitle) { expanded = true }
                 .semantics { contentDescription = statusLabel },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -4654,65 +4657,88 @@ private fun SessionConnectionStatusMenu(
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
+            modifier = Modifier.widthIn(min = 280.dp, max = 320.dp),
         ) {
-            Text(
-                stringResource(R.string.session_connection_menu_title),
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                style = MaterialTheme.typography.labelLarge,
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    menuTitle,
+                    modifier = Modifier.semantics { heading() },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    "$statusLabel · ${stringResource(carrier.labelResource())}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            HorizontalDivider()
             if (canRequestControl) {
                 DropdownMenuItem(
                     text = { Text(stringResource(R.string.session_request_control)) },
+                    leadingIcon = { Icon(Icons.Filled.Lock, contentDescription = null) },
                     onClick = { expanded = false; onRequestControl() },
                 )
             }
             if (canReleaseControl) {
                 DropdownMenuItem(
                     text = { Text(stringResource(R.string.session_release_control)) },
+                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null) },
                     onClick = { expanded = false; onReleaseControl() },
                 )
             }
-            DropdownMenuItem(
-                text = { Text(stringResource(carrier.labelResource())) },
-                onClick = {},
-                enabled = false,
-            )
             when (directRoutingPolicy) {
                 DirectRoutingPolicy.AUTO -> {
+                    Text(
+                        stringResource(R.string.session_network_checks_title),
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                            .semantics { heading() },
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     DropdownMenuItem(
-                        text = {
+                        text = { Text(stringResource(R.string.session_check_lan)) },
+                        leadingIcon = { Icon(Icons.Filled.Wifi, contentDescription = null) },
+                        trailingIcon = {
                             Text(
-                                stringResource(
-                                    R.string.session_check_lan,
-                                    networkCheckState?.lan.localizedLabel(),
-                                ),
+                                networkCheckState?.lan.localizedLabel(),
+                                modifier = Modifier.widthIn(max = 120.dp),
+                                style = MaterialTheme.typography.labelSmall,
                             )
                         },
-                        onClick = { expanded = false; onRequestNetworkCheck(DirectNetworkCheckKind.LAN) },
+                        onClick = { onRequestNetworkCheck(DirectNetworkCheckKind.LAN) },
                         enabled = canCheckNetwork,
                     )
                     DropdownMenuItem(
-                        text = {
+                        text = { Text(stringResource(R.string.session_check_nat)) },
+                        leadingIcon = { Icon(Icons.Filled.Public, contentDescription = null) },
+                        trailingIcon = {
                             Text(
-                                stringResource(
-                                    R.string.session_check_nat,
-                                    networkCheckState?.nat.localizedLabel(),
-                                ),
+                                networkCheckState?.nat.localizedLabel(),
+                                modifier = Modifier.widthIn(max = 120.dp),
+                                style = MaterialTheme.typography.labelSmall,
                             )
                         },
-                        onClick = { expanded = false; onRequestNetworkCheck(DirectNetworkCheckKind.NAT) },
+                        onClick = { onRequestNetworkCheck(DirectNetworkCheckKind.NAT) },
                         enabled = canCheckNetwork,
                     )
                 }
-                DirectRoutingPolicy.RELAY_ONLY -> DropdownMenuItem(
-                    text = { Text(stringResource(R.string.session_direct_relay_only)) },
-                    onClick = {},
-                    enabled = false,
-                )
-                DirectRoutingPolicy.UNKNOWN -> DropdownMenuItem(
-                    text = { Text(stringResource(R.string.session_direct_policy_loading)) },
-                    onClick = {},
-                    enabled = false,
+                DirectRoutingPolicy.RELAY_ONLY, DirectRoutingPolicy.UNKNOWN -> Text(
+                    stringResource(
+                        if (directRoutingPolicy == DirectRoutingPolicy.RELAY_ONLY) R.string.session_direct_relay_only
+                        else R.string.session_direct_policy_loading,
+                    ),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -5237,6 +5263,9 @@ internal fun sessionControlRequestTrigger(
         remoteState.reason == SESSION_BOOTSTRAP_IN_PROGRESS_REASON ->
         SessionControlRequestTrigger.INITIAL_OPEN
     remoteState is RemoteSessionState.Live -> SessionControlRequestTrigger.REALTIME_LIVE
+    // The menu is an explicit choice to watch read-only, unlike lifecycle lease release.
+    remoteState is RemoteSessionState.ReadOnly && remoteState.reason == "control released by user" ->
+        SessionControlRequestTrigger.NONE
     // ReadOnly is also reached after a transport reconnect and after Windows
     // local input fences the previous lease. Both are transient arbitration
     // boundaries, not a request to leave this foreground same-account client
