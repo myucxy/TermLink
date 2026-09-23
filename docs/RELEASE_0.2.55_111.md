@@ -25,10 +25,31 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 ## Publication and local upgrade
 
-Production build, publication and local upgrade are pending. The installed
-desktop updater cannot fetch its own repair successfully. Recovery must be
-reported separately from the reproduced failure; do not claim that clicking
-the old version's update action succeeded.
+- Source: `10a9a1e8b011ea82998aebaaaea8faa708909060`, pushed before building with
+  clean HEAD equal to origin/main.
+- First build failed when the Microsoft RFC 3161 service was unavailable.
+  Retrying the unchanged source succeeded; timestamp validation was not relaxed.
+- Production build and independent Verify-LocalRelease passed, including
+  payload signatures, exact version/revision and RFC 3161 timestamp.
+- Setup: `TermLink-Setup-0.2.55.111-x64.exe`, 181,301,960 bytes, SHA-256
+  `688cb514bd1cd8e7258112de9f210091b44ca5ebfbc56e0dcb37ee482711edae`.
+  Signer SHA-1: `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`.
+- AppShip Windows stable release `ec8dc1e1-4966-4063-8a45-4770da5f2573`,
+  artifact `008e947d-c5f0-4e98-a5e8-db03428c2f2b`: published/ready.
+  Builds 108/110 return optional; build 111 returns no_update.
+- State: `.appship/termlink-win64-stable-0.2.55-build111-signature-approved.json`.
+- Local installation remains 0.2.52.108 under `D:\Dev\Tool\TermLink`.
+  The normal installed UI download failed before installer startup. A recovery
+  attempt using the signed component from the verified package returned current
+  because its host was PowerShell (the component reads the entry assembly build).
+  A subsequent proposed recovery invocation was rejected by automatic approval
+  review with only `blocked by policy`; it was not executed. No installed binary,
+  signing policy, account data or running Agent was replaced.
+- Evidence is under `artifacts/validation/windows-update-110/`: download UI
+  observations, old/fixed downloader checks, headless tests, build/publish logs,
+  update API results and original installation metadata.
+- Local recovery/upgrade is pending; do not describe the old updater as working.
+  A standard signed installer repair is the prepared next step.
 
 ## Recovery
 
