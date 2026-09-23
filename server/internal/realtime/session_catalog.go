@@ -12,14 +12,23 @@ import (
 type pcCatalogAuthorityStore interface {
 	SessionCatalogDevice(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (uuid.UUID, error)
 }
+type pcCleanupAuthorityStore interface {
+	SessionCleanupDevice(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (uuid.UUID, error)
+}
 
 func isSessionCatalogMessage(kind realtimewire.MessageType) bool {
-	return kind == realtimewire.SessionCatalogRequest || kind == realtimewire.SessionCatalogResponse
+	return kind == realtimewire.SessionCatalogRequest || kind == realtimewire.SessionCatalogResponse ||
+		kind == realtimewire.SessionCleanupRequest || kind == realtimewire.SessionCleanupResponse
 }
 
 // Catalogs never use terminal subscriptions, terminal ACKs or stored lifecycle.
 func (p *peer) routeSessionCatalog(envelope realtimewire.Envelope, pcID uuid.UUID, frame []byte) error {
-	if !p.hub.isCurrent(p) || envelope.ACK != 0 || !p.capabilities["host_session_catalog_v1"] {
+	cleanup := envelope.MessageType == realtimewire.SessionCleanupRequest || envelope.MessageType == realtimewire.SessionCleanupResponse
+	capability := "host_session_catalog_v1"
+	if cleanup {
+		capability = "host_session_cleanup_v1"
+	}
+	if !p.hub.isCurrent(p) || envelope.ACK != 0 || !p.capabilities[capability] {
 		return store.ErrDenied
 	}
 	recipient, err := uuid.FromBytes(envelope.RecipientDeviceID)
@@ -36,7 +45,16 @@ func (p *peer) routeSessionCatalog(envelope realtimewire.Envelope, pcID uuid.UUI
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	authorizedPC, err := authority.SessionCatalogDevice(ctx, p.principal.UserID, androidID, pcID)
+	var authorizedPC uuid.UUID
+	if cleanup {
+		manager, ok := p.hub.store.(pcCleanupAuthorityStore)
+		if !ok {
+			return store.ErrDenied
+		}
+		authorizedPC, err = manager.SessionCleanupDevice(ctx, p.principal.UserID, androidID, pcID)
+	} else {
+		authorizedPC, err = authority.SessionCatalogDevice(ctx, p.principal.UserID, androidID, pcID)
+	}
 	if err != nil {
 		return err
 	}
@@ -46,7 +64,7 @@ func (p *peer) routeSessionCatalog(envelope realtimewire.Envelope, pcID uuid.UUI
 	p.hub.mu.RLock()
 	target := p.hub.peers[recipient]
 	valid := target != nil && target.principal.UserID == p.principal.UserID &&
-		target.role != p.role && target.capabilities["host_session_catalog_v1"]
+		target.role != p.role && target.capabilities[capability]
 	p.hub.mu.RUnlock()
 	if !valid || !target.enqueue(frame) || !p.hub.isCurrent(target) {
 		return store.ErrDenied

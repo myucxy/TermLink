@@ -23,12 +23,34 @@ sessions (including temporarily unreachable ones) never qualify. An empty
 selection disables the action. Confirmation names the PC, count and permanent
 history deletion; its fixed UUID list cannot grow during the operation.
 
-Cleanup reuses the existing per-session E2EE host acknowledgement → server
-mirror deletion → local cleanup path, sequentially. Each deletion checks a
-fresh Windows catalog before sending termination. Progress, partial failures,
-skipped sessions and cancellation are reported; completed deletions remain
-completed when cancelled. Newly ended sessions require another confirmation.
-No wire format, server API or Windows implementation changes are required.
+Cleanup uses native Windows batches over the existing encrypted device relay:
+`host_session_cleanup_v1`, messages 90/91, PC UUID as envelope session UUID.
+Each request contains 1..64 distinct confirmed session IDs and a random request
+ID. For example, 245 selected sessions require four requests, with no temporary
+terminal, subscription, lease or per-session catalog scan. Both Server and
+Windows must advertise the capability; older versions prompt an upgrade.
+
+Windows checks current host identity under the registration lock, skips live
+processes, persists a deletion marker and prevents later registration of deleted
+IDs. Outcomes are DELETED, SKIPPED_ACTIVE, NOT_FOUND or FAILED per ID; Android
+requires the exact requested ID set, authenticated sender, epoch, generation,
+sequence and request ID before applying local deletion. There is no process-kill
+operation in this batch path. Physical history removal runs in the background.
+
+The relay requires MANAGE (or existing same-account AutoTrust policy), and only
+the owning PC can POST `/v1/pcs/{id}/session-deletions` to update statistics and
+clear obsolete leases in one transaction per batch. Foreign IDs reject the whole
+transaction. Windows bounds this mirror attempt to five seconds and retries
+durable unsynchronized markers on heartbeat, including after restart. A missing
+mirror row can be tombstoned; stale snapshots cannot resurrect it. A confirmed
+host deletion remains complete when mirror sync is pending.
+
+Android rechecks eligibility before every batch. Cancellation waits for the
+current bounded request (30-second transport deadline), then stops subsequent
+batches; completed deletions remain completed. An unconfirmed request stops
+the remaining batches and asks the user to refresh before retrying. Counts do
+not claim success for an unknown remote outcome. Newly ended sessions require
+another confirmation.
 
 Termux reference: `termux/termux-app` at the pinned commit below,
 `app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java`
@@ -39,7 +61,7 @@ remote Windows authority and explicit durable-history deletion acknowledgement.
 Reviewed the local UPSTREAM.md, both patches, Sync-TermuxTerminal.ps1 and
 terminal-engine-termux adapter; no Termux code/resources were copied.
 
-Bulk cleanup verification (2026-09-23): Android app unit tests cover eligibility,
+Legacy bulk cleanup UI verification (0.2.56, 2026-09-23): Android app unit tests cover eligibility,
 fixed UUID selection, stale state, partial failure, request timeout and caller
 cancellation, alongside existing host → mirror → local deletion ordering tests.
 On emulator-5554 the signed-in debug app was upgraded in place with the same

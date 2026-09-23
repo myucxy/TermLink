@@ -96,6 +96,14 @@ func (s *Postgres) ReplaceSessionSnapshot(ctx context.Context, userID, deviceID,
 
 // Catalog authorization is device scoped and does not depend on a session mirror row.
 func (s *Postgres) SessionCatalogDevice(ctx context.Context, userID, androidID, pcID uuid.UUID) (uuid.UUID, error) {
+	return s.sessionDeviceAuthority(ctx, userID, androidID, pcID, false)
+}
+
+func (s *Postgres) SessionCleanupDevice(ctx context.Context, userID, androidID, pcID uuid.UUID) (uuid.UUID, error) {
+	return s.sessionDeviceAuthority(ctx, userID, androidID, pcID, true)
+}
+
+func (s *Postgres) sessionDeviceAuthority(ctx context.Context, userID, androidID, pcID uuid.UUID, manage bool) (uuid.UUID, error) {
 	var deviceID uuid.UUID
 	err := s.Pool.QueryRow(ctx, `SELECT p.device_id FROM pcs p
 		JOIN users u ON u.id=p.owner_user_id AND u.status='ACTIVE'
@@ -103,7 +111,8 @@ func (s *Postgres) SessionCatalogDevice(ctx context.Context, userID, androidID, 
 		JOIN devices d ON d.id=p.device_id AND d.user_id=$1 AND d.trust_state='TRUSTED' AND d.revoked_at IS NULL AND d.device_type IN ('WINDOWS_PC','PC_AGENT')
 		WHERE p.id=$3 AND p.owner_user_id=$1 AND p.remote_routing_enabled AND
 		($4 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=a.id
-		AND g.permission IN ('VIEW','CONTROL','MANAGE') AND (g.expires_at IS NULL OR g.expires_at>now())))`, userID, androidID, pcID, s.AutoTrustDevices).Scan(&deviceID)
+		AND g.permission IN ('VIEW','CONTROL','MANAGE') AND (NOT $5 OR g.permission='MANAGE')
+		AND (g.expires_at IS NULL OR g.expires_at>now())))`, userID, androidID, pcID, s.AutoTrustDevices, manage).Scan(&deviceID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrDenied
 	}

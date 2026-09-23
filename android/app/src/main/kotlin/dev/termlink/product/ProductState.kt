@@ -1069,6 +1069,9 @@ interface ProductRepository : Closeable {
     fun historyEngine(historyObjectId: UUID): TerminalViewportEngine?
     suspend fun stopSession(sessionId: UUID)
     suspend fun deleteSession(sessionId: UUID)
+    /** Device-scoped encrypted batch; Windows owns the inactive-process check and deletion. */
+    suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> =
+        error("Windows/server upgrade required for native batch cleanup")
     suspend fun sendTerminalAction(sessionId: UUID, action: TerminalAction)
     suspend fun sendTerminalKeyCombination(sessionId: UUID, combination: String)
     suspend fun sendPaste(sessionId: UUID, text: String)

@@ -436,6 +436,11 @@ namespace TermLink.Agent
                     error = "REGISTRY_CLOSED";
                     return false;
                 }
+                if (deletedSessions.Contains(registration.SessionId))
+                {
+                    error = "SESSION_RETIRED";
+                    return false;
+                }
                 if (!remoteAccessEnabled)
                 {
                     error = "REMOTE_ACCESS_DISABLED";
@@ -1127,6 +1132,31 @@ namespace TermLink.Agent
             if (!knownRegistrations.TryGetValue(sessionId, out registration)) return;
             registrationStore.Retire(sessionId);
             knownRegistrations[sessionId] = registration.AsRetired();
+        }
+
+        private readonly HashSet<Guid> deletedSessions = new();
+
+        internal void RestoreDeletedSessions(IEnumerable<Guid> ids)
+        {
+            lock (sync) deletedSessions.UnionWith(ids);
+        }
+
+        // Shares the registration lock: a delayed reconnect cannot revive an ID while it is deleted.
+        internal bool DeleteInactiveSession(Guid sessionId, Action persistDeletion)
+        {
+            lock (sync)
+            {
+                if (knownRegistrations.TryGetValue(sessionId, out var registration))
+                {
+                    if (registration.MatchesRunningHost()) return false;
+                }
+                else if (sessions.TryGetValue(sessionId, out var session) &&
+                    session.GetSummary().Lifecycle == SessionAgentLifecycle.Connected) return false;
+                persistDeletion();
+                deletedSessions.Add(sessionId);
+                RetireRegistration(sessionId);
+                return true;
+            }
         }
 
         private void FinalizeRegistration(IRegistryManagedSession session)

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="cleanup_interrupted">The batch could not be confirmed; later batches were stopped. Check the connection and upgrade both Windows and Server, then refresh the list before retrying.</string>
     <string name="app_name">TermLink</string>
     <string name="product_title">TermLink</string>
     <string name="nav_devices">Devices</string>
@@ -519,6 +520,8 @@
     <string name="failure_authentication_expired">Your sign-in has expired. Please sign in again.</string>
     <string name="device_menu_accessibility">Open device actions</string>
     <string name="action_close_inactive_sessions">Close all inactive sessions (%1$d)</string>
+    <string name="cleanup_upgrade_required">Update Windows and the server to use native batch cleanup.</string>
+    <string name="cleanup_cancelling">Finishing the current batch. No further batches will be sent…</string>
     <string name="confirm_close_inactive_sessions_title">Close all inactive sessions?</string>
     <string name="confirm_close_inactive_sessions_copy">Permanently delete %2$d ended or interrupted sessions and their saved history from %1$s. Running sessions are kept. This cannot be undone.</string>
     <string name="close_inactive_sessions_progress">Processed %1$d of %2$d sessions…</string>

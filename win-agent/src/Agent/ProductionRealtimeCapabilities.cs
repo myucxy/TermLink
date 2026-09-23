@@ -42,7 +42,8 @@ namespace TermLink.Agent
                 "terminal_presentation_metadata_v1",
                 "remote_agent_update_v1",
                 "host_history_v1",
-                "host_session_catalog_v1"
+                "host_session_catalog_v1",
+                "host_session_cleanup_v1"
             };
             if (terminalSnapshotEnabled) capabilities.Add("terminal_snapshot_v2");
             if (typedInputEnabled) capabilities.Add("terminal_typed_input_v1");

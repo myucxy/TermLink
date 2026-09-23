@@ -160,6 +160,7 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("GET /v1/pcs", a.listPCs)
 	trusted.HandleFunc("PUT /v1/pcs/{id}", a.upsertPC)
 	trusted.HandleFunc("PUT /v1/pcs/{id}/session-snapshot", a.replaceSessionSnapshot)
+	trusted.HandleFunc("POST /v1/pcs/{id}/session-deletions", a.applyHostSessionDeletions)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations", a.createFileOperation)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/claim", a.claimFileOperation)
 	trusted.HandleFunc("GET /v1/pcs/{pcId}/file-operations/{operationId}", a.getFileOperation)

@@ -63,6 +63,7 @@ object PcCapabilityIds {
     const val REMOTE_AGENT_UPDATE_V1 = "remote_agent_update_v1"
     const val HOST_HISTORY_V1 = "host_history_v1"
     const val HOST_SESSION_CATALOG_V1 = "host_session_catalog_v1"
+    const val HOST_SESSION_CLEANUP_V1 = "host_session_cleanup_v1"
 }
 
 data class TerminalCommandCapability(

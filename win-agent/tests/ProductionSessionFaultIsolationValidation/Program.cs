@@ -13,7 +13,7 @@ using TermLink.Agent;
 
 namespace TermLink.ProductionSessionFaultIsolation.Validation
 {
-    internal static class Program
+    internal static partial class Program
     {
         private static async Task<int> Main()
         {
@@ -22,6 +22,7 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 await ValidateTwoSessionIsolationAsync().ConfigureAwait(false);
                 ValidateExactRouteRetirement();
                 ValidateRetiredHostCatalog();
+                await ValidateNativeSessionCleanupAsync().ConfigureAwait(false);
                 await ValidateConnectionFatalSignalsEscapeAsync().ConfigureAwait(false);
                 Console.WriteLine("Production session fault isolation validation passed.");
                 return 0;

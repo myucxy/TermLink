@@ -1690,8 +1690,12 @@ fun ProductApp(
                     onStopSessionRequested = { pendingStopSessionId = it },
                     onDeleteSessionRequested = { pendingDeleteSessionId = it },
                     onDeleteInactiveSessionsRequested = { pc ->
-                        val ids = repository.snapshot.value.inactiveSessionIds(pc.id)
-                        if (ids.isNotEmpty()) pendingInactiveCleanup = pc to ids
+                        if (PcCapabilityIds.HOST_SESSION_CLEANUP_V1 !in pc.capabilities) {
+                            scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.cleanup_upgrade_required)) }
+                        } else {
+                            val ids = repository.snapshot.value.inactiveSessionIds(pc.id)
+                            if (ids.isNotEmpty()) pendingInactiveCleanup = pc to ids
+                        }
                     },
                     directRoutingPolicy = snapshot.directRoutingPolicy,
                     terminalPreferences = terminalPreferences,
@@ -7911,6 +7915,7 @@ private fun InactiveSessionCleanupDialog(
     val scope = rememberCoroutineScope()
     var started by remember { mutableStateOf(false) }
     var finished by remember { mutableStateOf(false) }
+    var cancelling by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf(InactiveSessionCleanupResult()) }
     var job by remember { mutableStateOf<Job?>(null) }
     if (!started) {
@@ -7945,14 +7950,18 @@ private fun InactiveSessionCleanupDialog(
                             progress = { result.processed.toFloat() / sessionIds.size },
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        Text(stringResource(R.string.close_inactive_sessions_progress, result.processed, sessionIds.size))
+                        Text(if (cancelling) stringResource(R.string.cleanup_cancelling) else
+                            stringResource(R.string.close_inactive_sessions_progress, result.processed, sessionIds.size))
                     } else {
                         Text(stringResource(R.string.close_inactive_sessions_result, result.deleted, result.failed, result.skipped))
+                        if (result.interrupted) Text(stringResource(R.string.cleanup_interrupted))
                     }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { if (finished) onDismiss() else job?.cancel() }) {
+                TextButton(enabled = finished || !cancelling, onClick = {
+                    if (finished) onDismiss() else { cancelling = true; job?.cancel() }
+                }) {
                     Text(stringResource(if (finished) R.string.action_close else R.string.action_cancel))
                 }
             },

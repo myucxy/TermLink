@@ -641,12 +641,13 @@ class ProductionRealtimeMultiplexer private constructor(
             }
             return synchronized(admissionLock) {
                 check(!closed.get() && !endpointClosed.get()) { "production session transport is closed" }
-                require(catalogOnly == (envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST)) {
+                require(catalogOnly == (envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST))) {
                     "Catalog and terminal endpoints cannot be mixed"
                 }
                 when (envelope.messageType) {
                     dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE,
-                    dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST -> {
+                    dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST,
+                    dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST -> {
                         val generation = expectedGeneration ?: supervisor.currentConnectedGeneration()
                         if (expectedGeneration == null) {
                             check(generation > 0) { "SUBSCRIBE requires a connected socket generation" }
@@ -770,7 +771,7 @@ class ProductionRealtimeMultiplexer private constructor(
                     if (subscribedGeneration.get() != received.generation) {
                         return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
                     }
-                    if (catalogOnly != (received.envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_RESPONSE)) {
+                    if (catalogOnly != (received.envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_RESPONSE, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_RESPONSE))) {
                         return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
                     }
                     val endpointEnvelope = reserveEndpointEnvelopeLocked(received)

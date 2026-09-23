@@ -413,6 +413,7 @@ internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set
     buildSet {
         add(PcCapabilityIds.HOST_HISTORY_V1)
         add(PcCapabilityIds.HOST_SESSION_CATALOG_V1)
+        add(PcCapabilityIds.HOST_SESSION_CLEANUP_V1)
         if (dataPlaneEnabled) {
             add(DIRECT_SESSION_CUTOVER_CAPABILITY)
             add(DIRECT_TRANSPORT_DATA_CAPABILITY)
@@ -2878,6 +2879,35 @@ internal class ProductionProductRepository(
             context.getString(R.string.activity_session_closed_detail),
             Severity.INFO,
         )
+    }
+
+    override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
+        val generation = captureAuthenticationState().authenticationGeneration
+        return refreshStateLock.withLock {
+            requireCurrentAuthentication(generation)
+            val product = mutableSnapshot.value
+            val pc = product.pcs.single { it.id == pcId }
+            val device = product.devices.single { it.id == pc.deviceId }
+            check(PcCapabilityIds.HOST_SESSION_CLEANUP_V1 in pc.capabilities && pc.online && pc.remoteRoutingEnabled &&
+                device.type.isPcAgent() && device.trustState == DeviceTrustState.TRUSTED) { "Native batch cleanup unavailable" }
+            val stored = identity()
+            val realtime = deviceRealtimeRuntime(stored, generation)
+            val response = catalogRequestLock.withLock {
+                dev.termlink.network.production.cleanupHostSessions(
+                    realtime.multiplexer, pc.id, pc.deviceId, stored.deviceId, stored.identity,
+                    device.exchangePublicKey, pc.keyEpoch,
+                    sessionStore.reserveEnvelopeSequenceRange(pc.id, count = 1).first, sessionIds,
+                )
+            }
+            requireCurrentAuthentication(generation)
+            val results = response.resultsList.associate { uuidFromBytes(it.sessionId.toByteArray()) to it.status }
+            withContext(NonCancellable) {
+                results.filterValues { it == "DELETED" }.keys.forEach { id ->
+                    sessionLifecycleLanes.withLock(id) { deleteLocalSession(id) }
+                }
+            }
+            results
+        }
     }
 
     override suspend fun deleteSession(sessionId: UUID) {

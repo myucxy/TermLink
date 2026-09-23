@@ -982,6 +982,13 @@ namespace TermLink.Agent
             }
         }
 
+        internal Guid[] DeletedSessionIds() => Directory.EnumerateFiles(root, DeleteMarkerPrefix + "*" + DeleteMarkerSuffix)
+            .Select(Path.GetFileName)
+            .Where(name => name.Length == DeleteMarkerPrefix.Length + 32 + DeleteMarkerSuffix.Length)
+            .Select(name => name.Substring(DeleteMarkerPrefix.Length, 32))
+            .Select(value => Guid.TryParseExact(value, "N", out var id) ? id : Guid.Empty)
+            .Where(id => id != Guid.Empty).ToArray();
+
         private string TranscriptArchiveDirectory(Guid sessionId) =>
             Path.Combine(SessionDirectory(sessionId), TranscriptArchiveDirectoryName);
 

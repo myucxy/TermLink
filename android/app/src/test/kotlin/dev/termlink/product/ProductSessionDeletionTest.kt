@@ -51,63 +51,74 @@ class ProductSessionDeletionTest {
     }
 
     @Test
-    fun cleanupKeepsConfirmedIdsRechecksEachSessionAndContinuesAfterFailure() = runBlocking {
+    fun nativeCleanupUsesFourBatchesFor245SessionsAndKeepsTheConfirmedSelection() = runBlocking {
         val first = session()
-        val succeeded = session().copy(pcId = first.pcId)
-        val revived = session().copy(pcId = first.pcId)
-        val newlyEnded = session().copy(pcId = first.pcId)
-        val state = MutableStateFlow(cleanupSnapshot(listOf(first, succeeded, revived)))
-        val calls = mutableListOf<UUID>()
+        val sessions = (1..245).map { session().copy(pcId = first.pcId) }
+        val extra = session().copy(pcId = first.pcId)
+        val state = MutableStateFlow(cleanupSnapshot(sessions + extra))
+        val calls = mutableListOf<List<UUID>>()
         val deleted = mutableListOf<UUID>()
-        val progress = mutableListOf<InactiveSessionCleanupResult>()
         val repository = object : ProductRepository by UnavailableProductRepository() {
             override val snapshot = state
-            override suspend fun deleteSession(sessionId: UUID) {
-                calls += sessionId
-                if (sessionId == first.id) throw IOException("host unavailable")
-                state.value = state.value.copy(sessions = listOf(revived.copy(state = SessionState.RUNNING), newlyEnded))
+            override suspend fun deleteSession(sessionId: UUID) = error("per-session path must not run")
+            override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
+                calls += sessionIds
+                return sessionIds.associateWith {
+                    when (it) { sessions[0].id -> "FAILED"; sessions[1].id -> "SKIPPED_ACTIVE"; else -> "DELETED" }
+                }
             }
         }
-        val result = repository.deleteInactiveSessions(
-            first.pcId, listOf(first.id, succeeded.id, revived.id, first.id),
-            onDeleted = { deleted += it }, onProgress = { progress += it },
-        )
-        assertEquals(listOf(first.id, succeeded.id), calls)
-        assertEquals(listOf(succeeded.id), deleted)
-        assertEquals(InactiveSessionCleanupResult(deleted = 1, failed = 1, skipped = 1), result)
-        assertEquals(listOf(1, 2, 3), progress.map { it.processed })
+        val result = repository.deleteInactiveSessions(first.pcId, sessions.map { it.id }, { deleted += it }, {})
+        assertEquals(listOf(64, 64, 64, 53), calls.map { it.size })
+        assertEquals(InactiveSessionCleanupResult(deleted = 243, failed = 1, skipped = 1), result)
+        assertFalse(calls.flatten().contains(extra.id))
+        assertEquals(243, deleted.size)
     }
 
     @Test
-    fun cleanupCountsRequestTimeoutButStopsWhenCallerCancels() = runBlocking {
+    fun nativeCleanupStopsAfterUnconfirmedBatchWithoutRepeatedTimeouts() = runBlocking {
         val first = session()
-        val second = session().copy(pcId = first.pcId)
-        val state = MutableStateFlow(cleanupSnapshot(listOf(first, second)))
-        val calls = mutableListOf<UUID>()
-        var cancelCaller = false
+        val sessions = (1..130).map { session().copy(pcId = first.pcId) }
+        var calls = 0
         val repository = object : ProductRepository by UnavailableProductRepository() {
-            override val snapshot = state
-            override suspend fun deleteSession(sessionId: UUID) {
-                calls += sessionId
-                if (cancelCaller) {
-                    currentCoroutineContext().cancel()
-                    currentCoroutineContext().ensureActive()
-                }
-                if (sessionId == first.id) withTimeout(1) { delay(100) }
+            override val snapshot = MutableStateFlow(cleanupSnapshot(sessions))
+            override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
+                calls++
+                throw IOException("bridge unavailable")
             }
         }
-        assertEquals(
-            InactiveSessionCleanupResult(deleted = 1, failed = 1),
-            repository.deleteInactiveSessions(first.pcId, listOf(first.id, second.id), {}, {}),
-        )
-        calls.clear()
-        cancelCaller = true
-        val job = launch { repository.deleteInactiveSessions(first.pcId, listOf(first.id, second.id), {}, {}) }
-        job.join()
-        assertTrue(job.isCancelled)
-        assertEquals(listOf(first.id), calls)
+        val result = repository.deleteInactiveSessions(first.pcId, sessions.map { it.id }, { error("unconfirmed deletion") }, {})
+        assertEquals(1, calls)
+        assertEquals(InactiveSessionCleanupResult(failed = 64, skipped = 66, interrupted = true), result)
     }
 
+    @Test
+    fun nativeCleanupSettlesInFlightBatchAndCancelsBeforeNextBatch() = runBlocking {
+        val first = session()
+        val sessions = (1..65).map { session().copy(pcId = first.pcId) }
+        val state = MutableStateFlow(cleanupSnapshot(sessions))
+        val entered = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val release = kotlinx.coroutines.CompletableDeferred<Unit>()
+        var calls = 0
+        var deleted = 0
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override val snapshot = state
+            override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
+                calls++
+                entered.complete(Unit)
+                release.await()
+                return sessionIds.associateWith { "DELETED" }
+            }
+        }
+        val job = launch { repository.deleteInactiveSessions(first.pcId, sessions.map { it.id }, { deleted++ }, {}) }
+        entered.await()
+        job.cancel()
+        release.complete(Unit)
+        job.join()
+        assertEquals(1, calls)
+        assertEquals(64, deleted)
+        assertTrue(job.isCancelled)
+    }
     private fun cleanupSnapshot(sessions: List<SessionSummary>): ProductSnapshot {
         val pc = PcSummary(sessions.first().pcId, UUID.randomUUID(), "PC", "1", remoteRoutingEnabled = true,
             online = true, lastSeenAt = null,

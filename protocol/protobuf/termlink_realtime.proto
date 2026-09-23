@@ -69,6 +69,24 @@ enum MessageType {
   // Device catalog only: session_id carries the PC ID, not a terminal ID.
   SESSION_CATALOG_REQUEST = 88;
   SESSION_CATALOG_RESPONSE = 89;
+  // Device-scoped MANAGE operation. Never enters terminal subscription/ACK state.
+  SESSION_CLEANUP_REQUEST = 90;
+  SESSION_CLEANUP_RESPONSE = 91;
+}
+
+message SessionCleanupRequestPayload {
+  bytes request_id = 1;
+  repeated bytes session_ids = 2; // 1..64 distinct, nonzero UUIDs confirmed by the user.
+}
+message SessionCleanupResult {
+  bytes session_id = 1;
+  // DELETED, SKIPPED_ACTIVE, NOT_FOUND, FAILED. DELETED requires a durable host tombstone.
+  string status = 2;
+}
+message SessionCleanupResponsePayload {
+  bytes request_id = 1;
+  repeated SessionCleanupResult results = 2;
+  string error_code = 3;
 }
 
 message SessionCatalogRequestPayload { bytes request_id = 1; }

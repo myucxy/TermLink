@@ -60,6 +60,8 @@ const (
 	SessionTerminateResponse MessageType = 87
 	SessionCatalogRequest    MessageType = 88
 	SessionCatalogResponse   MessageType = 89
+	SessionCleanupRequest    MessageType = 90
+	SessionCleanupResponse   MessageType = 91
 )
 
 var ErrInvalidEnvelope = errors.New("invalid production envelope")
@@ -244,7 +246,7 @@ func knownMessage(value MessageType) bool {
 		ResumeRequest, LeaseRequest, LeaseGranted, LeaseDenied, LeaseRevoked,
 		ThemeChanged, SessionStarted, SessionInterrupted, SessionEnded,
 		SessionTerminateRequest, HostHistoryRequest, HostHistoryResponse, HostHistoryControl,
-		SessionTerminateResponse, SessionCatalogRequest, SessionCatalogResponse:
+		SessionTerminateResponse, SessionCatalogRequest, SessionCatalogResponse, SessionCleanupRequest, SessionCleanupResponse:
 		return true
 	default:
 		return false

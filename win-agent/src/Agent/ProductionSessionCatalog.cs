@@ -25,6 +25,10 @@ namespace TermLink.Agent
         private async Task PublishSessionSnapshotAsync(CancellationToken token)
         {
             if (registry == null) return;
+            // Persisted host tombstones also recover a lost batch response or failed mirror update.
+            try { await RetrySessionDeletionsAsync(token).ConfigureAwait(false); }
+            catch (Exception error) when (error is HttpRequestException || error is IOException ||
+                (error is OperationCanceledException && !token.IsCancellationRequested)) { }
             await metadataSnapshotGate.WaitAsync(token).ConfigureAwait(false);
             try
             {

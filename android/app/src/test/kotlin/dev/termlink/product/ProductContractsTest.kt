@@ -42,11 +42,11 @@ import okhttp3.OkHttpClient
 class ProductContractsTest {
     @Test
     fun directDataPlaneHelloCapabilitiesAreOptionalAndGatedTogether() {
-        assertEquals(setOf("host_history_v1", "host_session_catalog_v1"), productRealtimeOptionalCapabilities(false))
+        assertEquals(setOf("host_history_v1", "host_session_catalog_v1", "host_session_cleanup_v1"), productRealtimeOptionalCapabilities(false))
         assertEquals(
             setOf(
                 "host_history_v1",
-                "host_session_catalog_v1",
+                "host_session_catalog_v1", "host_session_cleanup_v1",
                 "direct_session_cutover_v1",
                 "direct_transport_data_v1",
             ),

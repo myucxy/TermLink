@@ -46,6 +46,18 @@ After its own bounded hello/welcome, that lane accepts only serialized
 
 ## Envelope and E2EE
 
+Device-scoped catalog (88/89, `host_session_catalog_v1`) and inactive-session
+cleanup (90/91, `host_session_cleanup_v1`) use the PC UUID as envelope session ID
+and `ack=0`. They are encrypted peer-to-peer and relayed independently of
+terminal subscriptions, ACKs, control leases and Direct session arbitration.
+Cleanup requires a MANAGE grant (or the existing same-account AutoTrust policy),
+1..64 distinct nonzero session UUIDs and a nonzero request UUID. Windows verifies
+host liveness at deletion and returns exactly one outcome per requested UUID:
+DELETED, SKIPPED_ACTIVE, NOT_FOUND or FAILED. Responses echo request ID and
+sequence; the requester checks peer, key epoch and connection generation.
+`MIRROR_SYNC_PENDING` reports a durable host deletion awaiting statistical
+mirror synchronization. See [host catalog and cleanup](../../docs/HOST_SESSION_CATALOG.md).
+
 `termlink_realtime.proto` is the authoritative wire schema. Version 1 uses
 UUIDs as 16 raw bytes. A binary frame is one serialized `Envelope` and is at
 most 1 MiB. Unknown protobuf fields are ignored; an unknown message type is

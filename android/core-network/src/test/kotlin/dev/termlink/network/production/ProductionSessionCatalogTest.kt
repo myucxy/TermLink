@@ -9,6 +9,9 @@ import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.SessionCatalogEntry
 import dev.termlink.protocol.realtime.v1.SessionCatalogRequestPayload
 import dev.termlink.protocol.realtime.v1.SessionCatalogResponsePayload
+import dev.termlink.protocol.realtime.v1.SessionCleanupRequestPayload
+import dev.termlink.protocol.realtime.v1.SessionCleanupResponsePayload
+import dev.termlink.protocol.realtime.v1.SessionCleanupResult
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,7 +28,11 @@ import org.junit.Test
 class ProductionSessionCatalogTest {
     @Test
     fun encryptedDeviceCatalogRoundTripRejectsWrongPeerEpochAndReplayedRequest(): Unit = runBlocking {
-        for (fault in listOf("none", "peer", "epoch", "replay")) {
+        for (cleanup in listOf(false, true)) for (fault in listOf("none", "peer", "epoch", "replay", "capability")) {
+            val capability = if (cleanup) "host_session_cleanup_v1" else "host_session_catalog_v1"
+            val requestType = if (cleanup) MessageType.SESSION_CLEANUP_REQUEST else MessageType.SESSION_CATALOG_REQUEST
+            val responseType = if (cleanup) MessageType.SESSION_CLEANUP_RESPONSE else MessageType.SESSION_CATALOG_RESPONSE
+            val sessionId = UUID.randomUUID()
             val pcId = UUID.randomUUID()
             val pcDevice = UUID.randomUUID()
             val androidId = UUID.randomUUID()
@@ -39,20 +46,25 @@ class ProductionSessionCatalogTest {
             val server = MockWebServer()
             server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
-                    webSocket.send("""{"type":"welcome","protocol_version":1,"capabilities":["host_session_catalog_v1"]}""")
+                    webSocket.send("""{"type":"welcome","protocol_version":1,"capabilities":[${if (fault == "capability") "" else "\"$capability\""}]}""")
                 }
                 override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
                     val envelope = Envelope.parseFrom(bytes.toByteArray())
-                    assertEquals(MessageType.SESSION_CATALOG_REQUEST, envelope.messageType)
+                    assertEquals(requestType, envelope.messageType)
                     assertEquals(0L, envelope.ack)
                     val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, incoming)
-                    val request = try { SessionCatalogRequestPayload.parseFrom(plaintext) } finally { plaintext.fill(0) }
-                    val response = catalog(if (fault == "replay") uuid() else request.requestId)
+                    val requestId = try {
+                        if (cleanup) SessionCleanupRequestPayload.parseFrom(plaintext).also {
+                            assertEquals(listOf(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(sessionId))), it.sessionIdsList)
+                        }.requestId else SessionCatalogRequestPayload.parseFrom(plaintext).requestId
+                    } finally { plaintext.fill(0) }
+                    val echoedId = if (fault == "replay") uuid() else requestId
+                    val response = if (cleanup) cleanupResponse(echoedId, sessionId).toByteArray() else catalog(echoedId).toByteArray()
                     val reply = ProductionRealtimeClient.encryptedEnvelope(
                         pcId, if (fault == "peer") UUID.randomUUID() else pcDevice,
-                        MessageType.SESSION_CATALOG_RESPONSE, CryptoDirection.PC_TO_ANDROID, envelope.seq, 0,
+                        responseType, CryptoDirection.PC_TO_ANDROID, envelope.seq, 0,
                         if (fault == "epoch") "epoch-00000002".encodeToByteArray() else keyId,
-                        ByteArray(12) { 1 }, outgoing, response.toByteArray(), recipientId = androidId,
+                        ByteArray(12) { 1 }, outgoing, response, recipientId = androidId,
                     )
                     webSocket.send(okio.ByteString.of(*reply.toByteArray()))
                 }
@@ -61,11 +73,14 @@ class ProductionSessionCatalogTest {
             server.start()
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val mux = ProductionRealtimeMultiplexer(server.url("/").toString(), AccessTokenProvider { "test" },
-                androidId, identity, scope, optionalAdvertisedCapabilities = setOf("host_session_catalog_v1"),
+                androidId, identity, scope, optionalAdvertisedCapabilities = setOf(capability),
                 allowCleartextForLocalTest = true)
             try {
-                val result = runCatching { fetchHostSessionCatalog(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7) }
-                if (fault == "none") assertEquals("INTERRUPTED", result.getOrThrow().sessionsList.single().lifecycle)
+                val result = runCatching {
+                    if (cleanup) cleanupHostSessions(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7, listOf(sessionId)).resultsList.single().status
+                    else fetchHostSessionCatalog(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7).sessionsList.single().lifecycle
+                }
+                if (fault == "none") assertEquals(if (cleanup) "DELETED" else "INTERRUPTED", result.getOrThrow())
                 else assertTrue("$fault was accepted", result.isFailure)
             } finally {
                 mux.close(); scope.cancel(); server.shutdown()
@@ -91,5 +106,24 @@ class ProductionSessionCatalogTest {
         .setRequestId(request).setHostInstanceId(uuid()).setObservedAtMs(System.currentTimeMillis())
         .addSessions(SessionCatalogEntry.newBuilder().setSessionId(uuid()).setShellType("pwsh")
             .setLifecycle("INTERRUPTED").setColumns(80).setRows(24).setLastOutputSeq(9)).build()
+    private fun cleanupResponse(request: ByteString, id: UUID) = SessionCleanupResponsePayload.newBuilder()
+        .setRequestId(request).addResults(SessionCleanupResult.newBuilder()
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(id))).setStatus("DELETED")).build()
+
+    @Test
+    fun cleanupRequiresExactlyTheRequestedIdsAndKnownOutcomes() {
+        val request = uuid()
+        val id = UUID.randomUUID()
+        val valid = cleanupResponse(request, id)
+        validateHostSessionCleanup(valid, request, listOf(id))
+        validateHostSessionCleanup(valid.toBuilder().setErrorCode("MIRROR_SYNC_PENDING").build(), request, listOf(id))
+        val entry = valid.resultsList.single()
+        for (invalid in listOf(valid.toBuilder().clearResults().build(),
+            valid.toBuilder().addResults(entry).build(), cleanupResponse(request, UUID.randomUUID()),
+            valid.toBuilder().setResults(0, entry.toBuilder().setStatus("RUNNING")).build(),
+            valid.toBuilder().setErrorCode("DENIED").build())) {
+            assertThrows(IllegalArgumentException::class.java) { validateHostSessionCleanup(invalid, request, listOf(id)) }
+        }
+    }
     private fun uuid() = ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(UUID.randomUUID()))
 }

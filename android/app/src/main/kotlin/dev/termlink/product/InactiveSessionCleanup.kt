@@ -7,6 +7,8 @@ import dev.termlink.model.isPcAgent
 import java.util.UUID
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 internal fun isInactiveSession(state: SessionState, online: Boolean): Boolean =
     !online && (state == SessionState.EXITED || state == SessionState.INTERRUPTED)
@@ -28,6 +30,7 @@ internal data class InactiveSessionCleanupResult(
     val deleted: Int = 0,
     val failed: Int = 0,
     val skipped: Int = 0,
+    val interrupted: Boolean = false,
 ) {
     val processed: Int get() = deleted + failed + skipped
 }
@@ -40,24 +43,31 @@ internal suspend fun ProductRepository.deleteInactiveSessions(
     onProgress: (InactiveSessionCleanupResult) -> Unit,
 ): InactiveSessionCleanupResult {
     var result = InactiveSessionCleanupResult()
-    for (sessionId in sessionIds.distinct()) {
+    val confirmed = sessionIds.distinct()
+    for (batch in confirmed.chunked(64)) {
         currentCoroutineContext().ensureActive()
-        if (sessionId !in snapshot.value.inactiveSessionIds(pcId)) {
-            result = result.copy(skipped = result.skipped + 1)
-        } else {
-            val deleted = try {
-                deleteSession(sessionId)
-                true
-            } catch (_: Exception) {
-                // Request-local timeouts count as failures; caller cancellation stops the batch.
-                currentCoroutineContext().ensureActive()
-                false
+        val eligible = snapshot.value.inactiveSessionIds(pcId).toSet()
+        val selected = batch.filter { it in eligible }
+        result = result.copy(skipped = result.skipped + batch.size - selected.size)
+        if (selected.isNotEmpty()) {
+            // Cancellation stops subsequent batches; settle this bounded in-flight batch first.
+            val outcomes = withContext(NonCancellable) {
+                try { deleteInactiveSessionBatch(pcId, selected) }
+                catch (_: Exception) { null }
             }
-            if (deleted) {
-                onDeleted(sessionId)
-                result = result.copy(deleted = result.deleted + 1)
-            } else {
-                result = result.copy(failed = result.failed + 1)
+            if (outcomes == null) {
+                result = result.copy(failed = result.failed + selected.size,
+                    skipped = result.skipped + confirmed.size - result.processed - selected.size,
+                    interrupted = true)
+                onProgress(result)
+                return result
+            }
+            for (id in selected) {
+                when (outcomes[id]) {
+                    "DELETED" -> { onDeleted(id); result = result.copy(deleted = result.deleted + 1) }
+                    "SKIPPED_ACTIVE", "NOT_FOUND" -> result = result.copy(skipped = result.skipped + 1)
+                    else -> result = result.copy(failed = result.failed + 1)
+                }
             }
         }
         onProgress(result)

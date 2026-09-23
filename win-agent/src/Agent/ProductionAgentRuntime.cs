@@ -926,6 +926,7 @@ namespace TermLink.Agent
                 if (Volatile.Read(ref disposed) != 0) throw new ObjectDisposedException("ProductionAgentRuntime");
                 if (this.registry != null) throw new InvalidOperationException("Production runtime is already attached.");
                 this.registry = registry;
+                registry.RestoreDeletedSessions(terminalHistoryStore.DeletedSessionIds());
                 QueueRegisteredSessionsForReplay();
                 QueuePersistedHistoryForReplay();
                 historyUploader = new ProductionHistoryUploader(
@@ -2580,7 +2581,8 @@ namespace TermLink.Agent
                 "terminal_commands_v1",
                 "remote_agent_update_v1",
                 "host_history_v1",
-                "host_session_catalog_v1"
+                "host_session_catalog_v1",
+                "host_session_cleanup_v1"
             };
             if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v2");
             var normalizedCommands = terminalCommands.Select(command => new
@@ -4955,7 +4957,7 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Envelope recipient mismatch.");
             if (envelope.Seq == 0 || envelope.Nonce.Length != 12 || envelope.Ciphertext.Length < 16)
                 throw new InvalidDataException("Located session Envelope metadata is invalid.");
-            if (envelope.MessageType == MessageType.SessionCatalogRequest)
+            if (envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest)
             {
                 if (sessionId != config.PcId || envelope.Ack != 0 || registry == null || !registry.RemoteAccessEnabled)
                     throw new InvalidDataException("Catalog route is invalid.");
@@ -4999,14 +5001,27 @@ namespace TermLink.Agent
             CryptographicOperations.ZeroMemory(pairwiseKey);
             CryptographicOperations.ZeroMemory(expectedKeyId);
             byte[] plaintext = null;
-            var ingressApplied = true;
+            var deviceRequest = envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest;
+            var ingressApplied = !deviceRequest;
             try
             {
                 plaintext = SessionCrypto.Decrypt(sessionKey, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), envelope.Ciphertext.ToByteArray());
-                ObserveAndroidEnvelope(senderId, sessionId, envelope.Seq);
+                if (!deviceRequest) ObserveAndroidEnvelope(senderId, sessionId, envelope.Seq);
                 TouchSubscriber(subscriber);
-                if (envelope.MessageType == MessageType.SessionCatalogRequest)
+                if (envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest)
                 {
+                    if (envelope.MessageType == MessageType.SessionCleanupRequest)
+                    {
+                        var cleanup = await CleanupSessionsAsync(SessionCleanupRequestPayload.Parser.ParseFrom(plaintext), token).ConfigureAwait(false);
+                        var cleanupBytes = cleanup.ToByteArray();
+                        try
+                        {
+                            await SendSessionControlEnvelopeAsync(active, sessionId, subscriber, envelope.Seq,
+                                MessageType.SessionCleanupResponse, cleanupBytes, token).ConfigureAwait(false);
+                        }
+                        finally { CryptographicOperations.ZeroMemory(cleanupBytes); }
+                        return;
+                    }
                     var request = SessionCatalogRequestPayload.Parser.ParseFrom(plaintext);
                     if (GuidFromBytes(request.RequestId.Span) == Guid.Empty)
                         throw new InvalidDataException("Catalog request ID is invalid.");

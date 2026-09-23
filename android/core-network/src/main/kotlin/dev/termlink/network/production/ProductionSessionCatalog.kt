@@ -26,7 +26,21 @@ suspend fun fetchHostSessionCatalog(
     pcExchangePublicKey: ByteArray,
     keyEpoch: Long,
     sequence: Long,
-): SessionCatalogResponsePayload = withTimeout(8_000) {
+): SessionCatalogResponsePayload = requestHostDevice(
+    multiplexer, pcId, pcDeviceId, androidDeviceId, identity, pcExchangePublicKey, keyEpoch, sequence,
+    MessageType.SESSION_CATALOG_REQUEST, MessageType.SESSION_CATALOG_RESPONSE, "host_session_catalog_v1", 8_000,
+    request = { SessionCatalogRequestPayload.newBuilder().setRequestId(it).build().toByteArray() },
+    response = { bytes, id -> SessionCatalogResponsePayload.parseFrom(bytes).also { validateHostSessionCatalog(it, id) } },
+)
+
+internal suspend fun <T : Any> requestHostDevice(
+    multiplexer: ProductionRealtimeMultiplexer,
+    pcId: UUID, pcDeviceId: UUID, androidDeviceId: UUID,
+    identity: DeviceIdentity, pcExchangePublicKey: ByteArray, keyEpoch: Long, sequence: Long,
+    requestType: MessageType, responseType: MessageType, capability: String, timeoutMillis: Long,
+    request: (ByteString) -> ByteArray,
+    response: (ByteArray, ByteString) -> T,
+): T = withTimeout(timeoutMillis) {
     coroutineScope {
         require(sequence > 0 && keyEpoch > 0 && pcId != UUID(0, 0))
         val keyId = "epoch-${keyEpoch.toString().padStart(8, '0')}".encodeToByteArray()
@@ -40,22 +54,21 @@ suspend fun fetchHostSessionCatalog(
         var transport: ProductionRealtimeSessionTransport? = null
         try {
             val endpoint = multiplexer.register(pcId, catalogOnly = true).also { transport = it }
-            val response = async(start = CoroutineStart.UNDISPATCHED) {
-                var result: SessionCatalogResponsePayload? = null
+            val pendingResponse = async(start = CoroutineStart.UNDISPATCHED) {
+                var result: T? = null
                 endpoint.receivedEnvelopes.first { received ->
                     try {
                         val envelope = received.envelope
                         require(received.generation == requestGeneration.get() &&
                             received.generation == endpoint.currentConnectedGeneration()) { "Stale catalog generation" }
-                        require(envelope.messageType == MessageType.SESSION_CATALOG_RESPONSE &&
+                        require(envelope.messageType == responseType &&
                             envelope.direction == Direction.PC_TO_ANDROID && envelope.seq == sequence && envelope.ack == 0L &&
                             envelope.sessionId == ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pcId)) &&
                             envelope.senderDeviceId == ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pcDeviceId)) &&
                             envelope.recipientDeviceId == ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(androidDeviceId)) &&
                             envelope.keyId == ByteString.copyFrom(keyId)) { "Invalid catalog response route" }
                         val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, inbound)
-                        val value = try { SessionCatalogResponsePayload.parseFrom(plaintext) } finally { plaintext.fill(0) }
-                        validateHostSessionCatalog(value, requestId)
+                        val value = try { response(plaintext, requestId) } finally { plaintext.fill(0) }
                         result = value
                         true
                     } finally { received.close() }
@@ -64,21 +77,21 @@ suspend fun fetchHostSessionCatalog(
             }
             endpoint.connect()
             endpoint.state.first { it is RealtimeState.Connected }
-            check("host_session_catalog_v1" in multiplexer.directRealtimeNegotiatedCapabilities.value.capabilities) {
-                "Server requires host catalog support"
+            check(capability in multiplexer.directRealtimeNegotiatedCapabilities.value.capabilities) {
+                "Server upgrade required: $capability is unavailable"
             }
-            val payload = SessionCatalogRequestPayload.newBuilder().setRequestId(requestId).build().toByteArray()
+            val payload = request(requestId)
             val envelope = try {
                 ProductionRealtimeClient.encryptedEnvelope(
                     sessionId = pcId, senderId = androidDeviceId, recipientId = pcDeviceId,
-                    messageType = MessageType.SESSION_CATALOG_REQUEST, direction = CryptoDirection.ANDROID_TO_PC,
+                    messageType = requestType, direction = CryptoDirection.ANDROID_TO_PC,
                     sequence = sequence, acknowledgement = 0, keyId = keyId,
                     nonce = ByteArray(12).also(SecureRandom()::nextBytes), sessionKey = outbound, plaintext = payload,
                 )
             } finally { payload.fill(0) }
             requestGeneration.set(endpoint.currentConnectedGeneration())
             check(endpoint.sendForConnectedGeneration(envelope, requestGeneration.get())) { "Catalog transport unavailable" }
-            response.await()
+            pendingResponse.await()
         } finally {
             transport?.close()
             outbound.fill(0); inbound.fill(0); keyId.fill(0)
