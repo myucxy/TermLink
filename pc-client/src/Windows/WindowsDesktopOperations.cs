@@ -164,6 +164,8 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
             if (received != update.SizeBytes || !CryptographicOperations.FixedTimeEquals(
                     hash.GetHashAndReset(), Convert.FromHexString(update.Sha256)))
                 throw new CryptographicException("下载内容与 AppShip SHA-256 不一致。");
+            // WinTrust reopens the file; release the exclusive download handle first.
+            await destination.DisposeAsync().ConfigureAwait(false);
             var expectedSigner = WindowsUpdateSecurity.ResolveExpectedSignerThumbprint(installationRoot);
             WindowsUpdateSecurity.ValidateAuthenticode(
                 temporaryPath, expectedSigner, update.SignerSha1, installationRoot);
