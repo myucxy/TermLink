@@ -490,16 +490,25 @@ func runProduction() error {
 			slog.Warn("runtime setting direct_stun_servers is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
 		}
 	}
+	// Runtime AppShip overrides must resolve BEFORE the portal is built: the
+	// public downloads page fetches release metadata through its own release
+	// source, and an allowlist resolved only into the update catalog would
+	// leave that source blocked on private AppShip addresses.
+	resolvedAppShipBaseURL := appShipBaseURL
+	resolvedAppShipPrivateIPs := os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS")
 	if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipBaseURL); overrideErr == nil && found {
-		privateIPs := os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS")
 		if ipsOverride, ipsFound, ipsErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipAllowedPrivateIPs); ipsErr == nil && ipsFound {
-			privateIPs = ipsOverride
+			resolvedAppShipPrivateIPs = ipsOverride
 		}
-		if err := updateCatalog.UpdateTarget(override, privateIPs); err != nil {
+		if err := updateCatalog.UpdateTarget(override, resolvedAppShipPrivateIPs); err == nil {
+			resolvedAppShipBaseURL = override
+		} else {
 			slog.Warn("runtime setting appship_base_url is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
 		}
 	} else if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipAllowedPrivateIPs); overrideErr == nil && found {
-		if err := updateCatalog.UpdateTarget(appShipBaseURL, override); err != nil {
+		if err := updateCatalog.UpdateTarget(resolvedAppShipBaseURL, override); err == nil {
+			resolvedAppShipPrivateIPs = override
+		} else {
 			slog.Warn("runtime setting appship_allowed_private_ips is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
 		}
 	}
@@ -555,8 +564,8 @@ func runProduction() error {
 		HumanVerification:         humanVerificationManager,
 		CookieKey:                 cookieKey,
 		SubjectKey:                subjectKey,
-		AppShipBaseURL:            appShipBaseURL,
-		AppShipAllowedPrivateIPs:  os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
+		AppShipBaseURL:            resolvedAppShipBaseURL,
+		AppShipAllowedPrivateIPs:  resolvedAppShipPrivateIPs,
 		BuildInfo:                 buildinfo.Current(),
 		RegistrationCodeKey:       registrationCodeKey,
 		AccountDeletionBinder:     accountDeletionBinder,
