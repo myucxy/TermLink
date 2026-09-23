@@ -6,7 +6,8 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 - Android only. Live AppShip checks found Android and Windows stable at `0.2.52 (108)`;
   the new Android version is `0.2.53 (109)`. No matching remote Git tag exists.
-- Source revision and publication evidence will be completed after the tested source is committed and built.
+- Production source revision: `57eb3fa382a246e9ebcaabc25ff914cdca81802c`, committed and pushed before the
+  production build with a clean worktree and `HEAD == origin/main`.
 
 ## Changes
 
@@ -25,7 +26,8 @@ Date: 2026-09-23 (Asia/Shanghai)
 ## Verification
 
 - `:app:testDebugUnitTest`, `:app:testReleaseUnitTest`, `:core-network:testDebugUnitTest`,
-  and `:app:assembleDebug` passed. A regression checks explicit read-only intent across foreground generations
+  and `:app:assembleDebug` passed (314 Debug App, 309 Release App and 321 network tests; zero failures/errors).
+  A regression checks explicit read-only intent across foreground generations
   while preserving lifecycle auto-acquisition.
 - `release/Test-BuildRelease.ps1` and `git diff --check` passed.
 - Same-signer debug overlay on `emulator-5554` preserved app ID `10224`, first install time
@@ -57,7 +59,14 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 ## Production publication
 
-- Pending production build, independent APK verification and repository-wrapped AppShip publication.
+- Production build and independent `Verify-LocalRelease.ps1` passed. APK `TermLink-Android-0.2.53-109.apk`:
+  38,088,090 bytes, SHA-256 `931f59afa73aa7e34b3d94203255d813b0b23288a34f9760675289692ee96f24`.
+  APK application ID/version verified; one continuity signer, APK v2 signing verified.
+- AppShip `termlink-android/stable`: application `4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`,
+  release `8934f778-d5e2-43c5-a2d6-8c8df501473f` is `published`,
+  artifact `9b75837f-6a78-4509-be52-6f14032a796e` is `ready`.
+- Public update API: build 108 returns `optional` with `0.2.53 (109)` and a ready artifact;
+  build 109 returns `no_update`. Publication used only `scripts/Publish-AppShipProduction.ps1`.
 - Android continuity signer SHA-256: `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
 - State path: `.appship/termlink-android-stable-0.2.53-build109-signature-approved.json`.
 - Keep the published history/state. Rollback requires a newer same-signer build; never uninstall or clear
