@@ -518,6 +518,11 @@
     <string name="remote_file_error_generic">The Windows file operation failed. Try again.</string>
     <string name="failure_authentication_expired">Your sign-in has expired. Please sign in again.</string>
     <string name="device_menu_accessibility">Open device actions</string>
+    <string name="action_close_inactive_sessions">Close all inactive sessions (%1$d)</string>
+    <string name="confirm_close_inactive_sessions_title">Close all inactive sessions?</string>
+    <string name="confirm_close_inactive_sessions_copy">Permanently delete %2$d ended or interrupted sessions and their saved history from %1$s. Running sessions are kept. This cannot be undone.</string>
+    <string name="close_inactive_sessions_progress">Processed %1$d of %2$d sessions…</string>
+    <string name="close_inactive_sessions_result">Deleted: %1$d. Failed: %2$d. Skipped: %3$d. Refresh and retry any remaining inactive sessions.</string>
     <string name="agent_update_action">Automatically update Agent</string>
     <string name="agent_update_checking">Checking Agent update</string>
     <string name="agent_update_checking_copy">Reading the signed stable offer for Agent %1$s.</string>

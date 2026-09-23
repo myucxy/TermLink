@@ -14,6 +14,40 @@ offline, or catalog verification fails, terminal content is hidden and cannot
 be used as proof of a running process. Tab identities may be retained for a
 later user-initiated reopen. An explicit remote delete remains destructive.
 
+## Android bulk cleanup
+
+The device long-press menu offers “关闭所有失效会话” with the eligible count.
+Only EXITED/INTERRUPTED sessions with `online == false` from a trusted, online
+PC's verified catalog qualify. Offline devices, catalog errors and RUNNING
+sessions (including temporarily unreachable ones) never qualify. An empty
+selection disables the action. Confirmation names the PC, count and permanent
+history deletion; its fixed UUID list cannot grow during the operation.
+
+Cleanup reuses the existing per-session E2EE host acknowledgement → server
+mirror deletion → local cleanup path, sequentially. Each deletion checks a
+fresh Windows catalog before sending termination. Progress, partial failures,
+skipped sessions and cancellation are reported; completed deletions remain
+completed when cancelled. Newly ended sessions require another confirmation.
+No wire format, server API or Windows implementation changes are required.
+
+Termux reference: `termux/termux-app` at the pinned commit below,
+`app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java`
+(`onSessionFinished`, `removeFinishedSession`) and `TermuxActivity.java` (kill
+action gated by `isRunning`). These distinguish finished-session cleanup from
+process termination. Used as behavior references only: TermLink retains its
+remote Windows authority and explicit durable-history deletion acknowledgement.
+Reviewed the local UPSTREAM.md, both patches, Sync-TermuxTerminal.ps1 and
+terminal-engine-termux adapter; no Termux code/resources were copied.
+
+Bulk cleanup verification (2026-09-23): Android app unit tests cover eligibility,
+fixed UUID selection, stale state, partial failure, request timeout and caller
+cancellation, alongside existing host → mirror → local deletion ordering tests.
+On emulator-5554 the signed-in debug app was upgraded in place with the same
+signer; long-press showed 245 eligible HOME-PC sessions and the confirmation
+showed the same count and history-deletion warning. Cancelling closed the
+dialog. Existing user sessions were not deleted during this UI check; actual
+bulk deletion against a live host has not been exercised.
+
 ## Wire boundary
 
 `host_session_catalog_v1` negotiates device-scoped E2EE request/response messages

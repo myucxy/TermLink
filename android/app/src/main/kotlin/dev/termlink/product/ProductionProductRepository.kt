@@ -2894,7 +2894,7 @@ internal class ProductionProductRepository(
                         ?: error("The selected session is unavailable")
                     val pc = product.pcs.firstOrNull { it.id == session.pcId }
                         ?: error("The selected Windows PC is unavailable")
-                    require(!session.online || session.state == SessionState.EXITED) {
+                    require(isInactiveSession(session.state, session.online)) {
                         "Close an online session before deleting it"
                     }
                     check(hasHostHistoryAuthority(pc.capabilities)) {
@@ -2910,6 +2910,14 @@ internal class ProductionProductRepository(
                     }
                     check(pcDevice.exchangePublicKey.size == 32) {
                         "Windows PC 缺少有效加密密钥 / The selected Windows PC has no valid encryption key"
+                    }
+                    // A retained screen or stale catalog must never authorize terminating a live shell.
+                    val current = requestHostCatalog(pc, pcDevice, authenticationGeneration).sessionsList
+                        .firstOrNull { uuidFromBytes(it.sessionId.toByteArray()) == sessionId }
+                    // An absent entry still needs the host's durable deletion acknowledgement;
+                    // this lets a retry finish REST/local cleanup after an earlier host success.
+                    require(current == null || isInactiveSession(SessionState.valueOf(current.lifecycle), current.processAlive)) {
+                        "Close an online session before deleting it"
                     }
                     deleteHostHistorySessionAfterTermination(
                         terminateRemote = {

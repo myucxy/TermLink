@@ -1,6 +1,11 @@
 package dev.termlink.product
 
 import dev.termlink.model.HistoryObject
+import dev.termlink.model.DeviceSummary
+import dev.termlink.model.DeviceTrustState
+import dev.termlink.model.DeviceType
+import dev.termlink.model.PcSummary
+import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.network.production.TermLinkApiException
@@ -10,6 +15,13 @@ import java.io.IOException
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -18,6 +30,95 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductSessionDeletionTest {
+    @Test
+    fun cleanupSelectsOnlyConfirmedInactiveSessionsOnTheRequestedTrustedOnlinePc() {
+        val exited = session()
+        val interrupted = session().copy(pcId = exited.pcId, state = SessionState.INTERRUPTED)
+        val running = session().copy(pcId = exited.pcId, state = SessionState.RUNNING)
+        val inconsistent = interrupted.copy(id = UUID.randomUUID(), online = true)
+        val snapshot = cleanupSnapshot(listOf(exited, interrupted, running, inconsistent, session()))
+        assertEquals(listOf(exited.id, interrupted.id), snapshot.inactiveSessionIds(exited.pcId))
+        val pc = snapshot.pcs.single()
+        listOf(
+            snapshot.copy(signedIn = false),
+            snapshot.copy(connectionState = ProductConnectionState.ERROR),
+            snapshot.copy(pcSessionCatalogErrors = mapOf(pc.id to "TIMEOUT")),
+            snapshot.copy(pcs = listOf(pc.copy(online = false))),
+            snapshot.copy(pcs = listOf(pc.copy(remoteRoutingEnabled = false))),
+            snapshot.copy(pcs = listOf(pc.copy(capabilities = setOf(PcCapabilityIds.HOST_HISTORY_V1)))),
+            snapshot.copy(devices = snapshot.devices.map { it.copy(trustState = DeviceTrustState.REVOKED) }),
+        ).forEach { assertTrue(it.inactiveSessionIds(pc.id).isEmpty()) }
+    }
+
+    @Test
+    fun cleanupKeepsConfirmedIdsRechecksEachSessionAndContinuesAfterFailure() = runBlocking {
+        val first = session()
+        val succeeded = session().copy(pcId = first.pcId)
+        val revived = session().copy(pcId = first.pcId)
+        val newlyEnded = session().copy(pcId = first.pcId)
+        val state = MutableStateFlow(cleanupSnapshot(listOf(first, succeeded, revived)))
+        val calls = mutableListOf<UUID>()
+        val deleted = mutableListOf<UUID>()
+        val progress = mutableListOf<InactiveSessionCleanupResult>()
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override val snapshot = state
+            override suspend fun deleteSession(sessionId: UUID) {
+                calls += sessionId
+                if (sessionId == first.id) throw IOException("host unavailable")
+                state.value = state.value.copy(sessions = listOf(revived.copy(state = SessionState.RUNNING), newlyEnded))
+            }
+        }
+        val result = repository.deleteInactiveSessions(
+            first.pcId, listOf(first.id, succeeded.id, revived.id, first.id),
+            onDeleted = { deleted += it }, onProgress = { progress += it },
+        )
+        assertEquals(listOf(first.id, succeeded.id), calls)
+        assertEquals(listOf(succeeded.id), deleted)
+        assertEquals(InactiveSessionCleanupResult(deleted = 1, failed = 1, skipped = 1), result)
+        assertEquals(listOf(1, 2, 3), progress.map { it.processed })
+    }
+
+    @Test
+    fun cleanupCountsRequestTimeoutButStopsWhenCallerCancels() = runBlocking {
+        val first = session()
+        val second = session().copy(pcId = first.pcId)
+        val state = MutableStateFlow(cleanupSnapshot(listOf(first, second)))
+        val calls = mutableListOf<UUID>()
+        var cancelCaller = false
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override val snapshot = state
+            override suspend fun deleteSession(sessionId: UUID) {
+                calls += sessionId
+                if (cancelCaller) {
+                    currentCoroutineContext().cancel()
+                    currentCoroutineContext().ensureActive()
+                }
+                if (sessionId == first.id) withTimeout(1) { delay(100) }
+            }
+        }
+        assertEquals(
+            InactiveSessionCleanupResult(deleted = 1, failed = 1),
+            repository.deleteInactiveSessions(first.pcId, listOf(first.id, second.id), {}, {}),
+        )
+        calls.clear()
+        cancelCaller = true
+        val job = launch { repository.deleteInactiveSessions(first.pcId, listOf(first.id, second.id), {}, {}) }
+        job.join()
+        assertTrue(job.isCancelled)
+        assertEquals(listOf(first.id), calls)
+    }
+
+    private fun cleanupSnapshot(sessions: List<SessionSummary>): ProductSnapshot {
+        val pc = PcSummary(sessions.first().pcId, UUID.randomUUID(), "PC", "1", remoteRoutingEnabled = true,
+            online = true, lastSeenAt = null,
+            capabilities = setOf(PcCapabilityIds.HOST_HISTORY_V1, PcCapabilityIds.HOST_SESSION_CATALOG_V1))
+        return ProductSnapshot(
+            signedIn = true, connectionState = ProductConnectionState.CONNECTED, pcs = listOf(pc), sessions = sessions,
+            devices = listOf(DeviceSummary(pc.deviceId, DeviceType.WINDOWS_PC, "PC", "key", ByteArray(32),
+                trustState = DeviceTrustState.TRUSTED, createdAt = Instant.EPOCH)),
+        )
+    }
+
     @Test
     fun hostHistoryDeleteRunsAgentAckThenRestThenLocalCleanup() = runBlocking {
         val calls = mutableListOf<String>()

@@ -79,6 +79,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
@@ -1098,6 +1099,7 @@ fun ProductApp(
     val terminalInputResumeRegistry = remember { TerminalInputResumeRegistry() }
     var pendingStopSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
     var pendingDeleteSessionId by remember { mutableStateOf<java.util.UUID?>(null) }
+    var pendingInactiveCleanup by remember { mutableStateOf<Pair<PcSummary, List<java.util.UUID>>?>(null) }
     var refreshInFlight by remember { mutableStateOf(false) }
     var signOutConfirmation by remember { mutableStateOf(false) }
     var agentUpdateDialog by remember { mutableStateOf<AgentUpdateDialogState?>(null) }
@@ -1687,6 +1689,10 @@ fun ProductApp(
                     terminalInputResumeRegistry = terminalInputResumeRegistry,
                     onStopSessionRequested = { pendingStopSessionId = it },
                     onDeleteSessionRequested = { pendingDeleteSessionId = it },
+                    onDeleteInactiveSessionsRequested = { pc ->
+                        val ids = repository.snapshot.value.inactiveSessionIds(pc.id)
+                        if (ids.isNotEmpty()) pendingInactiveCleanup = pc to ids
+                    },
                     directRoutingPolicy = snapshot.directRoutingPolicy,
                     terminalPreferences = terminalPreferences,
                     onTerminalPreferencesChanged = onTerminalPreferencesChanged,
@@ -1760,6 +1766,15 @@ fun ProductApp(
                     }
                 }
             },
+        )
+    }
+    pendingInactiveCleanup?.let { (pc, ids) ->
+        InactiveSessionCleanupDialog(
+            pc = pc,
+            sessionIds = ids,
+            repository = repository,
+            onDeleted = ::removeSessionTabState,
+            onDismiss = { pendingInactiveCleanup = null },
         )
     }
     if (deletableSessionId != null) {
@@ -3179,6 +3194,7 @@ private fun ProductContent(
     terminalInputResumeRegistry: TerminalInputResumeRegistry,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
+    onDeleteInactiveSessionsRequested: (PcSummary) -> Unit,
     directRoutingPolicy: DirectRoutingPolicy,
     onReplay: (HistoryEntry) -> Unit,
 ) {
@@ -3211,6 +3227,7 @@ private fun ProductContent(
                     onBrowsePc = onBrowsePc,
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
+                    onDeleteInactiveSessionsRequested = onDeleteInactiveSessionsRequested,
                 )
             }
         }
@@ -3424,6 +3441,7 @@ private fun DevicesPage(
     onBrowsePc: (PcSummary) -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
+    onDeleteInactiveSessionsRequested: (PcSummary) -> Unit,
 ) {
     PrimaryHomeHeader(onOpenDownloads = onOpenDownloads)
     val pcs = visibleOnlineWindowsPcs(snapshot)
@@ -3458,6 +3476,8 @@ private fun DevicesPage(
                     },
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
+                    onDeleteInactiveSessions = { onDeleteInactiveSessionsRequested(pc) },
+                    inactiveSessionCount = snapshot.inactiveSessionIds(pc.id).size,
                 )
                 snapshot.pcSessionCatalogErrors[pc.id]?.let { error ->
                     Text(
@@ -3672,6 +3692,8 @@ private fun PcRow(
     onBrowseFiles: (() -> Unit)? = null,
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
+    onDeleteInactiveSessions: (() -> Unit)? = null,
+    inactiveSessionCount: Int = 0,
 ) {
     var deviceMenuExpanded by remember { mutableStateOf(false) }
     val deviceMenuDescription = stringResource(R.string.device_menu_accessibility)
@@ -3693,7 +3715,7 @@ private fun PcRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .combinedClickable(
-                        enabled = onToggleExpanded != null || onBrowseFiles != null,
+                        enabled = onToggleExpanded != null || onBrowseFiles != null || onDeleteInactiveSessions != null,
                         onClick = {
                             if (sessions.isNotEmpty()) onToggleExpanded?.invoke()
                         },
@@ -3791,6 +3813,17 @@ private fun PcRow(
                             onClick = {
                                 deviceMenuExpanded = false
                                 browse()
+                            },
+                        )
+                    }
+                    onDeleteInactiveSessions?.let { cleanup ->
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.action_close_inactive_sessions, inactiveSessionCount)) },
+                            leadingIcon = { Icon(Icons.Filled.DeleteSweep, contentDescription = null) },
+                            enabled = inactiveSessionCount > 0,
+                            onClick = {
+                                deviceMenuExpanded = false
+                                cleanup()
                             },
                         )
                     }
@@ -7865,6 +7898,66 @@ private fun PasteConfirmationDialog(onDismiss: () -> Unit, onConfirm: (String) -
         },
         dismissButton = { TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.action_cancel)) } },
     )
+}
+
+@Composable
+private fun InactiveSessionCleanupDialog(
+    pc: PcSummary,
+    sessionIds: List<java.util.UUID>,
+    repository: ProductRepository,
+    onDeleted: (java.util.UUID) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var started by remember { mutableStateOf(false) }
+    var finished by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf(InactiveSessionCleanupResult()) }
+    var job by remember { mutableStateOf<Job?>(null) }
+    if (!started) {
+        ConfirmActionDialog(
+            title = stringResource(R.string.confirm_close_inactive_sessions_title),
+            message = stringResource(R.string.confirm_close_inactive_sessions_copy, pc.name, sessionIds.size),
+            confirmLabel = stringResource(R.string.confirm_delete_session),
+            icon = Icons.Filled.DeleteSweep,
+            onDismiss = onDismiss,
+            onConfirm = {
+                if (!started) {
+                    started = true
+                    job = scope.launch {
+                        try {
+                            repository.deleteInactiveSessions(pc.id, sessionIds, onDeleted) { result = it }
+                        } finally {
+                            result = result.copy(skipped = result.skipped + sessionIds.size - result.processed)
+                            finished = true
+                        }
+                    }
+                }
+            },
+        )
+    } else {
+        AlertDialog(
+            onDismissRequest = { if (finished) onDismiss() },
+            title = { Text(stringResource(R.string.confirm_close_inactive_sessions_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (!finished) {
+                        LinearProgressIndicator(
+                            progress = { result.processed.toFloat() / sessionIds.size },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(stringResource(R.string.close_inactive_sessions_progress, result.processed, sessionIds.size))
+                    } else {
+                        Text(stringResource(R.string.close_inactive_sessions_result, result.deleted, result.failed, result.skipped))
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { if (finished) onDismiss() else job?.cancel() }) {
+                    Text(stringResource(if (finished) R.string.action_close else R.string.action_cancel))
+                }
+            },
+        )
+    }
 }
 
 @Composable
