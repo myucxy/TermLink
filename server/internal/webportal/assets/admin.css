@@ -576,6 +576,23 @@ html {
   font: 600 11px/1.4 "Cascadia Mono", Consolas, monospace;
 }
 
+/* Long runtime-setting values (STUN lists, appship URLs) must wrap inside
+   their cell instead of stretching the table past the panel edge. */
+.admin-table td code {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  white-space: normal;
+}
+
+.admin-table td form input[type="text"] {
+  width: min(220px, 100%);
+  min-width: 0;
+}
+
+.admin-table td[data-label="来源"] {
+  white-space: nowrap;
+}
+
 .empty-cell {
   height: 120px;
   color: var(--text-3) !important;
