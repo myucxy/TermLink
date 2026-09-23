@@ -25,10 +25,27 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 ## Release record
 
-Production build and publication are pending. Record the exact committed source,
-APK hash/size/signer, verification results and AppShip identifiers after success.
+Source commit: `994ed74bafb6799a9745fbe8329890c30d47a4b2` (pushed to
+`origin/main` before the production build). Production APK verification passed:
+
+- `TermLink-Android-0.2.56-112.apk`
+- 38,125,926 bytes
+- SHA-256 `3e619e65af8001bc606c7e10f579b8020e09adf3702c07340899f6ea769481e0`
+- APK Signature Scheme v2, one signer
+
 Expected Android signer SHA-256:
 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
+
+AppShip stable publication succeeded:
+
+- application `termlink-android`
+- release `61729adf-a3b8-4cdd-8a43-5a14bf9474c2`
+- artifact `a078720c-7d37-4d03-a315-002e0c98382e`
+- artifact status `ready`, release status `published`
+
+The public update API returns `optional` for build 111 and `no_update` for
+build 112. Docker and Windows were not rebuilt or published for this Android
+only change.
 
 ## Recovery
 
