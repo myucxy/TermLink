@@ -34,6 +34,8 @@ import okhttp3.OkHttpClient
 /** Server-authoritative Direct routing policy exposed to the product UI. */
 enum class ProductionDirectRoutingPolicy {
     UNKNOWN,
+    FAILED,
+    UNAVAILABLE,
     AUTO,
     RELAY_ONLY,
 }
@@ -243,8 +245,14 @@ class ProductionDirectDeviceCoordinator(
                     }
                     // An unknown server state blocks new promotions without
                     // tearing down an already committed Direct path.
-                    ProductionDirectRoutingPermission.UNKNOWN -> {
-                        mutableRoutingPolicy.value = ProductionDirectRoutingPolicy.UNKNOWN
+                    ProductionDirectRoutingPermission.UNKNOWN,
+                    ProductionDirectRoutingPermission.FAILED,
+                    ProductionDirectRoutingPermission.UNAVAILABLE -> {
+                        mutableRoutingPolicy.value = when (permission) {
+                            ProductionDirectRoutingPermission.FAILED -> ProductionDirectRoutingPolicy.FAILED
+                            ProductionDirectRoutingPermission.UNAVAILABLE -> ProductionDirectRoutingPolicy.UNAVAILABLE
+                            else -> ProductionDirectRoutingPolicy.UNKNOWN
+                        }
                         synchronized(networkLock) {
                             serverRoutingPermitted.set(false)
                             networkScopedGate = null
@@ -256,11 +264,16 @@ class ProductionDirectDeviceCoordinator(
         routingRefreshJob = scope.launch(start = CoroutineStart.LAZY) {
             while (!closed.get()) {
                 try {
-                    dispatcher.refreshRoutingPermission()
+                    val permission = dispatcher.refreshRoutingPermission()
+                    if (permission != ProductionDirectRoutingPermission.FAILED &&
+                        dispatcher.status.value == ProductionDirectSignalDispatcherStatus.IDLE && dispatcher.start()) {
+                        shadowRuntime.start()
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Throwable) {
-                    // refreshRoutingPermission publishes UNKNOWN for transport failures;
+                    mutableRoutingPolicy.value = ProductionDirectRoutingPolicy.FAILED
+                    // A failed refresh blocks new promotions;
                     // the Relay and committed Direct peers remain independently owned.
                 }
                 delay(ROUTING_PERMISSION_REFRESH_MILLIS)
@@ -278,17 +291,15 @@ class ProductionDirectDeviceCoordinator(
     }
 
     fun start(): Boolean {
-        if (!featureGates.shadowDiscoveryEnabled || closed.get() ||
-            !started.compareAndSet(false, true)
-        ) return false
-        if (!dispatcher.start()) {
-            started.set(false)
+        if (!featureGates.shadowDiscoveryEnabled) {
+            mutableRoutingPolicy.value = ProductionDirectRoutingPolicy.UNAVAILABLE
             return false
         }
+        if (closed.get() ||
+            !started.compareAndSet(false, true)
+        ) return false
         routingRefreshJob.start()
-        val shadowStarted = shadowRuntime.start()
-        if (!shadowStarted) started.set(false)
-        return shadowStarted
+        return true
     }
 
     fun replaceAuthorizedPeers(

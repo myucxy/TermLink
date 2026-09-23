@@ -74,7 +74,7 @@ type API struct {
 	// registration email-code endpoint (DB override, environment fallback).
 	// A nil predicate keeps the feature available.
 	RegistrationRecoveryEnabled func(context.Context) bool
-	Registration          interface {
+	Registration                interface {
 		Register(context.Context, auth.DirectRegistrationInput) error
 		RegisterAttempt(context.Context, uuid.UUID, auth.DirectRegistrationInput) error
 	}
@@ -159,6 +159,7 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("POST /v1/devices/{id}/revoke", a.revokeDevice)
 	trusted.HandleFunc("GET /v1/pcs", a.listPCs)
 	trusted.HandleFunc("PUT /v1/pcs/{id}", a.upsertPC)
+	trusted.HandleFunc("PUT /v1/pcs/{id}/session-snapshot", a.replaceSessionSnapshot)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations", a.createFileOperation)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations/claim", a.claimFileOperation)
 	trusted.HandleFunc("GET /v1/pcs/{pcId}/file-operations/{operationId}", a.getFileOperation)
@@ -1349,12 +1350,8 @@ func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
 	if a.Presence != nil {
 		filtered := items[:0]
 		for index := range items {
-			seen, online := a.Presence.Online(p.UserID, items[index].PCDeviceID)
-			items[index].Online = online && items[index].State == "RUNNING"
-			if online {
-				seen = seen.UTC()
-				items[index].LastSeenAt = &seen
-			}
+			_, online := a.Presence.Online(p.UserID, items[index].PCDeviceID)
+			items[index].Online = online && items[index].Online
 			if includeEnded || items[index].Online {
 				filtered = append(filtered, items[index])
 			}

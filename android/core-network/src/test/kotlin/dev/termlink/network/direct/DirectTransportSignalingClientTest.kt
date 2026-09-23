@@ -618,6 +618,49 @@ class DirectTransportSignalingClientTest {
     }
 
     @Test
+    fun welcomeValidationUsesCapabilitiesAdvertisedByThisSocket() = runBlocking {
+        val server = MockWebServer()
+        val signing = TicketSigningFixture()
+        val hello = CompletableDeferred<Pair<WebSocket, String>>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                DirectTransportSignalingClient.CONFIG_PATH -> MockResponse()
+                    .setResponseCode(200)
+                    .setBody(configJson(signing, multipair = true))
+                DirectTransportSignalingClient.SIGNAL_PATH -> MockResponse().withWebSocketUpgrade(
+                    object : WebSocketListener() {
+                        override fun onMessage(webSocket: WebSocket, text: String) {
+                            hello.complete(webSocket to text)
+                        }
+                        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                            webSocket.close(code, reason)
+                        }
+                    },
+                )
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        server.start()
+        val fixture = fixture(server, enabled = true, multipair = true, handshakeTimeoutMillis = 5_000)
+        try {
+            assertTrue(fixture.client.startSignaling())
+            val (socket, helloText) = withTimeout(5_000) { hello.await() }
+            assertFalse(helloText.contains(DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY))
+            assertTrue(fixture.client.fetchConfig() is DirectSignalingCallResult.Success)
+            socket.send(validWelcome(multipair = false))
+            assertTrue(withTimeout(5_000) {
+                fixture.client.state.first {
+                    it is DirectTransportSignalingState.Connected || it is DirectTransportSignalingState.Fault
+                }
+            } is DirectTransportSignalingState.Connected)
+        } finally {
+            fixture.close()
+            server.shutdown()
+            signing.destroy()
+        }
+    }
+
+    @Test
     fun negotiatedMultipairSocketDeliversInboundTypesElevenToFourteen() = runBlocking {
         val server = MockWebServer()
         val signing = TicketSigningFixture()
@@ -1237,6 +1280,7 @@ class DirectTransportSignalingClientTest {
         multipair: Boolean = false,
         directData: Boolean = false,
         httpClient: OkHttpClient = OkHttpClient(),
+        handshakeTimeoutMillis: Long = 100,
     ): ClientFixture {
         val identity = DeviceIdentity.generate()
         val client = DirectTransportSignalingClient(
@@ -1254,7 +1298,7 @@ class DirectTransportSignalingClientTest {
             random = FixedSecureRandom(),
             retryDelay = retryDelay,
             retryJitter = DirectSignalingRetryJitter { 0 },
-            signalHandshakeTimeoutMillis = 100,
+            signalHandshakeTimeoutMillis = handshakeTimeoutMillis,
             allowCleartextForLocalTest = true,
         )
         return ClientFixture(client, identity)

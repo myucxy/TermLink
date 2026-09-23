@@ -289,7 +289,7 @@ namespace TermLink.Agent
         }
     }
 
-    internal sealed class ProductionAgentRuntime : IDisposable
+    internal sealed partial class ProductionAgentRuntime : IDisposable
     {
         private static readonly TimeSpan SubscriberIdleTimeout = TimeSpan.FromSeconds(45);
         private static readonly TimeSpan AuthorityCacheDuration = TimeSpan.FromSeconds(30);
@@ -2579,7 +2579,8 @@ namespace TermLink.Agent
                 "file_operation_name_filter_v1",
                 "terminal_commands_v1",
                 "remote_agent_update_v1",
-                "host_history_v1"
+                "host_history_v1",
+                "host_session_catalog_v1"
             };
             if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v2");
             var normalizedCommands = terminalCommands.Select(command => new
@@ -4515,6 +4516,7 @@ namespace TermLink.Agent
             try
             {
                 await UpsertPCAsync(token).ConfigureAwait(false);
+                await PublishSessionSnapshotAsync(token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!token.IsCancellationRequested)
             {
@@ -4538,96 +4540,101 @@ namespace TermLink.Agent
             await state.RestUpsertGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                SessionPublicationSnapshot snapshot;
-                var attemptedAt = DateTime.UtcNow;
-                lock (state.Sync)
-                {
-                    if (!state.RestDirty || !state.HasSize) return;
-                    if (!force && attemptedAt - state.LastRestAttemptUtc < MetadataUpsertCadence) return;
-                    state.LastRestAttemptUtc = attemptedAt;
-                    snapshot = candidate != null &&
-                        candidate.LastEventSequence == state.LastEventSequence &&
-                        candidate.RestRevision == state.RestRevision
-                        ? candidate
-                        : CapturePublicationSnapshot(candidate == null ? Guid.Empty : candidate.SessionId, state);
-                }
-                if (snapshot.SessionId == Guid.Empty) return;
-                var titleAuthorityAvailable = true;
+                await metadataSnapshotGate.WaitAsync(token).ConfigureAwait(false);
                 try
                 {
-                    await RefreshAuthorizedRecipientsAsync(false, token).ConfigureAwait(false);
-                }
-                catch (Exception error) when (
-                    error is HttpRequestException ||
-                    error is IOException ||
-                    error is JsonException ||
-                    error is ProductionServerResponseException serverError &&
-                        serverError.StatusCode.HasValue && IsTransientStatus(serverError.StatusCode.Value))
-                {
-                    // Session presence and terminal dimensions remain useful
-                    // while the recipient directory is temporarily unavailable.
-                    // Retain the last encrypted title on the Server by omitting
-                    // title_cipher from this heartbeat.
-                    titleAuthorityAvailable = false;
-                }
-                byte[] titleCipher = null;
-                byte[] body = null;
-                try
-                {
-                    // The authority refresh may have changed the recipient
-                    // generation or local terminal frames may have advanced
-                    // while REST was in flight. Capture one current metadata
-                    // revision before sealing, so an older completion can never
-                    // clear a newer title/directory/reconnect publication.
+                    SessionPublicationSnapshot snapshot;
+                    var attemptedAt = DateTime.UtcNow;
                     lock (state.Sync)
                     {
-                        snapshot = CapturePublicationSnapshot(snapshot.SessionId, state);
-                        LimitSessionOutputToTailFirstSnapshotLocked(state, snapshot);
+                        if (!state.RestDirty || !state.HasSize) return;
+                        if (!force && attemptedAt - state.LastRestAttemptUtc < MetadataUpsertCadence) return;
+                        state.LastRestAttemptUtc = attemptedAt;
+                        snapshot = candidate != null &&
+                            candidate.LastEventSequence == state.LastEventSequence &&
+                            candidate.RestRevision == state.RestRevision
+                            ? candidate
+                            : CapturePublicationSnapshot(candidate == null ? Guid.Empty : candidate.SessionId, state);
                     }
-                    titleCipher = titleAuthorityAvailable
-                        ? await BuildSessionTitleCipherAsync(snapshot, token).ConfigureAwait(false)
-                        : Array.Empty<byte>();
-                    snapshot.TitleCipher = titleCipher;
-                    body = BuildSessionUpsertBody(config.PcId, snapshot);
-                }
-                finally
-                {
-                    snapshot.TitleCipher = null;
-                    if (titleCipher != null) CryptographicOperations.ZeroMemory(titleCipher);
-                }
-                try
-                {
-                    var path = "/v1/sessions/" + snapshot.SessionId.ToString("D");
-                    var idempotencyKey = SessionUpsertIdempotencyKey(
-                        snapshot.SessionId,
-                        snapshot.LastEventSequence,
-                        body);
-                    for (var attempt = 0; ; attempt++)
+                    if (snapshot.SessionId == Guid.Empty) return;
+                    var titleAuthorityAvailable = true;
+                    try
                     {
-                        try
-                        {
-                            using var response = await SendAsync(
-                                HttpMethod.Put,
-                                path,
-                                body,
-                                true,
-                                idempotencyKey,
-                                token).ConfigureAwait(false);
-                            if (response.IsSuccessStatusCode) break;
-                            if (attempt >= 2 || !IsTransientStatus(response.StatusCode))
-                                await EnsureServerSuccessAsync(response, "SESSION_UPSERT", token).ConfigureAwait(false);
-                        }
-                        catch (HttpRequestException) when (attempt < 2)
-                        {
-                        }
-                        await Task.Delay(TimeSpan.FromMilliseconds(100 * (1 << attempt)), token).ConfigureAwait(false);
+                        await RefreshAuthorizedRecipientsAsync(false, token).ConfigureAwait(false);
                     }
-                    ConfirmSessionUpsert(state, snapshot, DateTime.UtcNow);
+                    catch (Exception error) when (
+                        error is HttpRequestException ||
+                        error is IOException ||
+                        error is JsonException ||
+                        error is ProductionServerResponseException serverError &&
+                            serverError.StatusCode.HasValue && IsTransientStatus(serverError.StatusCode.Value))
+                    {
+                        // Session presence and terminal dimensions remain useful
+                        // while the recipient directory is temporarily unavailable.
+                        // Retain the last encrypted title on the Server by omitting
+                        // title_cipher from this heartbeat.
+                        titleAuthorityAvailable = false;
+                    }
+                    byte[] titleCipher = null;
+                    byte[] body = null;
+                    try
+                    {
+                        // The authority refresh may have changed the recipient
+                        // generation or local terminal frames may have advanced
+                        // while REST was in flight. Capture one current metadata
+                        // revision before sealing, so an older completion can never
+                        // clear a newer title/directory/reconnect publication.
+                        lock (state.Sync)
+                        {
+                            snapshot = CapturePublicationSnapshot(snapshot.SessionId, state);
+                            LimitSessionOutputToTailFirstSnapshotLocked(state, snapshot);
+                        }
+                        titleCipher = titleAuthorityAvailable
+                            ? await BuildSessionTitleCipherAsync(snapshot, token).ConfigureAwait(false)
+                            : Array.Empty<byte>();
+                        snapshot.TitleCipher = titleCipher;
+                        body = BuildSessionUpsertBody(config.PcId, snapshot);
+                    }
+                    finally
+                    {
+                        snapshot.TitleCipher = null;
+                        if (titleCipher != null) CryptographicOperations.ZeroMemory(titleCipher);
+                    }
+                    try
+                    {
+                        var path = "/v1/sessions/" + snapshot.SessionId.ToString("D");
+                        var idempotencyKey = SessionUpsertIdempotencyKey(
+                            snapshot.SessionId,
+                            snapshot.LastEventSequence,
+                            body);
+                        for (var attempt = 0; ; attempt++)
+                        {
+                            try
+                            {
+                                using var response = await SendAsync(
+                                    HttpMethod.Put,
+                                    path,
+                                    body,
+                                    true,
+                                    idempotencyKey,
+                                    token).ConfigureAwait(false);
+                                if (response.IsSuccessStatusCode) break;
+                                if (attempt >= 2 || !IsTransientStatus(response.StatusCode))
+                                    await EnsureServerSuccessAsync(response, "SESSION_UPSERT", token).ConfigureAwait(false);
+                            }
+                            catch (HttpRequestException) when (attempt < 2)
+                            {
+                            }
+                            await Task.Delay(TimeSpan.FromMilliseconds(100 * (1 << attempt)), token).ConfigureAwait(false);
+                        }
+                        ConfirmSessionUpsert(state, snapshot, DateTime.UtcNow);
+                    }
+                    finally
+                    {
+                        if (body != null) CryptographicOperations.ZeroMemory(body);
+                    }
                 }
-                finally
-                {
-                    if (body != null) CryptographicOperations.ZeroMemory(body);
-                }
+                finally { metadataSnapshotGate.Release(); }
             }
             finally { state.RestUpsertGate.Release(); }
         }
@@ -4948,7 +4955,13 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Envelope recipient mismatch.");
             if (envelope.Seq == 0 || envelope.Nonce.Length != 12 || envelope.Ciphertext.Length < 16)
                 throw new InvalidDataException("Located session Envelope metadata is invalid.");
-            if (envelope.MessageType == MessageType.Subscribe)
+            if (envelope.MessageType == MessageType.SessionCatalogRequest)
+            {
+                if (sessionId != config.PcId || envelope.Ack != 0 || registry == null || !registry.RemoteAccessEnabled)
+                    throw new InvalidDataException("Catalog route is invalid.");
+                subscriber = await GetSubscriberAsync(sessionId, senderId, token, true).ConfigureAwait(false);
+            }
+            else if (envelope.MessageType == MessageType.Subscribe)
             {
                 subscriber = await GetSubscriberAsync(sessionId, senderId, token, true).ConfigureAwait(false);
             }
@@ -4992,6 +5005,20 @@ namespace TermLink.Agent
                 plaintext = SessionCrypto.Decrypt(sessionKey, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), envelope.Ciphertext.ToByteArray());
                 ObserveAndroidEnvelope(senderId, sessionId, envelope.Seq);
                 TouchSubscriber(subscriber);
+                if (envelope.MessageType == MessageType.SessionCatalogRequest)
+                {
+                    var request = SessionCatalogRequestPayload.Parser.ParseFrom(plaintext);
+                    if (GuidFromBytes(request.RequestId.Span) == Guid.Empty)
+                        throw new InvalidDataException("Catalog request ID is invalid.");
+                    var responseBytes = BuildSessionCatalog(request.RequestId).ToByteArray();
+                    try
+                    {
+                        await SendSessionControlEnvelopeAsync(active, sessionId, subscriber,
+                            envelope.Seq, MessageType.SessionCatalogResponse, responseBytes, token).ConfigureAwait(false);
+                    }
+                    finally { CryptographicOperations.ZeroMemory(responseBytes); }
+                    return;
+                }
                 if (envelope.MessageType != MessageType.Subscribe &&
                     envelope.MessageType != MessageType.OutputAck &&
                     envelope.MessageType != MessageType.FlowControl &&

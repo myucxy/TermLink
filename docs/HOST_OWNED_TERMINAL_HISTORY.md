@@ -9,8 +9,9 @@ direct/P2P transports carry the same opaque protocol messages; the TermLink
 server does not inspect or retain terminal history.
 
 This design intentionally makes history unavailable while the Windows machine
-is offline. Android may keep renderer state needed by an already-open screen,
-but that cache is not an independent history authority.
+is offline. Android hides terminal content and releases live/history renderers
+when the owning Windows catalog is unavailable; cached content is not an
+independent history authority. See [host session catalog](HOST_SESSION_CATALOG.md).
 
 ## Storage and lifecycle
 

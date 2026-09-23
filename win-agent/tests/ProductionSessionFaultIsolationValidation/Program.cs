@@ -5,6 +5,10 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
+using Google.Protobuf;
+using TermLink.LocalIpc;
+using TermLink.Protocol.Realtime.V1;
 using TermLink.Agent;
 
 namespace TermLink.ProductionSessionFaultIsolation.Validation
@@ -17,6 +21,7 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
             {
                 await ValidateTwoSessionIsolationAsync().ConfigureAwait(false);
                 ValidateExactRouteRetirement();
+                ValidateRetiredHostCatalog();
                 await ValidateConnectionFatalSignalsEscapeAsync().ConfigureAwait(false);
                 Console.WriteLine("Production session fault isolation validation passed.");
                 return 0;
@@ -26,6 +31,51 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 Console.Error.WriteLine(error);
                 return 1;
             }
+        }
+
+        private static void ValidateRetiredHostCatalog()
+        {
+            var root = Path.Combine(Path.GetTempPath(), "termlink-catalog-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            try
+            {
+                var sessionId = Guid.NewGuid();
+                var registrations = new DpapiRegistryRegistrationStore(Path.Combine(root, "registrations.dpapi"));
+                registrations.Upsert(new SessionRegistration(sessionId, "catalog-test", RandomNumberGenerator.GetBytes(32),
+                    int.MaxValue, ManagedShellType.PowerShell7, DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).AsRetired());
+                using var registry = new SessionRegistry(root, 1200, 1024 * 1024, 20);
+                Require(registry.GetCatalogSummaries().Single().Lifecycle == SessionAgentLifecycle.HostLost,
+                    "A retired registration became a live process after restart.");
+                var history = new ProductionTerminalHistoryStore(Path.Combine(root, "history"), Guid.NewGuid());
+                history.AppendCommittedFrame(new LocalFrame(LocalFrameType.Lifecycle, sessionId, 1,
+                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Running, 0)));
+                history.AppendCommittedFrame(new LocalFrame(LocalFrameType.Output, sessionId, 2, new byte[] { 65 }));
+                const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                var type = typeof(ProductionAgentRuntime);
+                var runtime = RuntimeHelpers.GetUninitializedObject(type);
+                foreach (var name in new[] { "catalogSync", "catalogEntries", "catalogCursors", "destroyedHistorySessions" })
+                {
+                    var field = type.GetField(name, flags);
+                    field.SetValue(runtime, Activator.CreateInstance(field.FieldType));
+                }
+                type.GetField("catalogHostInstance", flags).SetValue(runtime, Guid.NewGuid());
+                type.GetField("registry", flags).SetValue(runtime, registry);
+                type.GetField("terminalHistoryStore", flags).SetValue(runtime, history);
+                var request = ByteString.CopyFrom(Guid.NewGuid().ToByteArray());
+                var build = type.GetMethod("BuildSessionCatalog", flags);
+                var catalog = (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
+                Require(catalog.RequestId == request && catalog.Sessions.Count == 1 &&
+                    !catalog.Sessions[0].ProcessAlive && catalog.Sessions[0].Lifecycle == "INTERRUPTED" &&
+                    catalog.Sessions[0].LastOutputSeq == 2,
+                    "Retained RUNNING history overrode retired process authority.");
+                history.AppendCommittedFrame(new LocalFrame(LocalFrameType.Lifecycle, sessionId, 3,
+                    LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0)));
+                catalog = (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
+                Require(catalog.Sessions[0].Lifecycle == "EXITED", "Catalog did not observe the final local lifecycle.");
+                Require(ProductionAgentRuntime.CatalogLifecycle(true, "INTERRUPTED") == "RUNNING",
+                    "Connected host was not reported running.");
+            }
+            finally { Directory.Delete(root, recursive: true); }
         }
 
         private static async Task ValidateTwoSessionIsolationAsync()

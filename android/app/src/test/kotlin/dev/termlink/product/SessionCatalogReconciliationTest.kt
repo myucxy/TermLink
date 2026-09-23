@@ -202,15 +202,12 @@ class SessionCatalogReconciliationTest {
         )
         val titles = mapOf(sessionA to "alpha", sessionB to "beta")
 
-        assertEquals(SessionState.RUNNING, a.state)
+        assertEquals(SessionState.INTERRUPTED, a.state)
         assertTrue(a.online)
         assertEquals(132, a.columns)
         assertEquals(43, a.rows)
         assertEquals(SessionState.INTERRUPTED, b.state)
-        // An explicit interruption makes the opened renderer read-only, but
-        // retaining online=true here keeps its detail surface visible until
-        // the authoritative catalog reports EXITED or deletion.
-        assertTrue(b.online)
+        assertFalse(b.online)
         assertEquals(91, b.columns)
         assertEquals(28, b.rows)
         assertEquals("alpha", displaySessionTitle(a, titles[a.id]))
@@ -233,19 +230,19 @@ class SessionCatalogReconciliationTest {
     }
 
     @Test
-    fun transientOfflineCatalogEntryRetainsOpenedRendererButExitedEntryDoesNot() {
+    fun offlineCatalogCannotRetainLiveOrHistoryRenderers() {
         val offlineRunning = session(sessionA, state = SessionState.RUNNING).copy(online = false)
         val exited = session(sessionB, state = SessionState.EXITED).copy(online = false)
 
         assertEquals(
-            setOf(sessionA),
+            emptySet<UUID>(),
             retainedLiveSessionIds(listOf(offlineRunning, exited), setOf(pcId)),
         )
         assertTrue(retainedLiveSessionIds(listOf(offlineRunning), emptySet()).isEmpty())
 
         val hostHistoryPc = pc(online = false).copy(capabilities = setOf(PcCapabilityIds.HOST_HISTORY_V1))
         assertEquals(
-            setOf(sessionB),
+            emptySet<UUID>(),
             retainedReadOnlySessionIds(listOf(offlineRunning, exited), listOf(hostHistoryPc), setOf(pcId)),
         )
         assertTrue(

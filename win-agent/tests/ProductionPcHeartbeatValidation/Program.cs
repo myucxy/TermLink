@@ -566,6 +566,32 @@ internal static class Program
                     "The fail-closed stable-machine request omitted its correlation identity.");
             }
 
+            var catalogRoot = Path.Combine(Path.GetTempPath(), "termlink-catalog-heartbeat-" + Guid.NewGuid().ToString("N"));
+            var registryType = agentAssembly.GetType("TermLink.Agent.SessionRegistry", true);
+            var catalogRegistry = (IDisposable)Activator.CreateInstance(registryType,
+                new object[] { catalogRoot, 1200, 1024L * 1024, 20, null, null });
+            var registryField = Field(runtimeType, "registry");
+            registryField.SetValue(runtime, catalogRegistry);
+            try
+            {
+                var publish = Method(runtimeType, "PublishSessionSnapshotAsync");
+                await InvokeTask(publish, runtime, CancellationToken.None);
+                await InvokeTask(publish, runtime, CancellationToken.None);
+                var snapshots = handler.Requests.Where(value => value.Path.EndsWith("/session-snapshot", StringComparison.Ordinal)).ToArray();
+                Require(snapshots.Length == 2 && snapshots[0].IdempotencyKey != snapshots[1].IdempotencyKey,
+                    "Idle session observations reused an idempotency key and could not refresh freshness.");
+                using var json = JsonDocument.Parse(snapshots[0].Body);
+                Require(json.RootElement.EnumerateObject().Count() == 1 &&
+                    json.RootElement.GetProperty("sessions").ValueKind == JsonValueKind.Array,
+                    "The statistical snapshot must carry a complete session array only.");
+            }
+            finally
+            {
+                registryField.SetValue(runtime, null);
+                catalogRegistry.Dispose();
+                Directory.Delete(catalogRoot, recursive: true);
+            }
+
             Console.WriteLine("Production PC heartbeat validation passed.");
             return 0;
         }

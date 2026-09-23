@@ -42,10 +42,11 @@ import okhttp3.OkHttpClient
 class ProductContractsTest {
     @Test
     fun directDataPlaneHelloCapabilitiesAreOptionalAndGatedTogether() {
-        assertEquals(setOf("host_history_v1"), productRealtimeOptionalCapabilities(false))
+        assertEquals(setOf("host_history_v1", "host_session_catalog_v1"), productRealtimeOptionalCapabilities(false))
         assertEquals(
             setOf(
                 "host_history_v1",
+                "host_session_catalog_v1",
                 "direct_session_cutover_v1",
                 "direct_transport_data_v1",
             ),
@@ -74,6 +75,8 @@ class ProductContractsTest {
         val deviceId = UUID.randomUUID()
         val pcId = UUID.randomUUID()
         assertEquals(DirectRoutingPolicy.AUTO, ProductionDirectRoutingPolicy.AUTO.toProductPolicy())
+        assertEquals(DirectRoutingPolicy.FAILED, ProductionDirectRoutingPolicy.FAILED.toProductPolicy())
+        assertEquals(DirectRoutingPolicy.UNAVAILABLE, ProductionDirectRoutingPolicy.UNAVAILABLE.toProductPolicy())
         assertEquals(
             DirectRoutingPolicy.RELAY_ONLY,
             ProductionDirectRoutingPolicy.RELAY_ONLY.toProductPolicy(),
@@ -259,15 +262,6 @@ class ProductContractsTest {
     fun durableNonOutputEventExtendsTheHostHistoryRestoreTarget() {
         assertEquals(46uL, restorableSessionEventTail(45uL, 46uL))
         assertEquals(46uL, restorableSessionEventTail(46uL, 45uL))
-    }
-
-    @Test
-    fun authoritativeTailLookupIncludesEndedSessions() {
-        val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
-        assertEquals(
-            "/v1/pcs/$pcId/sessions?include_ended=true",
-            authoritativeSessionCatalogPath(pcId),
-        )
     }
 
     @Test

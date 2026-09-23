@@ -1539,7 +1539,7 @@ fun ProductApp(
                     onOpenSession = { sessionId ->
                         runSessionOperation {
                             val selected = repository.snapshot.value.sessions.firstOrNull { it.id == sessionId }
-                            if (selected?.state == SessionState.EXITED) {
+                            if (selected?.state != SessionState.RUNNING) {
                                 repository.openSession(sessionId)
                             } else {
                                 repository.requestControl(sessionId)
@@ -3459,6 +3459,13 @@ private fun DevicesPage(
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                 )
+                snapshot.pcSessionCatalogErrors[pc.id]?.let { error ->
+                    Text(
+                        stringResource(if (error == "UPGRADE_REQUIRED") R.string.pc_catalog_upgrade_required else R.string.pc_catalog_unavailable),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -3877,8 +3884,8 @@ internal fun isSessionTabOpenable(
     hasReadOnlyRenderer: Boolean = false,
 ): Boolean = when {
     session == null -> false
-    session.state != SessionState.EXITED -> session.online
-    hasReadOnlyRenderer -> true
+    pc?.online == false -> false
+    session.state == SessionState.RUNNING -> session.online
     else -> pc?.online == true && PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities
 }
 
@@ -3927,7 +3934,10 @@ private fun SessionsPage(
         runCatching { java.util.UUID.fromString(value) }.getOrNull()
     }
     val opened = openedSessionIds.toHashSet()
-    val openedSessions = snapshot.sessions.filter { it.id.toString() in opened }
+    val openedSessions = snapshot.sessions.filter {
+        it.id.toString() in opened && it.pcId !in snapshot.pcSessionCatalogErrors &&
+            snapshot.pcs.any { pc -> pc.id == it.pcId && pc.online }
+    }
     val pcsById = snapshot.pcs.associateBy(PcSummary::id)
     val readOnlyOpenableSessionIds = openedSessions.asSequence()
         .filter { session ->
@@ -3980,7 +3990,7 @@ private fun SessionsPage(
             } else {
                 terminalEngine(selected.id)
             }
-            val controlRequestKey = if (selected.state == SessionState.EXITED) null else {
+            val controlRequestKey = if (selected.state != SessionState.RUNNING) null else {
                 sessionControlRequestEffectKey(
                     foreground = foreground,
                     foregroundGeneration = foregroundGeneration,
@@ -3994,7 +4004,7 @@ private fun SessionsPage(
                 }
             }
             LaunchedEffect(selected.id, selected.state, selectedEngine) {
-                if (selected.state == SessionState.EXITED && selectedEngine == null) {
+                if (selected.state != SessionState.RUNNING && selectedEngine == null) {
                     onOpenSession(selected.id)
                 }
             }
@@ -4354,9 +4364,7 @@ internal fun mobileSessionSelectionIndex(
 ): Int = sessions.indexOfFirst { it.id == selectedId }.coerceAtLeast(0)
 
 /**
- * Keeps the current renderer mounted across a transient catalog miss. Other
- * offline sessions remain outside the live-session surface, and an explicit
- * exit always wins over a stale engine or state entry.
+ * A cached renderer cannot keep an offline Windows session visible.
  */
 internal fun liveSessionPageSessions(
     sessions: List<SessionSummary>,
@@ -4370,7 +4378,7 @@ internal fun liveSessionPageSessions(
     if (explicitlyExited) {
         session.id in readOnlyOpenableSessionIds
     } else {
-        session.online || session.id == selectedId && (selectedHasEngine || remoteState != null)
+        session.online || session.id in readOnlyOpenableSessionIds
     }
 }
 
@@ -4731,10 +4739,15 @@ private fun SessionConnectionStatusMenu(
                         enabled = canCheckNetwork,
                     )
                 }
-                DirectRoutingPolicy.RELAY_ONLY, DirectRoutingPolicy.UNKNOWN -> Text(
+                DirectRoutingPolicy.RELAY_ONLY, DirectRoutingPolicy.UNKNOWN,
+                DirectRoutingPolicy.FAILED, DirectRoutingPolicy.UNAVAILABLE -> Text(
                     stringResource(
-                        if (directRoutingPolicy == DirectRoutingPolicy.RELAY_ONLY) R.string.session_direct_relay_only
-                        else R.string.session_direct_policy_loading,
+                        when (directRoutingPolicy) {
+                            DirectRoutingPolicy.RELAY_ONLY -> R.string.session_direct_relay_only
+                            DirectRoutingPolicy.FAILED -> R.string.session_direct_policy_failed
+                            DirectRoutingPolicy.UNAVAILABLE -> R.string.session_direct_unavailable
+                            else -> R.string.session_direct_policy_loading
+                        },
                     ),
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     style = MaterialTheme.typography.bodySmall,

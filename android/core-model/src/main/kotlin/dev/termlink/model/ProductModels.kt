@@ -62,6 +62,7 @@ object PcCapabilityIds {
     const val TERMINAL_COMMANDS_V1 = "terminal_commands_v1"
     const val REMOTE_AGENT_UPDATE_V1 = "remote_agent_update_v1"
     const val HOST_HISTORY_V1 = "host_history_v1"
+    const val HOST_SESSION_CATALOG_V1 = "host_session_catalog_v1"
 }
 
 data class TerminalCommandCapability(
@@ -82,7 +83,7 @@ data class SessionSummary(
     val lastOutputSequence: ULong,
     val createdAt: Instant,
     val endedAt: Instant?,
-    /** Server-authoritative reachability of this exact session UUID. */
+    /** Windows-authoritative reachability of this exact session UUID. */
     val online: Boolean = false,
     /** Safe producer diagnostic metadata; never contains terminal text. */
     val snapshotStatus: String? = null,

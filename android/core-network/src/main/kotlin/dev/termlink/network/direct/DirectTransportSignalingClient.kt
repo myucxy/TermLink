@@ -596,16 +596,21 @@ internal class DirectTransportSignalingClient(
     ) : WebSocketListener() {
         private var welcomed = false
         private var acceptingBinary = true
+        // Capabilities are negotiated per socket. Config refreshes may finish
+        // while this handshake is in flight; never validate an old WELCOME
+        // against a newer REST snapshot.
+        private var helloMultipair = false
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             if (!isCurrent(webSocket)) return
+            helloMultipair = multipairV2Configured.get()
             val hello = buildJsonObject {
                 put("type", "CLIENT_HELLO")
                 put("role", role)
                 putJsonArray("protocol_versions") { add(JsonPrimitive(PROTOCOL_VERSION)) }
                 putJsonArray("capabilities") {
                     add(JsonPrimitive(DIRECT_TRANSPORT_CAPABILITY))
-                    if (multipairV2Configured.get()) add(JsonPrimitive(DIRECT_MULTIPAIR_CAPABILITY))
+                    if (helloMultipair) add(JsonPrimitive(DIRECT_MULTIPAIR_CAPABILITY))
                     if (directDataV1Enabled) {
                         add(JsonPrimitive(DIRECT_DATA_CAPABILITY))
                         add(JsonPrimitive(DIRECT_SESSION_CUTOVER_CAPABILITY))
@@ -620,7 +625,7 @@ internal class DirectTransportSignalingClient(
         override fun onMessage(webSocket: WebSocket, text: String) {
             if (!isCurrent(webSocket)) return
             val negotiated = if (!welcomed && text.encodeToByteArray().size <= MAX_HELLO_BYTES) {
-                validateWelcome(text)
+                validateWelcome(text, helloMultipair)
             } else {
                 null
             }
@@ -984,7 +989,7 @@ internal class DirectTransportSignalingClient(
         require(envelope.ciphertext.size() in MIN_CIPHERTEXT_BYTES..MAX_SIGNAL_CIPHERTEXT_BYTES)
     }.isSuccess
 
-    private fun validateWelcome(text: String): Set<String>? = runCatching {
+    private fun validateWelcome(text: String, helloMultipair: Boolean): Set<String>? = runCatching {
         val value = JSON.parseToJsonElement(text) as? JsonObject
             ?: error("welcome must be an object")
         val required = setOf(
@@ -997,7 +1002,7 @@ internal class DirectTransportSignalingClient(
         require(value.keys.containsAll(required))
         require(value.requiredString("type") == "SERVER_WELCOME")
         require(value.requiredInt("protocol_version") == PROTOCOL_VERSION)
-        val expectedCapabilities = if (multipairV2Configured.get()) {
+        val expectedCapabilities = if (helloMultipair) {
             listOf(DIRECT_SHADOW_CAPABILITY, DIRECT_MULTIPAIR_CAPABILITY)
         } else {
             listOf(DIRECT_SHADOW_CAPABILITY)

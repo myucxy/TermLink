@@ -18,7 +18,6 @@ import dev.termlink.billing.PlayBillingAdapter
 import dev.termlink.crypto.DeviceKeyVault
 import dev.termlink.crypto.HistoryCrypto
 import dev.termlink.crypto.SessionCrypto
-import dev.termlink.crypto.SessionTitleCrypto
 import dev.termlink.crypto.TerminalSnapshotCrypto
 import dev.termlink.database.TermLinkDatabase
 import dev.termlink.history.HistoryRepository
@@ -361,6 +360,8 @@ internal fun ProductionDirectCarrier.toPcCarrierState(): PcCarrierState = when (
 
 internal fun ProductionDirectRoutingPolicy.toProductPolicy(): DirectRoutingPolicy = when (this) {
     ProductionDirectRoutingPolicy.UNKNOWN -> DirectRoutingPolicy.UNKNOWN
+    ProductionDirectRoutingPolicy.FAILED -> DirectRoutingPolicy.FAILED
+    ProductionDirectRoutingPolicy.UNAVAILABLE -> DirectRoutingPolicy.UNAVAILABLE
     ProductionDirectRoutingPolicy.AUTO -> DirectRoutingPolicy.AUTO
     ProductionDirectRoutingPolicy.RELAY_ONLY -> DirectRoutingPolicy.RELAY_ONLY
 }
@@ -411,6 +412,7 @@ private class RevokedDeviceIdentityException : Exception()
 internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set<String> =
     buildSet {
         add(PcCapabilityIds.HOST_HISTORY_V1)
+        add(PcCapabilityIds.HOST_SESSION_CATALOG_V1)
         if (dataPlaneEnabled) {
             add(DIRECT_SESSION_CUTOVER_CAPABILITY)
             add(DIRECT_TRANSPORT_DATA_CAPABILITY)
@@ -452,20 +454,17 @@ internal fun projectLiveSessionSummary(
         }
         is RemoteSessionState.Live,
         is RemoteSessionState.ReadOnly,
-        is RemoteSessionState.Controlling -> SessionState.RUNNING
+        is RemoteSessionState.Controlling -> session.state
         is RemoteSessionState.HistoryGap -> session.state
     },
     online = when (remoteState) {
         is RemoteSessionState.Exited -> false
-        // An opened renderer remains a valid read-only viewer while transport
-        // or remote lifecycle recovery is in progress. Publishing catalog
-        // reachability here made the selected detail disappear on one stale
-        // online=false poll even though the renderer was still recoverable.
-        is RemoteSessionState.Reconnecting -> true
+        // Retaining a renderer never proves that its Windows process is live.
+        is RemoteSessionState.Reconnecting -> session.online && remoteState.reason != "remote session interrupted"
         is RemoteSessionState.Live,
         is RemoteSessionState.ReadOnly,
-        is RemoteSessionState.Controlling -> true
-        is RemoteSessionState.HistoryGap -> true
+        is RemoteSessionState.Controlling -> session.online
+        is RemoteSessionState.HistoryGap -> session.online
     },
     columns = authoritativeSize.columns,
     rows = authoritativeSize.rows,
@@ -562,7 +561,7 @@ internal fun reconcileSessionDirectoryTitles(
     val retainedIds = sessions.mapTo(hashSetOf(), SessionSummary::id)
     val result = current.filterKeys(retainedIds::contains).toMutableMap()
     sessions.forEach { session ->
-        if (session.encryptedTitle == null) return@forEach
+        if (session.encryptedTitle == null && session.id !in decrypted) return@forEach
         val title = decrypted[session.id]
         if (title.isNullOrBlank()) result.remove(session.id) else result[session.id] = title
     }
@@ -617,12 +616,12 @@ internal fun validateAuthoritativePcKeyTransition(
     }
 }
 
-/** Keeps opened renderers through transient reachability changes; EXITED is terminal. */
+/** Live renderers require an online, running session confirmed by Windows. */
 internal fun retainedLiveSessionIds(
     sessions: List<SessionSummary>,
     trustedPcIds: Set<UUID>,
 ): Set<UUID> = sessions.asSequence()
-    .filter { it.state != SessionState.EXITED && it.pcId in trustedPcIds }
+    .filter { it.online && it.state == SessionState.RUNNING && it.pcId in trustedPcIds }
     .mapTo(hashSetOf(), SessionSummary::id)
 
 /** Retains only already-opened host-owned read-only renderers for trusted PCs. */
@@ -632,10 +631,10 @@ internal fun retainedReadOnlySessionIds(
     trustedPcIds: Set<UUID>,
 ): Set<UUID> {
     val hostHistoryPcIds = pcs.asSequence()
-        .filter { it.id in trustedPcIds && PcCapabilityIds.HOST_HISTORY_V1 in it.capabilities }
+        .filter { it.online && it.id in trustedPcIds && PcCapabilityIds.HOST_HISTORY_V1 in it.capabilities }
         .mapTo(hashSetOf(), PcSummary::id)
     return sessions.asSequence()
-        .filter { it.state == SessionState.EXITED && it.pcId in hostHistoryPcIds }
+        .filter { it.state != SessionState.RUNNING && it.pcId in hostHistoryPcIds }
         .mapTo(hashSetOf(), SessionSummary::id)
 }
 
@@ -1012,6 +1011,7 @@ internal class ProductionProductRepository(
     private val liveSessionLock = Any()
     private val accessStateLock = Mutex()
     private val refreshStateLock = Mutex()
+    private val catalogRequestLock = Mutex()
     private val sessionLifecycleLanes = SessionLifecycleLanes<UUID>()
     private val updateCheckLock = Mutex()
     private val updateDownloadLock = Mutex()
@@ -1162,13 +1162,25 @@ internal class ProductionProductRepository(
             if (!mutableSnapshot.value.signedIn ||
                 mutableSnapshot.value.enrollmentState == ProductEnrollmentState.REVOKED
             ) continue
+            val generation = authenticationLifecycle.capture()
             try {
                 withAuthenticatedApi { api, generation -> pollSessionCatalogWithApi(api, generation) }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Throwable) {
-                // A transient catalog poll must not replace the authoritative
-                // global connection state or flash a user-visible error.
+                refreshStateLock.withLock {
+                    authenticationStateMutationLock.withLock {
+                        if (authenticationLifecycle.isCurrent(generation) && !closed) {
+                            closeReadOnlySessionsExcept(emptySet())
+                            closeLiveSessionsExcept(emptySet())
+                            mutableSnapshot.update { current ->
+                                reconcileSessionCatalog(current, current.pcs, emptyList(), deletedSessionIds).copy(
+                                    pcSessionCatalogErrors = current.pcs.associate { it.id to "UNAVAILABLE" },
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2010,12 +2022,16 @@ internal class ProductionProductRepository(
         val catalogAtOpen = mutableSnapshot.value
         val catalogSession = catalogAtOpen.sessions.firstOrNull { it.id == sessionId }
             ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
+        if (catalogAtOpen.pcs.none { it.id == catalogSession.pcId && it.online } ||
+            catalogSession.pcId in catalogAtOpen.pcSessionCatalogErrors) {
+            throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
+        }
         readOnlySessionEngines[sessionId]?.let { existing ->
-            if (catalogSession.state == SessionState.EXITED) return
+            if (catalogSession.state != SessionState.RUNNING) return
             if (readOnlySessionEngines.remove(sessionId, existing)) existing.dispose()
         }
         liveSessions[sessionId]?.let { existing ->
-            if (catalogSession.state != SessionState.EXITED && !shouldReplaceLiveSessionForOpen(
+            if (catalogSession.online && catalogSession.state == SessionState.RUNNING && !shouldReplaceLiveSessionForOpen(
                     liveSessionExists = true,
                     remoteState = mutableSnapshot.value.sessionStates[sessionId],
                 )
@@ -2046,13 +2062,16 @@ internal class ProductionProductRepository(
             ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
         val pc = product.pcs.firstOrNull { it.id == summary.pcId }
             ?: throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
+        if (!pc.online || pc.id in product.pcSessionCatalogErrors) {
+            throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
+        }
         val pcDevice = product.devices.firstOrNull {
             it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
         } ?: throw sessionOpenException(SessionOpenFailureCode.PC_NOT_TRUSTED)
         if (pcDevice.exchangePublicKey.size != 32) {
             throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
         }
-        if (summary.state == SessionState.EXITED) {
+        if (summary.state != SessionState.RUNNING) {
             openEndedHostHistorySessionLocked(
                 session = summary,
                 pc = pc,
@@ -2060,12 +2079,6 @@ internal class ProductionProductRepository(
                 authentication = authentication,
             )
             return
-        }
-        if (summary.state == SessionState.INTERRUPTED) {
-            // The Windows host confirmed the session is gone (host-lost).
-            // Opening would bootstrap against a dead ConPTY and stall until
-            // timeout; fail fast instead of letting the tab spin.
-            throw sessionOpenException(SessionOpenFailureCode.SESSION_ENDED)
         }
         if (!summary.online) throw sessionOpenException(SessionOpenFailureCode.SESSION_OFFLINE)
         if (!hasHostHistoryAuthority(pc.capabilities)) {
@@ -2517,7 +2530,7 @@ internal class ProductionProductRepository(
         pcDevice: DeviceSummary,
         authentication: AuthenticationStateCapture,
     ) {
-        require(session.state == SessionState.EXITED) { "Read-only history requires an ended session" }
+        require(session.state != SessionState.RUNNING) { "Read-only history requires an inactive session" }
         if (!hasHostHistoryAuthority(pc.capabilities)) {
             throw sessionOpenException(SessionOpenFailureCode.HOST_HISTORY_REQUIRED)
         }
@@ -2627,7 +2640,7 @@ internal class ProductionProductRepository(
                     directCoordinator === realtime.directCoordinator &&
                     storedIdentity === stored &&
                     mutableSnapshot.value.sessions.any {
-                        it.id == session.id && it.state == SessionState.EXITED
+                        it.id == session.id && it.state != SessionState.RUNNING
                     }
             },
         ) {
@@ -3760,11 +3773,7 @@ internal class ProductionProductRepository(
         }
         val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
         val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
-        val sessions = pcs.flatMap { pc ->
-            ProductResponseParser.itemObjects(
-                api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
-            ).map { it.toSession() }
-        }.filterNot { it.id in deletedSessionIds }
+        val sessions = loadHostSessionCatalogs(devices, pcs, authenticationGeneration)
         val entitlement = api.get("/v1/account/entitlements").jsonObject.toEntitlement()
         val catalogPlans = ProductResponseParser.catalogPlanObjects(api.get("/v1/billing/plans").jsonObject)
             .map { it.toCatalogPlan() }
@@ -3780,7 +3789,7 @@ internal class ProductionProductRepository(
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         sessions.forEach { historyRepository.upsertSession(it) }
         val storedIdentity = identity()
-        val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, sessions, storedIdentity)
+        val directoryTitles = hostCatalogTitles.toMap()
         // Terminal history has no Server catalog. It is opened from the
         // owning Windows Agent through host_history_v1 on the session screen.
         val historyEntries = emptyList<HistoryEntry>()
@@ -3794,8 +3803,8 @@ internal class ProductionProductRepository(
                 }
             }
             .mapTo(mutableSetOf(), PcSummary::id)
-        closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds))
-        closeLiveSessionsExcept(retainedLiveSessionIds(sessions, trustedPcIds))
+        closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds - hostCatalogErrors.keys))
+        closeLiveSessionsExcept(retainedLiveSessionIds(sessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - hostCatalogErrors.keys))
         val runtimeSessions = sessions.map { session ->
             liveSessions[session.id]?.let { live ->
                 projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
@@ -3829,6 +3838,7 @@ internal class ProductionProductRepository(
                         runtimeSessions,
                     ),
                     sessions = runtimeSessions,
+                    pcSessionCatalogErrors = hostCatalogErrors.toMap(),
                     sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
                     sessionOpenFailures = current.sessionOpenFailures.filterKeys(retainedSessionIds::contains),
                     sessionTitles = reconcileSessionDirectoryTitles(
@@ -3875,6 +3885,66 @@ internal class ProductionProductRepository(
         }
     }
 
+    private val hostCatalogTitles = mutableMapOf<UUID, String>()
+    private val hostCatalogErrors = mutableMapOf<UUID, String>()
+
+    private suspend fun requestHostCatalog(
+        pc: PcSummary,
+        device: DeviceSummary,
+        authenticationGeneration: Long,
+    ) = catalogRequestLock.withLock {
+        requireCurrentAuthentication(authenticationGeneration)
+        check(pc.online && pc.remoteRoutingEnabled && device.id == pc.deviceId &&
+            device.type.isPcAgent() && device.trustState == DeviceTrustState.TRUSTED &&
+            PcCapabilityIds.HOST_SESSION_CATALOG_V1 in pc.capabilities) { "Host catalog unavailable" }
+        val stored = identity()
+        val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
+        dev.termlink.network.production.fetchHostSessionCatalog(
+            realtime.multiplexer, pc.id, pc.deviceId, stored.deviceId, stored.identity,
+            device.exchangePublicKey, pc.keyEpoch,
+            sessionStore.reserveEnvelopeSequenceRange(pc.id, count = 1).first,
+        ).also { requireCurrentAuthentication(authenticationGeneration) }
+    }
+
+    private suspend fun loadHostSessionCatalogs(
+        devices: List<DeviceSummary>,
+        pcs: List<PcSummary>,
+        authenticationGeneration: Long,
+    ): List<SessionSummary> {
+        validateAuthoritativePcKeyTransitions(devices, pcs)
+        val result = mutableListOf<SessionSummary>()
+        for (pc in pcs) {
+            val device = devices.firstOrNull { it.id == pc.deviceId && it.trustState == DeviceTrustState.TRUSTED }
+            try {
+                check(pc.online && pc.remoteRoutingEnabled && device != null &&
+                    PcCapabilityIds.HOST_SESSION_CATALOG_V1 in pc.capabilities) { "Host catalog unavailable" }
+                val catalog = requestHostCatalog(pc, device, authenticationGeneration)
+                requireCurrentAuthentication(authenticationGeneration)
+                catalog.sessionsList.forEach { item ->
+                    val id = uuidFromBytes(item.sessionId.toByteArray())
+                    if (id !in deletedSessionIds) {
+                        hostCatalogTitles[id] = item.title
+                        result += SessionSummary(id, pc.id, item.shellType, null,
+                            SessionState.valueOf(item.lifecycle), item.columns, item.rows,
+                            item.lastOutputSeq.toULong(), Instant.ofEpochMilli(item.createdAtMs), null,
+                            online = item.processAlive)
+                    }
+                }
+                hostCatalogErrors.remove(pc.id)
+            } catch (cancelled: kotlinx.coroutines.TimeoutCancellationException) {
+                hostCatalogErrors[pc.id] = "TIMEOUT"
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                hostCatalogErrors[pc.id] = if (!pc.online) "OFFLINE" else
+                    if (PcCapabilityIds.HOST_SESSION_CATALOG_V1 !in pc.capabilities) "UPGRADE_REQUIRED" else "UNAVAILABLE"
+            }
+        }
+        hostCatalogTitles.keys.retainAll(result.mapTo(hashSetOf(), SessionSummary::id))
+        hostCatalogErrors.keys.retainAll(pcs.mapTo(hashSetOf(), PcSummary::id))
+        return result
+    }
+
     private suspend fun pollSessionCatalogWithApi(
         api: ProductionApiClient,
         authenticationGeneration: Long,
@@ -3883,11 +3953,7 @@ internal class ProductionProductRepository(
             requireCurrentAuthentication(authenticationGeneration)
             val devices = ProductResponseParser.itemObjects(api.get("/v1/devices").jsonObject).map { it.toDevice() }
             val pcs = ProductResponseParser.itemObjects(api.get("/v1/pcs").jsonObject).map { it.toPc() }
-            val catalogSessions = pcs.flatMap { pc ->
-                ProductResponseParser.itemObjects(
-                    api.get("/v1/pcs/${pc.id}/sessions?include_ended=true").jsonObject,
-                ).map { it.toSession() }
-            }.filterNot { it.id in deletedSessionIds }
+            val catalogSessions = loadHostSessionCatalogs(devices, pcs, authenticationGeneration)
             authenticationStateMutationLock.withLock {
                 requireCurrentAuthentication(authenticationGeneration)
                 validateAuthoritativePcKeyTransitions(devices, pcs)
@@ -3895,7 +3961,7 @@ internal class ProductionProductRepository(
                 validateLiveSessionKeys(devices, pcs, catalogSessions)
                 historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
                 catalogSessions.forEach { historyRepository.upsertSession(it) }
-                val directoryTitles = decryptSessionDirectoryTitles(devices, pcs, catalogSessions, identity())
+                val directoryTitles = hostCatalogTitles.toMap()
                 rotateLiveSessionKeys(devices, pcs, catalogSessions)
 
                 val trustedPcIds = pcs.asSequence()
@@ -3907,8 +3973,8 @@ internal class ProductionProductRepository(
                         }
                     }
                     .mapTo(hashSetOf(), PcSummary::id)
-                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(catalogSessions, pcs, trustedPcIds))
-                closeLiveSessionsExcept(retainedLiveSessionIds(catalogSessions, trustedPcIds))
+                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(catalogSessions, pcs, trustedPcIds - hostCatalogErrors.keys))
+                closeLiveSessionsExcept(retainedLiveSessionIds(catalogSessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - hostCatalogErrors.keys))
 
                 val runtimeSessions = catalogSessions.map { session ->
                     liveSessions[session.id]?.let { live ->
@@ -3929,6 +3995,7 @@ internal class ProductionProductRepository(
                             deletedSessionIds = deletedSessionIds,
                         )
                         reconciled.copy(
+                            pcSessionCatalogErrors = hostCatalogErrors.toMap(),
                             pcCarrierStates = retainAuthoritativePcCarrierStates(
                                 reconciled.pcCarrierStates,
                                 devices,
@@ -4050,59 +4117,6 @@ internal class ProductionProductRepository(
             "record_id=$recordId operation_id=${operationId ?: "none"} " +
                 "stage=$stage result=$result failure=$failure",
         )
-    }
-
-    private fun decryptSessionDirectoryTitles(
-        devices: List<DeviceSummary>,
-        pcs: List<PcSummary>,
-        sessions: List<SessionSummary>,
-        stored: DeviceKeyVault.StoredIdentity,
-    ): Map<UUID, String> {
-        val pcsById = pcs.associateBy(PcSummary::id)
-        val devicesById = devices.associateBy(DeviceSummary::id)
-        return buildMap {
-            sessions.forEach { session ->
-                val sealed = session.encryptedTitle ?: return@forEach
-                val pc = pcsById[session.pcId] ?: return@forEach
-                val pcDevice = devicesById[pc.deviceId] ?: return@forEach
-                if (!pcDevice.type.isPcAgent() ||
-                    pcDevice.trustState != DeviceTrustState.TRUSTED ||
-                    pcDevice.exchangePublicKey.size != 32 || pc.keyEpoch < 1
-                ) {
-                    return@forEach
-                }
-                val pairwise = try {
-                    SessionCrypto.derivePairwiseKey(
-                        stored.identity.exchange.privateKey,
-                        pcDevice.exchangePublicKey,
-                        pc.deviceId,
-                        stored.deviceId,
-                        pc.keyEpoch,
-                    )
-                } catch (_: Exception) {
-                    return@forEach
-                }
-                try {
-                    put(
-                        session.id,
-                        SessionTitleCrypto.open(
-                            pairwiseKey = pairwise,
-                            sealedEnvelope = sealed,
-                            expectedSessionId = session.id,
-                            expectedPcDeviceId = pc.deviceId,
-                            expectedRecipientDeviceId = stored.deviceId,
-                            expectedKeyEpoch = pc.keyEpoch,
-                        ),
-                    )
-                } catch (_: Exception) {
-                    // The directory remains usable when a legacy, stale-key or
-                    // malformed title envelope is encountered. Its title is
-                    // omitted instead of displaying unauthenticated metadata.
-                } finally {
-                    pairwise.fill(0)
-                }
-            }
-        }
     }
 
     /** Snapshots the exact tri-state title precedence used by the realtime collector. */
@@ -4833,8 +4847,8 @@ internal class ProductionProductRepository(
                         }
                     }
                     .mapTo(mutableSetOf(), PcSummary::id)
-                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds))
-                closeLiveSessionsExcept(retainedLiveSessionIds(sessions, trustedPcIds))
+                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds - hostCatalogErrors.keys))
+                closeLiveSessionsExcept(retainedLiveSessionIds(sessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - hostCatalogErrors.keys))
             }
             refreshDirectAuthorizedPeers(authenticationGeneration, stored, devices, pcs)
         }
@@ -5027,7 +5041,7 @@ internal class ProductionProductRepository(
                         remainingAnchorRebases = remainingAnchorRebases,
                     )
                 } else {
-                    check(session.state == SessionState.EXITED &&
+                    check(session.state != SessionState.RUNNING &&
                         readOnlySessionEngines.containsKey(key.sessionId)
                     ) { "The transcript session has no authenticated read-only renderer" }
                     check(pc.online) { "The Windows PC is offline" }
@@ -6150,31 +6164,6 @@ internal class ProductionProductRepository(
         observedAgentBuild = get("observed_agent_build")?.jsonPrimitive?.long,
     )
 
-    private fun JsonObject.toSession() = SessionSummary(
-        id = UUID.fromString(requiredString("id")),
-        pcId = UUID.fromString(requiredString("pc_id")),
-        shellType = requiredString("shell_type"),
-        encryptedTitle = get("title_cipher")?.jsonPrimitive?.contentOrNull?.let(java.util.Base64.getDecoder()::decode),
-        state = SessionState.valueOf(requiredString("state")),
-        columns = getValue("columns").jsonPrimitive.int,
-        rows = getValue("rows").jsonPrimitive.int,
-        lastOutputSequence = getValue("last_output_seq").jsonPrimitive.long.toULong(),
-        createdAt = instant("created_at"),
-        endedAt = optionalInstant("ended_at"),
-        // Older servers did not return a session-level reachability signal.
-        // Treat that response as offline instead of reviving it from PC state
-        // or failing the entire catalog refresh during a rolling deployment.
-        online = get("online")?.jsonPrimitive?.booleanOrNull ?: false,
-        snapshotStatus = get("snapshot_status")?.jsonPrimitive?.contentOrNull?.also { value ->
-            require(value in setOf("PENDING", "READY", "UNSUPPORTED", "FAILED")) {
-                "Invalid snapshot producer status"
-            }
-        },
-        snapshotReasonCode = get("snapshot_reason_code")?.jsonPrimitive?.contentOrNull?.also { value ->
-            require(value.matches(Regex("[A-Z0-9_]{1,64}"))) { "Invalid snapshot producer reason" }
-        },
-    )
-
     private fun JsonObject.toEntitlement() = Entitlement(
         planKey = requiredString("plan_key"),
         catalogVersion = getValue("catalog_version").jsonPrimitive.long,
@@ -6659,21 +6648,18 @@ internal class ProductionProductRepository(
     ): ULong? = withAuthenticatedApi(
         httpClient = terminalSnapshotReadinessHttp,
         expectedGeneration = expectedAuthenticationGeneration,
-    ) { api, _ ->
-            ProductResponseParser.itemObjects(
-                // Ended sessions are deliberately absent from the default live directory. Their
-                // final tail remains authoritative while the Windows host serves local history.
-                api.get(authoritativeSessionCatalogPath(initialSession.pcId)).jsonObject,
-            ).map { it.toSession() }
-                .singleOrNull { it.id == initialSession.id }
-                ?.lastOutputSequence
-        }
+    ) { _, generation ->
+        val product = mutableSnapshot.value
+        val pc = product.pcs.singleOrNull { it.id == initialSession.pcId } ?: return@withAuthenticatedApi null
+        val device = product.devices.singleOrNull { it.id == pc.deviceId } ?: return@withAuthenticatedApi null
+        requestHostCatalog(pc, device, generation).sessionsList
+            .singleOrNull { uuidFromBytes(it.sessionId.toByteArray()) == initialSession.id }
+            ?.lastOutputSeq?.toULong()
+    }
 
     /**
-     * Confirms the snapshot sits within the server-authoritative output tail.
-     * The Agent flushes catalog metadata on a heartbeat cadence, so a snapshot
-     * served for a freshly spawned session can legitimately run ahead of the
-     * catalog for one flush interval. Re-poll the tail (bounded) before
+     * Confirms the snapshot sits within the Windows-authoritative output tail.
+     * Snapshot production and catalog observation may race. Re-poll the tail before
      * declaring the snapshot out of bounds; a persistent mismatch still
      * fails closed.
      */
@@ -7398,9 +7384,6 @@ internal suspend fun clearProductRoomCache(historyRepository: HistoryRepository)
     historyRepository.clearAll()
 }
 
-internal fun authoritativeSessionCatalogPath(pcId: UUID): String =
-    "/v1/pcs/$pcId/sessions?include_ended=true"
-
 /**
  * Validates the complete immutable Chunk while applying only the suffix after
  * an already-installed Snapshot. Validating the skipped prefix preserves the
@@ -7955,11 +7938,7 @@ internal val HOST_HISTORY_READINESS_RETRY_DELAYS_MILLIS =
     listOf(100L, 200L, 400L, 800L, 1_500L, 2_000L, 4_000L)
 
 /**
- * Bounded catch-up window for the snapshot-vs-catalog authority check. The
- * Agent flushes session catalog metadata on a heartbeat cadence (about 15
- * seconds), so a snapshot served right after session spawn can run ahead of
- * the catalog tail for one flush interval; the schedule covers several such
- * intervals before the restore fails closed.
+ * Bounded catch-up window for concurrent Windows snapshot and catalog observations.
  */
 internal val AUTHORITY_TAIL_CATCHUP_RETRY_DELAYS_MILLIS =
     listOf(500L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L, 15_000L, 15_000L)

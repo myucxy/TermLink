@@ -32,6 +32,8 @@ import okhttp3.OkHttpClient
 
 internal enum class ProductionDirectRoutingPermission {
     UNKNOWN,
+    FAILED,
+    UNAVAILABLE,
     FORBIDDEN,
     PERMITTED,
 }
@@ -303,7 +305,7 @@ internal class ProductionDirectSignalDispatcher internal constructor(
         synchronized(lifecycleLock) {
             if (closed.get() || clientTerminal) return
             clientTerminal = true
-            mutableRoutingPermission.value = ProductionDirectRoutingPermission.UNKNOWN
+            mutableRoutingPermission.value = ProductionDirectRoutingPermission.UNAVAILABLE
             mutableStatus.value = ProductionDirectSignalDispatcherStatus.FAULT(fault.code)
         }
     }
@@ -317,7 +319,7 @@ internal class ProductionDirectSignalDispatcher internal constructor(
             if (!closed.compareAndSet(false, true)) return
             clientStarted = false
             clientTerminal = true
-            mutableRoutingPermission.value = ProductionDirectRoutingPermission.UNKNOWN
+            mutableRoutingPermission.value = ProductionDirectRoutingPermission.UNAVAILABLE
             mutableStatus.value = terminal
             ShutdownResources(
                 discovery.getAndSet(null),
@@ -337,17 +339,24 @@ internal class ProductionDirectSignalDispatcher internal constructor(
 
     private suspend fun fetchConfig(): DirectSignalingCallResult<DirectTransportServerConfig> =
         configLock.withLock {
-            if (!dispatcherUsable()) return@withLock closedResult()
-            val result = client.fetchConfig()
-            if (!dispatcherUsable()) return@withLock closedResult()
+            if (closed.get()) return@withLock closedResult()
+            val result = try {
+                client.fetchConfig()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                DirectSignalingCallResult.Fault(DirectSignalingFault(DirectSignalingFaultCode.HTTP_UNAVAILABLE))
+            }
+            if (closed.get()) return@withLock closedResult()
             mutableRoutingPermission.value = when (result) {
                 is DirectSignalingCallResult.Success -> when {
+                    !result.value.directRoutingPermitted -> ProductionDirectRoutingPermission.FORBIDDEN
+                    !dispatcherUsable() -> ProductionDirectRoutingPermission.UNAVAILABLE
                     DirectTransportSignalingClient.hasDirectDataCapabilities(result.value) ->
                         ProductionDirectRoutingPermission.PERMITTED
-                    !result.value.directRoutingPermitted -> ProductionDirectRoutingPermission.FORBIDDEN
-                    else -> ProductionDirectRoutingPermission.UNKNOWN
+                    else -> ProductionDirectRoutingPermission.UNAVAILABLE
                 }
-                else -> ProductionDirectRoutingPermission.UNKNOWN
+                else -> ProductionDirectRoutingPermission.FAILED
             }
             result
         }

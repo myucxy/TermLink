@@ -66,6 +66,29 @@ enum MessageType {
   HOST_HISTORY_RESPONSE = 85;
   HOST_HISTORY_CONTROL = 86;
   SESSION_TERMINATE_RESPONSE = 87;
+  // Device catalog only: session_id carries the PC ID, not a terminal ID.
+  SESSION_CATALOG_REQUEST = 88;
+  SESSION_CATALOG_RESPONSE = 89;
+}
+
+message SessionCatalogRequestPayload { bytes request_id = 1; }
+message SessionCatalogEntry {
+  bytes session_id = 1;
+  string shell_type = 2;
+  string title = 3;
+  string lifecycle = 4;
+  uint32 columns = 5;
+  uint32 rows = 6;
+  uint64 last_output_seq = 7;
+  int64 created_at_ms = 8;
+  bool process_alive = 9;
+}
+message SessionCatalogResponsePayload {
+  bytes request_id = 1;
+  bytes host_instance_id = 2;
+  int64 observed_at_ms = 3;
+  repeated SessionCatalogEntry sessions = 4;
+  string error_code = 5;
 }
 
 // These payloads are serialized and encrypted into Envelope.ciphertext. The

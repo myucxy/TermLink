@@ -66,6 +66,7 @@ var optionalCapabilities = []string{
 	"terminal_typed_input_v1",
 	"liveness_probe_v1",
 	"host_history_v1",
+	"host_session_catalog_v1",
 }
 
 const (
@@ -85,18 +86,18 @@ type HubOptions struct {
 }
 
 type Hub struct {
-	store                 routeAuthorityStore
-	policyStore           controlPolicyStore
-	leases                liveSessionStore
-	logger                *slog.Logger
-	observer              Observer
-	directTransportDataV1           bool
-	directTransportDataV1Override  func() bool
-	presence              *presence.Registry
-	mu                    sync.RWMutex
-	peers                 map[uuid.UUID]*peer
-	subscriptions         map[uuid.UUID]map[uuid.UUID]*peer
-	closed                bool
+	store                         routeAuthorityStore
+	policyStore                   controlPolicyStore
+	leases                        liveSessionStore
+	logger                        *slog.Logger
+	observer                      Observer
+	directTransportDataV1         bool
+	directTransportDataV1Override func() bool
+	presence                      *presence.Registry
+	mu                            sync.RWMutex
+	peers                         map[uuid.UUID]*peer
+	subscriptions                 map[uuid.UUID]map[uuid.UUID]*peer
+	closed                        bool
 	// Fixed shards serialize each identity-scoped Valkey reservation with its
 	// connection owner without making unrelated devices wait for the same
 	// network round trip. ReleaseLiveSession has no generation parameter, so a
@@ -195,9 +196,9 @@ func NewHubWithObserverAndOptions(repository *store.Postgres, leases liveSession
 	}
 	return &Hub{
 		store: authorityStore, policyStore: policyStore, leases: leases, logger: logger, observer: observer,
-		directTransportDataV1:          options.DirectTransportDataV1,
+		directTransportDataV1:         options.DirectTransportDataV1,
 		directTransportDataV1Override: options.DirectTransportDataV1Override,
-		peers:                 map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{},
+		peers:                         map[uuid.UUID]*peer{}, subscriptions: map[uuid.UUID]map[uuid.UUID]*peer{},
 	}
 }
 
@@ -214,7 +215,6 @@ func (h *Hub) directTransportDataV1Allowed() bool {
 	}
 	return h.directTransportDataV1
 }
-
 
 // SetPresence attaches the process-local online registry. It is intentionally
 // optional so focused tests and legacy embedders keep the database fallback.
@@ -618,7 +618,9 @@ func (p *peer) readLoop() {
 		}
 		started := time.Now()
 		var routeErr error
-		if p.role == "pc" {
+		if isSessionCatalogMessage(envelope.MessageType) {
+			routeErr = p.routeSessionCatalog(envelope, sessionID, frame)
+		} else if p.role == "pc" {
 			routeErr = p.routePCFrame(envelope, sessionID, pcRecipient, frame)
 		} else {
 			routeErr = p.route(envelope, sessionID, frame)
@@ -675,7 +677,7 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.InputEvent, realtimewire.ResizeRequest,
 			realtimewire.ResumeRequest, realtimewire.LeaseRequest,
 			realtimewire.SessionTerminateRequest,
-			realtimewire.HostHistoryRequest, realtimewire.HostHistoryControl:
+			realtimewire.HostHistoryRequest, realtimewire.HostHistoryControl, realtimewire.SessionCatalogRequest:
 			return true
 		default:
 			return false
@@ -692,7 +694,7 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
 			realtimewire.ThemeChanged, realtimewire.SessionStarted,
 			realtimewire.SessionInterrupted, realtimewire.SessionEnded,
-			realtimewire.HostHistoryResponse, realtimewire.SessionTerminateResponse:
+			realtimewire.HostHistoryResponse, realtimewire.SessionTerminateResponse, realtimewire.SessionCatalogResponse:
 			return true
 		default:
 			return false

@@ -531,6 +531,25 @@ namespace TermLink.Agent
             return result;
         }
 
+        internal IList<SessionSummary> GetCatalogSummaries()
+        {
+            lock (sync)
+            {
+                return knownRegistrations.Values.Select(registration =>
+                {
+                    IRegistryManagedSession active;
+                    if (!registration.Retired && registration.MatchesRunningHost() &&
+                        sessions.TryGetValue(registration.SessionId, out active))
+                        return active.GetSummary();
+                    return new SessionSummary
+                    {
+                        SessionId = registration.SessionId, ShellType = registration.ShellType,
+                        RegisteredAtUtc = registration.RegisteredAtUtc, Lifecycle = SessionAgentLifecycle.HostLost
+                    };
+                }).ToList();
+            }
+        }
+
         public bool TrySendRemoteInput(Guid sessionId, Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
             return DispatchRemoteInput(sessionId, inputId, expectedLocalInputEpoch, bytes) ==

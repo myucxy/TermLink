@@ -167,7 +167,8 @@ class ProductUiLogicTest {
         assertTrue(isSessionTabOpenable(ended, onlineHost))
         assertFalse(isSessionTabOpenable(ended, onlineHost.copy(online = false)))
         assertFalse(isSessionTabOpenable(ended, onlineHost.copy(capabilities = emptySet())))
-        assertTrue(isSessionTabOpenable(ended, onlineHost.copy(online = false), hasReadOnlyRenderer = true))
+        assertFalse(isSessionTabOpenable(ended, onlineHost.copy(online = false), hasReadOnlyRenderer = true))
+        assertTrue(isSessionTabOpenable(ended.copy(state = SessionState.INTERRUPTED), onlineHost))
         assertFalse(isSessionTabOpenable(null))
     }
 
@@ -191,7 +192,7 @@ class ProductUiLogicTest {
     }
 
     @Test
-    fun selectedRendererSurvivesTransientCatalogOfflineAndDisplaysReconnecting() {
+    fun selectedRendererCannotKeepAnOfflineSessionVisible() {
         val selected = session(
             UUID.fromString("00000000-0000-0000-0000-000000000021"),
             SessionState.RUNNING,
@@ -219,7 +220,7 @@ class ProductUiLogicTest {
             selectedHasEngine = true,
         )
 
-        assertEquals(listOf(selected.id, online.id), visible.map(SessionSummary::id))
+        assertEquals(listOf(online.id), visible.map(SessionSummary::id))
         val displayed = selected.resolveDisplayedRemoteState(previousState)
         assertTrue(displayed is RemoteSessionState.Reconnecting)
         assertEquals(73L, displayed?.lastAckedSequence)
@@ -228,7 +229,7 @@ class ProductUiLogicTest {
     }
 
     @Test
-    fun selectedEngineAloneRetainsDetailButExplicitExitOrDeletionRemovesIt() {
+    fun selectedEngineAloneCannotExposeOfflineContent() {
         val selected = session(
             UUID.fromString("00000000-0000-0000-0000-000000000024"),
             SessionState.INTERRUPTED,
@@ -236,7 +237,7 @@ class ProductUiLogicTest {
             online = false,
         )
         assertEquals(
-            listOf(selected),
+            emptyList<SessionSummary>(),
             liveSessionPageSessions(
                 sessions = listOf(selected),
                 selectedId = selected.id,

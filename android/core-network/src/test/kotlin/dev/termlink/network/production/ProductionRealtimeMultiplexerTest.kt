@@ -56,6 +56,43 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
     @Test
+    fun catalogEndpointRejectsTerminalFramesAndOldGenerationWithoutTerminalSubscription(): Unit = runTest {
+        val socket = FakeSocket()
+        val pcId = UUID.randomUUID()
+        val mux = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val endpoint = mux.register(pcId, catalogOnly = true)
+        endpoint.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        val request = Envelope.newBuilder().setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pcId)))
+            .setMessageType(MessageType.SESSION_CATALOG_REQUEST).setSeq(1).build()
+        assertTrue(endpoint.sendForConnectedGeneration(request, 1))
+        val delivered = async { endpoint.receivedEnvelopes.first() }
+        fun frame(type: MessageType, generation: Int) = ProductionReceivedEnvelope(
+            request.toBuilder().setMessageType(type).build(), 64, generation,
+            releaseReservation = { socket.releasedReservations.incrementAndGet() },
+        )
+        socket.deliver(frame(MessageType.OUTPUT_CHUNK, 1))
+        runCurrent()
+        assertTrue(!delivered.isCompleted)
+        socket.activateGeneration(2)
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        assertTrue(endpoint.sendForConnectedGeneration(request.toBuilder().setSeq(2).build(), 2))
+        socket.deliver(frame(MessageType.SESSION_CATALOG_RESPONSE, 1))
+        runCurrent()
+        assertTrue(!delivered.isCompleted)
+        socket.deliver(frame(MessageType.SESSION_CATALOG_RESPONSE, 2))
+        runCurrent()
+        delivered.await().close()
+        assertEquals(listOf(MessageType.SESSION_CATALOG_REQUEST, MessageType.SESSION_CATALOG_REQUEST), socket.sentEnvelopes.map { it.messageType })
+        assertTrue(socket.sentEnvelopes.all { it.ack == 0L })
+        endpoint.close()
+        assertEquals(0, socket.disconnectCount)
+        mux.close()
+    }
+
+    @Test
     fun endpointReservationRetainsExactWireBytesUntilConsumerRelease(): Unit = runTest {
         val socket = FakeSocket()
         val sessionId = UUID.randomUUID()

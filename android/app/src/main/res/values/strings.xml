@@ -218,6 +218,10 @@
     <string name="session_network_unverified">not verified</string>
     <string name="session_direct_relay_only">Direct disabled by server; Relay only</string>
     <string name="session_direct_policy_loading">Reading server transport policy…</string>
+    <string name="session_direct_policy_failed">Could not read transport policy. Retrying automatically.</string>
+    <string name="pc_catalog_upgrade_required">Update Windows to read its session list.</string>
+    <string name="pc_catalog_unavailable">Windows session list is unavailable. Retrying automatically.</string>
+    <string name="session_direct_unavailable">Direct transport is unavailable.</string>
     <string name="terminal_history_gap">History gap</string>
     <string name="terminal_exited">Exited</string>
     <string name="terminal_history_loading">Loading earlier output…</string>

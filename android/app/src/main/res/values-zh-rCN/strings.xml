@@ -327,4 +327,4 @@
     <string name="settings_terminal_font_error_unsupported">请选择受支持的 TTF 或 OTF 字体文件。</string>
     <string name="settings_terminal_font_error_invalid">Android 无法加载这个字体，已保留原字体。</string>
     <string name="settings_terminal_font_error_unreadable">无法读取所选字体，已保留原字体。</string>
-</resources>
+<string name="session_direct_policy_failed">获取传输策略失败，正在自动重试。</string><string name="session_direct_unavailable">直连暂不可用。</string><string name="pc_catalog_upgrade_required">请升级 Windows 客户端以读取会话列表。</string><string name="pc_catalog_unavailable">暂时无法读取 Windows 会话列表，正在自动重试。</string></resources>

@@ -257,7 +257,9 @@ class ProductionRealtimeMultiplexer private constructor(
     fun register(
         sessionId: UUID,
         peerDeviceId: UUID? = null,
+        catalogOnly: Boolean = false,
     ): ProductionRealtimeSessionTransport {
+        require(!catalogOnly || peerDeviceId == null) { "Catalog endpoints use Relay only" }
         require(peerDeviceId == null || peerDeviceId != UUID(0, 0)) {
             "production session peer device ID is invalid"
         }
@@ -268,7 +270,7 @@ class ProductionRealtimeMultiplexer private constructor(
             check(!closed.get()) { "production realtime multiplexer is closed" }
             check(sessionId !in endpoints) { "production session is already registered" }
             closedEndpointIncarnations.remove(sessionId)
-            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation()).also { endpoint ->
+            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation(), catalogOnly).also { endpoint ->
                 endpoints[sessionId] = endpoint
                 logEndpointLifecycle("endpoint_register", endpoint)
             }
@@ -533,6 +535,7 @@ class ProductionRealtimeMultiplexer private constructor(
         val sessionId: UUID,
         val peerDeviceId: UUID?,
         val incarnation: Int,
+        private val catalogOnly: Boolean,
     ) : ProductionRealtimeSessionTransport {
         private val endpointClosed = AtomicBoolean(false)
         private val subscribedGeneration = AtomicInteger(0)
@@ -638,8 +641,12 @@ class ProductionRealtimeMultiplexer private constructor(
             }
             return synchronized(admissionLock) {
                 check(!closed.get() && !endpointClosed.get()) { "production session transport is closed" }
+                require(catalogOnly == (envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST)) {
+                    "Catalog and terminal endpoints cannot be mixed"
+                }
                 when (envelope.messageType) {
-                    dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE -> {
+                    dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE,
+                    dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST -> {
                         val generation = expectedGeneration ?: supervisor.currentConnectedGeneration()
                         if (expectedGeneration == null) {
                             check(generation > 0) { "SUBSCRIBE requires a connected socket generation" }
@@ -761,6 +768,9 @@ class ProductionRealtimeMultiplexer private constructor(
                         )
                     }
                     if (subscribedGeneration.get() != received.generation) {
+                        return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
+                    }
+                    if (catalogOnly != (received.envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_RESPONSE)) {
                         return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
                     }
                     val endpointEnvelope = reserveEndpointEnvelopeLocked(received)

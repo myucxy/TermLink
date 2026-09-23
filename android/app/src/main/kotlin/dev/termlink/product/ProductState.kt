@@ -152,6 +152,8 @@ enum class PcCarrierState {
 /** Server-authoritative policy controlling whether Direct diagnostics are useful. */
 enum class DirectRoutingPolicy {
     UNKNOWN,
+    FAILED,
+    UNAVAILABLE,
     AUTO,
     RELAY_ONLY,
 }
@@ -909,6 +911,7 @@ data class ProductSnapshot(
     /** Exact active-session carrier; missing and late-unlisted sessions are Relay. */
     val sessionCarrierStates: Map<UUID, PcCarrierState> = emptyMap(),
     val directRoutingPolicy: DirectRoutingPolicy = DirectRoutingPolicy.UNKNOWN,
+    val pcSessionCatalogErrors: Map<UUID, String> = emptyMap(),
     val directNetworkChecks: Map<UUID, DirectNetworkCheckState> = emptyMap(),
     val sessions: List<SessionSummary> = emptyList(),
     val remoteFileBrowser: RemoteFileBrowserState = RemoteFileBrowserState(),
