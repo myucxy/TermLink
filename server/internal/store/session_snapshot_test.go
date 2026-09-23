@@ -146,12 +146,18 @@ func TestSessionSnapshotReconcilesStaleRowsAndEnforcesDeviceAuthority(t *testing
 	if _, err = s.Pool.Exec(ctx, `INSERT INTO sessions(id,pc_id,shell_type,state,columns,rows) VALUES($1,$2,'pwsh','EXITED',80,24)`, foreign, otherPC); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.ApplyHostSessionDeletions(ctx, user, device, pc, []uuid.UUID{untouched, foreign}, "cleanup-test"); !errors.Is(err, ErrDenied) {
-		t.Fatal("foreign session accepted", err)
+	if _, err = s.Pool.Exec(ctx, `INSERT INTO control_leases(session_id,holder_device_id,lease_id,expires_at,version) VALUES($1,$2,$3,now()+interval '1 minute',1)`, foreign, android, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ApplyHostSessionDeletions(ctx, user, device, pc, []uuid.UUID{untouched, foreign}, "cleanup-test"); err != nil {
+		t.Fatal("historical foreign ID blocked this PC's deletion", err)
 	}
 	var exists bool
-	if err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sessions WHERE id=$1)`, untouched).Scan(&exists); err != nil || exists {
-		t.Fatal("denied batch partially committed", err)
+	if err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sessions WHERE id=$1 AND pc_id=$2 AND state='DELETED')`, untouched, pc).Scan(&exists); err != nil || !exists {
+		t.Fatal("owning PC's deletion not committed", err)
+	}
+	if err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sessions s JOIN control_leases l ON l.session_id=s.id WHERE s.id=$1 AND s.pc_id=$2 AND s.state='EXITED' AND s.deleted_at IS NULL)`, foreign, otherPC).Scan(&exists); err != nil || !exists {
+		t.Fatal("foreign session or lease was mutated", err)
 	}
 	if err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM control_leases WHERE session_id=$1)`, first).Scan(&exists); err != nil || exists {
 		t.Fatal("deleted session lease retained", err)

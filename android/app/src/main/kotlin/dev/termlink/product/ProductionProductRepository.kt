@@ -1013,6 +1013,7 @@ internal class ProductionProductRepository(
     private val accessStateLock = Mutex()
     private val refreshStateLock = Mutex()
     private val catalogRequestLock = Mutex()
+    private val cleanupRequestLock = Mutex()
     private val sessionLifecycleLanes = SessionLifecycleLanes<UUID>()
     private val updateCheckLock = Mutex()
     private val updateDownloadLock = Mutex()
@@ -2865,14 +2866,14 @@ internal class ProductionProductRepository(
         // succeeds, permanently fence in-flight catalog/realtime events and
         // remove the renderer, Room history, and directory row together.
         withApi { api ->
-            refreshStateLock.withLock {
-                sessionLifecycleLanes.withLock(sessionId) {
-                    deleteClosedSessionAfterTermination(
-                        deleteRemote = { api.delete("/v1/sessions/$sessionId") },
-                        deleteLocal = { deleteLocalSession(sessionId) },
-                    )
-                }
-            }
+            deleteClosedSessionAfterTermination(
+                deleteRemote = { api.delete("/v1/sessions/$sessionId") },
+                deleteLocal = {
+                    refreshStateLock.withLock {
+                        sessionLifecycleLanes.withLock(sessionId) { deleteLocalSession(sessionId) }
+                    }
+                },
+            )
         }
         appendActivity(
             context.getString(R.string.activity_session_closed),
@@ -2883,27 +2884,38 @@ internal class ProductionProductRepository(
 
     override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
         val generation = captureAuthenticationState().authenticationGeneration
-        return refreshStateLock.withLock {
+        return cleanupRequestLock.withLock {
             requireCurrentAuthentication(generation)
             val product = mutableSnapshot.value
             val pc = product.pcs.single { it.id == pcId }
             val device = product.devices.single { it.id == pc.deviceId }
-            check(PcCapabilityIds.HOST_SESSION_CLEANUP_V1 in pc.capabilities && pc.online && pc.remoteRoutingEnabled &&
+            if (PcCapabilityIds.HOST_SESSION_CLEANUP_V1 !in pc.capabilities)
+                throw dev.termlink.network.production.HostDeviceUpgradeRequiredException(PcCapabilityIds.HOST_SESSION_CLEANUP_V1)
+            check(pc.online && pc.remoteRoutingEnabled &&
                 device.type.isPcAgent() && device.trustState == DeviceTrustState.TRUSTED) { "Native batch cleanup unavailable" }
             val stored = identity()
             val realtime = deviceRealtimeRuntime(stored, generation)
-            val response = catalogRequestLock.withLock {
+            val response = try {
                 dev.termlink.network.production.cleanupHostSessions(
                     realtime.multiplexer, pc.id, pc.deviceId, stored.deviceId, stored.identity,
                     device.exchangePublicKey, pc.keyEpoch,
                     sessionStore.reserveEnvelopeSequenceRange(pc.id, count = 1).first, sessionIds,
                 )
+            } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+                throw java.io.IOException("Windows cleanup acknowledgement timed out", error)
             }
             requireCurrentAuthentication(generation)
             val results = response.resultsList.associate { uuidFromBytes(it.sessionId.toByteArray()) to it.status }
             withContext(NonCancellable) {
-                results.filterValues { it == "DELETED" }.keys.forEach { id ->
-                    sessionLifecycleLanes.withLock(id) { deleteLocalSession(id) }
+                // Network waits must not hold the directory publication lock. A refresh
+                // already in flight publishes first; the permanent fence then removes it.
+                refreshStateLock.withLock {
+                    authenticationStateMutationLock.withLock {
+                        requireCurrentAuthentication(generation)
+                        results.filterValues { it == "DELETED" }.keys.forEach { id ->
+                            sessionLifecycleLanes.withLock(id) { deleteLocalSession(id) }
+                        }
+                    }
                 }
             }
             results
@@ -2912,83 +2924,15 @@ internal class ProductionProductRepository(
 
     override suspend fun deleteSession(sessionId: UUID) {
         check(!closed) { "Repository is closed" }
-        withAuthenticatedApi { api, authenticationGeneration ->
-            // A refresh that began before this request must publish before the
-            // deletion, never resurrect the deleted session afterward. The
-            // lifecycle lock also prevents an open from installing a new
-            // client or renderer between server success and cleanup.
-            refreshStateLock.withLock {
-                sessionLifecycleLanes.withLock(sessionId) {
-                    val product = mutableSnapshot.value
-                    val session = product.sessions.firstOrNull { it.id == sessionId }
-                        ?: error("The selected session is unavailable")
-                    val pc = product.pcs.firstOrNull { it.id == session.pcId }
-                        ?: error("The selected Windows PC is unavailable")
-                    require(isInactiveSession(session.state, session.online)) {
-                        "Close an online session before deleting it"
-                    }
-                    check(hasHostHistoryAuthority(pc.capabilities)) {
-                        "Windows Agent upgrade required: host_history_v1 is unavailable"
-                    }
-                    val pcDevice = product.devices.firstOrNull {
-                        it.id == pc.deviceId &&
-                            it.type.isPcAgent() &&
-                            it.trustState == DeviceTrustState.TRUSTED
-                    } ?: error("Windows PC 不受信任 / The selected Windows PC is not trusted")
-                    check(pc.online) {
-                        "Windows PC 已离线，本地主机会话历史未删除 / The Windows PC is offline; its local session history was not deleted"
-                    }
-                    check(pcDevice.exchangePublicKey.size == 32) {
-                        "Windows PC 缺少有效加密密钥 / The selected Windows PC has no valid encryption key"
-                    }
-                    // A retained screen or stale catalog must never authorize terminating a live shell.
-                    val current = requestHostCatalog(pc, pcDevice, authenticationGeneration).sessionsList
-                        .firstOrNull { uuidFromBytes(it.sessionId.toByteArray()) == sessionId }
-                    // An absent entry still needs the host's durable deletion acknowledgement;
-                    // this lets a retry finish REST/local cleanup after an earlier host success.
-                    require(current == null || isInactiveSession(SessionState.valueOf(current.lifecycle), current.processAlive)) {
-                        "Close an online session before deleting it"
-                    }
-                    deleteHostHistorySessionAfterTermination(
-                        terminateRemote = {
-                            terminateInactiveHostHistorySession(
-                                session = session,
-                                pc = pc,
-                                pcDevice = pcDevice,
-                                stored = identity(),
-                                authenticationGeneration = authenticationGeneration,
-                            )
-                        },
-                        deleteRemote = { api.delete("/v1/sessions/$sessionId") },
-                        deleteLocal = { deleteLocalSession(sessionId) },
-                    )
-                }
-            }
-        }
-    }
-
-    /**
-     * Explicit deletion of a host-history session is acknowledged by the
-     * authoritative Windows Agent before the server catalog or Android cache
-     * is touched. The temporary endpoint advertises a permanent zero window,
-     * so no terminal replay can enter the throwaway renderer.
-     */
-    private suspend fun terminateInactiveHostHistorySession(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        authenticationGeneration: Long,
-    ) {
-        require(session.pcId == pc.id) { "Session and Windows PC do not match" }
-        withTemporaryHostHistoryClient(
-            session = session,
-            pc = pc,
-            pcDevice = pcDevice,
-            stored = stored,
-            authenticationGeneration = authenticationGeneration,
-        ) { client ->
-            client.requestTermination(awaitAcknowledgement = true)
+        val session = mutableSnapshot.value.sessions.firstOrNull { it.id == sessionId }
+            ?: error("The selected session is unavailable")
+        require(isInactiveSession(session.state, session.online)) { "Close an online session before deleting it" }
+        // A one-item native batch also handles host-only history, without a
+        // terminal SUBSCRIBE or a Server session row as a prerequisite.
+        when (deleteInactiveSessionBatch(session.pcId, listOf(sessionId))[sessionId]) {
+            "DELETED" -> Unit
+            "SKIPPED_ACTIVE" -> throw TermLinkApiException(409, "SESSION_ACTIVE", null)
+            else -> error("Windows did not confirm session deletion")
         }
     }
 
@@ -3769,6 +3713,7 @@ internal class ProductionProductRepository(
 
     override suspend fun refresh() {
         check(!closed) { "Repository is closed" }
+        Log.i("TermLinkProduct", "refresh_started")
         val authenticationGeneration = authenticationLifecycle.capture()
         authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
             mutableSnapshot.value = mutableSnapshot.value.copy(
@@ -3786,6 +3731,7 @@ internal class ProductionProductRepository(
             withAuthenticatedApi(expectedGeneration = authenticationGeneration) { api, generation ->
                 refreshWithApi(api, generation)
             }
+            Log.i("TermLinkProduct", "refresh_completed")
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -4659,6 +4605,9 @@ internal class ProductionProductRepository(
     }
 
     private fun publishFailure(error: Throwable) {
+        Log.w("TermLinkProduct", "operation_failed type=${error.javaClass.simpleName} " +
+            "http=${(error as? TermLinkApiException)?.status ?: 0} " +
+            "source=${error.stackTrace.firstOrNull { it.className.startsWith("dev.termlink") }?.let { "${it.className}.${it.methodName}:${it.lineNumber}" }}")
         val expiredMessage = context.getString(R.string.failure_authentication_expired)
         if (shouldPreserveAuthenticationExpiredFailure(mutableSnapshot.value, expiredMessage)) return
         val message = safeFailureMessage(error)

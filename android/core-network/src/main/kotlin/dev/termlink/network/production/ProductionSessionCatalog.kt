@@ -17,6 +17,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
 
+class HostDeviceUpgradeRequiredException(val capability: String) : IllegalStateException("Host device capability unavailable: $capability")
+
 suspend fun fetchHostSessionCatalog(
     multiplexer: ProductionRealtimeMultiplexer,
     pcId: UUID,
@@ -53,7 +55,8 @@ internal suspend fun <T : Any> requestHostDevice(
         val requestGeneration = AtomicInteger(0)
         var transport: ProductionRealtimeSessionTransport? = null
         try {
-            val endpoint = multiplexer.register(pcId, catalogOnly = true).also { transport = it }
+            val endpoint = multiplexer.register(pcId, catalogOnly = true,
+                cleanupOnly = requestType == MessageType.SESSION_CLEANUP_REQUEST).also { transport = it }
             val pendingResponse = async(start = CoroutineStart.UNDISPATCHED) {
                 var result: T? = null
                 endpoint.receivedEnvelopes.first { received ->
@@ -77,9 +80,8 @@ internal suspend fun <T : Any> requestHostDevice(
             }
             endpoint.connect()
             endpoint.state.first { it is RealtimeState.Connected }
-            check(capability in multiplexer.directRealtimeNegotiatedCapabilities.value.capabilities) {
-                "Server upgrade required: $capability is unavailable"
-            }
+            if (capability !in multiplexer.directRealtimeNegotiatedCapabilities.value.capabilities)
+                throw HostDeviceUpgradeRequiredException(capability)
             val payload = request(requestId)
             val envelope = try {
                 ProductionRealtimeClient.encryptedEnvelope(

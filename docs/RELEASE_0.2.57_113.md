@@ -49,17 +49,24 @@ Date: 2026-09-23 (Asia/Shanghai)
 
 ## Publication and deployment
 
-Production build/publication results and exact source revision will be recorded
-after verification. AppShip uses the resumable repository wrapper and existing
-signers. Docker uses the documented pinned local BuildKit fallback if GitHub
-Actions credentials cannot be inspected, with SPDX/SLSA evidence; that path
-lacks GitHub OIDC/Cosign and an independent CycloneDX attestation.
+Source: `26f2d6804a7ea003abfd1c6bbdfc490be5b59a79`. Both clients are published
+and ready in AppShip stable; signer/hash/size and update responses were verified.
 
-This request publishes packages; local Server/Windows deployment is separate.
-Actual native deletion from the installed Android through the deployed Server
-to an upgraded Windows, and physical LAN/NAT regression, remain field checks
-after the coordinated upgrade. Unit tests and the old-peer emulator check do
-not establish that live acceptance.
+| Artifact | SHA-256 | AppShip release | AppShip artifact |
+| --- | --- | --- | --- |
+| Android APK (38,127,926 bytes) | `ce37d75ff56c163264778a1f5802f960b65b35508183926eefee4fe3368b3e60` | `4895aa28-026e-458f-ab48-81bd674c36d2` | `6bcb13d5-205b-4a6a-873d-106488c17900` |
+| Windows Setup (181,308,136 bytes) | `a7d77c7e38abac3b4cae525c1ba8e9b116a97ee529b747342e19937ab967dd4b` | `51713407-4b15-4b1c-b5b5-55ed60c2db57` | `acbd04b1-1390-452a-a83c-62f4961249a0` |
+
+Docker multiarch compilation completed, but Docker Hub upload repeatedly failed
+with TLS errors/timeouts. No verified v0.2.57 publication is claimed. Preserve
+BuildKit and encrypted resumable upload state. The Server fix in 0.2.58 supersedes
+this unpublished image. See [0.2.58 live diagnosis](RELEASE_0.2.58_114.md).
+
+Later live diagnosis found Windows already upgraded to 113 but the local Server
+still lacked cleanup capability. Local Server 113 was loaded from hash-verified
+BuildKit blobs and deployed for the user's authorized emulator deletion test;
+real single/batch outcomes are recorded in the 114 report. Physical LAN/NAT was
+not re-tested.
 
 ## Recovery
 

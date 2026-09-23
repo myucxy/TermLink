@@ -43,24 +43,18 @@ func (s *Postgres) ApplyHostSessionDeletions(ctx context.Context, user, device, 
 	if err != nil {
 		return err
 	}
-	var foreign bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sessions WHERE id=ANY($1::uuid[]) AND pc_id<>$2)`, ids, pc).Scan(&foreign); err != nil {
-		return err
-	}
-	if foreign {
-		return ErrDenied
-	}
-	applied, err := tx.Exec(ctx, `INSERT INTO sessions(id,pc_id,shell_type,state,columns,rows,deleted_at,deletion_reason,ended_at)
+	// Machine-local history can predate an account/PC identity change. Apply
+	// this PC's tombstones only; never mutate or expose another PC's records.
+	// ON CONFLICT also fences a concurrent insert under a different owner.
+	_, err = tx.Exec(ctx, `INSERT INTO sessions(id,pc_id,shell_type,state,columns,rows,deleted_at,deletion_reason,ended_at)
  SELECT id,$2,'custom','DELETED',80,24,now(),'USER_REQUESTED',now() FROM unnest($1::uuid[]) id
  ON CONFLICT(id) DO UPDATE SET state='DELETED',deleted_at=COALESCE(sessions.deleted_at,now()),deletion_reason='USER_REQUESTED',ended_at=COALESCE(sessions.ended_at,now())
  WHERE sessions.pc_id=$2`, ids, pc)
 	if err != nil {
 		return err
 	}
-	if applied.RowsAffected() != int64(len(ids)) {
-		return ErrDenied // A concurrent foreign insert must roll back the whole batch.
-	}
-	if _, err = tx.Exec(ctx, `DELETE FROM control_leases WHERE session_id=ANY($1::uuid[])`, ids); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM control_leases l USING sessions s
+ WHERE l.session_id=s.id AND s.pc_id=$2 AND s.state='DELETED' AND s.id=ANY($1::uuid[])`, ids, pc); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id)

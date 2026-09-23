@@ -56,11 +56,45 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
     @Test
+    fun pendingCleanupDoesNotBlockCatalogAndClosingItPreservesCatalogRoute(): Unit = runTest {
+        val socket = FakeSocket()
+        val pcId = UUID.randomUUID()
+        val mux = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val cleanup = mux.register(pcId, catalogOnly = true, cleanupOnly = true)
+        val catalog = mux.register(pcId, catalogOnly = true)
+        cleanup.connect()
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        fun envelope(type: MessageType) = Envelope.newBuilder()
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pcId)))
+            .setMessageType(type).setSeq(1).build()
+        assertTrue(cleanup.sendForConnectedGeneration(envelope(MessageType.SESSION_CLEANUP_REQUEST), 1))
+        assertTrue(catalog.sendForConnectedGeneration(envelope(MessageType.SESSION_CATALOG_REQUEST), 1))
+        val pendingCleanup = async { cleanup.receivedEnvelopes.first() }
+        val pendingCatalog = async { catalog.receivedEnvelopes.first() }
+        socket.deliver(ProductionReceivedEnvelope(envelope(MessageType.SESSION_CATALOG_RESPONSE), 64, 1, releaseReservation = {}))
+        runCurrent()
+        assertTrue(pendingCatalog.isCompleted)
+        assertTrue(!pendingCleanup.isCompleted)
+        pendingCatalog.await().close()
+        cleanup.close()
+        pendingCleanup.cancel()
+        val next = async { catalog.receivedEnvelopes.first() }
+        socket.deliver(ProductionReceivedEnvelope(envelope(MessageType.SESSION_CLEANUP_RESPONSE), 64, 1, releaseReservation = {}))
+        socket.deliver(ProductionReceivedEnvelope(envelope(MessageType.SESSION_CATALOG_RESPONSE), 64, 1, releaseReservation = {}))
+        runCurrent()
+        assertEquals(MessageType.SESSION_CATALOG_RESPONSE, next.await().envelope.messageType)
+        next.await().close()
+        assertEquals(0, socket.disconnectCount)
+        mux.close()
+    }
+
+    @Test
     fun catalogEndpointRejectsTerminalFramesAndOldGenerationWithoutTerminalSubscription(): Unit = runTest {
         val socket = FakeSocket()
         val pcId = UUID.randomUUID()
         val mux = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
-        val endpoint = mux.register(pcId, catalogOnly = true)
+        val endpoint = mux.register(pcId, catalogOnly = true, cleanupOnly = true)
         endpoint.connect()
         socket.emitState(RealtimeState.Connected)
         runCurrent()

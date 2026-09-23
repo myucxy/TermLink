@@ -93,6 +93,19 @@ class ProductSessionDeletionTest {
     }
 
     @Test
+    fun nativeCleanupReportsUpgradeWithoutPretendingTheServerIsOffline() = runBlocking {
+        val session = session()
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override val snapshot = MutableStateFlow(cleanupSnapshot(listOf(session)))
+            override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
+                throw dev.termlink.network.production.HostDeviceUpgradeRequiredException("host_session_cleanup_v1")
+            }
+        }
+        val result = repository.deleteInactiveSessions(session.pcId, listOf(session.id), { error("unconfirmed deletion") }, {})
+        assertEquals(InactiveSessionCleanupResult(failed = 1, interrupted = true, upgradeRequired = true), result)
+    }
+
+    @Test
     fun nativeCleanupSettlesInFlightBatchAndCancelsBeforeNextBatch() = runBlocking {
         val first = session()
         val sessions = (1..65).map { session().copy(pcId = first.pcId) }

@@ -31,6 +31,7 @@ internal data class InactiveSessionCleanupResult(
     val failed: Int = 0,
     val skipped: Int = 0,
     val interrupted: Boolean = false,
+    val upgradeRequired: Boolean = false,
 ) {
     val processed: Int get() = deleted + failed + skipped
 }
@@ -53,6 +54,10 @@ internal suspend fun ProductRepository.deleteInactiveSessions(
             // Cancellation stops subsequent batches; settle this bounded in-flight batch first.
             val outcomes = withContext(NonCancellable) {
                 try { deleteInactiveSessionBatch(pcId, selected) }
+                catch (_: dev.termlink.network.production.HostDeviceUpgradeRequiredException) {
+                    result = result.copy(upgradeRequired = true)
+                    null
+                }
                 catch (_: Exception) { null }
             }
             if (outcomes == null) {

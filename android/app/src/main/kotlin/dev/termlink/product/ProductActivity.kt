@@ -1799,7 +1799,9 @@ fun ProductApp(
                         throw error
                     } catch (error: Throwable) {
                         snackbarHostState.showSnackbar(
-                            safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
+                            if (error is dev.termlink.network.production.HostDeviceUpgradeRequiredException)
+                                context.getString(R.string.session_cleanup_upgrade_required)
+                            else safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
                         )
                     }
                 }
@@ -7954,7 +7956,8 @@ private fun InactiveSessionCleanupDialog(
                             stringResource(R.string.close_inactive_sessions_progress, result.processed, sessionIds.size))
                     } else {
                         Text(stringResource(R.string.close_inactive_sessions_result, result.deleted, result.failed, result.skipped))
-                        if (result.interrupted) Text(stringResource(R.string.cleanup_interrupted))
+                        if (result.upgradeRequired) Text(stringResource(R.string.session_cleanup_upgrade_required))
+                        else if (result.interrupted) Text(stringResource(R.string.cleanup_interrupted))
                     }
                 }
             },

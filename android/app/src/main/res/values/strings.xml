@@ -453,7 +453,7 @@
     <string name="unknown_device">Unnamed device</string>
     <string name="unknown_target">Target device</string>
     <string name="unknown_pc">Windows PC</string>
-    <string name="unknown_server_operation">The server operation was not available</string>
+    <string name="unknown_server_operation">The operation could not be completed. Check the connection and try again.</string>
     <string name="status_revoked_server">Revoked by the server</string>
     <string name="trust_trusted">Trusted</string><string name="trust_pending">Pending</string><string name="trust_revoked">Revoked</string>
     <string name="session_running">Running</string><string name="session_interrupted">Interrupted</string><string name="session_exited">Exited</string>
@@ -584,4 +584,5 @@
     <string name="settings_terminal_font_error_unsupported">Choose a supported TTF or OTF font file.</string>
     <string name="settings_terminal_font_error_invalid">Android could not load this font. The previous font was kept.</string>
     <string name="settings_terminal_font_error_unreadable">The selected font could not be read. The previous font was kept.</string>
+    <string name="session_cleanup_upgrade_required">Upgrade the server and Windows client to use native session cleanup.</string>
 </resources>

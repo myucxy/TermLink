@@ -207,9 +207,9 @@ class ProductionRealtimeMultiplexer private constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
     private val closed = AtomicBoolean(false)
     private val endpointLock = Any()
-    private val endpoints = mutableMapOf<UUID, Endpoint>()
+    private val endpoints = mutableMapOf<Pair<UUID, Boolean>, Endpoint>()
     private val directDataGateway = AtomicReference<ProductionRealtimeDirectDataGateway?>(null)
-    private val closedEndpointIncarnations = LinkedHashMap<UUID, ClosedEndpoint>()
+    private val closedEndpointIncarnations = LinkedHashMap<Pair<UUID, Boolean>, ClosedEndpoint>()
     /** Socket-global fence; it intentionally survives endpoint replacement. */
     private val rejectedThroughGeneration = AtomicInteger(0)
     /** Highest socket generation observed by any endpoint incarnation. */
@@ -258,7 +258,9 @@ class ProductionRealtimeMultiplexer private constructor(
         sessionId: UUID,
         peerDeviceId: UUID? = null,
         catalogOnly: Boolean = false,
+        cleanupOnly: Boolean = false,
     ): ProductionRealtimeSessionTransport {
+        require(!cleanupOnly || catalogOnly) { "Cleanup endpoints use the device Relay route" }
         require(!catalogOnly || peerDeviceId == null) { "Catalog endpoints use Relay only" }
         require(peerDeviceId == null || peerDeviceId != UUID(0, 0)) {
             "production session peer device ID is invalid"
@@ -268,10 +270,11 @@ class ProductionRealtimeMultiplexer private constructor(
             // Rechecking under the map lock prevents a register/close race from
             // installing an endpoint after the owner has already drained it.
             check(!closed.get()) { "production realtime multiplexer is closed" }
-            check(sessionId !in endpoints) { "production session is already registered" }
-            closedEndpointIncarnations.remove(sessionId)
-            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation(), catalogOnly).also { endpoint ->
-                endpoints[sessionId] = endpoint
+            val routeKey = sessionId to cleanupOnly
+            check(routeKey !in endpoints) { "production session is already registered" }
+            closedEndpointIncarnations.remove(routeKey)
+            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation(), catalogOnly, cleanupOnly).also { endpoint ->
+                endpoints[routeKey] = endpoint
                 logEndpointLifecycle("endpoint_register", endpoint)
             }
         }
@@ -300,7 +303,7 @@ class ProductionRealtimeMultiplexer private constructor(
             ?: return false
         val sessionId = ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray())
             ?: return false
-        val endpoint = synchronized(endpointLock) { endpoints[sessionId] } ?: return false
+        val endpoint = synchronized(endpointLock) { endpoints[sessionId to false] } ?: return false
         if (endpoint.peerDeviceId != peerDeviceId) return false
         return endpoint.sendRelayExact(envelope, exactEnvelopeBytes)
     }
@@ -324,7 +327,7 @@ class ProductionRealtimeMultiplexer private constructor(
             ?: return false
         val sessionId = ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray())
             ?: return false
-        val endpoint = synchronized(endpointLock) { endpoints[sessionId] } ?: return false
+        val endpoint = synchronized(endpointLock) { endpoints[sessionId to false] } ?: return false
         if (endpoint.peerDeviceId != peerDeviceId) return false
 
         val generation = when (carrierOwner) {
@@ -440,10 +443,11 @@ class ProductionRealtimeMultiplexer private constructor(
             }
 
             val sessionId = ProductionRealtimeClient.uuidFromBytes(received.envelope.sessionId.toByteArray())
+            val routeKey = sessionId?.let { it to (received.envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_RESPONSE) }
             val target = synchronized(endpointLock) {
                 RouteTarget(
-                    endpoint = sessionId?.let(endpoints::get),
-                    closedEndpoint = sessionId?.let(closedEndpointIncarnations::get),
+                    endpoint = routeKey?.let(endpoints::get),
+                    closedEndpoint = routeKey?.let(closedEndpointIncarnations::get),
                 )
             }
             val endpoint = target.endpoint
@@ -509,9 +513,9 @@ class ProductionRealtimeMultiplexer private constructor(
 
     private fun unregister(endpoint: Endpoint, graceful: Boolean) {
         val removed = synchronized(endpointLock) endpoint@{
-            if (endpoints[endpoint.sessionId] !== endpoint) return@endpoint false
-            endpoints.remove(endpoint.sessionId)
-            closedEndpointIncarnations[endpoint.sessionId] = ClosedEndpoint(
+            if (endpoints[endpoint.routeKey] !== endpoint) return@endpoint false
+            endpoints.remove(endpoint.routeKey)
+            closedEndpointIncarnations[endpoint.routeKey] = ClosedEndpoint(
                 incarnation = endpoint.incarnation,
                 graceful = graceful,
                 retiredGeneration = socket.diagnostics().generation,
@@ -536,7 +540,9 @@ class ProductionRealtimeMultiplexer private constructor(
         val peerDeviceId: UUID?,
         val incarnation: Int,
         private val catalogOnly: Boolean,
+        private val cleanupOnly: Boolean,
     ) : ProductionRealtimeSessionTransport {
+        val routeKey = sessionId to cleanupOnly
         private val endpointClosed = AtomicBoolean(false)
         private val subscribedGeneration = AtomicInteger(0)
         private val admissionLock = Any()
@@ -643,6 +649,9 @@ class ProductionRealtimeMultiplexer private constructor(
                 check(!closed.get() && !endpointClosed.get()) { "production session transport is closed" }
                 require(catalogOnly == (envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST))) {
                     "Catalog and terminal endpoints cannot be mixed"
+                }
+                require(cleanupOnly == (envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST)) {
+                    "Cleanup and catalog endpoints cannot be mixed"
                 }
                 when (envelope.messageType) {
                     dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE,
@@ -753,7 +762,7 @@ class ProductionRealtimeMultiplexer private constructor(
                     // generation immediately before admission. Holding the map
                     // lock through trySend prevents close/register from exposing
                     // a replacement in the gap between this check and enqueue.
-                    if (endpointClosed.get() || endpoints[sessionId] !== this) {
+                    if (endpointClosed.get() || endpoints[routeKey] !== this) {
                         return@synchronized classifyProductionRealtimeRoute(
                             endpointPresent = true,
                             endpointClosed = true,
