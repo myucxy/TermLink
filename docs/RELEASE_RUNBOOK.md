@@ -27,7 +27,7 @@
    已人工审核的签名、`published` release 和 `ready` artifact。Docker 首选经审核的 Git tag 工作流，
    但 GitHub 只作为 CI 触发器：Server 镜像只发布到 `docker.io/myucxy/termlink`，不创建 GitHub Release，
    也不发布到 GHCR/GitHub Packages。核对 amd64/arm64、OCI index digest、revision、Cosign 签名及三类
-   attestation。失败或网络受限时保留原 AppShip 状态/镜像 tag；恢复同一操作，不移动 tag 或以降级结果
+   attestation；通过后将同一 digest 同步到 `latest`。失败或网络受限时保留原 AppShip 状态/版本镜像 tag；恢复同一操作，不移动版本 tag 或以降级结果
    冒充首选流程。
 6. **部署与回归**：只有用户明确要求部署时，先做 age 加密备份，再以不可变 `tag@sha256:index-digest`
    无损升级单节点 Server；核对两个健康常驻容器、数据卷、migration、OIDC 和公网 `/readyz`。
@@ -112,9 +112,9 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 - 不通过卸载 Android App 解决签名不一致，否则会删除登录、设备身份和 Android Keystore 数据。
 - 不使用旧 `Start-ProductionAcceptance.ps1` 或它的 `-Reset` 路径做版本升级；当前
   `termlink-deploy` 不暴露 reset，禁止用 `docker compose down --volumes` 自行模拟。
-- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。当前 `.github/workflows/release.yml`
-  设置 `latest=false`，不会推送 `latest`；生产/共享部署一律引用 `TAG@sha256:DIGEST`，
-  不依赖已有的 `latest` 或本地缓存 tag。
+- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。`.github/workflows/release.yml`
+  先发布版本镜像，通过签名与证明校验后再把相同 digest 同步到 `latest`；构建阶段的
+  `latest=false` 只用于防止提前更新别名。生产/共享部署仍引用 `TAG@sha256:DIGEST`。
 - 密码、Token、PFX/keystore 密码只能从 Credential Manager、`SecureString` 或受保护的进程环境读取，
   不进入命令参数、日志、manifest 或文档。
 - AppShip 失败时保留 `.appship/` 状态；Docker/AppShip draft 或状态不因失败而删除后重新创建。
@@ -282,6 +282,15 @@ GET /api/v1/apps/termlink-win64/updates?platform=windows&arch=x64&channel=stable
 
 首选 `.github/workflows/release.yml`：它登录 `docker.io/myucxy/termlink`，发布 amd64/arm64，生成
 BuildKit provenance、SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 签名 digest 与三类 attestation。
+校验通过后自动更新 Docker Hub `latest`，并复核其 digest 与版本镜像一致；发布任务串行执行。
+`latest` 是可更新别名，版本标签保持不可变。重跑旧版本任务也会更新 `latest`，因此不要通过
+重跑旧 tag 回滚；回滚部署应指定历史版本的不可变 digest。
+
+仅同步现有已发布版本到 `latest` 时，无需重新编译或修改版本标签。先检查源 manifest 的
+digest、架构与 OCI revision，再使用 `docker buildx imagetools create --prefer-index=false`
+把精确 `docker.io/myucxy/termlink@sha256:...` 复制到 `docker.io/myucxy/termlink:latest`，
+最后复核两标签摘要相同。此操作保留源镜像原有架构与签名状态，不会补齐缺失的架构或证明；
+必须在发布记录中注明现有制品的限制。不要用单架构本地 `docker tag/push` 覆盖多架构索引。
 
 推 tag 前先确认仓库 Actions secrets 中 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 可用。若 workflow 在
 `docker/login-action` 失败，后续 build/sign/attest 都没有发生；不要移动 tag、不要重复创建同版本 tag，

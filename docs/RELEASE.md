@@ -115,7 +115,8 @@ Server 使用 `docker buildx build --output type=oci,dest=...` 生成本地多�
 目标固定为 `docker.io/myucxy/termlink`。工作流使用受保护的 `DOCKERHUB_USERNAME` 与
 `DOCKERHUB_TOKEN` secrets 登录 Docker Hub，构建 `linux/amd64`/`linux/arm64` manifest，生成
 BuildKit provenance 和 SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 对 immutable digest
-及三类 attestation 签名和就地复核。工作流不发布 `latest` 标签。
+及三类 attestation 签名和就地复核。校验通过后，将同一 digest 同步到 `latest` 标签并复核；
+发布任务串行执行，版本标签保持不可变。部署仍使用明确的版本及 digest。
 
 ## AppShip Production 包装门禁
 

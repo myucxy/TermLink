@@ -11,7 +11,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-server-image
   cancel-in-progress: false
 
 env:
@@ -48,6 +48,7 @@ jobs:
         uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f
         with:
           images: ${{ env.IMAGE }}
+          # Promote latest only after digest signatures and attestations pass.
           flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
@@ -135,6 +136,16 @@ jobs:
           cosign verify-attestation --type slsaprovenance --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
           cosign verify-attestation --type spdxjson --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
           cosign verify-attestation --type cyclonedx --certificate-identity "${CERTIFICATE_IDENTITY}" --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE}@${DIGEST}"
+
+      - name: Promote verified image to latest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
+          latest_digest="$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{.Manifest.Digest}}')"
+          test "${latest_digest}" = "${DIGEST}"
 
       # actions/upload-artifact v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
