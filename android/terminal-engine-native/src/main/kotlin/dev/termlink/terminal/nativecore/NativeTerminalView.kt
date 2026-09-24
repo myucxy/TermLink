@@ -39,6 +39,8 @@ import dev.termlink.terminal.api.TerminalRenderGraphemeV1
 import dev.termlink.terminal.api.TerminalRenderRenditionV3
 import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.TerminalViewportMetrics
 import dev.termlink.terminal.api.TerminalTypefaceResolver
 import java.util.LinkedHashMap
 import java.util.concurrent.ExecutorService
@@ -363,6 +365,16 @@ internal class NativeTerminalView @JvmOverloads constructor(
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
         if (followCursor) ensureCursorVisible() else clampViewport()
+    }
+
+    internal fun measuredViewport(): TerminalViewportMetrics? {
+        refreshTypeface()
+        val contentWidth = floor(width - 2 * contentPadding).toInt()
+        val contentHeight = floor(height - 2 * contentPadding).toInt()
+        val columns = floor(contentWidth / cellWidth).toInt()
+        val rows = floor(contentHeight / cellHeight).toInt()
+        if (detached || !isShown || columns !in 2..1000 || rows !in 2..1000) return null
+        return TerminalViewportMetrics(TerminalSize(columns, rows), contentWidth, contentHeight, cellWidth, cellHeight)
     }
 
     override fun onDraw(canvas: Canvas) {

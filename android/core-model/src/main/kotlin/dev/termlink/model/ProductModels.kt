@@ -64,6 +64,7 @@ object PcCapabilityIds {
     const val HOST_HISTORY_V1 = "host_history_v1"
     const val HOST_SESSION_CATALOG_V1 = "host_session_catalog_v1"
     const val HOST_SESSION_CLEANUP_V1 = "host_session_cleanup_v1"
+    const val TERMINAL_WINDOW_RESIZE_V1 = "terminal_window_resize_v1"
 }
 
 data class TerminalCommandCapability(

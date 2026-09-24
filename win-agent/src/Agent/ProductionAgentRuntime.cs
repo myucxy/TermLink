@@ -398,6 +398,7 @@ namespace TermLink.Agent
             public bool DrainRequested;
             public bool ReplayInProgress;
             public bool Removed;
+            public ulong LastResizeRequestSequence;
         }
         private sealed class DirectCutoverReservation
         {
@@ -529,6 +530,7 @@ namespace TermLink.Agent
         // still awaiting its durable SessionHost result.
         private readonly object inputReplayAdmissionSync = new object();
         private readonly ConcurrentDictionary<Guid, Guid> terminationRequests = new ConcurrentDictionary<Guid, Guid>();
+        private readonly ConcurrentDictionary<Guid, byte> resizeRequests = new ConcurrentDictionary<Guid, byte>();
         private readonly ConcurrentDictionary<Guid, ProductionHostHistoryResponseRequest> hostHistoryRequests =
             new ConcurrentDictionary<Guid, ProductionHostHistoryResponseRequest>();
         private readonly ConcurrentDictionary<Guid, byte> destroyedHistorySessions =
@@ -2585,7 +2587,8 @@ namespace TermLink.Agent
                 "remote_agent_update_v1",
                 "host_history_v1",
                 "host_session_catalog_v1",
-                "host_session_cleanup_v1"
+                "host_session_cleanup_v1",
+                "terminal_window_resize_v1"
             };
             if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v2");
             var normalizedCommands = terminalCommands.Select(command => new
@@ -5141,14 +5144,16 @@ namespace TermLink.Agent
                 if (envelope.MessageType == MessageType.ResizeRequest)
                 {
                     var resize = ResizePayload.Parser.ParseFrom(plaintext);
-                    if (resize.Columns < 1 || resize.Columns > short.MaxValue ||
-                        resize.Rows < 1 || resize.Rows > short.MaxValue)
+                    // Legacy automatic viewport notifications remain inert. Only
+                    // an explicit, leased, bounded one-shot request is executable.
+                    if (resize.RequestId.Length != 16 || GuidFromBytes(resize.RequestId.Span) == Guid.Empty) return;
+                    lock (subscriber.Sync)
                     {
-                        return;
+                        if (envelope.Seq <= subscriber.LastResizeRequestSequence) return;
+                        subscriber.LastResizeRequestSequence = envelope.Seq;
                     }
-                    // The PC terminal viewport is authoritative.  Android may
-                    // send an older ResizeRequest, but it can never resize the
-                    // local ConPTY or mutate the published PC dimensions.
+                    var requestSequence = envelope.Seq;
+                    _ = HandleWindowResizeAsync(active, sessionId, senderId, subscriber, requestSequence, resize, token);
                     return;
                 }
                 if (envelope.MessageType == MessageType.HostHistoryRequest)
@@ -5880,6 +5885,43 @@ namespace TermLink.Agent
             {
                 if (digest.Length > 0) CryptographicOperations.ZeroMemory(digest);
             }
+        }
+
+        private async Task HandleWindowResizeAsync(ClientWebSocket active, Guid sessionId, Guid senderId,
+            Subscriber subscriber, ulong requestSequence, ResizePayload resize, CancellationToken token)
+        {
+            var response = new ResizeResponsePayload { RequestId = resize.RequestId };
+            var admitted = resizeRequests.TryAdd(sessionId, 0);
+            try
+            {
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                if (!admitted) response.ErrorCode = "RESIZE_BUSY";
+                else if ((!resize.Restore && (resize.Columns < 2 || resize.Columns > 1000 || resize.Rows < 2 || resize.Rows > 1000)) ||
+                    resize.CellWidthPx > 1024 || resize.CellHeightPx > 1024 || resize.LeaseId.Length != 16 ||
+                    resize.ExpiresAtMs <= now || resize.ExpiresAtMs > now + 15000)
+                    response.ErrorCode = "RESIZE_EXPIRED_OR_INVALID";
+                else if (!await LeaseMatchesAsync(sessionId, senderId, GuidFromBytes(resize.LeaseId.Span), resize.LeaseVersion, token).ConfigureAwait(false))
+                    response.ErrorCode = "CONTROL_LEASE_REJECTED";
+                else
+                {
+                    var result = await registry.RequestResizeAsync(sessionId, new LocalResizeRequest {
+                        Id = GuidFromBytes(resize.RequestId.Span), LocalInputEpoch = resize.ObservedLocalInputEpoch,
+                        ExpiresAtMs = resize.ExpiresAtMs, Restore = resize.Restore,
+                        Columns = resize.Restore ? (short)0 : (short)resize.Columns,
+                        Rows = resize.Restore ? (short)0 : (short)resize.Rows
+                    }).ConfigureAwait(false);
+                    response.Columns = (uint)Math.Max(0, (int)result.Columns);
+                    response.Rows = (uint)Math.Max(0, (int)result.Rows);
+                    response.ErrorCode = result.Error == LocalResizeError.OK ? string.Empty : result.Error.ToString();
+                }
+                var bytes = response.ToByteArray();
+                try { await SendSessionControlEnvelopeAsync(active, sessionId, subscriber, requestSequence,
+                    MessageType.ResizeResponse, bytes, token).ConfigureAwait(false); }
+                finally { CryptographicOperations.ZeroMemory(bytes); }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception) { /* Connection loss leaves an explicitly unknown result at the caller. */ }
+            finally { if (admitted) resizeRequests.TryRemove(sessionId, out _); }
         }
 
         private async Task SendSessionTerminateResponseAsync(

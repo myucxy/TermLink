@@ -2,6 +2,7 @@
 !server/
 !server/go.mod
 !server/go.sum
+!server/THIRD_PARTY_NOTICES.md
 !server/cmd/
 !server/cmd/**
 !server/internal/

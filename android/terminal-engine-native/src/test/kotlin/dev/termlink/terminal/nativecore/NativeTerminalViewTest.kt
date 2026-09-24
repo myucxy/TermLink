@@ -38,6 +38,39 @@ import org.robolectric.annotation.Config
 @Config(sdk = [26])
 class NativeTerminalViewTest {
     @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun viewportMeasurementUsesFontSpacingAndVisibleAreaWithoutResizingAuthority() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val engine = NativeTerminalEngine(TerminalSize(120, 40), FakeNativeBridge())
+        try {
+            fun measure(font: Float, spacing: Float, height: Int = 600): dev.termlink.terminal.api.TerminalViewportMetrics {
+                val view = engine.createView(controller.get(), font, spacing) as NativeTerminalView
+                controller.get().setContentView(view)
+                view.layout(0, 0, 400, height)
+                return requireNotNull(engine.measuredViewport())
+            }
+            val normal = measure(13f, 1f)
+            val large = measure(26f, 1f)
+            val spaced = measure(13f, 1.5f)
+            val keyboard = measure(13f, 1f, 300)
+            assertTrue(large.size.columns < normal.size.columns)
+            assertTrue(large.size.rows < normal.size.rows)
+            assertEquals(normal.size.columns, spaced.size.columns)
+            assertTrue(spaced.size.rows < normal.size.rows)
+            assertEquals(normal.size.columns, keyboard.size.columns)
+            assertTrue(keyboard.size.rows < normal.size.rows)
+            assertTrue(normal.size.columns * normal.cellWidthPx <= normal.widthPx)
+            assertTrue((normal.size.columns + 1) * normal.cellWidthPx > normal.widthPx)
+            assertTrue(normal.size.rows * normal.cellHeightPx <= normal.heightPx)
+            assertEquals(TerminalSize(120, 40), engine.authoritativeSize.value)
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
     fun imeCompositionCommitsOneCharacterExactlyOnce() {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
         val bridge = FakeNativeBridge()

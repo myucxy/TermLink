@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0-windows7.0": {
+      "Microsoft.Windows.Console.ConPTY": {
+        "type": "Direct",
+        "requested": "[1.24.260710001, 1.24.260710001]",
+        "resolved": "1.24.260710001",
+        "contentHash": "JR1xAkZbNnAALBjzFpqSwEx7YZfD1LI228jF9j9cgKknBPCiFy9mpphlgH+TpTN8vajTUpcgg9Miy5Y8eUAH9g=="
+      },
+      "termlink.agentcontrol": {
+        "type": "Project"
+      },
+      "termlink.terminalcore": {
+        "type": "Project"
+      }
+    },
+    "net8.0-windows7.0/win-x64": {
+      "Microsoft.Windows.Console.ConPTY": {
+        "type": "Direct",
+        "requested": "[1.24.260710001, 1.24.260710001]",
+        "resolved": "1.24.260710001",
+        "contentHash": "JR1xAkZbNnAALBjzFpqSwEx7YZfD1LI228jF9j9cgKknBPCiFy9mpphlgH+TpTN8vajTUpcgg9Miy5Y8eUAH9g=="
+      }
+    }
+  }
+}

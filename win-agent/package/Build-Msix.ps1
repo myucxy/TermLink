@@ -234,6 +234,7 @@ try {
             'The package is missing the Windows terminal-core managed runtime.'
         Assert-True (Test-Path -LiteralPath (Join-Path $layout 'termlink_terminal_ffi.dll') -PathType Leaf) `
             'The package is missing the Windows terminal-core native runtime.'
+        & (Join-Path $projectRoot 'scripts/Test-ConPtyRuntime.ps1') -Directory $layout
         $directNativePath = Join-Path $layout 'termlink_direct_ffi.dll'
         Assert-True (Test-Path -LiteralPath $directNativePath -PathType Leaf) `
             'The package is missing the Windows network-core native runtime.'

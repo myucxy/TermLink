@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -797,7 +798,24 @@ using (var gapAuthority = new TerminalCoreAuthority(80, 24, _ => { }, (_, _, _, 
         "terminal-core authority remained usable after a common-journal gap");
 }
 
-Console.WriteLine("SessionHost title validation passed.");
+// Exercise the actual create/resize/close exports against disposable pipes.
+using (var inputPipe = new AnonymousPipeServerStream(PipeDirection.Out))
+using (var outputPipe = new AnonymousPipeServerStream(PipeDirection.In))
+{
+    Require(PseudoConsoleApi.Create(new PseudoConsoleApi.Size { X = 80, Y = 24 },
+        inputPipe.ClientSafePipeHandle.DangerousGetHandle(),
+        outputPipe.ClientSafePipeHandle.DangerousGetHandle(), 0, out var console) >= 0,
+        "ConPTY creation failed");
+    try
+    {
+        Require(PseudoConsoleApi.Resize(console, new PseudoConsoleApi.Size { X = 100, Y = 30 }) >= 0,
+            "ConPTY resize failed");
+    }
+    finally { PseudoConsoleApi.Close(console); }
+}
+
+Console.WriteLine("SessionHost title, reply routing and ConPTY lifecycle validation passed.");
+WindowResizeValidation.Run();
 
 static void Require(bool condition, string message)
 {

@@ -42,6 +42,7 @@ const (
 	InputRejected            MessageType = 32
 	ResizeRequest            MessageType = 40
 	ResizeApplied            MessageType = 41
+	ResizeResponse           MessageType = 42
 	SnapshotOffer            MessageType = 50
 	SnapshotChunk            MessageType = 51
 	ResumeRequest            MessageType = 52
@@ -242,7 +243,7 @@ func knownMessage(value MessageType) bool {
 	switch value {
 	case Heartbeat, Goodbye, SessionUpsert, SessionRemoved, Subscribe, Unsubscribe,
 		OutputChunk, OutputACK, FlowControl, Gap, InputEvent, InputAccepted,
-		InputRejected, ResizeRequest, ResizeApplied, SnapshotOffer, SnapshotChunk,
+		InputRejected, ResizeRequest, ResizeApplied, ResizeResponse, SnapshotOffer, SnapshotChunk,
 		ResumeRequest, LeaseRequest, LeaseGranted, LeaseDenied, LeaseRevoked,
 		ThemeChanged, SessionStarted, SessionInterrupted, SessionEnded,
 		SessionTerminateRequest, HostHistoryRequest, HostHistoryResponse, HostHistoryControl,

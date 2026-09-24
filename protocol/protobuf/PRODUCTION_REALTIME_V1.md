@@ -249,7 +249,7 @@ applies this allowlist before looking up a route:
 | Direction | Message types |
 | --- | --- |
 | Android → PC | `SUBSCRIBE`, `UNSUBSCRIBE`, `OUTPUT_ACK`, `FLOW_CONTROL`, `INPUT_EVENT`, `RESIZE_REQUEST`, `RESUME_REQUEST`, `LEASE_REQUEST`, `SESSION_TERMINATE_REQUEST`, `HOST_HISTORY_REQUEST`, `HOST_HISTORY_CONTROL`, `GOODBYE`, `HEARTBEAT` |
-| PC → Android | `SESSION_UPSERT`, `SESSION_REMOVED`, `OUTPUT_CHUNK`, `GAP`, `INPUT_ACCEPTED`, `INPUT_REJECTED`, `RESIZE_APPLIED`, `SNAPSHOT_OFFER`, `SNAPSHOT_CHUNK`, `LEASE_GRANTED`, `LEASE_DENIED`, `LEASE_REVOKED`, `THEME_CHANGED`, `SESSION_STARTED`, `SESSION_INTERRUPTED`, `SESSION_ENDED`, `HOST_HISTORY_RESPONSE`, `SESSION_TERMINATE_RESPONSE`, `GOODBYE`, `HEARTBEAT` |
+| PC → Android | `SESSION_UPSERT`, `SESSION_REMOVED`, `OUTPUT_CHUNK`, `GAP`, `INPUT_ACCEPTED`, `INPUT_REJECTED`, `RESIZE_APPLIED`, `RESIZE_RESPONSE`, `SNAPSHOT_OFFER`, `SNAPSHOT_CHUNK`, `LEASE_GRANTED`, `LEASE_DENIED`, `LEASE_REVOKED`, `THEME_CHANGED`, `SESSION_STARTED`, `SESSION_INTERRUPTED`, `SESSION_ENDED`, `HOST_HISTORY_RESPONSE`, `SESSION_TERMINATE_RESPONSE`, `GOODBYE`, `HEARTBEAT` |
 
 `SNAPSHOT_OFFER` and `SNAPSHOT_CHUNK` retain their existing numbers and ACL
 positions for wire compatibility, but are reserved and unused by
@@ -264,9 +264,35 @@ unacknowledged events and serialized Envelope/WebSocket binary payload bytes,
 a monotonic control epoch, and an optional reason. A zero limit or
 `paused=true` pauses the complete ordered PC-to-Android session stream. V1
 uses one sequence for output, resize, lifecycle, lease and input-result events,
-so no later control frame may overtake a paused terminal frame. The PC must
+so no later ordered control frame may overtake a paused terminal frame. The PC must
 still service the local ConPTY and Shell. It resumes from the subscriber's
 cumulative ACK when a newer positive window arrives.
+
+## Explicit window resize
+
+`terminal_window_resize_v1` in the PC catalog advertises support for an explicit,
+leased `RESIZE_REQUEST` (40). Legacy automatic requests without a nonzero UUID
+remain ignored. The request carries `request_id`, target columns/rows (2..1000),
+phone cell metrics, `lease_id`, `lease_version`, `observed_local_input_epoch`, and
+an absolute UTC `expires_at_ms` (phone now + 10 seconds). Both device clocks must
+be synchronized. `restore=true` requests the saved desktop grid instead.
+Android also requires this optional capability echoed in the current Relay
+WELCOME before sending. Old servers remain usable for all existing operations;
+the new menu reports that the server needs upgrading without sending new messages.
+
+The Host requests the outer window resize and waits for the outer grid and its
+real ConPTY to agree. Its normal resize loop remains the sole source of ordered
+`RESIZE_APPLIED` (41). `RESIZE_RESPONSE` (42, PC → Android only) is a separate
+E2EE control reply containing the same UUID, observed grid, and an error code
+(empty on success). Like termination replies it echoes the request Envelope
+sequence; it never enters terminal replay, advances its high-water mark, or
+consumes an output ACK. The phone reports success only after its authoritative
+renderer has also applied the returned grid. Control replies may overtake replay.
+
+Resize controls use Relay; they do not expand the LAN/NAT data allowlist. Only
+one operation per session executes at a time, requests are not automatically
+retried, and local input epochs fence queued requests. Server, Windows Agent,
+SessionHost, and Android must all support this extension before use.
 
 ## Input authority
 

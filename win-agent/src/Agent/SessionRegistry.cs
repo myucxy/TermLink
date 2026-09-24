@@ -555,6 +555,19 @@ namespace TermLink.Agent
             }
         }
 
+        public Task<LocalResizeResult> RequestResizeAsync(Guid sessionId, LocalResizeRequest request)
+        {
+            ManagedSession managed;
+            lock (sync)
+            {
+                IRegistryManagedSession session;
+                managed = remoteAccessEnabled && sessions.TryGetValue(sessionId, out session)
+                    ? session as ManagedSession : null;
+            }
+            return managed != null ? managed.RequestResizeAsync(request) : Task.FromResult(
+                new LocalResizeResult { Id = request.Id, Error = LocalResizeError.SESSION_UNAVAILABLE });
+        }
+
         public bool TrySendRemoteInput(Guid sessionId, Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
             return DispatchRemoteInput(sessionId, inputId, expectedLocalInputEpoch, bytes) ==
@@ -1515,6 +1528,8 @@ namespace TermLink.Agent
             }
             if (request) agent.RequestRemoteStop(commitInterruptedLifecycle);
         }
+
+        public Task<LocalResizeResult> RequestResizeAsync(LocalResizeRequest request) => agent.RequestResizeAsync(request);
 
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {

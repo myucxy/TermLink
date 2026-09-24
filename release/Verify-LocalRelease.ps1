@@ -628,6 +628,16 @@ if ($setupRecords.Count -eq 1) {
             Assert-Release (Test-Path -LiteralPath (Join-Path $payloadRoot $requiredWindowsRuntime) -PathType Leaf) `
                 "Windows Setup payload is missing required runtime binary: $requiredWindowsRuntime"
         }
+        # Older releases predate bundled ConPTY. Require it when declared by the
+        # dependency manifest or when any vendor artifact is present.
+        $hostDeps = Join-Path $payloadRoot 'TermLink.SessionHost.deps.json'
+        if (((Test-Path -LiteralPath $hostDeps -PathType Leaf) -and
+            (Get-Content -LiteralPath $hostDeps -Raw).Contains('Microsoft.Windows.Console.ConPTY/')) -or
+            (Test-Path -LiteralPath (Join-Path $payloadRoot 'conpty.dll')) -or
+            (Test-Path -LiteralPath (Join-Path $payloadRoot 'x64/OpenConsole.exe')) -or
+            (Test-Path -LiteralPath (Join-Path $payloadRoot 'arm64/OpenConsole.exe'))) {
+            & (Join-Path $PSScriptRoot '../win-agent/scripts/Test-ConPtyRuntime.ps1') -Directory $payloadRoot
+        }
         $ownedPayloadBinaries = @(Get-ChildItem -LiteralPath $payloadRoot -File -Recurse | Where-Object {
             $_.Name -match '^TermLink(?:\..+)?\.(exe|dll)$' -or
             $_.Name -ceq 'termlink_terminal_ffi.dll' -or

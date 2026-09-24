@@ -248,10 +248,16 @@ class ProductionRealtimeMultiplexer private constructor(
     val directRelayConnectionEvents: Flow<ProductionRealtimeSessionConnectionEvent>
         get() = supervisor.connectionEvents
 
-    /** Read-only generation-fenced capability echo used to admit new Direct cutovers. */
+    /** Read-only generation-fenced capability echo for optional transport features. */
     internal val directRealtimeNegotiatedCapabilities:
         StateFlow<ProductionRealtimeNegotiatedCapabilities>
         get() = socket.negotiatedCapabilities
+
+    fun hasNegotiatedCapability(capability: String): Boolean {
+        val negotiated = socket.negotiatedCapabilities.value
+        return negotiated.generation > 0 && negotiated.generation == socket.diagnostics().connectedGeneration &&
+            capability in negotiated.capabilities
+    }
 
     /** Registers exactly one consumer for [sessionId]. */
     fun register(

@@ -56,6 +56,22 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
     @Test
+    fun optionalResizeRequiresCapabilityOnCurrentServerGeneration(): Unit = runTest {
+        val socket = FakeSocket()
+        val mux = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val capability = "terminal_window_resize_v1"
+        socket.activateGeneration(1)
+        assertTrue(!mux.hasNegotiatedCapability(capability))
+        socket.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1, setOf(capability))
+        assertTrue(mux.hasNegotiatedCapability(capability))
+        socket.activateGeneration(2)
+        assertTrue(!mux.hasNegotiatedCapability(capability))
+        socket.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(2, emptySet())
+        assertTrue(!mux.hasNegotiatedCapability(capability))
+        mux.close()
+    }
+
+    @Test
     fun pendingCleanupDoesNotBlockCatalogAndClosingItPreservesCatalogRoute(): Unit = runTest {
         val socket = FakeSocket()
         val pcId = UUID.randomUUID()
@@ -1822,6 +1838,7 @@ class ProductionRealtimeMultiplexerTest {
         .build()
 
     private class FakeSocket : ProductionRealtimeSocket {
+        override val negotiatedCapabilities = MutableStateFlow(ProductionRealtimeNegotiatedCapabilities(0, emptySet()))
         val incoming = Channel<ProductionReceivedEnvelope>(Channel.UNLIMITED)
         val releasedReservations = AtomicInteger(0)
         private val mutableState = MutableSharedFlow<RealtimeState>(extraBufferCapacity = 8)

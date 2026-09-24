@@ -1041,6 +1041,8 @@ interface ProductRepository : Closeable {
     suspend fun releaseControl(sessionId: UUID)
     /** Re-runs the existing Direct discovery for the session's target PC. */
     suspend fun requestNetworkCheck(sessionId: UUID, kind: DirectNetworkCheckKind) = Unit
+    suspend fun resizeSessionWindow(sessionId: UUID, metrics: dev.termlink.terminal.api.TerminalViewportMetrics?): dev.termlink.terminal.api.TerminalSize =
+        error("RESIZE_UNSUPPORTED")
     /** Release all active server control leases while keeping read-only viewing alive. */
     suspend fun releaseAllControlLeases() = Unit
     /** Lists one Windows directory page. An empty path requests the drive roots. */

@@ -439,7 +439,7 @@ namespace TermLink.Agent
                 "Local IPC capabilities enabled an unsupported feature.");
             LocalPayloadCodec.ParseRemoteAccessStopped(LocalPayloadCodec.RemoteAccessStopped());
             var invalidRejected = false;
-            try { LocalPayloadCodec.ParseCapabilities(new byte[] { 1, 2 }); }
+            try { LocalPayloadCodec.ParseCapabilities(new byte[] { 1, 4 }); }
             catch (InvalidDataException) { invalidRejected = true; }
             Require(invalidRejected, "Local IPC capabilities accepted unknown feature bits.");
         }

@@ -206,6 +206,7 @@ import dev.termlink.terminal.api.TerminalFontFamilyHintV1
 import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.api.TerminalTypefaceResolver
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
+import dev.termlink.terminal.api.TerminalViewportMetrics
 import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.termux.TermuxTerminalEngine
 import dev.termlink.terminal.termux.TermuxTranscriptViewport
@@ -1554,6 +1555,7 @@ fun ProductApp(
                     onRequestNetworkCheck = { sessionId, kind ->
                         runOperation { repository.requestNetworkCheck(sessionId, kind) }
                     },
+                    onResizeSessionWindow = repository::resizeSessionWindow,
                     onLoadTranscript = { sessionId ->
                         scope.launch { runSessionOperation { repository.loadTranscriptBefore(sessionId) } }
                     },
@@ -3155,6 +3157,7 @@ private fun ProductContent(
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onRequestNetworkCheck: (java.util.UUID, DirectNetworkCheckKind) -> Unit,
+    onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
     terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
@@ -3328,6 +3331,7 @@ private fun ProductContent(
             onOpenSession = onOpenSession,
             onReleaseControl = onReleaseControl,
             onRequestNetworkCheck = onRequestNetworkCheck,
+            onResizeSessionWindow = onResizeSessionWindow,
             directRoutingPolicy = directRoutingPolicy,
             onLoadTranscript = onLoadTranscript,
             onClearTranscript = onClearTranscript,
@@ -3956,6 +3960,7 @@ private fun SessionsPage(
     onOpenSession: suspend (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onRequestNetworkCheck: (java.util.UUID, DirectNetworkCheckKind) -> Unit,
+    onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
     directRoutingPolicy: DirectRoutingPolicy,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
@@ -4094,6 +4099,7 @@ private fun SessionsPage(
                         onRequestControl = { sessionOpenScope.launch { onOpenSession(selected.id) } },
                         onReleaseControl = { onReleaseControl(selected.id) },
                         onRequestNetworkCheck = { kind -> onRequestNetworkCheck(selected.id, kind) },
+                        onResizeSessionWindow = onResizeSessionWindow,
                         onTerminalAction = onTerminalAction,
                         onTerminalCustomShortcut = onTerminalCustomShortcut,
                         onPasteRequested = onPasteRequested,
@@ -4148,6 +4154,7 @@ private fun SessionsPage(
                     },
                     onReleaseControl = onReleaseControl,
                     onRequestNetworkCheck = onRequestNetworkCheck,
+                    onResizeSessionWindow = onResizeSessionWindow,
                     terminalPreferences = terminalPreferences,
                     shortcutPreferences = shortcutPreferences,
                     modifier = Modifier.weight(1f),
@@ -4185,6 +4192,7 @@ private fun MobileSessionContent(
     onRequestControl: (java.util.UUID) -> Unit,
     onReleaseControl: (java.util.UUID) -> Unit,
     onRequestNetworkCheck: (java.util.UUID, DirectNetworkCheckKind) -> Unit,
+    onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
     terminalPreferences: TerminalDisplayPreferences,
     shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
@@ -4232,6 +4240,7 @@ private fun MobileSessionContent(
             onRequestControl = { onRequestControl(session.id) },
             onReleaseControl = { onReleaseControl(session.id) },
             onRequestNetworkCheck = { kind -> onRequestNetworkCheck(session.id, kind) },
+            onResizeSessionWindow = onResizeSessionWindow,
             onTerminalAction = onTerminalAction,
             onTerminalCustomShortcut = onTerminalCustomShortcut,
             onPasteRequested = onPasteRequested,
@@ -4568,6 +4577,7 @@ private fun SessionDetail(
     onRequestControl: () -> Unit,
     onReleaseControl: () -> Unit,
     onRequestNetworkCheck: (DirectNetworkCheckKind) -> Unit,
+    onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
     onPasteRequested: (java.util.UUID) -> Unit,
@@ -4619,6 +4629,8 @@ private fun SessionDetail(
                         softWrap = false,
                     )
                     SessionConnectionStatusMenu(
+                        sessionId = session.id,
+                        engine = engine,
                         statusLabel = statusLabel,
                         remoteState = remoteState,
                         sessionOnline = sessionOnline,
@@ -4628,6 +4640,7 @@ private fun SessionDetail(
                         onRequestControl = onRequestControl,
                         onReleaseControl = onReleaseControl,
                         onRequestNetworkCheck = onRequestNetworkCheck,
+                        onResizeSessionWindow = onResizeSessionWindow,
                     )
                 }
             }
@@ -4667,6 +4680,8 @@ private fun SessionDetail(
 
 @Composable
 private fun SessionConnectionStatusMenu(
+    sessionId: java.util.UUID,
+    engine: TerminalViewportEngine?,
     statusLabel: String,
     remoteState: RemoteSessionState?,
     sessionOnline: Boolean,
@@ -4675,9 +4690,11 @@ private fun SessionConnectionStatusMenu(
     onRequestControl: () -> Unit,
     onReleaseControl: () -> Unit,
     onRequestNetworkCheck: (DirectNetworkCheckKind) -> Unit,
+    onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
     networkCheckState: DirectNetworkCheckState?,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember(sessionId) { mutableStateOf(false) }
+    var resizeMetrics by remember(sessionId) { mutableStateOf<TerminalViewportMetrics?>(null) }
     val menuTitle = stringResource(R.string.session_connection_menu_title)
     val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
     val canReleaseControl = remoteState is RemoteSessionState.Controlling
@@ -4688,7 +4705,10 @@ private fun SessionConnectionStatusMenu(
         Row(
             modifier = Modifier
                 // Keep the original header height; clickable expands the touch target without layout space.
-                .clickable(role = Role.Button, onClickLabel = menuTitle) { expanded = true }
+                .clickable(role = Role.Button, onClickLabel = menuTitle) {
+                    resizeMetrics = engine?.measuredViewport()
+                    expanded = true
+                }
                 .semantics { contentDescription = statusLabel },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -4740,6 +4760,12 @@ private fun SessionConnectionStatusMenu(
                     onClick = { expanded = false; onReleaseControl() },
                 )
             }
+            SessionWindowSizeMenuItems(
+                sessionId = sessionId,
+                metrics = resizeMetrics,
+                enabled = sessionOnline && canReleaseControl,
+                onResize = onResizeSessionWindow,
+            )
             when (directRoutingPolicy) {
                 DirectRoutingPolicy.AUTO -> {
                     Text(

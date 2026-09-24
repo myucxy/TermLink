@@ -26,6 +26,9 @@ interface TerminalViewportEngine : TerminalEngine {
 
     fun currentSize(): TerminalSize
 
+    /** Measured presentation capacity only; never resizes the authoritative grid. Call on UI thread. */
+    fun measuredViewport(): TerminalViewportMetrics? = null
+
     fun setOnAcceptedLocalUserInputListener(listener: (() -> Unit)?)
 
     /**
@@ -62,3 +65,11 @@ interface TerminalViewportEngine : TerminalEngine {
 
     fun submitPaste(text: String): Boolean
 }
+
+data class TerminalViewportMetrics(
+    val size: TerminalSize,
+    val widthPx: Int,
+    val heightPx: Int,
+    val cellWidthPx: Float,
+    val cellHeightPx: Float,
+)

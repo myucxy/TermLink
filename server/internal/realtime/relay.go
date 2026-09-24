@@ -68,6 +68,7 @@ var optionalCapabilities = []string{
 	"host_history_v1",
 	"host_session_catalog_v1",
 	"host_session_cleanup_v1",
+	"terminal_window_resize_v1",
 }
 
 const (
@@ -690,7 +691,7 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.SessionUpsert, realtimewire.SessionRemoved,
 			realtimewire.OutputChunk, realtimewire.Gap,
 			realtimewire.InputAccepted, realtimewire.InputRejected,
-			realtimewire.ResizeApplied, realtimewire.SnapshotOffer,
+			realtimewire.ResizeApplied, realtimewire.ResizeResponse, realtimewire.SnapshotOffer,
 			realtimewire.SnapshotChunk, realtimewire.LeaseGranted,
 			realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
 			realtimewire.ThemeChanged, realtimewire.SessionStarted,
@@ -787,8 +788,8 @@ func (p *peer) acceptPCSequence(sessionID, recipientID uuid.UUID, sequence uint6
 // opens the replay epoch that asks the Agent for the missed ordered frames.
 func (p *peer) routePCFrame(envelope realtimewire.Envelope, sessionID, recipientID uuid.UUID, frame []byte) error {
 	if envelope.MessageType == realtimewire.HostHistoryResponse ||
-		envelope.MessageType == realtimewire.SessionTerminateResponse {
-		// Host-history chunks and termination results are correlated by an E2EE
+		envelope.MessageType == realtimewire.SessionTerminateResponse || envelope.MessageType == realtimewire.ResizeResponse {
+		// Host-history, termination and resize results are correlated by an E2EE
 		// request UUID. They do not consume the ordered terminal event sequence
 		// or replay window.
 		return p.route(envelope, sessionID, frame)

@@ -42,4 +42,5 @@ foreach ($dependency in @('TermLink.TerminalCore.dll', 'termlink_terminal_ffi.dl
     }
 }
 
+& (Join-Path $PSScriptRoot '../../scripts/Test-ConPtyRuntime.ps1') -Directory $output
 $executable

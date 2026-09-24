@@ -121,6 +121,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -418,6 +419,7 @@ internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set
         add(PcCapabilityIds.HOST_HISTORY_V1)
         add(PcCapabilityIds.HOST_SESSION_CATALOG_V1)
         add(PcCapabilityIds.HOST_SESSION_CLEANUP_V1)
+        add(PcCapabilityIds.TERMINAL_WINDOW_RESIZE_V1)
         if (dataPlaneEnabled) {
             add(DIRECT_SESSION_CUTOVER_CAPABILITY)
             add(DIRECT_TRANSPORT_DATA_CAPABILITY)
@@ -1935,6 +1937,23 @@ internal class ProductionProductRepository(
             context.getString(R.string.activity_session_detail, sessionId),
             Severity.INFO,
         )
+    }
+
+    override suspend fun resizeSessionWindow(sessionId: UUID, metrics: dev.termlink.terminal.api.TerminalViewportMetrics?): dev.termlink.terminal.api.TerminalSize {
+        val relay = realtimeMultiplexer ?: error("SESSION_UNAVAILABLE")
+        check(relay.hasNegotiatedCapability(PcCapabilityIds.TERMINAL_WINDOW_RESIZE_V1)) { "RESIZE_SERVER_UPGRADE_REQUIRED" }
+        val session = snapshot.value.sessions.firstOrNull { it.id == sessionId } ?: error("SESSION_UNAVAILABLE")
+        check(session.online && session.state == SessionState.RUNNING) { "SESSION_UNAVAILABLE" }
+        val pc = snapshot.value.pcs.firstOrNull { it.id == session.pcId }
+        check(pc != null && PcCapabilityIds.TERMINAL_WINDOW_RESIZE_V1 in pc.capabilities) { "RESIZE_UNSUPPORTED" }
+        val live = liveSessions[sessionId] ?: error("SESSION_UNAVAILABLE")
+        val size = live.client.requestWindowResize(metrics)
+        // The control reply can overtake ordered replay. Only report success once
+        // the normal authority path has applied the same dimensions on the phone.
+        check(withTimeoutOrNull(4_000) {
+            live.engine.authoritativeSize.first { it == size }
+        } != null) { "RESIZE_TIMEOUT" }
+        return size
     }
 
     override suspend fun requestNetworkCheck(sessionId: UUID, kind: DirectNetworkCheckKind) {

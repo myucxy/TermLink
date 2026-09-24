@@ -22,6 +22,7 @@ import dev.termlink.protocol.realtime.v1.MessageType
 import dev.termlink.protocol.realtime.v1.OutputAckPayload
 import dev.termlink.protocol.realtime.v1.OutputChunkPayload
 import dev.termlink.protocol.realtime.v1.ResizePayload
+import dev.termlink.protocol.realtime.v1.ResizeResponsePayload
 import dev.termlink.protocol.realtime.v1.SessionTerminateRequestPayload
 import dev.termlink.protocol.realtime.v1.SessionTerminateResponsePayload
 import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
@@ -449,6 +450,8 @@ class ProductionRealtimeSessionClient(
     private val pendingInputs = ConcurrentHashMap<UUID, CompletableDeferred<Unit>>()
     private val semanticInputOutbox = SemanticInputOutbox()
     private val pendingTerminations = ConcurrentHashMap<UUID, CompletableDeferred<Boolean>>()
+    private val pendingResizes = ConcurrentHashMap<UUID, CompletableDeferred<TerminalSize>>()
+    private val resizeInProgress = AtomicBoolean(false)
     private val pendingHostHistory = ConcurrentHashMap<UUID, HostHistoryAccumulator>()
     private val reconnectMutex = Mutex()
     private var reconnectJob: Job? = null
@@ -1595,6 +1598,48 @@ class ProductionRealtimeSessionClient(
         Unit
     }
 
+    /** Explicit user action, distinct from legacy automatic viewport notifications. No blind retries. */
+    suspend fun requestWindowResize(metrics: dev.termlink.terminal.api.TerminalViewportMetrics?): TerminalSize {
+        val controlling = session.state.value as? RemoteSessionState.Controlling
+            ?: error("CONTROL_LEASE_REJECTED")
+        check(started.get() && !closed.get() && subscriberReady.value > 0) { "SESSION_UNAVAILABLE" }
+        metrics?.let {
+            require(it.size.columns in 2..1000 && it.size.rows in 2..1000 &&
+                it.cellWidthPx.isFinite() && it.cellHeightPx.isFinite() &&
+                it.cellWidthPx > 0 && it.cellWidthPx <= 1024 && it.cellHeightPx > 0 && it.cellHeightPx <= 1024)
+        }
+        val id = UUID.randomUUID()
+        val pending = CompletableDeferred<TerminalSize>()
+        val payload = ResizePayload.newBuilder()
+            .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(id)))
+            .setLeaseId(ByteString.copyFrom(leaseIdBytes(controlling.leaseId)))
+            .setLeaseVersion(controlling.leaseVersion)
+            .setObservedLocalInputEpoch(observedLocalInputEpoch.get())
+            .setExpiresAtMs(System.currentTimeMillis() + 10_000)
+            .setRestore(metrics == null)
+            .setColumns(metrics?.size?.columns ?: 0).setRows(metrics?.size?.rows ?: 0)
+            .setCellWidthPx(metrics?.cellWidthPx?.toInt()?.coerceAtLeast(1) ?: 0)
+            .setCellHeightPx(metrics?.cellHeightPx?.toInt()?.coerceAtLeast(1) ?: 0)
+            .build().toByteArray()
+        check(resizeInProgress.compareAndSet(false, true)) { "RESIZE_BUSY" }
+        try {
+            pendingResizes[id] = pending
+            controlArbitrationMutex.withLock {
+                check(session.state.value == controlling) { "CONTROL_LEASE_REJECTED" }
+                check(started.get() && !closed.get() && subscriberReady.value > 0) { "SESSION_UNAVAILABLE" }
+                sendEncrypted(MessageType.RESIZE_REQUEST, payload,
+                    expectedConnectedGeneration = transport.currentConnectedGeneration())
+            }
+            return withTimeout(12_000) { pending.await() }
+        } catch (_: TimeoutCancellationException) {
+            throw IllegalStateException("RESIZE_TIMEOUT")
+        } finally {
+            pendingResizes.remove(id)
+            resizeInProgress.set(false)
+            payload.fill(0)
+        }
+    }
+
     override suspend fun renewLease(leaseId: String, leaseVersion: Long): RemoteControlLease =
         withContext(Dispatchers.IO) {
             try {
@@ -2073,6 +2118,19 @@ class ProductionRealtimeSessionClient(
                 return
             }
             when (envelope.messageType) {
+                MessageType.RESIZE_RESPONSE -> {
+                    val response = parseIncomingPayload(context) { ResizeResponsePayload.parseFrom(plaintext) }
+                    val id = ProductionRealtimeClient.uuidFromBytes(response.requestId.toByteArray())
+                    require(response.errorCode.length <= 128) { "Resize error code is too long" }
+                    if (id != null) pendingResizes[id]?.let { pending ->
+                        if (response.errorCode.isNotEmpty()) pending.completeExceptionally(IllegalStateException(response.errorCode))
+                        else {
+                            require(response.columns in 2..1000 && response.rows in 2..1000) { "Invalid resize result" }
+                            pending.complete(TerminalSize(response.columns, response.rows))
+                        }
+                    }
+                    return // Control results do not advance terminal sequence/ACK cursors.
+                }
                 MessageType.HOST_HISTORY_RESPONSE -> handleHostHistoryResponse(context, plaintext)
                 MessageType.SESSION_TERMINATE_RESPONSE -> handleSessionTerminateResponse(context, plaintext)
                 MessageType.OUTPUT_CHUNK -> {
@@ -2969,6 +3027,8 @@ class ProductionRealtimeSessionClient(
     }
 
     private fun failPendingInputs(reason: String) {
+        pendingResizes.values.forEach { it.completeExceptionally(IllegalStateException("RESIZE_INTERRUPTED")) }
+        pendingResizes.clear()
         pendingInputs.values.forEach { it.completeExceptionally(RemoteInputDeliveryUnknownException(reason)) }
         pendingInputs.clear()
     }

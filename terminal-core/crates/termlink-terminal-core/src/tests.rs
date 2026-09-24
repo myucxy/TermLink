@@ -3921,6 +3921,39 @@ fn xtversion_query_has_one_canonical_v2_reply_and_strict_parameters() {
 }
 
 #[test]
+fn openconsole_startup_preserves_faint_and_color_queries() {
+    let bytes =
+        b"\x1b[1t\x1b[c\x1b[?1004h\x1b[?9001h\x1b[2mF\x1b[22mN\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+    let mut expected = Terminal::new(8, 2).expect("terminal");
+    output(&mut expected, 0, bytes).expect("OpenConsole startup");
+    assert!(expected.cell(0, 0).expect("F").attributes.faint);
+    assert!(!expected.cell(0, 1).expect("N").attributes.faint);
+    assert_snapshot_self_closure(&expected);
+    for split in 0..=bytes.len() {
+        let mut terminal = Terminal::new(8, 2).expect("terminal");
+        output(&mut terminal, 0, &bytes[..split]).expect("split prefix");
+        output(&mut terminal, 1, &bytes[split..]).expect("split suffix");
+        assert_eq!(terminal.cell(0, 0), expected.cell(0, 0));
+        assert_eq!(terminal.cell(0, 1), expected.cell(0, 1));
+    }
+    let mut terminal = Terminal::new(8, 2).expect("terminal");
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 0,
+            bytes: b"\x1b[1t",
+        })
+        .expect("window restore hint");
+    assert!(host_effect_payloads(prepared.host_effect_frame_v2()).is_empty());
+    for malformed in [&b"\x1b[1;0t"[..], b"\x1b[2t"] {
+        let mut terminal = Terminal::new(8, 2).expect("terminal");
+        assert!(matches!(
+            output(&mut terminal, 0, malformed),
+            Err(TerminalError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
 fn text_area_pixel_query_is_an_exact_no_reply_probe() {
     let mut terminal = Terminal::new(8, 2).expect("terminal");
     let prepared = terminal

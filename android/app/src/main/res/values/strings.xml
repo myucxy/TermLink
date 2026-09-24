@@ -591,4 +591,21 @@
     <string name="session_network_negotiation_failed">Negotiation failed</string>
     <string name="session_network_changed">Network interrupted</string>
     <string name="session_network_retry_later">Please retry shortly</string>
+    <string name="session_window_size_title">Session window</string>
+    <string name="session_resize_fit">Fit session to phone window</string>
+    <string name="session_resize_restore">Restore desktop window size</string>
+    <string name="session_resize_preview">%1$d columns × %2$d rows · %3$d × %4$d px</string>
+    <string name="session_resize_unmeasured">Terminal viewport is not ready</string>
+    <string name="session_resize_applied">Windows applied %1$d columns × %2$d rows.</string>
+    <string name="session_resize_pending">Waiting for Windows to apply the size…</string>
+    <string name="session_resize_control_required">Connect and acquire control to resize.</string>
+    <string name="session_resize_upgrade">Update Windows and reopen this terminal session.</string>
+    <string name="session_resize_window_unsupported">Windows did not apply the requested size. Use a single tab and pane, exit full screen, and check window size limits.</string>
+    <string name="session_resize_no_restore">No saved desktop size, or a local window resize has replaced it.</string>
+    <string name="session_resize_control_lost">Control changed. Check the current window size before trying again.</string>
+    <string name="session_resize_timeout">No confirmation received. Check the window and server version before trying again.</string>
+    <string name="session_resize_failed">Could not adjust this session window. Check its connection and try again.</string>
+    <string name="session_resize_busy">Another window resize is in progress. Try again shortly.</string>
+    <string name="session_resize_server_upgrade">Update the server to enable window resizing.</string>
+    <string name="session_resize_expired">The request expired or its size was invalid. Check both device clocks and the connection.</string>
 </resources>

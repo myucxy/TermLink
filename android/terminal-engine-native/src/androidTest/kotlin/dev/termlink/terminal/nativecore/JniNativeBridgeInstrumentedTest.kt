@@ -37,6 +37,64 @@ import kotlinx.coroutines.withTimeoutOrNull
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
     @Test
+    fun measuredPhoneViewportRespectsFontScaleSpacingAndKeyboardArea() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val intent = android.content.Intent(instrumentation.context, ViewportTestActivity::class.java)
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        val activity = instrumentation.startActivitySync(intent)
+        instrumentation.runOnMainSync {
+            val engine = NativeTerminalEngine(TerminalSize(120, 40))
+            try {
+                fun measure(font: Float, spacing: Float, height: Int = 600, scale: Float = 1f): dev.termlink.terminal.api.TerminalViewportMetrics {
+                    val configuration = android.content.res.Configuration(activity.resources.configuration).apply { fontScale = scale }
+                    val context = activity.createConfigurationContext(configuration)
+                    val view = engine.createView(context, font, spacing)
+                    activity.setContentView(view)
+                    view.layout(0, 0, 400, height)
+                    return requireNotNull(engine.measuredViewport())
+                }
+                val normal = measure(13f, 1f)
+                val large = measure(26f, 1f)
+                val spaced = measure(13f, 1.5f)
+                val keyboard = measure(13f, 1f, height = 300)
+                val scaled = measure(13f, 1f, scale = 1.5f)
+                assertTrue(large.size.columns < normal.size.columns && large.size.rows < normal.size.rows)
+                assertEquals(normal.size.columns, spaced.size.columns)
+                assertTrue(spaced.size.rows < normal.size.rows)
+                assertEquals(normal.size.columns, keyboard.size.columns)
+                assertTrue(keyboard.size.rows < normal.size.rows)
+                assertTrue(scaled.size.columns < normal.size.columns && scaled.size.rows < normal.size.rows)
+                assertEquals(TerminalSize(120, 40), engine.authoritativeSize.value)
+            } finally {
+                activity.setContentView(android.view.View(activity))
+                engine.dispose()
+                activity.finish()
+            }
+        }
+    }
+
+    @Test
+    fun openConsoleStartupRetainsFaintAcrossJniAndCheckpoint() {
+        val bytes = ("\u001b[1t\u001b[c\u001b[?1004h\u001b[?9001h" +
+            "\u001b[2mF\u001b[22mN\u001b]10;?\u001b\\\u001b]11;?\u001b\\").encodeToByteArray()
+        NativeTerminalHandle.create(JniNativeBridge, TerminalSize(8, 2), 1).use { terminal ->
+            // Network chunks may split any escape sequence, including the startup hint.
+            bytes.forEachIndexed { index, byte -> terminal.feed(index + 1L, byteArrayOf(byte)) }
+            val frame = terminal.renderV3().renderFrame
+            assertEquals("F", firstCellText(frame))
+            assertTrue(frame.renditions[frame.rows[0].cells[0].renditionId].faint)
+            assertFalse(frame.renditions[frame.rows[0].cells[1].renditionId].faint)
+            val checkpoint = terminal.exportCheckpoint().copyPayload()
+            NativeTerminalHandle.importCheckpoint(JniNativeBridge, checkpoint).use { restored ->
+                val restoredFrame = restored.renderV3().renderFrame
+                assertEquals(frame.nextSourceSequence, restoredFrame.nextSourceSequence)
+                assertEquals(frame.renditions, restoredFrame.renditions)
+                assertEquals(frame.rows.map { it.cells }, restoredFrame.rows.map { it.cells })
+            }
+        }
+    }
+
+    @Test
     fun deviceFontMetricsBatchAnAsciiTerminalRowIntoOneTextDraw() = kotlinx.coroutines.runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val engine = NativeTerminalEngine(TerminalSize(20, 2))

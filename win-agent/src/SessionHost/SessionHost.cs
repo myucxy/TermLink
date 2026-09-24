@@ -105,7 +105,7 @@ namespace TermLink.SessionHost
             }
             catch (Exception error)
             {
-                Console.Error.WriteLine("TermLink Session Host failed: " + error.Message);
+                Console.Error.WriteLine("TermLink Session Host failed: " + error.GetBaseException().Message);
                 return 125;
             }
         }
@@ -444,6 +444,10 @@ namespace TermLink.SessionHost
         private readonly object inputSync = new object();
         private readonly object terminalWriteSync = new object();
         private readonly object resizeSync = new object();
+        private readonly object outerWriteSync = new object();
+        private COORD? desktopSizeBeforeFit;
+        private COORD? lastFittedSize;
+        private int remoteResizeBusy;
         private readonly object titleSync = new object();
         private readonly ManualResetEventSlim inputThreadReady = new ManualResetEventSlim(false);
         private readonly TerminalTitleTracker titleTracker = new TerminalTitleTracker();
@@ -521,7 +525,8 @@ namespace TermLink.SessionHost
                     ApplyAgentInput,
                     ApplyAgentRemoteInput,
                     options.AgentBufferBytes,
-                    ApplyDurableAuthorityFrame);
+                    ApplyDurableAuthorityFrame,
+                    ApplyRemoteResize);
                 agentPipe.Start();
                 if (options.AutoRegister)
                 {
@@ -760,7 +765,9 @@ namespace TermLink.SessionHost
         {
             CheckWin32(CreatePipe(out pseudoConsoleInput, out terminalInput, IntPtr.Zero, 0), "CreatePipe(input)");
             CheckWin32(CreatePipe(out terminalOutput, out pseudoConsoleOutput, IntPtr.Zero, 0), "CreatePipe(output)");
-            CheckHResult(CreatePseudoConsole(size, pseudoConsoleInput, pseudoConsoleOutput, 0, out pseudoConsole), "CreatePseudoConsole");
+            CheckHResult(PseudoConsoleApi.Create(new PseudoConsoleApi.Size { X = size.X, Y = size.Y },
+                pseudoConsoleInput, pseudoConsoleOutput, 0, out pseudoConsole), "CreatePseudoConsole");
+            if (options.Diagnostics) Console.Error.WriteLine("__CONPTY_BACKEND__:" + PseudoConsoleApi.Backend);
             innerSize = size;
             CloseIfValid(ref pseudoConsoleInput);
             CloseIfValid(ref pseudoConsoleOutput);
@@ -1338,7 +1345,7 @@ namespace TermLink.SessionHost
                         agentBytes,
                         agentBytes.Length,
                         outputSequence,
-                        () => WriteAll(outerOutput, buffer, total));
+                        () => { lock (outerWriteSync) return WriteAll(outerOutput, buffer, total); });
                 }
                 catch (Exception error)
                 {
@@ -1372,6 +1379,16 @@ namespace TermLink.SessionHost
             {
                 var nextPollDelayMilliseconds = ResizePollMilliseconds;
                 var current = QueryOuterSize(outerOutput, observed.X, observed.Y);
+                lock (resizeSync)
+                {
+                    if (Volatile.Read(ref remoteResizeBusy) == 0 && lastFittedSize.HasValue &&
+                        (current.X != lastFittedSize.Value.X || current.Y != lastFittedSize.Value.Y))
+                    {
+                        // A local resize supersedes the previous phone fit.
+                        desktopSizeBeforeFit = null;
+                        lastFittedSize = null;
+                    }
+                }
                 observed = current;
                 var nowMilliseconds = Environment.TickCount64;
                 settle.Observe(current.X, current.Y, nowMilliseconds);
@@ -1433,13 +1450,80 @@ namespace TermLink.SessionHost
             PublishAgentFrame(LocalFrameType.Title, payload);
         }
 
+        private LocalResizeResult ApplyRemoteResize(LocalResizeRequest request)
+        {
+            var result = new LocalResizeResult { Id = request.Id, Error = LocalResizeError.WINDOW_RESIZE_UNSUPPORTED };
+            if (Interlocked.CompareExchange(ref remoteResizeBusy, 1, 0) != 0)
+            { result.Error = LocalResizeError.RESIZE_BUSY; return result; }
+            try
+            {
+                var outer = GetStdHandle(-11);
+                CONSOLE_SCREEN_BUFFER_INFO info;
+                if (!GetConsoleScreenBufferInfo(outer, out info)) return result;
+                var before = QueryOuterSize(outer, 80, 24);
+                var target = new COORD { X = request.Columns, Y = request.Rows };
+                lock (resizeSync)
+                {
+                    if (lastFittedSize.HasValue &&
+                        (before.X != lastFittedSize.Value.X || before.Y != lastFittedSize.Value.Y))
+                    { desktopSizeBeforeFit = null; lastFittedSize = null; }
+                    if (request.Restore)
+                    {
+                        if (!desktopSizeBeforeFit.HasValue || !lastFittedSize.HasValue ||
+                            before.X != lastFittedSize.Value.X || before.Y != lastFittedSize.Value.Y)
+                        { result.Error = LocalResizeError.NO_DESKTOP_SIZE; return result; }
+                        target = desktopSizeBeforeFit.Value;
+                    }
+                }
+                lock (terminalWriteSync)
+                {
+                    if (request.LocalInputEpoch != localInputEpoch)
+                    { result.Error = LocalResizeError.LOCAL_INPUT_PRIORITY; return result; }
+                    if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() >= request.ExpiresAtMs)
+                    { result.Error = LocalResizeError.RESIZE_EXPIRED; return result; }
+                    // Request an OUTER window resize. Never put this in the child input
+                    // or the durable terminal output: it controls local presentation only.
+                    var command = Encoding.ASCII.GetBytes("\x1b[8;" + target.Y + ";" + target.X + "t");
+                    lock (outerWriteSync) if (!WriteAll(outer, command, command.Length)) return result;
+                }
+                var deadline = Stopwatch.StartNew();
+                while (!stopResize && deadline.ElapsedMilliseconds < 3500)
+                {
+                    if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() >= request.ExpiresAtMs)
+                    { result.Error = LocalResizeError.RESIZE_EXPIRED; return result; }
+                    lock (terminalWriteSync)
+                        if (request.LocalInputEpoch != localInputEpoch)
+                        { result.Error = LocalResizeError.LOCAL_INPUT_PRIORITY; return result; }
+                    var actual = QueryOuterSize(outer, before.X, before.Y);
+                    result.Columns = actual.X;
+                    result.Rows = actual.Y;
+                    // The normal settle loop is the only owner of ConPTY resizing
+                    // and journal events. Both dimensions must agree before success.
+                    lock (resizeSync)
+                    {
+                        if (actual.X == target.X && actual.Y == target.Y &&
+                            innerSize.X == target.X && innerSize.Y == target.Y)
+                        {
+                            if (request.Restore) { desktopSizeBeforeFit = null; lastFittedSize = null; }
+                            else { desktopSizeBeforeFit ??= before; lastFittedSize = target; }
+                            result.Error = LocalResizeError.OK;
+                            return result;
+                        }
+                    }
+                    Thread.Sleep(40);
+                }
+                return result;
+            }
+            finally { Volatile.Write(ref remoteResizeBusy, 0); }
+        }
+
         private bool ResizeInner(COORD size)
         {
             lock (resizeSync)
             {
                 if (pseudoConsole == IntPtr.Zero) return false;
                 if (innerSize.X == size.X && innerSize.Y == size.Y) return false;
-                var result = ResizePseudoConsole(pseudoConsole, size);
+                var result = PseudoConsoleApi.Resize(pseudoConsole, new PseudoConsoleApi.Size { X = size.X, Y = size.Y });
                 if (result != 0) return false;
                 innerSize = size;
             }
@@ -1472,11 +1556,11 @@ namespace TermLink.SessionHost
                 pseudoConsole = IntPtr.Zero;
                 if (abandonOutput)
                 {
-                    Task.Run(() => ClosePseudoConsole(ownedPseudoConsole));
+                    Task.Run(() => PseudoConsoleApi.Close(ownedPseudoConsole));
                 }
                 else
                 {
-                    ClosePseudoConsole(ownedPseudoConsole);
+                    PseudoConsoleApi.Close(ownedPseudoConsole);
                 }
             }
         }
@@ -1582,7 +1666,7 @@ namespace TermLink.SessionHost
             CloseIfValid(ref pseudoConsoleOutput);
             if (pseudoConsole != IntPtr.Zero)
             {
-                ClosePseudoConsole(pseudoConsole);
+                PseudoConsoleApi.Close(pseudoConsole);
                 pseudoConsole = IntPtr.Zero;
             }
             CloseIfValid(ref terminalOutput);
@@ -1802,15 +1886,6 @@ namespace TermLink.SessionHost
         private static extern bool CloseHandle(IntPtr handle);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern int CreatePseudoConsole(COORD size, IntPtr input, IntPtr output, uint flags, out IntPtr pseudoConsole);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern int ResizePseudoConsole(IntPtr pseudoConsole, COORD size);
-
-        [DllImport("kernel32.dll")]
-        private static extern void ClosePseudoConsole(IntPtr pseudoConsole);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -1969,6 +2044,8 @@ namespace TermLink.SessionHost
         private readonly Action<Guid, byte[]> inputHandler;
         private readonly Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler;
         private readonly Action<LocalFrame> acknowledgedFrameHandler;
+        private readonly Func<LocalResizeRequest, LocalResizeResult> resizeHandler;
+        private readonly Queue<LocalFrame> controlResults = new Queue<LocalFrame>();
         private readonly int maximumBufferedBytes;
         private readonly object sync = new object();
         private readonly object authorityApplySync = new object();
@@ -1993,7 +2070,8 @@ namespace TermLink.SessionHost
             Action<Guid, byte[]> inputHandler,
             Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler,
             int maximumBufferedBytes,
-            Action<LocalFrame> acknowledgedFrameHandler = null)
+            Action<LocalFrame> acknowledgedFrameHandler = null,
+            Func<LocalResizeRequest, LocalResizeResult> resizeHandler = null)
         {
             this.pipeName = pipeName;
             this.sessionId = sessionId;
@@ -2002,6 +2080,7 @@ namespace TermLink.SessionHost
             this.remoteInputHandler = remoteInputHandler;
             this.maximumBufferedBytes = maximumBufferedBytes;
             this.acknowledgedFrameHandler = acknowledgedFrameHandler;
+            this.resizeHandler = resizeHandler;
         }
 
         public ulong LastAcknowledgedSequence
@@ -2139,7 +2218,7 @@ namespace TermLink.SessionHost
                 LocalFrameType.Capabilities,
                 sessionId,
                 0,
-                LocalPayloadCodec.Capabilities(true)));
+                LocalPayloadCodec.Capabilities(true, resizeHandler != null)));
         }
 
         private void ReadAgentCommands(NamedPipeClientStream candidate)
@@ -2170,6 +2249,23 @@ namespace TermLink.SessionHost
                 lastAgentCommandSequence = frame.Sequence;
                 switch (frame.Type)
                 {
+                    case LocalFrameType.ResizeRequest:
+                        var resizeRequest = LocalPayloadCodec.ParseRemoteResize(frame.Payload);
+                        // Keep reading journal ACKs while Windows settles the window.
+                        _ = Task.Run(() => {
+                            LocalResizeResult result;
+                            try { result = resizeHandler?.Invoke(resizeRequest) ?? new LocalResizeResult {
+                                Id = resizeRequest.Id, Error = LocalResizeError.RESIZE_UNSUPPORTED }; }
+                            catch { result = new LocalResizeResult { Id = resizeRequest.Id, Error = LocalResizeError.SESSION_UNAVAILABLE }; }
+                            lock (sync)
+                            {
+                                if (disposed || stop || controlResults.Count >= 16) return;
+                                controlResults.Enqueue(new LocalFrame(LocalFrameType.ResizeResult, sessionId, 0,
+                                    LocalPayloadCodec.ResizeResult(result)));
+                                sendPending.Set();
+                            }
+                        });
+                        break;
                     case LocalFrameType.Input:
                         byte[] bytes;
                         var inputId = LocalPayloadCodec.ParseInput(frame.Payload, out bytes);
@@ -2318,9 +2414,13 @@ namespace TermLink.SessionHost
                 lock (sync)
                 {
                     if (!ReferenceEquals(pipe, candidate)) return;
-                    var node = pending.First;
-                    while (node != null && node.Value.Sequence <= lastSent) node = node.Next;
-                    if (node != null) next = node.Value;
+                    if (controlResults.Count > 0) next = controlResults.Dequeue();
+                    else
+                    {
+                        var node = pending.First;
+                        while (node != null && node.Value.Sequence <= lastSent) node = node.Next;
+                        if (node != null) next = node.Value;
+                    }
                 }
                 if (next == null)
                 {
@@ -2330,7 +2430,7 @@ namespace TermLink.SessionHost
                 try
                 {
                     LocalFrameCodec.Write(candidate, next);
-                    lastSent = next.Sequence;
+                    if (next.Sequence > 0) lastSent = next.Sequence;
                 }
                 catch (IOException)
                 {

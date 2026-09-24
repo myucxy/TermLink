@@ -72,6 +72,7 @@ func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 		"terminal_typed_input_v1",
 		"liveness_probe_v1",
 		"unknown_future_capability",
+		"terminal_window_resize_v1",
 		"lease_v1",
 		"cumulative_ack",
 		"flow_control_v1",
@@ -89,6 +90,7 @@ func TestNegotiatedCapabilitiesAreBoundedAndOrdered(t *testing.T) {
 		"terminal_typed_input_v1",
 		"liveness_probe_v1",
 		"host_history_v1",
+		"terminal_window_resize_v1",
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("negotiated capabilities = %v, want %v", got, want)
@@ -295,7 +297,7 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.FlowControl, realtimewire.Gap,
 		realtimewire.InputEvent, realtimewire.InputAccepted,
 		realtimewire.InputRejected, realtimewire.ResizeRequest,
-		realtimewire.ResizeApplied, realtimewire.SnapshotOffer,
+		realtimewire.ResizeApplied, realtimewire.ResizeResponse, realtimewire.SnapshotOffer,
 		realtimewire.SnapshotChunk, realtimewire.ResumeRequest,
 		realtimewire.LeaseRequest, realtimewire.LeaseGranted,
 		realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
@@ -320,7 +322,7 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.SessionUpsert: true, realtimewire.SessionRemoved: true,
 		realtimewire.OutputChunk: true, realtimewire.Gap: true,
 		realtimewire.InputAccepted: true, realtimewire.InputRejected: true,
-		realtimewire.ResizeApplied: true, realtimewire.SnapshotOffer: true,
+		realtimewire.ResizeApplied: true, realtimewire.ResizeResponse: true, realtimewire.SnapshotOffer: true,
 		realtimewire.SnapshotChunk: true, realtimewire.LeaseGranted: true,
 		realtimewire.LeaseDenied: true, realtimewire.LeaseRevoked: true,
 		realtimewire.ThemeChanged: true, realtimewire.SessionStarted: true,
@@ -452,6 +454,7 @@ func TestOutOfBandPCResponsesBypassTerminalReplaySequence(t *testing.T) {
 	}{
 		{messageType: realtimewire.HostHistoryResponse, frame: []byte("opaque-host-history-response")},
 		{messageType: realtimewire.SessionTerminateResponse, frame: []byte("opaque-session-terminate-response")},
+		{messageType: realtimewire.ResizeResponse, frame: []byte("opaque-window-resize-response")},
 	} {
 		envelope := realtimewire.Envelope{
 			RecipientDeviceID: androidID[:],

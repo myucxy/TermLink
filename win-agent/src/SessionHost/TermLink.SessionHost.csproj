@@ -4,17 +4,27 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>TermLink.SessionHost</AssemblyName>
     <RootNamespace>TermLink.SessionHost</RootNamespace>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
     <ProjectReference Include="..\TerminalCore\TermLink.TerminalCore.csproj" />
     <InternalsVisibleTo Include="TermLink.SessionHost.Validation" />
+    <PackageReference Include="Microsoft.Windows.Console.ConPTY" Version="[1.24.260710001]" GeneratePathProperty="true" />
   </ItemGroup>
   <ItemGroup Condition="Exists('..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll')">
     <None Include="..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
           Link="termlink_terminal_ffi.dll"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="ConPTY-NOTICE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Keep the DLL beside the architecture-specific OpenConsole directories in
+         both RID-less test builds and published applications. -->
+    <None Include="$(PkgMicrosoft_Windows_Console_ConPTY)\runtimes\win-x64\native\conpty.dll"
+          Link="conpty.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

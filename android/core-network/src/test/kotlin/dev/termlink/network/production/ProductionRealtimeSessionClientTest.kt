@@ -4476,6 +4476,42 @@ class ProductionRealtimeSessionClientTest {
     private suspend fun resetAcknowledgement(generation: Long): DurableAckCommit =
         DurableAckCommit(sequence = 0L, rendererGeneration = generation + 1L)
 
+    @Test
+    fun explicitWindowResizeRequiresControlAndMatchesOnlyItsControlReply(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val metrics = dev.termlink.terminal.api.TerminalViewportMetrics(TerminalSize(45, 28), 450, 560, 10f, 20f)
+            assertEquals("CONTROL_LEASE_REJECTED", runCatching {
+                harness.client.requestWindowResize(metrics)
+            }.exceptionOrNull()?.message)
+            val leaseId = UUID.randomUUID()
+            harness.client.remoteSession.grantControl(leaseId.toString(), Long.MAX_VALUE, leaseVersion = 3)
+            val pending = harness.requestResizeAsync(metrics)
+            val request = harness.awaitResizeRequest()
+            assertEquals(45, request.columns)
+            assertEquals(28, request.rows)
+            assertEquals(3L, request.leaseVersion)
+            assertFalse(request.restore)
+            assertEquals(leaseId, ProductionRealtimeClient.uuidFromBytes(request.leaseId.toByteArray()))
+            assertTrue(request.expiresAtMs > System.currentTimeMillis())
+            assertEquals("RESIZE_BUSY", runCatching {
+                harness.client.requestWindowResize(null)
+            }.exceptionOrNull()?.message)
+            harness.deliverResizeResponse(ProductionRealtimeClient.uuidBytes(UUID.randomUUID()), 500)
+            harness.deliverResizeResponse(request.requestId.toByteArray(), 501)
+            assertEquals(TerminalSize(45, 28), withTimeout(2_000) { pending.await() })
+            assertEquals(0L, harness.client.diagnostics().lastHandledSequence)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 500 })
+            val restore = harness.requestResizeAsync(null)
+            val restoreRequest = harness.awaitResizeRequest(count = 2)
+            assertTrue(restoreRequest.restore)
+            assertEquals(0, restoreRequest.columns)
+            harness.deliverResizeResponse(restoreRequest.requestId.toByteArray(), 502, "NO_DESKTOP_SIZE")
+            assertEquals("NO_DESKTOP_SIZE", runCatching { withTimeout(2_000) { restore.await() } }.exceptionOrNull()?.message)
+        } finally { harness.close() }
+    }
+
     private fun createHostHistoryHarness(
         holdLiveReplayForHostHistory: Boolean = false,
         orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
@@ -4596,6 +4632,25 @@ class ProductionRealtimeSessionClientTest {
 
         fun requestTerminationAsync() = requestScope.async {
             client.requestTermination(awaitAcknowledgement = true)
+        }
+
+        fun requestResizeAsync(metrics: dev.termlink.terminal.api.TerminalViewportMetrics?) = requestScope.async {
+            client.requestWindowResize(metrics)
+        }
+
+        suspend fun awaitResizeRequest(count: Int = 1): dev.termlink.protocol.realtime.v1.ResizePayload {
+            withTimeout(2_000) {
+                while (transport.sent.count { it.messageType == MessageType.RESIZE_REQUEST } < count) kotlinx.coroutines.yield()
+            }
+            return decryptOutbound(transport.sent.last { it.messageType == MessageType.RESIZE_REQUEST }) {
+                dev.termlink.protocol.realtime.v1.ResizePayload.parseFrom(it)
+            }
+        }
+
+        fun deliverResizeResponse(id: ByteArray, sequence: Long, error: String = "") {
+            val response = dev.termlink.protocol.realtime.v1.ResizeResponsePayload.newBuilder()
+                .setRequestId(ByteString.copyFrom(id)).setColumns(45).setRows(28).setErrorCode(error).build()
+            transport.deliver(incomingEnvelope(MessageType.RESIZE_RESPONSE, response.toByteArray(), sequence), generation = 1)
         }
 
         suspend fun startAndAwaitReady() {

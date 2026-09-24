@@ -2104,6 +2104,12 @@ impl Terminal {
 
     fn dispatch_window_manipulation(&mut self, csi: &CsiSequence) -> Result<(), TerminalError> {
         require_max_parameters(csi, 3, "window manipulation parameters")?;
+        // Modern OpenConsole begins its VT stream with the window-restore hint.
+        // Window visibility belongs to the outer UI; it has no durable cell state
+        // or reply. Recognize only this exact operation, not arbitrary window ops.
+        if csi.parameters() == [1] {
+            return Ok(());
+        }
         // XTVERSION-capable TUIs commonly probe `CSI 14 t` for the text-area
         // pixel dimensions. TermLink's durable cross-device model owns cell
         // dimensions only; pixel geometry belongs to each renderer and is not

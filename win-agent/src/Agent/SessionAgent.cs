@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using TermLink.LocalIpc;
 
 namespace TermLink.Agent
@@ -324,6 +325,9 @@ namespace TermLink.Agent
         private bool commandsSent;
         private bool testDisconnectTriggered;
         private volatile bool remoteInputRejectSupported;
+        private volatile bool remoteResizeSupported;
+        private TaskCompletionSource<LocalResizeResult> pendingResize;
+        private Guid pendingResizeId;
         private bool ended;
         private bool removed;
         private bool interruptedCommitted;
@@ -575,6 +579,7 @@ namespace TermLink.Agent
                     try
                     {
                         remoteInputRejectSupported = false;
+                        remoteResizeSupported = false;
                         Authenticate(pipe);
                         SetConnectedPipe(pipe);
                         if (lastHostSequence > 0) reconnects++;
@@ -667,6 +672,15 @@ namespace TermLink.Agent
                 {
                     if (frame.Sequence != 0) throw new InvalidDataException("Host capabilities must use sequence zero.");
                     remoteInputRejectSupported = LocalPayloadCodec.ParseCapabilities(frame.Payload);
+                    remoteResizeSupported = (frame.Payload[1] & 2) != 0;
+                    continue;
+                }
+                if (frame.Type == LocalFrameType.ResizeResult)
+                {
+                    if (frame.Sequence != 0) throw new InvalidDataException("Resize results must use sequence zero.");
+                    var result = LocalPayloadCodec.ParseResizeResult(frame.Payload);
+                    lock (commandSync)
+                        if (result.Id == pendingResizeId) pendingResize?.TrySetResult(result);
                     continue;
                 }
                 if (frame.Sequence <= lastHostSequence)
@@ -821,6 +835,35 @@ namespace TermLink.Agent
                 LocalFrameCodec.Write(pipe,
                     new LocalFrame(type, options.SessionId, nextCommandSequence, payload));
             }
+        }
+
+        public async Task<LocalResizeResult> RequestResizeAsync(LocalResizeRequest request)
+        {
+            var payload = LocalPayloadCodec.RemoteResize(request);
+            TaskCompletionSource<LocalResizeResult> completion;
+            lock (commandSync)
+            {
+                if (!remoteResizeSupported) return new LocalResizeResult { Id = request.Id, Error = LocalResizeError.RESIZE_UNSUPPORTED };
+                if (pendingResize != null) return new LocalResizeResult { Id = request.Id, Error = LocalResizeError.RESIZE_BUSY };
+                NamedPipeServerStream pipe;
+                lock (statusSync) pipe = connectedPipe;
+                if (pipe == null || !pipe.IsConnected || stopRequested)
+                    return new LocalResizeResult { Id = request.Id, Error = LocalResizeError.SESSION_UNAVAILABLE };
+                completion = new TaskCompletionSource<LocalResizeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+                pendingResize = completion;
+                pendingResizeId = request.Id;
+                try { Send(pipe, LocalFrameType.ResizeRequest, payload); }
+                catch (IOException) { completion.TrySetResult(new LocalResizeResult { Id = request.Id, Error = LocalResizeError.SESSION_UNAVAILABLE }); }
+                catch (ObjectDisposedException) { completion.TrySetResult(new LocalResizeResult { Id = request.Id, Error = LocalResizeError.SESSION_UNAVAILABLE }); }
+                catch { pendingResize = null; pendingResizeId = Guid.Empty; throw; }
+            }
+            try
+            {
+                if (await Task.WhenAny(completion.Task, Task.Delay(6000)).ConfigureAwait(false) != completion.Task)
+                    return new LocalResizeResult { Id = request.Id, Error = LocalResizeError.RESIZE_TIMEOUT };
+                return await completion.Task.ConfigureAwait(false);
+            }
+            finally { lock (commandSync) { pendingResize = null; pendingResizeId = Guid.Empty; } }
         }
 
         public bool TrySendRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
@@ -1011,6 +1054,9 @@ namespace TermLink.Agent
         private void SetConnectedPipe(NamedPipeServerStream pipe)
         {
             lock (statusSync) connectedPipe = pipe;
+            if (pipe == null)
+                lock (commandSync) pendingResize?.TrySetResult(new LocalResizeResult {
+                    Id = pendingResizeId, Error = LocalResizeError.SESSION_UNAVAILABLE });
         }
 
         private void Transition(SessionAgentLifecycle value)

@@ -264,6 +264,9 @@ class NativeTerminalEngine(
         mutableSize.value
     }
 
+    override fun measuredViewport(): dev.termlink.terminal.api.TerminalViewportMetrics? =
+        viewReference?.get()?.measuredViewport()
+
     override fun setOnAcceptedLocalUserInputListener(listener: (() -> Unit)?) {
         synchronized(lock) {
             checkActive()

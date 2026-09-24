@@ -342,4 +342,21 @@
     <string name="session_network_negotiation_failed">直连协商失败</string>
     <string name="session_network_changed">网络连接中断</string>
     <string name="session_network_retry_later">冷却中，请稍后重试</string>
+    <string name="session_window_size_title">会话窗口</string>
+    <string name="session_resize_fit">按手机窗口调整会话</string>
+    <string name="session_resize_restore">恢复电脑窗口尺寸</string>
+    <string name="session_resize_preview">%1$d 列 × %2$d 行 · %3$d × %4$d 像素</string>
+    <string name="session_resize_unmeasured">终端可视区域尚未就绪</string>
+    <string name="session_resize_applied">Windows 已应用 %1$d 列 × %2$d 行。</string>
+    <string name="session_resize_pending">正在等待 Windows 应用尺寸…</string>
+    <string name="session_resize_control_required">请连接会话并获取控制权限后调整。</string>
+    <string name="session_resize_upgrade">请升级 Windows 客户端，并重新打开此终端会话。</string>
+    <string name="session_resize_window_unsupported">Windows 未应用目标尺寸。请使用单标签、单窗格，退出全屏，并检查窗口大小限制。</string>
+    <string name="session_resize_no_restore">没有可恢复的电脑尺寸，或电脑本地调整已替代该尺寸。</string>
+    <string name="session_resize_control_lost">控制权限已变化，请确认当前窗口尺寸后再试。</string>
+    <string name="session_resize_timeout">未收到确认，请检查窗口实际尺寸及服务端版本后再试。</string>
+    <string name="session_resize_failed">无法调整此会话窗口，请检查连接后重试。</string>
+    <string name="session_resize_busy">正在处理另一个窗口调整请求，请稍后再试。</string>
+    <string name="session_resize_server_upgrade">服务端尚未支持窗口调整，请先升级服务端。</string>
+    <string name="session_resize_expired">请求已过期或尺寸无效，请检查两端系统时间及网络后重试。</string>
 </resources>

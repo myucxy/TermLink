@@ -4,6 +4,30 @@ using System.Text;
 
 namespace TermLink.LocalIpc
 {
+    internal enum LocalResizeError : byte
+    {
+        OK, RESIZE_UNSUPPORTED, RESIZE_BUSY, LOCAL_INPUT_PRIORITY, RESIZE_EXPIRED,
+        WINDOW_RESIZE_UNSUPPORTED, NO_DESKTOP_SIZE, SESSION_UNAVAILABLE, RESIZE_TIMEOUT
+    }
+
+    internal sealed class LocalResizeRequest
+    {
+        public Guid Id;
+        public ulong LocalInputEpoch;
+        public long ExpiresAtMs;
+        public short Columns;
+        public short Rows;
+        public bool Restore;
+    }
+
+    internal sealed class LocalResizeResult
+    {
+        public Guid Id;
+        public short Columns;
+        public short Rows;
+        public LocalResizeError Error;
+    }
+
     internal enum LocalFrameType : byte
     {
         HostHello = 1,
@@ -22,7 +46,8 @@ namespace TermLink.LocalIpc
         RemoteInputReject = 14,
         Title = 15,
         SessionRemoved = 16,
-        RemoteAccessStopped = 17
+        RemoteAccessStopped = 17,
+        ResizeResult = 18
     }
 
     internal enum LocalRemoteInputResult : byte
@@ -209,18 +234,81 @@ namespace TermLink.LocalIpc
         public const int MaximumTitleBytes = 4096;
         private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
 
-        public static byte[] Capabilities(bool remoteInputReject)
+        public static byte[] Capabilities(bool remoteInputReject, bool remoteResize = false)
         {
-            return new[] { (byte)1, remoteInputReject ? (byte)1 : (byte)0 };
+            return new[] { (byte)1, (byte)((remoteInputReject ? 1 : 0) | (remoteResize ? 2 : 0)) };
         }
 
         public static bool ParseCapabilities(byte[] payload)
         {
-            if (payload == null || payload.Length != 2 || payload[0] != 1 || (payload[1] & 0xfe) != 0)
+            if (payload == null || payload.Length != 2 || payload[0] != 1 || (payload[1] & 0xfc) != 0)
             {
                 throw new InvalidDataException("Invalid local IPC capabilities payload.");
             }
             return (payload[1] & 1) != 0;
+        }
+
+        public static byte[] RemoteResize(LocalResizeRequest request)
+        {
+            if (request.Id == Guid.Empty || request.ExpiresAtMs <= 0 ||
+                (!request.Restore && (request.Columns < 2 || request.Columns > 1000 || request.Rows < 2 || request.Rows > 1000)))
+                throw new InvalidDataException("Invalid remote resize request.");
+            using (var stream = new MemoryStream())
+            using (var writer = new BinaryWriter(stream))
+            {
+                writer.Write(request.Id.ToByteArray());
+                writer.Write(request.LocalInputEpoch);
+                writer.Write(request.ExpiresAtMs);
+                writer.Write(request.Columns);
+                writer.Write(request.Rows);
+                writer.Write(request.Restore);
+                return stream.ToArray();
+            }
+        }
+
+        public static LocalResizeRequest ParseRemoteResize(byte[] payload)
+        {
+            if (payload == null || payload.Length != 37 || payload[36] > 1)
+                throw new InvalidDataException("Invalid remote resize request length.");
+            using (var reader = new BinaryReader(new MemoryStream(payload)))
+            {
+                var request = new LocalResizeRequest {
+                    Id = new Guid(reader.ReadBytes(16)), LocalInputEpoch = reader.ReadUInt64(),
+                    ExpiresAtMs = reader.ReadInt64(), Columns = reader.ReadInt16(), Rows = reader.ReadInt16(),
+                    Restore = reader.ReadBoolean()
+                };
+                RemoteResize(request); // Same bounds at both IPC boundaries.
+                return request;
+            }
+        }
+
+        public static byte[] ResizeResult(LocalResizeResult result)
+        {
+            if (result.Id == Guid.Empty || !Enum.IsDefined(typeof(LocalResizeError), result.Error) ||
+                (result.Error == LocalResizeError.OK && (result.Columns < 2 || result.Rows < 2)))
+                throw new InvalidDataException("Invalid remote resize result.");
+            using (var stream = new MemoryStream())
+            using (var writer = new BinaryWriter(stream))
+            {
+                writer.Write(result.Id.ToByteArray());
+                writer.Write(result.Columns);
+                writer.Write(result.Rows);
+                writer.Write((byte)result.Error);
+                return stream.ToArray();
+            }
+        }
+
+        public static LocalResizeResult ParseResizeResult(byte[] payload)
+        {
+            if (payload == null || payload.Length != 21 || !Enum.IsDefined(typeof(LocalResizeError), payload[20]))
+                throw new InvalidDataException("Invalid remote resize result.");
+            using (var reader = new BinaryReader(new MemoryStream(payload)))
+            {
+                var result = new LocalResizeResult { Id = new Guid(reader.ReadBytes(16)), Columns = reader.ReadInt16(),
+                    Rows = reader.ReadInt16(), Error = (LocalResizeError)reader.ReadByte() };
+                ResizeResult(result);
+                return result;
+            }
         }
 
         public static byte[] Hello(int processId, byte[] token)
