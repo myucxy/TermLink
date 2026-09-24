@@ -210,8 +210,7 @@ import dev.termlink.terminal.api.TerminalTypefaceResolver
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportMetrics
 import dev.termlink.terminal.api.TerminalViewportEngine
-import dev.termlink.terminal.termux.TermuxTerminalEngine
-import dev.termlink.terminal.termux.TermuxTranscriptViewport
+import dev.termlink.terminal.nativecore.NativeTranscriptViewport
 import java.time.Instant
 import java.time.LocalTime
 import java.time.ZoneId
@@ -504,7 +503,7 @@ internal fun dispatchTranscriptRetry(
 
 /** Converts malformed/depth-exhausted renderer projections into durable UI state for this frame. */
 internal fun applyTranscriptViewportPagesSafely(
-    viewport: TermuxTranscriptViewport,
+    viewport: NativeTranscriptViewport,
     pages: List<TerminalTranscriptPageV1>,
     authoritativeColumns: Int,
 ): Exception? = try {
@@ -5420,16 +5419,8 @@ private fun TerminalSurface(
     terminalInputResumeRegistry: TerminalInputResumeRegistry,
     modifier: Modifier = Modifier,
 ) {
-    val placeholder = remember(session.id, session.columns, session.rows) {
-        TermuxTerminalEngine(
-            initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
-        ).also {
-            it.applyTheme(productTerminalTheme(terminalPreferences))
-            it.setReadOnly(true)
-        }
-    }
-    val activeEngine = engine ?: placeholder
-    val transcriptViewport = remember(session.id) { TermuxTranscriptViewport() }
+    val activeEngine = engine
+    val transcriptViewport = remember(session.id) { NativeTranscriptViewport() }
     val liveViewHolder = remember(session.id) { arrayOfNulls<View>(1) }
     var dockBounds by remember(session.id) { mutableStateOf<TailFirstPixelBounds?>(null) }
     val latestTranscriptState = rememberUpdatedState(transcriptState)
@@ -5475,7 +5466,7 @@ private fun TerminalSurface(
         overlayRequested = false
         localLoadingGuard = false
         transcriptRendererFailed = false
-        activeEngine.scrollToLatest()
+        activeEngine?.scrollToLatest()
         latestClearTranscript.value()
     }
 
@@ -5490,7 +5481,7 @@ private fun TerminalSurface(
             ),
         )
         if (resumeViewport && effect.resumeViewportAfterLocalInput) {
-            activeEngine.resumeViewportAfterLocalInput()
+            activeEngine?.resumeViewportAfterLocalInput()
         }
         if (effect.closeDetachedOverlay) {
             overlayRequested = false
@@ -5504,16 +5495,15 @@ private fun TerminalSurface(
         // The engine applies its cursor-visibility policy at the exact input
         // acceptance point. This callback owns only the detached overlay so a
         // later render frame cannot retroactively change that viewport choice.
-        activeEngine.setOnAcceptedLocalUserInputListener {
+        activeEngine?.setOnAcceptedLocalUserInputListener {
             resumeLiveAfterAcceptedInput(resumeViewport = false)
         }
         val registration = terminalInputResumeRegistry.register(session.id) {
             resumeLiveAfterAcceptedInput()
         }
         onDispose {
-            // The placeholder and this effect are siblings; disposal ordering
-            // must not turn an already-disposed placeholder into a UI crash.
-            runCatching { activeEngine.setOnAcceptedLocalUserInputListener(null) }
+            // Repository disposal may race this UI effect.
+            runCatching { activeEngine?.setOnAcceptedLocalUserInputListener(null) }
             registration.close()
         }
     }
@@ -5521,7 +5511,7 @@ private fun TerminalSurface(
     if (BuildConfig.DEBUG) {
         val tailFirstSurfaceController = object : TailFirstTerminalSurfaceController {
             override fun observe(): TailFirstSurfaceObservation {
-                val liveText = runCatching(activeEngine::visibleText).getOrDefault("")
+                val liveText = runCatching { activeEngine?.visibleText().orEmpty() }.getOrDefault("")
                 val history = runCatching(transcriptViewport::debugState).getOrNull()
                 val visibleText = if (overlayVisible) history?.visibleText.orEmpty() else liveText
                 val liveView = liveViewHolder[0]
@@ -5568,8 +5558,8 @@ private fun TerminalSurface(
                 overlayVisible && transcriptViewport.scrollToLineId(lineId)
 
             override fun openHistory(): Boolean {
-                if (overlayVisible) return false
-                activeEngine.scrollPastTopBoundary()
+                if (overlayVisible || activeEngine == null) return false
+                activeEngine?.scrollPastTopBoundary()
                 return true
             }
 
@@ -5590,8 +5580,8 @@ private fun TerminalSurface(
 
     SideEffect {
         val theme = productTerminalTheme(terminalPreferences)
-        activeEngine.applyTheme(theme)
-        activeEngine.setReadOnly(remoteState !is RemoteSessionState.Controlling)
+        activeEngine?.applyTheme(theme)
+        activeEngine?.setReadOnly(remoteState !is RemoteSessionState.Controlling)
         transcriptViewport.applyTheme(theme)
     }
     LaunchedEffect(
@@ -5629,9 +5619,6 @@ private fun TerminalSurface(
             overlayRequested = false
         }
     }
-    DisposableEffect(placeholder) {
-        onDispose { placeholder.dispose() }
-    }
     DisposableEffect(transcriptViewport) {
         onDispose { transcriptViewport.close() }
     }
@@ -5656,12 +5643,12 @@ private fun TerminalSurface(
             ) {
                 AndroidView(
                     factory = { context ->
-                        activeEngine.createView(
+                        activeEngine?.createView(
                             context = context,
                             textSizeSp = terminalPreferences.fontSizeSp,
                             lineSpacingMultiplier = terminalPreferences.lineSpacingMultiplier,
                             onScrollPastTop = ::requestOlderRows,
-                        ).also { liveViewHolder[0] = it }
+                        ).let { it ?: View(context) }.also { liveViewHolder[0] = it }
                     },
                     modifier = Modifier
                         .fillMaxSize()
@@ -5956,29 +5943,21 @@ private fun HistoryReplaySurface(
                     color = MaterialTheme.colorScheme.tertiary,
                 )
             }
-            HistoryTerminalSurface(entry = entry, engine = engine, terminalPreferences = terminalPreferences)
+            HistoryTerminalSurface(engine = engine, terminalPreferences = terminalPreferences)
         }
     }
 }
 
 @Composable
 private fun HistoryTerminalSurface(
-    entry: HistoryEntry,
     engine: TerminalViewportEngine?,
     terminalPreferences: TerminalDisplayPreferences,
 ) {
-    val placeholder = remember(entry.historyObject.id) {
-        TermuxTerminalEngine().also {
-            it.applyTheme(productTerminalTheme(terminalPreferences))
-            it.setReadOnly(true)
-        }
-    }
-    val activeEngine = engine ?: placeholder
+    val activeEngine = engine
     SideEffect {
-        activeEngine.applyTheme(productTerminalTheme(terminalPreferences))
-        activeEngine.setReadOnly(true)
+        activeEngine?.applyTheme(productTerminalTheme(terminalPreferences))
+        activeEngine?.setReadOnly(true)
     }
-    DisposableEffect(placeholder) { onDispose { placeholder.dispose() } }
     key(
         activeEngine,
         terminalPreferences.fontScheme,
@@ -5988,11 +5967,11 @@ private fun HistoryTerminalSurface(
     ) {
         AndroidView(
             factory = { context ->
-                activeEngine.createView(
+                activeEngine?.createView(
                     context = context,
                     textSizeSp = terminalPreferences.fontSizeSp,
                     lineSpacingMultiplier = terminalPreferences.lineSpacingMultiplier,
-                )
+                ) ?: View(context)
             },
             modifier = Modifier
                 .fillMaxWidth()

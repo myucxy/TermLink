@@ -2,7 +2,7 @@ package dev.termlink.product
 
 import dev.termlink.terminal.api.TerminalPaletteSnapshotV1
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
-import dev.termlink.terminal.termux.TermuxTranscriptViewport
+import dev.termlink.terminal.nativecore.NativeTranscriptViewport
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -15,7 +15,7 @@ import org.robolectric.annotation.Config
 class TranscriptRendererBoundaryTest {
     @Test
     fun malformedMappedPageBecomesAStableErrorInsteadOfEscapingTheUiEffect() {
-        val viewport = TermuxTranscriptViewport()
+        val viewport = NativeTranscriptViewport()
         val malformed = TerminalTranscriptPageV1(
             snapshotAnchorSequence = 80,
             firstLineId = 41,

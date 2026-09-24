@@ -79,7 +79,7 @@ class NativeTerminalViewTest {
             engine.setReadOnly(false)
             val view = engine.createView(controller.get()) as NativeTerminalView
             controller.get().setContentView(view)
-            val input = view.onCreateInputConnection(EditorInfo())
+            val input = requireNotNull(view.onCreateInputConnection(EditorInfo()))
 
             assertTrue(input.setComposingText("1", 1))
             assertTrue(input.commitText("1", 1))

@@ -13,7 +13,6 @@ import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportEngine
-import dev.termlink.terminal.termux.TermuxTranscriptViewport
 import java.io.Closeable
 import java.time.Instant
 import java.util.UUID
@@ -806,8 +805,8 @@ data class TranscriptViewportState(
     }
 }
 
-/** The state window and detached Termux renderer deliberately share one hard capacity. */
-internal const val MAX_TRANSCRIPT_VIEWPORT_ROWS = TermuxTranscriptViewport.MAX_RENDERED_ROWS
+/** The state window and detached renderer deliberately share one hard capacity. */
+internal const val MAX_TRANSCRIPT_VIEWPORT_ROWS = TerminalTranscriptPageV1.MAX_VIEWPORT_ROWS
 internal const val MAX_TRANSCRIPT_VIEWPORT_IDENTITIES = MAX_TRANSCRIPT_VIEWPORT_ROWS
 
 internal fun transcriptViewportRowCount(pages: List<TerminalTranscriptPageV1>): Int {

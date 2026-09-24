@@ -23,6 +23,8 @@ data class TerminalTranscriptPageV1(
     companion object {
         const val FORMAT_VERSION = 1
         const val MAX_ROWS = 200
+        /** Bounded mobile history window; pagination may continue beyond the resident window. */
+        const val MAX_VIEWPORT_ROWS = 1_000
         const val MAX_COLUMNS = TerminalSnapshotV1.MAX_COLUMNS
     }
 }

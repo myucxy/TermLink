@@ -5,8 +5,7 @@
     <application android:usesCleartextTraffic="${termlinkUsesCleartextTraffic}">
         <activity
             android:name=".MainActivity"
-            android:exported="true"
-            tools:replace="android:exported" />
+            android:exported="true" />
         <receiver
             android:name="dev.termlink.product.debug.TailFirstE2EReceiver"
             android:enabled="true"

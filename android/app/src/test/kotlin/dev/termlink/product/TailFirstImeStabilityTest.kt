@@ -56,7 +56,7 @@ class TailFirstImeStabilityTest {
         assertTrue(source.contains("sessionImeAvoidance("))
         assertTrue(source.contains("imeAvoidance.scaffoldBottom.toDp()"))
         assertTrue(source.contains("contentBottom.toDp()"))
-        assertTrue(terminalSurface.contains("activeEngine.createView("))
+        assertTrue(terminalSurface.contains("activeEngine?.createView("))
         assertFalse(terminalSurface.contains(".resize("))
         assertFalse(terminalSurface.contains("sendResize"))
         assertFalse(terminalSurface.contains("onSize"))

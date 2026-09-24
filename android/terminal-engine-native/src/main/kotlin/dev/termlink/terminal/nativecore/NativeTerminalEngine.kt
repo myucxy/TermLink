@@ -723,7 +723,7 @@ class NativeTerminalEngine(
         check(!disposed) { "Terminal engine is disposed" }
     }
 
-    private companion object {
+    internal companion object {
         const val DEFAULT_COLUMNS = 80
         const val DEFAULT_ROWS = 24
         const val DEFAULT_HISTORY_CAPACITY_ROWS = 2_000L

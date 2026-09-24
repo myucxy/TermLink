@@ -13,9 +13,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.TermLink">
         <activity
-            android:name=".MainActivity"
-            android:exported="false" />
-        <activity
             android:name="dev.termlink.product.EmbeddedOidcActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
