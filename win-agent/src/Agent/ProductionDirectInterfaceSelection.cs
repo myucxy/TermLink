@@ -58,6 +58,8 @@ namespace TermLink.Agent
                 foreach (var key in failures.Where(value => now - value.Value > TimeSpan.FromMinutes(2) ||
                     !interfaces.Any(nic => nic.Address.Equals(value.Key.Address))).Select(value => value.Key).ToArray())
                     failures.Remove(key);
+                interfaces = interfaces.Where(value => peerHosts.Count == 0 ||
+                    peerHosts.Any(remote => remote.AddressFamily == value.Address.AddressFamily)).ToArray();
                 var eligible = interfaces.Where(value => value.HasGateway || routeSources.Contains(value.Address) ||
                     peerHosts.Any(remote => SameLan(value.Address, remote, value.PrefixLength))).ToArray();
                 // No default route/STUN DNS can still leave a usable LAN-only interface.

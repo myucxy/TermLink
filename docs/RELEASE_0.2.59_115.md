@@ -59,9 +59,11 @@ or assets were copied; TermLink socket/protocol regression tests apply here.
 
 ## Publication and operational evidence
 
-Pending exact committed-source Production build, independent signer/version/hash
-verification, in-place client smoke tests and AppShip publication. Append final
-revision, hashes and release/artifact IDs after those gates complete.
+Production packages were built from `4faac41c5919e7a1ff3a3e5b9ac12a1843a57b98`
+and independently signature/version/hash verified. HOME-PC and the emulator were
+upgraded in place for validation. **115 was not uploaded to AppShip**: real menu
+testing exposed missing discovery PATH_CLOSE and responder cooldown interference
+between consecutive LAN/NAT checks. Final publication moves to 0.2.60/116.
 
 Physical phone same-Wi-Fi LAN and cross-NAT acceptance require the actual devices
 and networks. Emulator host NAT and unit tests do not establish that matrix.

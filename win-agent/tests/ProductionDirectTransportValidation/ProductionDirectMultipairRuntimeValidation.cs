@@ -189,6 +189,20 @@ namespace TermLink.ProductionDirectTransport.Validation
                 .ConfigureAwait(false);
             Require(answer.SignalType == TransportSignalTypeV1.PathAnswer && peerCalls >= 2,
                 "An inbound offer did not interrupt the responder retry cooldown.");
+            signaling.Inject(Encrypt(pairwise, ticket, android, pc, TransportSignalTypeV1.PathClose,
+                2, answer.SignalSeq, now.ToUnixTimeMilliseconds(), new TransportSignalPayloadV1
+                {
+                    FormatVersion = 1,
+                    PathClose = new DirectPathCloseV1 { ReasonCode = "DIRECT_ATTEMPT_RETIRED" }
+                }));
+            await WaitUntilAsync(() => native.DisposeCalls == 1, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            Require(supervisor.Snapshot().ConsecutiveFailures == 0,
+                "Explicit authenticated cancellation was counted as a failed path.");
+            Require(supervisor.TryBeginAttempt(android, Guid.NewGuid(), ticket.PathEpoch + 1, out var next, out _),
+                "A completed diagnostic check rate-limited the next candidate class.");
+            supervisor.TryCancelAttempt(next);
+            Require(!supervisor.TryBeginAttempt(android, Guid.NewGuid(), ticket.PathEpoch, out _, out var replay) &&
+                replay == "STALE_PATH_EPOCH", "Diagnostic cancellation bypassed epoch replay protection.");
         }
 
         private static async Task ValidatePromotionNetworkRaceAndLateCallbacksAsync(bool retireReady = false)

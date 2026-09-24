@@ -59,7 +59,7 @@ namespace TermLink.Agent
     internal sealed class ProductionDirectTransportSupervisor
     {
         internal static readonly TimeSpan MinimumAttemptInterval = TimeSpan.FromSeconds(30);
-        internal static readonly TimeSpan FailureCooldown = TimeSpan.FromMinutes(5);
+        internal static readonly TimeSpan FailureCooldown = TimeSpan.FromMinutes(1);
         private const int MaximumTrackedPeers = 64;
         private sealed class PeerAttemptHistory
         {
@@ -203,6 +203,8 @@ namespace TermLink.Agent
                     ProductionDirectPathState.Probing,
                     ProductionDirectPathState.ShadowReadyNotRouted);
                 authenticatedProbeSha256 = directPathBinding.ToArray();
+                activePeerHistory.ConsecutiveFailures = 0;
+                activePeerHistory.CooldownUntilUtc = DateTime.MinValue;
             }
         }
 
@@ -218,6 +220,19 @@ namespace TermLink.Agent
                     !IsCurrentAttemptLocked(attemptToken))
                     return false;
                 FallbackLocked(reasonCode, countFailure: true);
+                return true;
+            }
+        }
+
+        internal bool TryCancelAttempt(ProductionDirectAttemptToken token)
+        {
+            lock (sync)
+            {
+                if (state == ProductionDirectPathState.RelayOnly || !IsCurrentAttemptLocked(token)) return false;
+                // Explicit authenticated cancellation is not a connectivity failure.
+                // Server ticket issuance still bounds retry rate and replay.
+                activePeerHistory.LastAttemptUtc = DateTime.MinValue;
+                FallbackLocked("DIRECT_REMOTE_PATH_CLOSED", countFailure: false);
                 return true;
             }
         }

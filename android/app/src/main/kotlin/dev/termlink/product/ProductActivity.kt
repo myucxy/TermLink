@@ -4803,6 +4803,7 @@ private fun DirectNetworkCheckStatus?.localizedLabel(reason: String = ""): Strin
         DirectNetworkCheckStatus.CHECKING -> R.string.session_network_checking
         DirectNetworkCheckStatus.AVAILABLE -> R.string.session_network_available
         DirectNetworkCheckStatus.NOT_ESTABLISHED -> when {
+            reason == "DIRECT_CHECK_RETRY_LATER" -> R.string.session_network_retry_later
             "TIMEOUT" in reason -> R.string.session_network_timeout
             "CANDIDATE" in reason -> R.string.session_network_no_path
             "UNSUPPORTED" in reason -> R.string.session_network_unsupported

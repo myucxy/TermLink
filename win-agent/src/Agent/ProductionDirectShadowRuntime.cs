@@ -180,6 +180,7 @@ namespace TermLink.Agent
                 {
                     var addresses = await Dns.GetHostAddressesAsync(host, dnsTimeout.Token).ConfigureAwait(false);
                     resolved.AddRange(addresses.Where(ProductionDirectCandidateCollector.IsAllowedHostAddress)
+                        .GroupBy(address => address.AddressFamily).Select(group => group.First())
                         .Select(address => new ProductionDirectNativeEndpoint(address, port)));
                 }
                 catch (SocketException) { /* STUN DNS must not disable host/LAN candidates. */ }

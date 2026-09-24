@@ -590,4 +590,5 @@
     <string name="session_network_unsupported">Paired upgrade needed</string>
     <string name="session_network_negotiation_failed">Negotiation failed</string>
     <string name="session_network_changed">Network interrupted</string>
+    <string name="session_network_retry_later">Please retry shortly</string>
 </resources>

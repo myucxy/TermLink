@@ -112,6 +112,7 @@ class ProductionDirectMultipairV4RuntimeTest {
         } finally {
             peer.close()
             runtime.closeAndJoin()
+            assertEquals(1, signaling.closeSignals)
             identity.destroy()
         }
     }
@@ -467,6 +468,10 @@ class ProductionDirectMultipairV4RuntimeTest {
             try {
                 val payload = TransportSignalPayloadV1.parseFrom(plaintext)
                 when (envelope.signalType) {
+                    TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE -> {
+                        assertEquals("DIRECT_ATTEMPT_RETIRED", payload.pathClose.reasonCode)
+                        closeSignals++
+                    }
                     TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_OFFER -> {
                         offerGatheringStates += payload.pathOffer.gatheringComplete
                         emitAnswer(envelope)
@@ -584,6 +589,7 @@ class ProductionDirectMultipairV4RuntimeTest {
             }
         }
 
+        var closeSignals = 0
         override fun close() = Unit
     }
 

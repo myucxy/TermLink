@@ -341,4 +341,5 @@
     <string name="session_network_unsupported">需配套升级客户端</string>
     <string name="session_network_negotiation_failed">直连协商失败</string>
     <string name="session_network_changed">网络连接中断</string>
+    <string name="session_network_retry_later">冷却中，请稍后重试</string>
 </resources>

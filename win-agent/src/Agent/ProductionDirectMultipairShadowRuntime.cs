@@ -300,8 +300,13 @@ namespace TermLink.Agent
                 var attempt = new Attempt(inbound, Guid.NewGuid(), configResult.Value, currentLane);
                 inbound.TransferOwnership();
                 if (!supervisor.TryBeginAttempt(attempt.Peer.DeviceId, attempt.ConnectionId,
-                        attempt.Ticket.Ticket.PathEpoch, out var supervisorToken, out _))
+                        attempt.Ticket.Ticket.PathEpoch, out var supervisorToken, out var rejection))
                 {
+                    SendEncrypted(attempt, TransportSignalTypeV1.PathClose, new TransportSignalPayloadV1
+                    {
+                        FormatVersion = 1,
+                        PathClose = new DirectPathCloseV1 { ReasonCode = rejection }
+                    });
                     attempt.Dispose();
                     Publish(ProductionDirectShadowState.RelayOnly, "DIRECT_ATTEMPT_REJECTED", null);
                     return;
@@ -401,6 +406,7 @@ namespace TermLink.Agent
                         Retire(attempt, "DIRECT_SIGNAL_PAYLOAD_REJECTED", false);
                         return;
                     }
+                    if (!IsCurrent(attempt)) return;
                     attempt.LastRemoteSequence = envelope.SignalSeq;
                     attempt.LastRemoteAcknowledgement = envelope.SignalAck;
                     if (!TrySubmitPendingBatches(attempt)) return;
@@ -500,6 +506,19 @@ namespace TermLink.Agent
                 plaintext = ProductionDirectTransportCrypto.DecryptSignal(attempt.Peer.PairwiseKey, envelope);
                 var payload = TransportSignalPayloadV1.Parser.ParseFrom(plaintext);
                 if (payload.FormatVersion != 1) return false;
+                if (envelope.SignalType == TransportSignalTypeV1.PathClose &&
+                    payload.SignalCase == TransportSignalPayloadV1.SignalOneofCase.PathClose &&
+                    ProductionDirectTransportSupervisor.ValidReasonCode(payload.PathClose.ReasonCode) &&
+                    CanonicalEquals(plaintext, new TransportSignalPayloadV1
+                    {
+                        FormatVersion = 1,
+                        PathClose = new DirectPathCloseV1 { ReasonCode = payload.PathClose.ReasonCode }
+                    }))
+                {
+                    supervisor.TryCancelAttempt(attempt.SupervisorToken);
+                    Retire(attempt, "DIRECT_REMOTE_PATH_CLOSED", false);
+                    return true;
+                }
                 if (envelope.SignalType == TransportSignalTypeV1.CandidateUpdate &&
                     payload.SignalCase == TransportSignalPayloadV1.SignalOneofCase.CandidateUpdate)
                     return HandleRemoteCandidateUpdate(attempt, payload.CandidateUpdate, plaintext);
@@ -1127,7 +1146,8 @@ namespace TermLink.Agent
                 PublishLocked(relayConnected ? ProductionDirectShadowState.RelayOnly :
                     ProductionDirectShadowState.WaitingForRelay, reason, attempt);
             }
-            if (!networkChanged && !attempt.ShadowReady && reason != "RELAY_UNAVAILABLE")
+            if (!networkChanged && !attempt.ShadowReady && reason != "RELAY_UNAVAILABLE" &&
+                reason != "DIRECT_REMOTE_PATH_CLOSED")
                 platform.ReportPathOutcome(attempt.Peer.DeviceId, attempt.LocalAddress, false);
             try
             {
@@ -1494,7 +1514,8 @@ namespace TermLink.Agent
             public string PromotionFailure { get; set; }
             public void ReleaseSecretsAfterReady()
             {
-                Peer.Dispose();
+                // Retain the signal key until PATH_CLOSE/retirement so a completed
+                // diagnostic can release this responder before the next check.
                 CryptographicOperations.ZeroMemory(Ticket.WireBytes);
                 Zero(LocalSendProbeKey); LocalSendProbeKey = null;
                 Zero(PeerReceiveProbeKey); PeerReceiveProbeKey = null;

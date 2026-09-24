@@ -48,6 +48,7 @@ import dev.termlink.protocol.transport.v1.DirectNominationAckV2
 import dev.termlink.protocol.transport.v1.DirectNominationResultV2
 import dev.termlink.protocol.transport.v1.DirectNominationV2
 import dev.termlink.protocol.transport.v1.DirectPathAnswerV1
+import dev.termlink.protocol.transport.v1.DirectPathCloseV1
 import dev.termlink.protocol.transport.v1.DirectPathOfferV1
 import dev.termlink.protocol.transport.v1.DirectPathResultV1
 import dev.termlink.protocol.transport.v1.TransportSignalEnvelopeV1
@@ -1724,7 +1725,10 @@ class ProductionDirectShadowRuntime internal constructor(
                 if (!payload.hasPathClose() ||
                     !DIRECT_REMOTE_REASON_CODE.matches(payload.pathClose.reasonCode)
                 ) throw DirectAttemptFailure("DIRECT_V4_PATH_CLOSE_REJECTED")
-                throw DirectAttemptFailure("DIRECT_REMOTE_PATH_CLOSED")
+                throw DirectAttemptFailure(when (payload.pathClose.reasonCode) {
+                    "PATH_COOLDOWN", "ATTEMPT_RATE_LIMITED" -> "DIRECT_CHECK_RETRY_LATER"
+                    else -> "DIRECT_REMOTE_PATH_CLOSED"
+                })
             }
             else -> throw DirectAttemptFailure("DIRECT_V4_SIGNAL_TYPE_REJECTED")
         }
@@ -2096,6 +2100,7 @@ class ProductionDirectShadowRuntime internal constructor(
         if (!attempt.shadowReady.compareAndSet(false, true)) {
             throw DirectAttemptFailure("DIRECT_V4_SHADOW_READY_DUPLICATE")
         }
+        if (productionHandoffConsumer == null || attempt.gate.networkCheckKind != null) attempt.sendClose()
         if (productionHandoffConsumer == null) {
             attempt.releaseNegotiationSecrets()
             runCatching(attempt.signaling::close)
@@ -2755,9 +2760,11 @@ class ProductionDirectShadowRuntime internal constructor(
         attempt: Attempt,
         type: TransportSignalTypeV1,
         payload: TransportSignalPayloadV1,
-    ): Boolean {
+    ): Boolean = synchronized(attempt) {
+        if (attempt.retired.get() && type != TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE)
+            return@synchronized false
         val plaintext = payload.toByteArray()
-        return try {
+        try {
             val metadata = TransportSignalEnvelopeV1.newBuilder()
                 .setProtocolVersion(PROTOCOL_VERSION)
                 .setSignalType(type)
@@ -3273,9 +3280,21 @@ class ProductionDirectShadowRuntime internal constructor(
         var remotePathBindingV4 = ByteArray(0)
         var nominationRequestV4: DirectNativeCommitNominationRequestV4? = null
         var networkCheckCompleted = false
+        private val closeSent = AtomicBoolean(false)
+
+        fun sendClose() {
+            if (!multipairV2 || !offerSent || nativeV4.get() == null || !closeSent.compareAndSet(false, true)) return
+            runCatching {
+                sendEncrypted(this, TransportSignalTypeV1.TRANSPORT_SIGNAL_TYPE_V1_PATH_CLOSE,
+                    TransportSignalPayloadV1.newBuilder().setFormatVersion(PROTOCOL_VERSION)
+                        .setPathClose(DirectPathCloseV1.newBuilder().setReasonCode("DIRECT_ATTEMPT_RETIRED"))
+                        .build())
+            }
+        }
 
         fun retire(reason: String, networkChanged: Boolean) {
             if (!retired.compareAndSet(false, true)) return
+            sendClose()
             val currentNative = native.getAndSet(null)
             if (currentNative != null) {
                 runCatching {
