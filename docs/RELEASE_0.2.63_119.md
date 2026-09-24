@@ -64,3 +64,44 @@ completion in a documentation-only commit.
 Rollback is a strictly newer Android build made from the previous known-good
 implementation with the same app identity and signer. Never overwrite published
 bytes, replace the signing key or uninstall/clear user data to force an upgrade.
+
+## Publication record
+
+Production APK was built from clean, pushed source commit
+`3705e7c50c4c7e3d7b950ebfd2e6573be18e01fe`. This subsequent documentation-only
+record is not the binary revision. Production assembly and independent manifest,
+hash, identity, version and APK v2 signature verification passed.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `TermLink-Android-0.2.63-119.apk` | 38040774 | `1bca691e60e0246ff798ec55180ddb72c00a9e838e629241722b6a5c7e6d782a` |
+
+Application ID: `dev.termlink.harness`; versionName `0.2.63`, versionCode `119`.
+Signer SHA-256 matches the continuity fingerprint above. The final signed APK
+was checked again: four DEX files contain no Termux descriptors, no Termux
+selection resources are packaged, and native terminal JNI libraries remain for
+`arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`.
+
+Manifest: `artifacts/release/0.2.63-119/artifact-manifest.json`.
+Build and independent verification log:
+`artifacts/validation/release-119-production-build.log`.
+Signed content evidence: `artifacts/validation/release-119-apk-content.json`.
+Release test XML archive: `artifacts/validation/release-119-test-results.zip`.
+
+AppShip stable publication completed at 2026-09-24 14:16:13 UTC (22:16:13 CST).
+
+| Application | Release ID | Artifact ID |
+| --- | --- | --- |
+| `termlink-android` | `3cc68238-3c86-4d0c-b94f-415f2f93827b` | `414230e3-85e1-4e60-bc1f-36f237164d29` |
+
+Release status is `published`; artifact is `ready`, `manual_approved` and
+download-enabled. Public artifact hash, size and signer match the exact local
+Production manifest. Android build 118 returns `optional` for 0.2.63/119;
+Android build 119 returns `no_update`. Windows build 118 still returns
+`no_update` for 0.2.62/118. Local Windows, emulator and Server installations
+were not upgraded by this publication.
+
+Upload log: `artifacts/validation/release-119-appship-android.log`.
+Sanitized public checks: `artifacts/validation/release-119-public-*.json`.
+Resumable state is retained at
+`.appship/termlink-android-stable-0.2.63-build119-signature-approved.json`.

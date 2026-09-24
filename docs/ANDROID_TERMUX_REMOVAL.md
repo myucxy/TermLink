@@ -80,3 +80,7 @@ gradle :app:dependencies --configuration releaseRuntimeClasspath
 
 The APK is an unsigned local validation artifact, not a production release. No version increment,
 AppShip upload, Windows deployment or Server image change was performed.
+
+The subsequent signed Android 0.2.63/119 publication is recorded separately in
+[the release record](RELEASE_0.2.63_119.md); the hash above remains the original
+unsigned validation artifact's hash.
