@@ -140,3 +140,50 @@ Build, signature, test and image evidence remains in the ignored
 `release-117-server-verification.json`, `release-117-menu.xml` and
 `release-117-result.xml`. These local evidence files and all publish credentials
 are excluded from Git.
+
+## Subsequent authorized local upgrade (2026-09-24)
+
+After publication, the user requested the local Server, Windows client and Android
+emulator upgrade. This section supersedes the earlier local installation state.
+
+- Server now runs the verified amd64 image ID
+  `sha256:6f16ac1c9bfa5d6f6822aa7902dafeb0c057b50768b2816ec0e1cd505fc46127`
+  (0.2.61+117, source `9be56278d83c5ab1b2bd26e6fa34417f4db9b579`). The existing
+  local `server/compose.yml` deployment was preserved, with the exact image ID
+  and `--no-deps --pull never`. This is still a locally built image, not a Docker
+  Hub or Cosign-qualified registry release.
+- Before replacement, a PostgreSQL custom-format dump was encrypted and verified
+  using the existing local Windows DPAPI CurrentUser backup method. Backup:
+  `artifacts/backups/termlink-local-pre-v0.2.61-20260924T090127Z.dump.dpapi`.
+  Previous container configuration was separately encrypted for rollback. This
+  local stack is not the Linux managed single-node/age deployment. The previous
+  image remains available as
+  `sha256:e7b39563ae0e80fd9395cd55ca1cdbc4e5d6092cdff96ec017fc7556f64310ae`.
+- Server environment, PostgreSQL container and mounts were unchanged. Migration
+  stayed at 50. Both containers are healthy; loopback health/readiness and public
+  `https://termlink2.kget.cc:8910/readyz` passed. OIDC discovery retained issuer
+  `https://termlink2.kget.cc:8910/realms/termlink`.
+- Independently reverified the Production packages before installation. Windows
+  Setup exited 0 and upgraded `D:\Dev\Tool\TermLink` to 0.2.61.117. All five
+  installed TermLink executables report that version and the correct source
+  revision. Credentials, control secret, registrations and remote-access policy
+  retained their file hashes; the runtime identity-store file changed during
+  restart, so byte-for-byte preservation of that file is not claimed. The Android
+  device page confirmed HOME-PC online with Agent 0.2.61.117.
+- The emulator was already on same-source Debug 0.2.61/117 from release validation;
+  no reinstall or data clearing was needed. appId 10224, original firstInstallTime
+  and signed-in access were retained. Its signer remains Debug, not the AppShip
+  Production signer.
+- An isolated session using the installed 117 SessionHost displayed
+  `TERMLINK_117_UPGRADE_OK` on Android over Relay. Android input
+  `echo PHONE117_INPUT_OK` produced visible command/output, and sending `exit`
+  ended the owned test host with code 0. Fit reached Windows and returned the
+  expected window-refusal message because this hidden test host has no physical
+  outer terminal window. No old-Server upgrade prompt remained. Successful resize
+  of a physical Windows Terminal window and physical LAN/NAT routing were not
+  tested in this upgrade smoke check.
+
+Evidence: `artifacts/validation/release-117-local-deployment.json`,
+`release-117-windows-installed.json`, `release-117-windows-preserved-after.json`,
+`release-117-emulator-installed-final.txt`, and `release-117-postupgrade-*` UI
+captures and test-session metadata. Publish artifacts and manifest were unchanged.
