@@ -82,8 +82,20 @@ does not build or publish an image or create a tag that triggers Docker CI.
 
 ## Publication record
 
-Production artifact hashes, immutable source commit and AppShip publication
-results will be recorded after build and independent signature verification.
+Both Production artifacts were built from clean, pushed source commit
+`49b04502c8789b0b6645ee632eb92545dd04dcff`. The later documentation-only commit
+records publication results and is not the binary revision. Independent
+`Verify-LocalRelease.ps1` passed for manifest, versions, SHA-256, APK signature,
+all signed Windows payloads and the RFC 3161 timestamp. Windows ProductVersion
+is `0.2.62.118+49b04502c8789b0b6645ee632eb92545dd04dcff`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `TermLink-Android-0.2.62-118.apk` | 38125238 | `4770ec9edd6b4c5d392a0ab1b316c4dc6703412cf820e9e419eb8697e2941736` |
+| `TermLink-Setup-0.2.62.118-x64.exe` | 182468312 | `52c92543f6afb85be4739614405bdc2f1c1cb51bd1275822f2cbdc6c87c8f83f` |
+
+Manifest: `artifacts/release/0.2.62-118/artifact-manifest.json`.
+Build/verification evidence: `artifacts/validation/release-118-production-build.log`.
 Android reuses signer SHA-256
 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`.
 Windows reuses SHA-1 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`, valid through
@@ -91,3 +103,27 @@ Windows reuses SHA-1 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`, valid through
 Authenticode certificate, not a public CA certificate. Rollback requires a
 strictly newer build with the same identities; never overwrite published bytes
 or clear user data to change signing keys.
+
+The emulator retains build 118 with its existing Debug signer and its original
+two-row shortcut preference was restored after testing. The local Windows
+installation remains 0.2.61.117; this publication does not restart user sessions.
+
+## AppShip stable
+
+Both releases completed as `published` using the repository wrapper and the
+existing protected release-manager credential. Resumable state is preserved in
+`.appship/termlink-{android,win64}-stable-0.2.62-build118-signature-approved.json`.
+
+| Application | Release ID | Artifact ID |
+| --- | --- | --- |
+| `termlink-android` | `7b80762c-473c-4586-8541-f4e2e990589b` | `dbc3e9e4-d756-4d82-90df-7ce58e50ee25` |
+| `termlink-win64` | `82aedc7a-42c0-47d3-a0ae-23633fbb4f8d` | `0bafa8cd-5ecd-4df2-883b-29b5ad652f01` |
+
+Publication logs are `artifacts/validation/release-118-appship-{android,windows}.log`.
+Public update responses were successfully obtained despite intermittent request
+timeouts: both build 117 clients receive `optional` for 0.2.62/118; both build
+118 clients receive `no_update`. Published artifacts are `ready`,
+`manual_approved`, download-enabled, and match the local manifest's exact hashes,
+sizes and signer fingerprints. Sanitized evidence is retained at
+`artifacts/validation/release-118-appship-public.json`. Android published at
+2026-09-24 10:19:10 UTC; Windows at 10:20:09 UTC.
