@@ -136,6 +136,7 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -169,6 +170,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -3477,6 +3479,7 @@ private fun DevicesPage(
                     sessions = sessions,
                     sessionTitles = snapshot.sessionTitles,
                     expanded = pcKey in expandedPcIds,
+                    catalogConfirmed = pc.id !in snapshot.pcSessionCatalogErrors,
                     onToggleExpanded = { onTogglePcExpanded(pc.id) },
                     onOpenSession = onOpenSession,
                     onBrowseFiles = if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) {
@@ -3491,7 +3494,11 @@ private fun DevicesPage(
                 )
                 snapshot.pcSessionCatalogErrors[pc.id]?.let { error ->
                     Text(
-                        stringResource(if (error == "UPGRADE_REQUIRED") R.string.pc_catalog_upgrade_required else R.string.pc_catalog_unavailable),
+                        stringResource(when (error) {
+                            "UPGRADE_REQUIRED" -> R.string.pc_catalog_upgrade_required
+                            "TIMEOUT" -> R.string.pc_catalog_timeout
+                            else -> R.string.pc_catalog_unavailable
+                        }),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -3697,6 +3704,7 @@ private fun PcRow(
     sessions: List<SessionSummary> = emptyList(),
     sessionTitles: Map<java.util.UUID, String> = emptyMap(),
     expanded: Boolean = false,
+    catalogConfirmed: Boolean = true,
     onToggleExpanded: (() -> Unit)? = null,
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
     onBrowseFiles: (() -> Unit)? = null,
@@ -3848,13 +3856,15 @@ private fun PcRow(
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     sessions.forEach { session ->
-                        val active = isDeviceSessionActive(session.online)
+                        val active = catalogConfirmed && isDeviceSessionActive(session.online)
+                        val statusLabel = if (catalogConfirmed) session.state.localizedLabel()
+                            else stringResource(R.string.session_status_unconfirmed)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(ProductShape)
                                 .clickable(
-                                    enabled = onOpenSession != null && isSessionTabOpenable(session, pc),
+                                    enabled = catalogConfirmed && onOpenSession != null && isSessionTabOpenable(session, pc),
                                 ) {
                                     onOpenSession?.invoke(session.id)
                                 }
@@ -3864,7 +3874,7 @@ private fun PcRow(
                         ) {
                             StatusDot(
                                 color = if (active) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                contentDescription = session.state.localizedLabel(),
+                                contentDescription = statusLabel,
                             )
                             Text(
                                 displaySessionTitle(session, sessionTitles[session.id]),
@@ -3875,11 +3885,11 @@ private fun PcRow(
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Text(
-                                session.state.localizedLabel(),
+                                statusLabel,
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            when (sessionDestructiveAction(session.online)) {
+                            if (catalogConfirmed) when (sessionDestructiveAction(session.online)) {
                                 SessionDestructiveAction.TERMINATE_ONLINE -> if (onStopSessionRequested != null) {
                                     IconButton(
                                         onClick = { onStopSessionRequested(session.id) },
@@ -3979,7 +3989,8 @@ private fun SessionsPage(
     }
     val opened = openedSessionIds.toHashSet()
     val openedSessions = snapshot.sessions.filter {
-        it.id.toString() in opened && it.pcId !in snapshot.pcSessionCatalogErrors &&
+        it.id.toString() in opened && (it.pcId !in snapshot.pcSessionCatalogErrors ||
+            snapshot.pcSessionCatalogErrors[it.pcId] == "TIMEOUT" && terminalEngine(it.id) != null) &&
             snapshot.pcs.any { pc -> pc.id == it.pcId && pc.online }
     }
     val pcsById = snapshot.pcs.associateBy(PcSummary::id)
@@ -4004,6 +4015,7 @@ private fun SessionsPage(
     val density = LocalDensity.current
     val contentBottom = contentBottomPixels
     val contentBottomPadding = with(density) { contentBottom.toDp() }
+    CompositionLocalProvider(LocalSessionImeAvoidancePixels provides contentBottomPixels) {
     Column(
         // ProductApp owns the one IME/scaffold allocation. SessionsPage only
         // consumes the residual inset which was not already applied outside.
@@ -4029,12 +4041,16 @@ private fun SessionsPage(
         } else {
             val selected = activeSessions.firstOrNull { it.id.toString() == selectedSessionId }
                 ?: activeSessions.first()
+            if (snapshot.pcSessionCatalogErrors[selected.pcId] == "TIMEOUT") {
+                Text(stringResource(R.string.pc_catalog_timeout), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             val selectedEngine = if (selected.id == requestedSelectedId) {
                 requestedSelectedEngine
             } else {
                 terminalEngine(selected.id)
             }
-            val controlRequestKey = if (selected.state != SessionState.RUNNING) null else {
+            val controlRequestKey = if (selected.state != SessionState.RUNNING || selected.pcId in snapshot.pcSessionCatalogErrors) null else {
                 sessionControlRequestEffectKey(
                     foreground = foreground,
                     foregroundGeneration = foregroundGeneration,
@@ -4161,6 +4177,7 @@ private fun SessionsPage(
                 )
             }
         }
+    }
     }
 }
 
@@ -4695,6 +4712,16 @@ private fun SessionConnectionStatusMenu(
 ) {
     var expanded by remember(sessionId) { mutableStateOf(false) }
     var resizeMetrics by remember(sessionId) { mutableStateOf<TerminalViewportMetrics?>(null) }
+    val imeAvoidancePixels = LocalSessionImeAvoidancePixels.current
+    val configuration = LocalConfiguration.current
+    LaunchedEffect(expanded, engine, imeAvoidancePixels, configuration) {
+        if (expanded) {
+            // Insets are observed in composition; wait until the native View has
+            // been laid out with them before compensating its measured height.
+            androidx.compose.runtime.withFrameNanos { }
+            resizeMetrics = viewportWithKeyboardHidden(engine?.measuredViewport(), imeAvoidancePixels)
+        }
+    }
     val menuTitle = stringResource(R.string.session_connection_menu_title)
     val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
     val canReleaseControl = remoteState is RemoteSessionState.Controlling
@@ -4706,7 +4733,7 @@ private fun SessionConnectionStatusMenu(
             modifier = Modifier
                 // Keep the original header height; clickable expands the touch target without layout space.
                 .clickable(role = Role.Button, onClickLabel = menuTitle) {
-                    resizeMetrics = engine?.measuredViewport()
+                    resizeMetrics = viewportWithKeyboardHidden(engine?.measuredViewport(), imeAvoidancePixels)
                     expanded = true
                 }
                 .semantics { contentDescription = statusLabel },

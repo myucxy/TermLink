@@ -65,13 +65,19 @@ internal suspend fun <T : Any> requestHostDevice(
                         require(received.generation == requestGeneration.get() &&
                             received.generation == endpoint.currentConnectedGeneration()) { "Stale catalog generation" }
                         require(envelope.messageType == responseType &&
-                            envelope.direction == Direction.PC_TO_ANDROID && envelope.seq == sequence && envelope.ack == 0L &&
+                            envelope.direction == Direction.PC_TO_ANDROID && envelope.ack == 0L &&
                             envelope.sessionId == ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pcId)) &&
                             envelope.senderDeviceId == ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pcDeviceId)) &&
                             envelope.recipientDeviceId == ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(androidDeviceId)) &&
                             envelope.keyId == ByteString.copyFrom(keyId)) { "Invalid catalog response route" }
                         val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, inbound)
-                        val value = try { response(plaintext, requestId) } finally { plaintext.fill(0) }
+                        val value = try {
+                            // A timed-out request may finish while the next endpoint
+                            // is registered. Authenticate but ignore its late reply.
+                            if (envelope.seq > 0 && envelope.seq < sequence) return@first false
+                            require(envelope.seq == sequence) { "Invalid catalog response sequence" }
+                            response(plaintext, requestId)
+                        } finally { plaintext.fill(0) }
                         result = value
                         true
                     } finally { received.close() }

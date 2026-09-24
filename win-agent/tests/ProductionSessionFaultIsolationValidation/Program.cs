@@ -54,7 +54,7 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
                 var type = typeof(ProductionAgentRuntime);
                 var runtime = RuntimeHelpers.GetUninitializedObject(type);
-                foreach (var name in new[] { "catalogSync", "catalogEntries", "catalogCursors", "destroyedHistorySessions" })
+                foreach (var name in new[] { "catalogSync", "catalogEntries", "destroyedHistorySessions" })
                 {
                     var field = type.GetField(name, flags);
                     field.SetValue(runtime, Activator.CreateInstance(field.FieldType));
@@ -62,6 +62,12 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 type.GetField("catalogHostInstance", flags).SetValue(runtime, Guid.NewGuid());
                 type.GetField("registry", flags).SetValue(runtime, registry);
                 type.GetField("terminalHistoryStore", flags).SetValue(runtime, history);
+                var observe = (Action<LocalFrame>)type.GetMethod("ObserveCatalogFrame", flags)
+                    .CreateDelegate(typeof(Action<LocalFrame>), runtime);
+                history.FrameObserved += observe;
+                // Existing recovery hydrates metadata; catalog reads themselves
+                // must not scan a cold or partially recovered WAL.
+                foreach (var frame in history.ReadFrames(sessionId)) CryptographicOperations.ZeroMemory(frame.Payload);
                 var request = ByteString.CopyFrom(Guid.NewGuid().ToByteArray());
                 var build = type.GetMethod("BuildSessionCatalog", flags);
                 var catalog = (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
@@ -75,6 +81,40 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 Require(catalog.Sessions[0].Lifecycle == "EXITED", "Catalog did not observe the final local lifecycle.");
                 Require(ProductionAgentRuntime.CatalogLifecycle(true, "INTERRUPTED") == "RUNNING",
                     "Connected host was not reported running.");
+                observe(new LocalFrame(LocalFrameType.Output, sessionId, 100, new byte[] { 66 }));
+                observe(new LocalFrame(LocalFrameType.Title, sessionId, 5, LocalPayloadCodec.Title("new title")));
+                observe(new LocalFrame(LocalFrameType.Title, sessionId, 4, LocalPayloadCodec.Title("stale title")));
+                observe(new LocalFrame(LocalFrameType.Resize, sessionId, 2, LocalPayloadCodec.Resize(101, 37)));
+                catalog = (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
+                Require(catalog.Sessions[0].Title == "new title" && catalog.Sessions[0].Columns == 101 &&
+                    catalog.Sessions[0].Rows == 37 && catalog.Sessions[0].LastOutputSeq == 100 &&
+                    catalog.Sessions[0].Lifecycle == "EXITED", "Late recovery erased newer metadata or output.");
+
+                var deleted = Guid.NewGuid();
+                history.AppendCommittedFrame(new LocalFrame(LocalFrameType.Output, deleted, 1, new byte[] { 65 }));
+                history.MarkSessionDeleted(deleted);
+                var sessionLock = typeof(ProductionTerminalHistoryStore).GetMethod("SessionLock", flags);
+                var deletionGate = sessionLock.Invoke(history, new object[] { deleted });
+                var replayGate = sessionLock.Invoke(history, new object[] { sessionId });
+                Task<SessionCatalogResponsePayload> query;
+                using var queryStarted = new ManualResetEventSlim();
+                Monitor.Enter(deletionGate);
+                Monitor.Enter(replayGate);
+                try
+                {
+                    query = Task.Run(() => {
+                        queryStarted.Set();
+                        return (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
+                    });
+                    Require(queryStarted.Wait(5000), "Catalog query did not start.");
+                    Require(query.Wait(2000), "Catalog waited for another session's disk cleanup or WAL replay lock.");
+                    Require(query.Result.Sessions.Count == 1 && query.Result.Sessions[0].LastOutputSeq == 100,
+                        "Deleted session reappeared or retained metadata disappeared.");
+                }
+                finally { Monitor.Exit(replayGate); Monitor.Exit(deletionGate); }
+                var restarted = new ProductionTerminalHistoryStore(Path.Combine(root, "history"), Guid.NewGuid());
+                Require(restarted.IsSessionDeleted(deleted) && !restarted.ListSessions().Contains(deleted),
+                    "Cleanup marker was not authoritative after restart.");
             }
             finally { Directory.Delete(root, recursive: true); }
         }

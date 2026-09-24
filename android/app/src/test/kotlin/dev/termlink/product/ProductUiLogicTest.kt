@@ -317,6 +317,22 @@ class ProductUiLogicTest {
     }
 
     @Test
+    fun windowFitRestoresOnlyImeSpaceAndKeepsActualDockAndFontMetrics() {
+        for (dock in listOf(34, 67)) for (cellHeight in listOf(20f, 27.5f, 40f)) {
+            val fullHeight = 1400 - dock
+            val avoidance = sessionImeAvoidance(900, 200).contentBottom
+            fun metrics(height: Int) = dev.termlink.terminal.api.TerminalViewportMetrics(
+                dev.termlink.terminal.api.TerminalSize(50, kotlin.math.floor(height / cellHeight).toInt()),
+                1000, height, 20f, cellHeight)
+            val hidden = metrics(fullHeight)
+            val shown = metrics(fullHeight - avoidance)
+            assertEquals(hidden, viewportWithKeyboardHidden(shown, avoidance))
+            assertEquals(hidden, viewportWithKeyboardHidden(hidden, 0))
+        }
+        assertEquals(null, viewportWithKeyboardHidden(null, 500))
+    }
+
+    @Test
     fun acceptedActionBarInputResumesLiveAndClosesAnActiveOverlay() {
         assertEquals(
             TerminalInputResumeEffect(resumeViewportAfterLocalInput = true, closeDetachedOverlay = true),

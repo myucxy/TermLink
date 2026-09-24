@@ -526,6 +526,35 @@ internal fun productSessionUpsertEvent(
     )
 }
 
+/** A timeout is not an authoritative removal. Retain only this identity/epoch's
+ * last directory while the fresh device authority still permits access. The UI
+ * marks these rows unconfirmed and disallows new/destructive operations. */
+internal fun retainTimedOutCatalogSessions(
+    current: ProductSnapshot,
+    devices: List<DeviceSummary>,
+    pcs: List<PcSummary>,
+    fresh: List<SessionSummary>,
+    errors: Map<UUID, String>,
+    deleted: Set<UUID>,
+): List<SessionSummary> {
+    val retainedPcs = pcs.filter { pc ->
+        val previous = current.pcs.firstOrNull { it.id == pc.id }
+        val oldDevice = current.devices.firstOrNull { it.id == pc.deviceId }
+        val device = devices.firstOrNull { it.id == pc.deviceId }
+        errors[pc.id] == "TIMEOUT" && pc.online && pc.remoteRoutingEnabled &&
+            previous?.deviceId == pc.deviceId && previous.keyEpoch == pc.keyEpoch &&
+            device?.type?.isPcAgent() == true && device.trustState == DeviceTrustState.TRUSTED &&
+            oldDevice?.trustState == DeviceTrustState.TRUSTED &&
+            device.exchangePublicKey.contentEquals(oldDevice.exchangePublicKey)
+    }.mapTo(hashSetOf(), PcSummary::id)
+    val freshIds = fresh.mapTo(hashSetOf(), SessionSummary::id)
+    return (fresh + current.sessions.filter { it.pcId in retainedPcs && it.id !in freshIds })
+        .filterNot { it.id in deleted }
+}
+
+internal fun blockingCatalogPcIds(errors: Map<UUID, String>): Set<UUID> =
+    errors.filterValues { it != "TIMEOUT" }.keys
+
 /** Reconciles an authoritative catalog without touching global connection UI state. */
 internal fun reconcileSessionCatalog(
     current: ProductSnapshot,
@@ -2039,7 +2068,9 @@ internal class ProductionProductRepository(
         val catalogSession = catalogAtOpen.sessions.firstOrNull { it.id == sessionId }
             ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
         if (catalogAtOpen.pcs.none { it.id == catalogSession.pcId && it.online } ||
-            catalogSession.pcId in catalogAtOpen.pcSessionCatalogErrors) {
+            catalogSession.pcId in catalogAtOpen.pcSessionCatalogErrors &&
+            !(catalogAtOpen.pcSessionCatalogErrors[catalogSession.pcId] == "TIMEOUT" &&
+                (liveSessions.containsKey(sessionId) || readOnlySessionEngines.containsKey(sessionId)))) {
             throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
         }
         readOnlySessionEngines[sessionId]?.let { existing ->
@@ -3801,8 +3832,8 @@ internal class ProductionProductRepository(
                 }
             }
             .mapTo(mutableSetOf(), PcSummary::id)
-        closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds - hostCatalogErrors.keys))
-        closeLiveSessionsExcept(retainedLiveSessionIds(sessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - hostCatalogErrors.keys))
+        closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds - blockingCatalogPcIds(hostCatalogErrors)))
+        closeLiveSessionsExcept(retainedLiveSessionIds(sessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - blockingCatalogPcIds(hostCatalogErrors)))
         val runtimeSessions = sessions.map { session ->
             liveSessions[session.id]?.let { live ->
                 projectLiveSessionSummary(session, live.client.sessionState.value, live.engine.authoritativeSize.value)
@@ -3938,9 +3969,10 @@ internal class ProductionProductRepository(
                     if (PcCapabilityIds.HOST_SESSION_CATALOG_V1 !in pc.capabilities) "UPGRADE_REQUIRED" else "UNAVAILABLE"
             }
         }
-        hostCatalogTitles.keys.retainAll(result.mapTo(hashSetOf(), SessionSummary::id))
         hostCatalogErrors.keys.retainAll(pcs.mapTo(hashSetOf(), PcSummary::id))
-        return result
+        val retained = retainTimedOutCatalogSessions(mutableSnapshot.value, devices, pcs, result, hostCatalogErrors, deletedSessionIds)
+        hostCatalogTitles.keys.retainAll(retained.mapTo(hashSetOf(), SessionSummary::id))
+        return retained
     }
 
     private suspend fun pollSessionCatalogWithApi(
@@ -3971,8 +4003,8 @@ internal class ProductionProductRepository(
                         }
                     }
                     .mapTo(hashSetOf(), PcSummary::id)
-                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(catalogSessions, pcs, trustedPcIds - hostCatalogErrors.keys))
-                closeLiveSessionsExcept(retainedLiveSessionIds(catalogSessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - hostCatalogErrors.keys))
+                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(catalogSessions, pcs, trustedPcIds - blockingCatalogPcIds(hostCatalogErrors)))
+                closeLiveSessionsExcept(retainedLiveSessionIds(catalogSessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - blockingCatalogPcIds(hostCatalogErrors)))
 
                 val runtimeSessions = catalogSessions.map { session ->
                     liveSessions[session.id]?.let { live ->
@@ -4848,8 +4880,9 @@ internal class ProductionProductRepository(
                         }
                     }
                     .mapTo(mutableSetOf(), PcSummary::id)
-                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, trustedPcIds - hostCatalogErrors.keys))
-                closeLiveSessionsExcept(retainedLiveSessionIds(sessions.filter { it.state == SessionState.RUNNING }, trustedPcIds - hostCatalogErrors.keys))
+                val availablePcIds = trustedPcIds.intersect(pcs.filter { it.online && it.remoteRoutingEnabled }.mapTo(hashSetOf(), PcSummary::id))
+                closeReadOnlySessionsExcept(retainedReadOnlySessionIds(sessions, pcs, availablePcIds - blockingCatalogPcIds(hostCatalogErrors)))
+                closeLiveSessionsExcept(retainedLiveSessionIds(sessions.filter { it.state == SessionState.RUNNING }, availablePcIds - blockingCatalogPcIds(hostCatalogErrors)))
             }
             refreshDirectAuthorizedPeers(authenticationGeneration, stored, devices, pcs)
         }

@@ -17,8 +17,49 @@ namespace TermLink.Agent
     {
         private readonly Guid catalogHostInstance = Guid.NewGuid();
         private readonly object catalogSync = new();
-        private readonly Dictionary<Guid, SessionCatalogEntry> catalogEntries = new();
-        private readonly Dictionary<Guid, ulong> catalogCursors = new();
+        private sealed class CatalogMetadata
+        {
+            public readonly SessionCatalogEntry Entry = new()
+            {
+                ShellType = "custom", Lifecycle = "INTERRUPTED", Columns = 80, Rows = 24
+            };
+            public ulong TitleSequence, SizeSequence, LifecycleSequence;
+        }
+        private readonly Dictionary<Guid, CatalogMetadata> catalogEntries = new();
+
+        // Live durable events and the existing background history recovery feed
+        // this small projection. A directory request never opens/decrypts WAL.
+        private void ObserveCatalogFrame(LocalFrame frame)
+        {
+            if (frame.Type != LocalFrameType.Title && frame.Type != LocalFrameType.Resize &&
+                frame.Type != LocalFrameType.Lifecycle && frame.Type != LocalFrameType.Output) return;
+            lock (catalogSync)
+            {
+                if (!catalogEntries.TryGetValue(frame.SessionId, out var metadata))
+                    catalogEntries.Add(frame.SessionId, metadata = new CatalogMetadata());
+                var entry = metadata.Entry;
+                // Recovery may visit old metadata after a newer live output.
+                // Fence each field independently so neither can erase the other.
+                if (frame.Type == LocalFrameType.Title && frame.Sequence > metadata.TitleSequence)
+                {
+                    entry.Title = LocalPayloadCodec.ParseTitle(frame.Payload);
+                    metadata.TitleSequence = frame.Sequence;
+                }
+                if (frame.Type == LocalFrameType.Resize && frame.Sequence > metadata.SizeSequence)
+                {
+                    LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
+                    entry.Columns = (uint)columns; entry.Rows = (uint)rows;
+                    metadata.SizeSequence = frame.Sequence;
+                }
+                if (frame.Type == LocalFrameType.Lifecycle && frame.Sequence > metadata.LifecycleSequence)
+                {
+                    entry.Lifecycle = LifecycleText(LocalPayloadCodec.ParseLifecycle(frame.Payload, out _));
+                    metadata.LifecycleSequence = frame.Sequence;
+                }
+                if (frame.Type == LocalFrameType.Output)
+                    entry.LastOutputSeq = Math.Max(entry.LastOutputSeq, frame.Sequence);
+            }
+        }
         // ponytail: serialize metadata snapshots with per-session REST writes; split only if metadata throughput demands it.
         private readonly SemaphoreSlim metadataSnapshotGate = new(1, 1);
 
@@ -58,6 +99,12 @@ namespace TermLink.Agent
 
         private SessionCatalogResponsePayload BuildSessionCatalog(ByteString requestId)
         {
+            // No history/registry lock may be acquired while holding catalogSync:
+            // background recovery publishes metadata in the opposite order.
+            var summaries = registry.GetCatalogSummaries().ToDictionary(item => item.SessionId);
+            var retained = terminalHistoryStore.ListSessions().ToHashSet();
+            retained.UnionWith(summaries.Keys);
+            retained.RemoveWhere(id => destroyedHistorySessions.ContainsKey(id) || terminalHistoryStore.IsSessionDeleted(id));
             lock (catalogSync)
             {
                 var response = new SessionCatalogResponsePayload
@@ -66,53 +113,21 @@ namespace TermLink.Agent
                     HostInstanceId = ByteString.CopyFrom(GuidBytes(catalogHostInstance)),
                     ObservedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 };
-                var summaries = registry.GetCatalogSummaries().ToDictionary(item => item.SessionId);
-                var retained = terminalHistoryStore.ListSessions().ToHashSet();
-                retained.UnionWith(summaries.Keys);
                 foreach (var old in catalogEntries.Keys.Where(id => !retained.Contains(id)).ToArray())
                 {
-                    catalogEntries.Remove(old); catalogCursors.Remove(old);
+                    catalogEntries.Remove(old);
                 }
                 foreach (var sessionId in retained.OrderBy(id => id))
                 {
                     if (destroyedHistorySessions.ContainsKey(sessionId) || terminalHistoryStore.IsSessionDeleted(sessionId)) continue;
                     summaries.TryGetValue(sessionId, out var local);
-                    if (!catalogEntries.TryGetValue(sessionId, out var entry))
-                    {
-                        entry = new SessionCatalogEntry
-                        {
-                            SessionId = ByteString.CopyFrom(GuidBytes(sessionId)),
-                            ShellType = local == null ? "custom" : ShellTypeText(local.ShellType),
-                            Lifecycle = "INTERRUPTED", Columns = 80, Rows = 24,
-                            CreatedAtMs = local == null ? 0 : new DateTimeOffset(local.RegisteredAtUtc).ToUnixTimeMilliseconds()
-                        };
-                        catalogEntries.Add(sessionId, entry);
-                    }
-                    catalogCursors.TryGetValue(sessionId, out var cursor);
-                    if (local != null) entry.ShellType = ShellTypeText(local.ShellType);
-                    var frames = terminalHistoryStore.ReadFramesAfter(sessionId, cursor);
-                    try
-                    {
-                        foreach (var frame in frames)
-                        {
-                            if (frame.Type == LocalFrameType.Title) entry.Title = LocalPayloadCodec.ParseTitle(frame.Payload);
-                            if (frame.Type == LocalFrameType.Resize)
-                            {
-                                LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
-                                entry.Columns = (uint)columns; entry.Rows = (uint)rows;
-                            }
-                            if (frame.Type == LocalFrameType.Lifecycle)
-                                entry.Lifecycle = LifecycleText(LocalPayloadCodec.ParseLifecycle(frame.Payload, out _));
-                            if (frame.Type == LocalFrameType.Output) entry.LastOutputSeq = frame.Sequence;
-                            cursor = Math.Max(cursor, frame.Sequence);
-                        }
-                        catalogCursors[sessionId] = cursor;
-                    }
-                    finally
-                    {
-                        foreach (var frame in frames) if (frame.Payload != null) CryptographicOperations.ZeroMemory(frame.Payload);
-                    }
+                    if (!catalogEntries.TryGetValue(sessionId, out var metadata))
+                        catalogEntries.Add(sessionId, metadata = new CatalogMetadata());
+                    var entry = metadata.Entry;
                     var result = entry.Clone();
+                    result.SessionId = ByteString.CopyFrom(GuidBytes(sessionId));
+                    result.ShellType = local == null ? "custom" : ShellTypeText(local.ShellType);
+                    result.CreatedAtMs = local == null ? 0 : new DateTimeOffset(local.RegisteredAtUtc).ToUnixTimeMilliseconds();
                     result.ProcessAlive = local != null && local.Lifecycle == SessionAgentLifecycle.Connected && entry.Lifecycle != "EXITED";
                     result.Lifecycle = CatalogLifecycle(result.ProcessAlive, entry.Lifecycle);
                     response.Sessions.Add(result);

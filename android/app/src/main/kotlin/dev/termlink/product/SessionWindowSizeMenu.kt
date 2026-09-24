@@ -7,6 +7,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -27,6 +28,23 @@ import dev.termlink.terminal.api.TerminalViewportMetrics
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+
+// This is the exact IME-only padding allocated by the session scaffold, after
+// navigation/bottom-bar overlap. The actual View has already excluded the dock.
+internal val LocalSessionImeAvoidancePixels = compositionLocalOf { 0 }
+
+internal fun viewportWithKeyboardHidden(
+    measured: TerminalViewportMetrics?,
+    imeAvoidancePixels: Int,
+): TerminalViewportMetrics? {
+    require(imeAvoidancePixels >= 0)
+    measured ?: return null
+    val height = measured.heightPx.toLong() + imeAvoidancePixels
+    if (height > Int.MAX_VALUE || !measured.cellHeightPx.isFinite() || measured.cellHeightPx <= 0) return null
+    val rows = kotlin.math.floor(height.toFloat() / measured.cellHeightPx).toInt()
+    if (rows !in 2..1000) return null
+    return measured.copy(size = TerminalSize(measured.size.columns, rows), heightPx = height.toInt())
+}
 
 @Composable
 internal fun SessionWindowSizeMenuItems(

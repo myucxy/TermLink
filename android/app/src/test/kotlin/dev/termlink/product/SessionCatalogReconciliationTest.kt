@@ -23,6 +23,37 @@ class SessionCatalogReconciliationTest {
     private val sessionB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
     @Test
+    fun catalogTimeoutKeepsOnlyTheSameAuthorizedPcAndFreshReplyRemovesMissingRows() {
+        val host = pc(true)
+        val trusted = device(host.deviceId, 1)
+        val old = ProductSnapshot(pcs = listOf(host), devices = listOf(trusted),
+            sessions = listOf(session(sessionA), session(sessionB).copy(state = SessionState.EXITED, online = false)),
+            sessionStates = mapOf(sessionA to RemoteSessionState.Controlling(7, "lease", Long.MAX_VALUE)))
+        val timeout = mapOf(pcId to "TIMEOUT")
+        val retained = retainTimedOutCatalogSessions(old, listOf(trusted), listOf(host), emptyList(), timeout, emptySet())
+        assertEquals(old.sessions, retained)
+        assertEquals(setOf(sessionA), retainedLiveSessionIds(retained, setOf(pcId) - blockingCatalogPcIds(timeout)))
+        assertEquals(old.sessionStates, reconcileSessionCatalog(old, listOf(host), retained, emptySet()).sessionStates)
+        assertEquals(listOf(sessionB), retainTimedOutCatalogSessions(old, listOf(trusted), listOf(host), emptyList(), timeout, setOf(sessionA)).map { it.id })
+        for (error in listOf("OFFLINE", "UNAVAILABLE", "UPGRADE_REQUIRED")) {
+            assertTrue(retainTimedOutCatalogSessions(old, listOf(trusted), listOf(host), emptyList(), mapOf(pcId to error), emptySet()).isEmpty())
+            assertEquals(setOf(pcId), blockingCatalogPcIds(mapOf(pcId to error)))
+        }
+        for (changed in listOf(host.copy(online = false), host.copy(remoteRoutingEnabled = false),
+            host.copy(keyEpoch = host.keyEpoch + 1), host.copy(deviceId = UUID.randomUUID()))) {
+            assertTrue(retainTimedOutCatalogSessions(old, listOf(trusted), listOf(changed), emptyList(), timeout, emptySet()).isEmpty())
+        }
+        assertTrue(retainTimedOutCatalogSessions(old, emptyList(), listOf(host), emptyList(), timeout, emptySet()).isEmpty())
+        assertTrue(retainTimedOutCatalogSessions(old, listOf(trusted.copy(trustState = DeviceTrustState.REVOKED)),
+            listOf(host), emptyList(), timeout, emptySet()).isEmpty())
+        assertTrue(retainTimedOutCatalogSessions(old, listOf(device(host.deviceId, 2)), listOf(host), emptyList(), timeout, emptySet()).isEmpty())
+        assertTrue(retainTimedOutCatalogSessions(old, listOf(trusted), emptyList(), emptyList(), timeout, emptySet()).isEmpty())
+        val fresh = listOf(session(sessionA).copy(state = SessionState.EXITED, online = false))
+        assertEquals(fresh, retainTimedOutCatalogSessions(old, listOf(trusted), listOf(host), fresh, emptyMap(), emptySet()))
+        assertTrue(retainTimedOutCatalogSessions(old, listOf(trusted), listOf(host), emptyList(), emptyMap(), emptySet()).isEmpty())
+    }
+
+    @Test
     fun newSessionAppearsWithoutChangingGlobalConnectionState() {
         val current = ProductSnapshot(
             signedIn = true,

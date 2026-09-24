@@ -28,7 +28,7 @@ import org.junit.Test
 class ProductionSessionCatalogTest {
     @Test
     fun encryptedDeviceCatalogRoundTripRejectsWrongPeerEpochAndReplayedRequest(): Unit = runBlocking {
-        for (cleanup in listOf(false, true)) for (fault in listOf("none", "peer", "epoch", "replay", "capability")) {
+        for (cleanup in listOf(false, true)) for (fault in listOf("none", "late", "peer", "epoch", "replay", "capability")) {
             val capability = if (cleanup) "host_session_cleanup_v1" else "host_session_catalog_v1"
             val requestType = if (cleanup) MessageType.SESSION_CLEANUP_REQUEST else MessageType.SESSION_CATALOG_REQUEST
             val responseType = if (cleanup) MessageType.SESSION_CLEANUP_RESPONSE else MessageType.SESSION_CATALOG_RESPONSE
@@ -60,6 +60,13 @@ class ProductionSessionCatalogTest {
                     } finally { plaintext.fill(0) }
                     val echoedId = if (fault == "replay") uuid() else requestId
                     val response = if (cleanup) cleanupResponse(echoedId, sessionId).toByteArray() else catalog(echoedId).toByteArray()
+                    if (fault == "late") {
+                        val old = ProductionRealtimeClient.encryptedEnvelope(
+                            pcId, pcDevice, responseType, CryptoDirection.PC_TO_ANDROID, envelope.seq - 1, 0,
+                            keyId, ByteArray(12) { 2 }, outgoing, response, recipientId = androidId,
+                        )
+                        webSocket.send(okio.ByteString.of(*old.toByteArray()))
+                    }
                     val reply = ProductionRealtimeClient.encryptedEnvelope(
                         pcId, if (fault == "peer") UUID.randomUUID() else pcDevice,
                         responseType, CryptoDirection.PC_TO_ANDROID, envelope.seq, 0,
@@ -80,7 +87,7 @@ class ProductionSessionCatalogTest {
                     if (cleanup) cleanupHostSessions(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7, listOf(sessionId)).resultsList.single().status
                     else fetchHostSessionCatalog(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7).sessionsList.single().lifecycle
                 }
-                if (fault == "none") assertEquals(if (cleanup) "DELETED" else "INTERRUPTED", result.getOrThrow())
+                if (fault == "none" || fault == "late") assertEquals(if (cleanup) "DELETED" else "INTERRUPTED", result.getOrThrow())
                 else assertTrue("$fault was accepted", result.isFailure)
             } finally {
                 mux.close(); scope.cancel(); server.shutdown()

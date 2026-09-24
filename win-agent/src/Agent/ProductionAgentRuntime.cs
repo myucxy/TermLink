@@ -726,6 +726,7 @@ namespace TermLink.Agent
             var historyRoot = ProductionTerminalHistoryRoot(config);
             MigrateLegacyTerminalHistory(config.PcId, historyRoot);
             terminalHistoryStore = new ProductionTerminalHistoryStore(historyRoot, credentials.DeviceId);
+            terminalHistoryStore.FrameObserved += ObserveCatalogFrame;
             terminalHistoryProducer = new ProductionTerminalHistoryProducer(
                 terminalHistoryStore,
                 credentials.DeviceId,
@@ -2016,6 +2017,7 @@ namespace TermLink.Agent
                 publicationState,
                 new CommittedEvent { ShellType = shellType, Frame = frame },
                 DateTimeOffset.UtcNow);
+            ObserveCatalogFrame(frame);
             if (terminalSnapshotEnabled && frame.Type == LocalFrameType.Output)
             {
                 StageTailFirstSnapshotPublication(publicationState, frame.Sequence);

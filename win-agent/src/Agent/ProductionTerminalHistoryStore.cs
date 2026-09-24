@@ -201,6 +201,8 @@ namespace TermLink.Agent
         }
 
         public string RootPath => root;
+        // Consumers retain only metadata. Never retain or modify the borrowed payload.
+        internal event Action<LocalFrame> FrameObserved;
 
         public void AppendCommittedFrame(LocalFrame frame)
         {
@@ -224,9 +226,11 @@ namespace TermLink.Agent
                                 throw new InvalidDataException("A terminal WAL sequence was replayed with different bytes.");
                         }
                         finally { CryptographicOperations.ZeroMemory(existing); }
+                        FrameObserved?.Invoke(frame);
                         return;
                     }
                     WriteProtectedAtomic(path, frame.SessionId, "wal", encoded);
+                    FrameObserved?.Invoke(frame);
                 }
             }
             finally { CryptographicOperations.ZeroMemory(encoded); }
@@ -279,6 +283,7 @@ namespace TermLink.Agent
                         var frame = LocalFrameCodec.Decode(encoded);
                         if (frame.SessionId != sessionId || frame.Sequence != sequence)
                             throw new InvalidDataException("A terminal WAL frame identity is invalid.");
+                        FrameObserved?.Invoke(frame);
                         frames.Add(frame);
                         decodedBytes = checked(decodedBytes + encoded.Length);
                     }
@@ -323,6 +328,7 @@ namespace TermLink.Agent
                         var frame = LocalFrameCodec.Decode(encoded);
                         if (frame.SessionId != sessionId || frame.Sequence != sequence)
                             throw new InvalidDataException("A terminal WAL frame identity is invalid.");
+                        FrameObserved?.Invoke(frame);
                         frames.Add(frame);
                     }
                     finally { CryptographicOperations.ZeroMemory(encoded); }
@@ -361,10 +367,9 @@ namespace TermLink.Agent
         public bool IsSessionDeleted(Guid sessionId)
         {
             ValidateSessionId(sessionId);
-            lock (SessionLock(sessionId))
-            {
-                return File.Exists(DeleteMarkerPath(sessionId));
-            }
+            // Markers are atomically published and never removed. Observing one
+            // must not wait for WAL replay or recursive cleanup under SessionLock.
+            return File.Exists(DeleteMarkerPath(sessionId));
         }
 
         public void AppendTranscriptArchivePage(
