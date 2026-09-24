@@ -81,7 +81,7 @@ class ProductionDirectDeviceCoordinator(
     private val serverRoutingPermitted = AtomicBoolean(false)
     private val mutableRoutingPolicy = MutableStateFlow(ProductionDirectRoutingPolicy.UNKNOWN)
     val routingPolicy: StateFlow<ProductionDirectRoutingPolicy> = mutableRoutingPolicy.asStateFlow()
-    val networkCheckResults: StateFlow<Map<UUID, ProductionDirectNetworkCheckResult>> by lazy {
+    val networkCheckResults: StateFlow<Map<Pair<UUID, ProductionDirectNetworkCheckKind>, ProductionDirectNetworkCheckResult>> by lazy {
         shadowRuntime.networkCheckResults
     }
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])

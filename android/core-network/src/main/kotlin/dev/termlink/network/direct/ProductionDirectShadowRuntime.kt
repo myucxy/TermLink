@@ -139,6 +139,9 @@ enum class ProductionDirectNetworkCheckKind {
 data class ProductionDirectNetworkCheckResult(
     val kind: ProductionDirectNetworkCheckKind,
     val available: Boolean,
+    val checking: Boolean = false,
+    val requestId: Long = 0,
+    val reasonCode: String = "",
 )
 
 internal fun ProductionDirectNetworkCheckKind.acceptsPair(
@@ -507,6 +510,7 @@ internal data class CapturedDirectNetwork(
     val token: Any,
     val handle: Long,
     val advertisedAddress: InetAddress,
+    val prefixLength: Int = if (advertisedAddress is Inet4Address) 24 else 64,
 ) {
     init {
         require(handle != 0L) { "Direct Android network handle is required" }
@@ -567,19 +571,19 @@ private class AndroidProductionDirectShadowPlatform(
         ) return null
         val handle = runCatching { network.networkHandle }.getOrDefault(0L)
         if (handle == 0L) return null
-        val address = connectivityManager.getLinkProperties(network)?.linkAddresses
+        val linkAddress = connectivityManager.getLinkProperties(network)?.linkAddresses
             .orEmpty()
-            .map { it.address }
-            .filter { DirectAddressPolicy.isCandidateEndpoint(it, 49_152) }
+            .filter { DirectAddressPolicy.isCandidateEndpoint(it.address, 49_152) }
             .sortedWith(
-                compareByDescending<InetAddress> { it is Inet4Address }
-                    .thenBy { it.hostAddress.orEmpty() },
+                compareByDescending<android.net.LinkAddress> { it.address is Inet4Address }
+                    .thenBy { it.address.hostAddress.orEmpty() },
             )
             .firstOrNull() ?: return null
         return CapturedDirectNetwork(
             token = network,
             handle = handle,
-            advertisedAddress = InetAddress.getByAddress(address.address.copyOf()),
+            advertisedAddress = InetAddress.getByAddress(linkAddress.address.address.copyOf()),
+            prefixLength = linkAddress.prefixLength,
         )
     }
 
@@ -600,9 +604,18 @@ private class AndroidProductionDirectShadowPlatform(
             if (resolved.size >= 2) break
             val endpoint = parseStunEndpoint(value)
             if (endpoint.second < 1_024) throw IllegalArgumentException("DIRECT_STUN_PORT_INVALID")
-            val address = withTimeout(DIRECT_DNS_TIMEOUT_MILLIS) {
-                resolveOnOwnedLane(androidNetwork, endpoint.first)
+            val addresses = try {
+                withTimeout(DIRECT_DNS_TIMEOUT_MILLIS) {
+                    resolveOnOwnedLane(androidNetwork, endpoint.first)
+                }
+            } catch (_: TimeoutCancellationException) {
+                continue
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: java.net.UnknownHostException) {
+                continue
             }
+            val address = addresses
                 .asSequence()
                 .filter { candidate -> sameFamily(candidate, current.advertisedAddress) }
                 .firstOrNull { candidate ->
@@ -803,9 +816,10 @@ class ProductionDirectShadowRuntime internal constructor(
     private var peerGeneration = 0L
     private var peers: List<ProductionDirectAuthorizedPeer> = emptyList()
     private var peerSelectionCursor = 0
-    private val pendingNetworkChecks = LinkedHashMap<UUID, ProductionDirectNetworkCheckKind>()
-    private val mutableNetworkCheckResults = MutableStateFlow<Map<UUID, ProductionDirectNetworkCheckResult>>(emptyMap())
-    val networkCheckResults: StateFlow<Map<UUID, ProductionDirectNetworkCheckResult>> =
+    private val pendingNetworkChecks = LinkedHashMap<UUID, ProductionDirectNetworkCheckResult>()
+    private var networkCheckSequence = 0L
+    private val mutableNetworkCheckResults = MutableStateFlow<Map<Pair<UUID, ProductionDirectNetworkCheckKind>, ProductionDirectNetworkCheckResult>>(emptyMap())
+    val networkCheckResults: StateFlow<Map<Pair<UUID, ProductionDirectNetworkCheckKind>, ProductionDirectNetworkCheckResult>> =
         mutableNetworkCheckResults.asStateFlow()
     /** Peers already handed to v5; retained across Relay reconnect generations. */
     private val promotedPeerEpochs = LinkedHashMap<UUID, Long>()
@@ -923,7 +937,28 @@ class ProductionDirectShadowRuntime internal constructor(
         synchronized(lock) {
             if (peers.none { it.deviceId == peerDeviceId }) return false
             if (peerDeviceId in pendingNetworkChecks) return false
-            pendingNetworkChecks[peerDeviceId] = kind
+            if (network == null || relayGeneration <= 0) return false
+            val requested = ProductionDirectNetworkCheckResult(kind, available = false, checking = true,
+                requestId = ++networkCheckSequence)
+            pendingNetworkChecks[peerDeviceId] = requested
+            mutableNetworkCheckResults.value = mutableNetworkCheckResults.value + ((peerDeviceId to kind) to requested)
+            scope.launch {
+                delay(30_000)
+                val expired = synchronized(lock) {
+                    if (pendingNetworkChecks[peerDeviceId]?.requestId != requested.requestId) return@launch
+                    pendingNetworkChecks.remove(peerDeviceId)
+                    mutableNetworkCheckResults.value = mutableNetworkCheckResults.value +
+                        ((peerDeviceId to kind) to requested.copy(checking = false, reasonCode = "DIRECT_CHECK_TIMEOUT"))
+                    active?.takeIf { it.gate.networkCheckRequestId == requested.requestId }?.also {
+                        active = null
+                        attemptJob?.cancel()
+                    }
+                }
+                expired?.retire("DIRECT_CHECK_TIMEOUT", networkChanged = false)
+                wake.trySend(Unit)
+            }
+            retryJob?.cancel()
+            retryJob = null
             promotedPeerEpochs.remove(peerDeviceId)
             current = active?.takeIf { it.peer.deviceId == peerDeviceId }
             if (current != null) active = null
@@ -1120,8 +1155,8 @@ class ProductionDirectShadowRuntime internal constructor(
             val useMultipairV2 = availableNativeV4 != null && signaling.multipairV2Active &&
                 DirectTransportSignalingClient.DIRECT_MULTIPAIR_CAPABILITY in config.capabilities
             if (gate.networkCheckKind != null && !useMultipairV2) {
-                completeNetworkCheck(gate, available = false)
                 publishIfCurrent(gate, ProductionDirectShadowState.RELAY_ONLY, "DIRECT_NETWORK_CHECK_UNSUPPORTED")
+                completeNetworkCheck(gate, available = false)
                 return
             }
             if (!useMultipairV2) {
@@ -1760,6 +1795,7 @@ class ProductionDirectShadowRuntime internal constructor(
         val ordered = selectCandidatePairs(
             attempt.localCandidatesV4.map(::candidateToSignalV4),
             attempt.remoteCandidatesV4,
+            attempt.gate.network.prefixLength,
         ).filter { pair ->
             attempt.gate.networkCheckKind?.acceptsPair(
                 pair.local.wire.kind,
@@ -2519,6 +2555,7 @@ class ProductionDirectShadowRuntime internal constructor(
         val selectedPair = selectCandidatePairs(
             attempt.localCandidates,
             answer.candidatesList,
+            attempt.gate.network.prefixLength,
         ).firstOrNull() ?: throw DirectAttemptFailure("DIRECT_CANDIDATE_PAIR_UNAVAILABLE")
         attempt.selectedPairRank = 1
         attempt.localCandidateKind = diagnosticCandidateKind(selectedPair.local.wire.kind)
@@ -2630,6 +2667,7 @@ class ProductionDirectShadowRuntime internal constructor(
     private fun selectCandidatePairs(
         localCandidates: List<DirectCandidateV1>,
         remoteCandidates: List<DirectCandidateV1>,
+        localPrefixLength: Int,
     ): List<SelectableCandidatePair> {
         val local = localCandidates.mapNotNull(::selectableCandidate)
         val remote = remoteCandidates.mapNotNull(::selectableCandidate)
@@ -2637,7 +2675,7 @@ class ProductionDirectShadowRuntime internal constructor(
             for (localCandidate in local) {
                 for (remoteCandidate in remote) {
                     if (localCandidate.address.address.size == remoteCandidate.address.address.size) {
-                        add(SelectableCandidatePair(localCandidate, remoteCandidate))
+                        add(SelectableCandidatePair(localCandidate, remoteCandidate, localPrefixLength))
                     }
                 }
             }
@@ -3000,7 +3038,8 @@ class ProductionDirectShadowRuntime internal constructor(
             network = selectedNetwork,
             peerGeneration = peerGeneration,
             peer = selectedPeer.ownedCopy(),
-            networkCheckKind = pendingNetworkChecks[selectedPeer.deviceId],
+            networkCheckKind = pendingNetworkChecks[selectedPeer.deviceId]?.kind,
+            networkCheckRequestId = pendingNetworkChecks[selectedPeer.deviceId]?.requestId ?: 0,
         )
     }
 
@@ -3041,10 +3080,12 @@ class ProductionDirectShadowRuntime internal constructor(
     private fun completeNetworkCheck(gate: Gate, available: Boolean) {
         val kind = gate.networkCheckKind ?: return
         synchronized(lock) {
-            if (pendingNetworkChecks[gate.peer.deviceId] != kind) return
+            val requested = pendingNetworkChecks[gate.peer.deviceId] ?: return
+            if (requested.requestId != gate.networkCheckRequestId) return
             pendingNetworkChecks.remove(gate.peer.deviceId)
             mutableNetworkCheckResults.value = mutableNetworkCheckResults.value +
-                (gate.peer.deviceId to ProductionDirectNetworkCheckResult(kind, available))
+                ((gate.peer.deviceId to kind) to requested.copy(available = available, checking = false,
+                    reasonCode = if (available) "" else mutableSnapshot.value.reasonCode.ifEmpty { "DIRECT_CHECK_INCOMPLETE" }))
         }
         wake.trySend(Unit)
     }
@@ -3328,6 +3369,7 @@ class ProductionDirectShadowRuntime internal constructor(
     private data class SelectableCandidatePair(
         val local: SelectableCandidate,
         val remote: SelectableCandidate,
+        val localPrefixLength: Int,
     ) {
         fun hasKinds(localKind: DirectCandidateKindV1, remoteKind: DirectCandidateKindV1): Boolean =
             local.wire.kind == localKind && remote.wire.kind == remoteKind
@@ -3339,14 +3381,7 @@ class ProductionDirectShadowRuntime internal constructor(
                 ) || !DirectAddressPolicy.isLanHostAddress(local.address) ||
                 !DirectAddressPolicy.isLanHostAddress(remote.address)
             ) return false
-            val localBytes = local.address.address
-            val remoteBytes = remote.address.address
-            val prefixBytes = when {
-                local.address is Inet4Address && remote.address is Inet4Address -> 3
-                local.address is Inet6Address && remote.address is Inet6Address -> 8
-                else -> return false
-            }
-            return (0 until prefixBytes).all { localBytes[it] == remoteBytes[it] }
+            return DirectAddressPolicy.sameSubnet(local.address, remote.address, localPrefixLength)
         }
     }
 
@@ -3358,6 +3393,7 @@ class ProductionDirectShadowRuntime internal constructor(
         val peerGeneration: Long,
         val peer: ProductionDirectAuthorizedPeer,
         val networkCheckKind: ProductionDirectNetworkCheckKind?,
+        val networkCheckRequestId: Long,
     )
 
     private class DirectAttemptFailure(val reason: String) : IllegalStateException(reason)
@@ -3381,6 +3417,7 @@ class ProductionDirectShadowRuntime internal constructor(
     private fun sameNetwork(left: CapturedDirectNetwork?, right: CapturedDirectNetwork?): Boolean =
         left === right || (left != null && right != null && left.token == right.token &&
             left.handle == right.handle &&
+            left.prefixLength == right.prefixLength &&
             left.advertisedAddress.address.contentEquals(right.advertisedAddress.address))
 
     private fun nextGeneration(value: Long): Long {

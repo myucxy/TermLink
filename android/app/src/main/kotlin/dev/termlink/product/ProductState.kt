@@ -168,6 +168,8 @@ enum class DirectNetworkCheckStatus {
 data class DirectNetworkCheckState(
     val lan: DirectNetworkCheckStatus = DirectNetworkCheckStatus.UNKNOWN,
     val nat: DirectNetworkCheckStatus = DirectNetworkCheckStatus.UNKNOWN,
+    val lanReason: String = "",
+    val natReason: String = "",
 )
 
 /** User-facing app chrome theme. Terminal colors intentionally remain independent. */

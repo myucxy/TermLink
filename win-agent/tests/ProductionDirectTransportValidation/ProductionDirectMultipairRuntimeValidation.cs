@@ -135,6 +135,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             await ValidateUnsupportedCapabilityFailsClosedAsync(pc, pcIdentity, android,
                 androidIdentity, serverIdentity, now).ConfigureAwait(false);
             await ValidatePromotionNetworkRaceAndLateCallbacksAsync().ConfigureAwait(false);
+            await ValidatePromotionNetworkRaceAndLateCallbacksAsync(retireReady: true).ConfigureAwait(false);
         }
 
         private static async Task ValidateOfferInterruptsRetryCooldownAsync(Guid pc, Guid android,
@@ -190,7 +191,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                 "An inbound offer did not interrupt the responder retry cooldown.");
         }
 
-        private static async Task ValidatePromotionNetworkRaceAndLateCallbacksAsync()
+        private static async Task ValidatePromotionNetworkRaceAndLateCallbacksAsync(bool retireReady = false)
         {
             var now = new DateTimeOffset(2026, 9, 2, 11, 0, 0, TimeSpan.Zero);
             var pc = Guid.NewGuid(); var android = Guid.NewGuid();
@@ -209,6 +210,8 @@ namespace TermLink.ProductionDirectTransport.Validation
             var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             Action<byte[]> ready = null;
             Action<string> failed = null;
+            ProductionDirectPathFenceV5 promotedPath = null;
+            var platform = new FakePlatform();
             await using var runtime = new ProductionDirectMultipairShadowRuntime(
                 true, pc, ProductionAgentRuntime.DeviceKeyId(pc), pcIdentity, supervisor,
                 () => throw new InvalidOperationException("Shared signaling must not use its factory."),
@@ -218,7 +221,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                         android, pairwise, androidIdentity.SigningPublicKey, 1)
                 }),
                 nativeFactory: () => native,
-                platform: new FakePlatform(),
+                platform: platform,
                 delay: ShortDelay,
                 clockMilliseconds: () => now.ToUnixTimeMilliseconds(),
                 nativeCapability: () => true,
@@ -227,6 +230,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                 {
                     ready = handoff.NominationCompleted;
                     failed = handoff.NominationFailed;
+                    promotedPath = handoff.Path;
                     entered.TrySetResult(true);
                     await release.Task.ConfigureAwait(false);
                     return true;
@@ -239,6 +243,24 @@ namespace TermLink.ProductionDirectTransport.Validation
             try
             {
                 await entered.Task.WaitAsync(TimeSpan.FromSeconds(8)).ConfigureAwait(false);
+                if (retireReady)
+                {
+                    ready(FakeNativeV4.Binding());
+                    release.TrySetResult(true);
+                    await WaitUntilAsync(() => runtime.Snapshot.State == ProductionDirectShadowState.ShadowReadyNotRouted,
+                        TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                    Require(runtime.IsCurrentNetworkUnchanged(), "An unrelated adapter event would retire a healthy path.");
+                    platform.NetworkCurrent = false;
+                    Require(!runtime.IsCurrentNetworkUnchanged(), "A changed selected route was ignored.");
+                    runtime.NotifyPromotedPathRetired(Guid.NewGuid(), promotedPath, "DIRECT_TIMEOUT");
+                    Require(platform.FailureReports == 0, "A stale peer retired a healthy promoted path.");
+                    runtime.NotifyPromotedPathRetired(android, promotedPath, "DIRECT_TIMEOUT");
+                    Require(platform.FailureReports == 1, "A failed promoted path did not enable another interface attempt.");
+                    ready(FakeNativeV4.Binding());
+                    failed("DIRECT_LATE_FAILURE");
+                    Require(platform.FailureReports == 1, "A late callback changed a retired path's outcome.");
+                    return;
+                }
                 runtime.NotifyNetworkChanged();
                 release.TrySetResult(true);
                 await WaitUntilAsync(() => runtime.Snapshot.ReasonCode == "NETWORK_CHANGED",
@@ -789,11 +811,18 @@ namespace TermLink.ProductionDirectTransport.Validation
 
         private sealed class FakePlatform : IProductionDirectShadowPlatform
         {
+            public bool NetworkCurrent { get; set; } = true;
+            public int FailureReports { get; private set; }
+            public void ReportPathOutcome(Guid peer, IPAddress address, bool succeeded)
+            {
+                if (!succeeded) FailureReports++;
+            }
             public Task<ProductionDirectGatherPlatform> PrepareGatherAsync(IReadOnlyList<string> stunServers,
                 CancellationToken cancellationToken) => Task.FromResult(new ProductionDirectGatherPlatform
                 {
                     LocalBind = new ProductionDirectNativeEndpoint(IPAddress.Parse("192.168.80.10"), 0),
                     AdvertisedLocalAddress = IPAddress.Parse("192.168.80.10"),
+                    IsNetworkCurrent = () => NetworkCurrent,
                     StunServers = Array.Empty<ProductionDirectNativeEndpoint>()
                 });
         }

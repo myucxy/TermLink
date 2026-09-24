@@ -188,6 +188,27 @@ namespace TermLink.Agent
             }
         }
 
+        internal bool IsCurrentNetworkUnchanged()
+        {
+            Attempt current;
+            lock (sync) current = active ?? currentPromotion?.Attempt;
+            if (current?.IsNetworkCurrent?.Invoke() != true) return false;
+            lock (sync) return ReferenceEquals(current, active ?? currentPromotion?.Attempt);
+        }
+
+        internal void NotifyPromotedPathRetired(Guid peer, ProductionDirectPathFenceV5 path, string reason)
+        {
+            PromotionLease lease;
+            lock (sync)
+            {
+                lease = currentPromotion;
+                if (lease == null || path == null || lease.Attempt.Peer.DeviceId != peer ||
+                    lease.Attempt.Epoch != path.PathEpoch || lease.Attempt.ConnectionId != path.ConnectionId ||
+                    lease.Attempt.AttemptId != path.AttemptId) return;
+            }
+            ObservePromotedFailure(lease, reason, allowReady: true);
+        }
+
         private async Task RunAsync(CancellationToken token)
         {
             while (!token.IsCancellationRequested)
@@ -297,8 +318,14 @@ namespace TermLink.Agent
                     }
                     active = attempt;
                 }
-                var gather = await platform.PrepareGatherAsync(configResult.Value.StunServers, token).ConfigureAwait(false);
+                var gather = await platform.PrepareGatherForPeerAsync(attempt.Peer.DeviceId,
+                    attempt.RemoteCandidates.Values.Where(value => value.Kind == ProductionDirectCandidateKindV4.Host)
+                        .Select(value => value.Endpoint.Address).ToArray(),
+                    configResult.Value.StunServers, token).ConfigureAwait(false);
                 if (!IsCurrent(attempt)) return;
+                attempt.LocalAddress = gather.AdvertisedLocalAddress;
+                attempt.LocalPrefixLength = gather.PrefixLength;
+                attempt.IsNetworkCurrent = gather.IsNetworkCurrent;
                 var native = nativeFactory();
                 attempt.Native = native;
                 if (!native.Snapshot.NativeAvailable || native.Gather(new ProductionDirectGatherRequestV4
@@ -646,8 +673,8 @@ namespace TermLink.Agent
                     }
                     if (initiator.Kind == ProductionDirectCandidateKindV4.Host &&
                         responder.Kind == ProductionDirectCandidateKindV4.Host &&
-                        !ProductionDirectMultipairPlanner.SameConservativeLan(
-                            initiator.Endpoint.Address, responder.Endpoint.Address))
+                        !ProductionDirectInterfaceSelection.SameLan(
+                            responder.Endpoint.Address, initiator.Endpoint.Address, attempt.LocalPrefixLength))
                         return Fail(attempt, "DIRECT_HOST_ROUTE_UNSAFE");
                     var rank = checked((uint)attempt.PlannedPairs.Count + (uint)pairs.Count + 1);
                     pairs.Add(new ProductionDirectCandidatePairV4
@@ -893,6 +920,7 @@ namespace TermLink.Agent
             if (attempt.ShadowReady) return true;
             supervisor.MarkShadowReady(attempt.SupervisorToken, attempt.LocalPathBinding);
             attempt.ShadowReady = true;
+            platform.ReportPathOutcome(attempt.Peer.DeviceId, attempt.LocalAddress, true);
             attempt.ReleaseSecretsAfterReady();
             Publish(ProductionDirectShadowState.ShadowReadyNotRouted, string.Empty, attempt);
             return true;
@@ -1099,6 +1127,8 @@ namespace TermLink.Agent
                 PublishLocked(relayConnected ? ProductionDirectShadowState.RelayOnly :
                     ProductionDirectShadowState.WaitingForRelay, reason, attempt);
             }
+            if (!networkChanged && !attempt.ShadowReady && reason != "RELAY_UNAVAILABLE")
+                platform.ReportPathOutcome(attempt.Peer.DeviceId, attempt.LocalAddress, false);
             try
             {
                 if (networkChanged) native?.NetworkChanged(attempt.Epoch, attempt.AttemptId);
@@ -1191,6 +1221,7 @@ namespace TermLink.Agent
             }
             if (!string.IsNullOrEmpty(earlyFailure))
             {
+                platform.ReportPathOutcome(attempt.Peer.DeviceId, attempt.LocalAddress, false);
                 supervisor.TryFallbackAttempt(attempt.SupervisorToken, earlyFailure);
                 if (relayConnected) Wake();
             }
@@ -1209,6 +1240,7 @@ namespace TermLink.Agent
                         !ReferenceEquals(currentPromotion, lease)) return;
                     supervisor.MarkShadowReady(lease.Attempt.SupervisorToken, binding);
                     lease.Ready = true;
+                    platform.ReportPathOutcome(lease.Attempt.Peer.DeviceId, lease.Attempt.LocalAddress, true);
                     if (!lease.HandedOff) return;
                     PublishLocked(ProductionDirectShadowState.ShadowReadyNotRouted,
                         string.Empty, lease.Attempt);
@@ -1220,13 +1252,13 @@ namespace TermLink.Agent
             }
         }
 
-        private void ObservePromotedFailure(PromotionLease lease, string reason)
+        private void ObservePromotedFailure(PromotionLease lease, string reason, bool allowReady = false)
         {
             string failure;
             ProductionDirectAttemptToken supervisorToken;
             lock (sync)
             {
-                if (disposed != 0 || lease == null || lease.Retired || lease.Ready ||
+                if (disposed != 0 || lease == null || lease.Retired || (lease.Ready && !allowReady) ||
                     !ReferenceEquals(currentPromotion, lease)) return;
                 failure = string.IsNullOrWhiteSpace(reason)
                     ? "DIRECT_PROMOTED_FAILED" : reason;
@@ -1234,6 +1266,7 @@ namespace TermLink.Agent
                 if (!lease.HandedOff) return;
                 supervisorToken = lease.Attempt.SupervisorToken;
                 var attempt = lease.Attempt;
+                platform.ReportPathOutcome(attempt.Peer.DeviceId, attempt.LocalAddress, false);
                 InvalidatePromotionLocked(lease);
                 PublishLocked(relayConnected ? ProductionDirectShadowState.RelayOnly :
                     ProductionDirectShadowState.WaitingForRelay,
@@ -1453,6 +1486,9 @@ namespace TermLink.Agent
             public bool AckSent { get; set; }
             public bool LocalResultSent { get; set; }
             public bool ShadowReady { get; set; }
+            public System.Net.IPAddress LocalAddress { get; set; }
+            public int LocalPrefixLength { get; set; } = 24;
+            public Func<bool> IsNetworkCurrent { get; set; }
             public bool Promoted { get; set; }
             public bool PromotionReady { get; set; }
             public string PromotionFailure { get; set; }

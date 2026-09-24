@@ -370,26 +370,30 @@ private data class DirectProjection(
     val pcCarriers: Map<UUID, ProductionDirectCarrier>,
     val sessionCarriers: Map<UUID, ProductionDirectCarrier>,
     val routingPolicy: ProductionDirectRoutingPolicy,
-    val networkChecks: Map<UUID, ProductionDirectNetworkCheckResult>,
+    val networkChecks: Map<Pair<UUID, ProductionDirectNetworkCheckKind>, ProductionDirectNetworkCheckResult>,
 )
 
 internal fun Map<UUID, DirectNetworkCheckState>.mergeNetworkChecks(
-    results: Map<UUID, ProductionDirectNetworkCheckResult>,
+    results: Map<Pair<UUID, ProductionDirectNetworkCheckKind>, ProductionDirectNetworkCheckResult>,
     pcIdByDeviceId: Map<UUID, UUID>,
 ): Map<UUID, DirectNetworkCheckState> {
-    if (results.isEmpty()) return this
-    val merged = toMutableMap()
-    results.forEach { (deviceId, result) ->
+    val merged = mutableMapOf<UUID, DirectNetworkCheckState>()
+    results.forEach { (key, result) ->
+        val deviceId = key.first
         val pcId = pcIdByDeviceId[deviceId] ?: return@forEach
         val current = merged[pcId] ?: DirectNetworkCheckState()
         merged[pcId] = when (result.kind) {
             ProductionDirectNetworkCheckKind.LAN -> current.copy(
-                lan = if (result.available) DirectNetworkCheckStatus.AVAILABLE
+                lan = if (result.checking) DirectNetworkCheckStatus.CHECKING
+                else if (result.available) DirectNetworkCheckStatus.AVAILABLE
                 else DirectNetworkCheckStatus.NOT_ESTABLISHED,
+                lanReason = result.reasonCode,
             )
             ProductionDirectNetworkCheckKind.NAT -> current.copy(
-                nat = if (result.available) DirectNetworkCheckStatus.AVAILABLE
+                nat = if (result.checking) DirectNetworkCheckStatus.CHECKING
+                else if (result.available) DirectNetworkCheckStatus.AVAILABLE
                 else DirectNetworkCheckStatus.NOT_ESTABLISHED,
+                natReason = result.reasonCode,
             )
         }
     }
@@ -1941,15 +1945,6 @@ internal class ProductionProductRepository(
             ?: return
         val coordinator = synchronized(liveSessionLock) { directCoordinator }
             ?: return
-        mutableSnapshot.update { snapshot ->
-            val current = snapshot.directNetworkChecks[session.pcId] ?: DirectNetworkCheckState()
-            snapshot.copy(
-                directNetworkChecks = snapshot.directNetworkChecks + (session.pcId to when (kind) {
-                    DirectNetworkCheckKind.LAN -> current.copy(lan = DirectNetworkCheckStatus.CHECKING)
-                    DirectNetworkCheckKind.NAT -> current.copy(nat = DirectNetworkCheckStatus.CHECKING)
-                }),
-            )
-        }
         val accepted = coordinator.requestNetworkCheck(
             pcDeviceId,
             when (kind) {
@@ -1962,8 +1957,8 @@ internal class ProductionProductRepository(
                 val current = snapshot.directNetworkChecks[session.pcId] ?: DirectNetworkCheckState()
                 snapshot.copy(
                     directNetworkChecks = snapshot.directNetworkChecks + (session.pcId to when (kind) {
-                        DirectNetworkCheckKind.LAN -> current.copy(lan = DirectNetworkCheckStatus.NOT_ESTABLISHED)
-                        DirectNetworkCheckKind.NAT -> current.copy(nat = DirectNetworkCheckStatus.NOT_ESTABLISHED)
+                        DirectNetworkCheckKind.LAN -> current.copy(lan = DirectNetworkCheckStatus.NOT_ESTABLISHED, lanReason = "DIRECT_NETWORK_UNAVAILABLE")
+                        DirectNetworkCheckKind.NAT -> current.copy(nat = DirectNetworkCheckStatus.NOT_ESTABLISHED, natReason = "DIRECT_NETWORK_UNAVAILABLE")
                     }),
                 )
             }

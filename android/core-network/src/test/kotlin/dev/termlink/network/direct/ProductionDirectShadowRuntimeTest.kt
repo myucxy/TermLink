@@ -778,6 +778,43 @@ class ProductionDirectShadowRuntimeTest {
         }
     }
 
+    @Test
+    fun repeatedCheckPublishesFreshProgressAndNetworkChangeClearsIt() = runTest {
+        val identity = DeviceIdentity.generate(FixedSecureRandom())
+        val runtime = runtime(this, identity, FakeSignaling(now, androidId, pcId, pairwise),
+            FakeNative(), FakePlatform())
+        val callerPeer = peer()
+        val key = pcId to ProductionDirectNetworkCheckKind.LAN
+        try {
+            arm(runtime, callerPeer, relayGeneration = 1)
+            assertTrue(runtime.requestNetworkCheck(AUTH_GENERATION, pcId, key.second))
+            val first = runtime.networkCheckResults.value.getValue(key)
+            assertTrue(first.checking)
+            runCurrent() // Fake v3 signaling cannot perform a forced v4 check.
+            assertFalse(runtime.networkCheckResults.value.getValue(key).checking)
+            assertTrue(runtime.requestNetworkCheck(AUTH_GENERATION, pcId, key.second))
+            val second = runtime.networkCheckResults.value.getValue(key)
+            assertTrue(second.checking)
+            assertTrue(second.requestId > first.requestId)
+            runCurrent()
+            assertFalse(runtime.networkCheckResults.value.getValue(key).checking)
+            runtime.observeCapturedNetwork(AUTH_GENERATION, network(2, 102L))
+            assertTrue(runtime.networkCheckResults.value.isEmpty())
+        } finally {
+            callerPeer.close()
+            runtime.closeAndJoin()
+            identity.destroy()
+        }
+    }
+
+    @Test
+    fun lanChecksUseTheActualPrefixAndExcludeBroadcast() {
+        val local = InetAddress.getByName("172.19.32.1")
+        assertTrue(DirectAddressPolicy.sameSubnet(local, InetAddress.getByName("172.19.40.2"), 20))
+        assertFalse(DirectAddressPolicy.sameSubnet(local, InetAddress.getByName("172.19.48.2"), 20))
+        assertFalse(DirectAddressPolicy.sameSubnet(local, InetAddress.getByName("172.19.47.255"), 20))
+    }
+
     private fun runtime(
         parentScope: kotlinx.coroutines.CoroutineScope,
         identity: DeviceIdentity,

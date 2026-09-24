@@ -4756,7 +4756,7 @@ private fun SessionConnectionStatusMenu(
                         leadingIcon = { Icon(Icons.Filled.Wifi, contentDescription = null) },
                         trailingIcon = {
                             Text(
-                                networkCheckState?.lan.localizedLabel(),
+                                networkCheckState?.lan.localizedLabel(networkCheckState?.lanReason.orEmpty()),
                                 modifier = Modifier.widthIn(max = 120.dp),
                                 style = MaterialTheme.typography.labelSmall,
                             )
@@ -4769,7 +4769,7 @@ private fun SessionConnectionStatusMenu(
                         leadingIcon = { Icon(Icons.Filled.Public, contentDescription = null) },
                         trailingIcon = {
                             Text(
-                                networkCheckState?.nat.localizedLabel(),
+                                networkCheckState?.nat.localizedLabel(networkCheckState?.natReason.orEmpty()),
                                 modifier = Modifier.widthIn(max = 120.dp),
                                 style = MaterialTheme.typography.labelSmall,
                             )
@@ -4798,11 +4798,18 @@ private fun SessionConnectionStatusMenu(
 }
 
 @Composable
-private fun DirectNetworkCheckStatus?.localizedLabel(): String = stringResource(
+private fun DirectNetworkCheckStatus?.localizedLabel(reason: String = ""): String = stringResource(
     when (this) {
         DirectNetworkCheckStatus.CHECKING -> R.string.session_network_checking
         DirectNetworkCheckStatus.AVAILABLE -> R.string.session_network_available
-        DirectNetworkCheckStatus.NOT_ESTABLISHED -> R.string.session_network_not_established
+        DirectNetworkCheckStatus.NOT_ESTABLISHED -> when {
+            "TIMEOUT" in reason -> R.string.session_network_timeout
+            "CANDIDATE" in reason -> R.string.session_network_no_path
+            "UNSUPPORTED" in reason -> R.string.session_network_unsupported
+            "CONFIG" in reason || "TICKET" in reason || "SIGNAL" in reason -> R.string.session_network_negotiation_failed
+            "NETWORK" in reason || reason == "RELAY_UNAVAILABLE" -> R.string.session_network_changed
+            else -> R.string.session_network_not_established
+        }
         DirectNetworkCheckStatus.UNKNOWN, null -> R.string.session_network_unverified
     },
 )

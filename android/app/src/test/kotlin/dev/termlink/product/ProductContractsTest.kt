@@ -84,7 +84,7 @@ class ProductContractsTest {
 
         val lan = emptyMap<UUID, DirectNetworkCheckState>().mergeNetworkChecks(
             mapOf(
-                deviceId to ProductionDirectNetworkCheckResult(
+                (deviceId to ProductionDirectNetworkCheckKind.LAN) to ProductionDirectNetworkCheckResult(
                     ProductionDirectNetworkCheckKind.LAN,
                     available = true,
                 ),
@@ -93,7 +93,10 @@ class ProductContractsTest {
         )
         val both = lan.mergeNetworkChecks(
             mapOf(
-                deviceId to ProductionDirectNetworkCheckResult(
+                (deviceId to ProductionDirectNetworkCheckKind.LAN) to ProductionDirectNetworkCheckResult(
+                    ProductionDirectNetworkCheckKind.LAN, available = true,
+                ),
+                (deviceId to ProductionDirectNetworkCheckKind.NAT) to ProductionDirectNetworkCheckResult(
                     ProductionDirectNetworkCheckKind.NAT,
                     available = false,
                 ),
@@ -104,6 +107,13 @@ class ProductContractsTest {
         assertEquals(DirectNetworkCheckStatus.AVAILABLE, both.getValue(pcId).lan)
         assertEquals(DirectNetworkCheckStatus.NOT_ESTABLISHED, both.getValue(pcId).nat)
         assertFalse(deviceId in both)
+        assertTrue(both.mergeNetworkChecks(emptyMap(), mapOf(deviceId to pcId)).isEmpty())
+        val repeated = both.mergeNetworkChecks(mapOf(
+            (deviceId to ProductionDirectNetworkCheckKind.NAT) to ProductionDirectNetworkCheckResult(
+                ProductionDirectNetworkCheckKind.NAT, available = false, checking = true, requestId = 2,
+            )), mapOf(deviceId to pcId))
+        assertEquals(DirectNetworkCheckStatus.CHECKING, repeated.getValue(pcId).nat)
+        assertEquals(DirectNetworkCheckStatus.UNKNOWN, repeated.getValue(pcId).lan)
     }
 
     @Test

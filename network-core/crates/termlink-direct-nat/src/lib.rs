@@ -749,7 +749,9 @@ impl MultipairUdpPump {
 
         if !self.stun_requests_sent {
             for (server, transaction) in &self.stun_transactions {
-                self.socket.send_stun_request(*server, transaction)?;
+                // STUN is optional discovery. A failed server/route must not retire
+                // the bound socket and its independently usable LAN candidates.
+                let _ = self.socket.send_stun_request(*server, transaction);
             }
             self.stun_requests_sent = true;
         }
@@ -875,8 +877,18 @@ impl MultipairUdpPump {
             {
                 continue;
             }
-            self.socket
-                .send_probe(&state.pair.probe_packet, state.pair.peer)?;
+            match self
+                .socket
+                .send_probe(&state.pair.probe_packet, state.pair.peer)
+            {
+                Ok(_) => {}
+                Err(NatError::Io(_)) => {
+                    state.status = PairStatus::Failed;
+                    state.next_probe_at = None;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             state.last_probe_sent_at = Some(now);
             state.attempts_sent += 1;
             state.next_probe_at = (state.attempts_sent < MAX_PROBE_ATTEMPTS_PER_DIRECTION)
@@ -1371,6 +1383,46 @@ mod tests {
         );
         assert!(!pump.is_checks_complete());
         assert_eq!(pump.active_pair_count(), 1);
+    }
+
+    #[test]
+    fn failed_stun_send_preserves_lan_checks_on_the_same_socket() {
+        let ip = active_unicast_ip();
+        let owner = DirectUdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        // A different address family deterministically fails send_to on this bound socket.
+        let unreachable: SocketAddr = if ip.is_ipv4() {
+            "[2001:4860:4860::8888]:3478".parse().unwrap()
+        } else {
+            "192.0.2.1:3478".parse().unwrap()
+        };
+        assert!(
+            owner
+                .send_stun_request(unreachable, &StunTransaction::generate().unwrap())
+                .is_err()
+        );
+        let peer = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let peer_task = thread::spawn(move || {
+            let mut request = [0_u8; MAX_PROBE_PACKET_BYTES];
+            let (_, source) = peer.recv_from(&mut request).unwrap();
+            peer.send_to(b"peer-probe", source).unwrap();
+            peer.send_to(b"probe-ack", source).unwrap();
+        });
+        let token = test_pair_token(1);
+        let mut pump = owner
+            .into_multipair_pump(&[unreachable], Duration::from_secs(2))
+            .unwrap();
+        pump.append_pair(test_pair(test_pair_token(2), unreachable))
+            .unwrap();
+        pump.append_pair(test_pair(token, peer_addr)).unwrap();
+        pump.mark_plan_complete();
+        assert!(drive_until_validated(
+            &mut pump,
+            token,
+            Duration::from_secs(1)
+        ));
+        peer_task.join().unwrap();
     }
 
     #[test]

@@ -1079,6 +1079,8 @@ namespace TermLink.Agent
 
         private void NotifyDirectNetworkChangedSafely()
         {
+            try { if (directShadowRuntime?.IsCurrentNetworkUnchanged() == true) return; }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
             try { directDataRuntime?.NotifyNetworkChanged(); }
             catch (Exception error) when (error is not OutOfMemoryException) { }
             try { directPeerRoutes.RetireAllDirect("NETWORK_CHANGED"); }
@@ -1478,6 +1480,7 @@ namespace TermLink.Agent
                 {
                     directPeerRoutes.TryRetirePeer(
                         value.PeerDeviceId, fence, value.LastFault);
+                    directShadowRuntime?.NotifyPromotedPathRetired(value.PeerDeviceId, value.Path, value.LastFault);
                     return;
                 }
                 var pathKind = value.PcToAndroidCarrier == ProductionDirectCarrierV5.LanDirect ||

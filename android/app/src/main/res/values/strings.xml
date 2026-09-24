@@ -585,4 +585,9 @@
     <string name="settings_terminal_font_error_invalid">Android could not load this font. The previous font was kept.</string>
     <string name="settings_terminal_font_error_unreadable">The selected font could not be read. The previous font was kept.</string>
     <string name="session_cleanup_upgrade_required">Upgrade the server and Windows client to use native session cleanup.</string>
+    <string name="session_network_timeout">Check timed out</string>
+    <string name="session_network_no_path">No matching path</string>
+    <string name="session_network_unsupported">Paired upgrade needed</string>
+    <string name="session_network_negotiation_failed">Negotiation failed</string>
+    <string name="session_network_changed">Network interrupted</string>
 </resources>

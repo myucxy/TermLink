@@ -120,6 +120,8 @@ namespace TermLink.Agent
     {
         public ProductionDirectNativeEndpoint LocalBind { get; init; }
         public IPAddress AdvertisedLocalAddress { get; init; }
+        public int PrefixLength { get; init; } = 24;
+        public Func<bool> IsNetworkCurrent { get; init; }
         public IReadOnlyList<ProductionDirectNativeEndpoint> StunServers { get; init; } =
             Array.Empty<ProductionDirectNativeEndpoint>();
     }
@@ -143,41 +145,64 @@ namespace TermLink.Agent
         Task<ProductionDirectGatherPlatform> PrepareGatherAsync(
             IReadOnlyList<string> stunServers,
             CancellationToken cancellationToken);
+
+        Task<ProductionDirectGatherPlatform> PrepareGatherForPeerAsync(
+            Guid peer, IReadOnlyList<IPAddress> peerHosts, IReadOnlyList<string> stunServers,
+            CancellationToken cancellationToken) => PrepareGatherAsync(stunServers, cancellationToken);
+
+        void ReportPathOutcome(Guid peer, IPAddress address, bool succeeded) { }
     }
 
     internal sealed class ProductionWindowsDirectShadowPlatform : IProductionDirectShadowPlatform
     {
-        public async Task<ProductionDirectGatherPlatform> PrepareGatherAsync(
+        private readonly ProductionDirectInterfaceSelection selection = new();
+
+        public Task<ProductionDirectGatherPlatform> PrepareGatherAsync(
             IReadOnlyList<string> stunServers,
+            CancellationToken cancellationToken) =>
+            PrepareGatherForPeerAsync(Guid.Empty, Array.Empty<IPAddress>(), stunServers, cancellationToken);
+
+        public void ReportPathOutcome(Guid peer, IPAddress address, bool succeeded) =>
+            selection.Report(peer, address, succeeded);
+
+        public async Task<ProductionDirectGatherPlatform> PrepareGatherForPeerAsync(
+            Guid peer, IReadOnlyList<IPAddress> peerHosts, IReadOnlyList<string> stunServers,
             CancellationToken cancellationToken)
         {
-            var address = NetworkInterface.GetAllNetworkInterfaces()
-                .Where(value => value.OperationalStatus == OperationalStatus.Up &&
-                    value.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                    value.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
-                .SelectMany(value => value.GetIPProperties().UnicastAddresses)
-                .Select(value => value.Address)
-                .FirstOrDefault(ProductionDirectCandidateCollector.IsAllowedHostAddress);
-            if (address == null) throw new InvalidOperationException("DIRECT_NO_ACTIVE_INTERFACE");
-
-            var resolved = new List<ProductionDirectNativeEndpoint>(2);
+            var interfaces = ProductionDirectInterfaceSelection.Capture();
+            var resolved = new List<ProductionDirectNativeEndpoint>();
             foreach (var text in stunServers ?? Array.Empty<string>())
             {
-                if (resolved.Count == 2) break;
                 var (host, port) = ParseStunEndpoint(text);
-                var addresses = await Dns.GetHostAddressesAsync(host, cancellationToken)
-                    .ConfigureAwait(false);
-                var endpointAddress = addresses.FirstOrDefault(value =>
-                    value.AddressFamily == address.AddressFamily &&
-                    ProductionDirectCandidateCollector.IsAllowedHostAddress(value));
-                if (endpointAddress != null)
-                    resolved.Add(new ProductionDirectNativeEndpoint(endpointAddress, port));
+                using var dnsTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                dnsTimeout.CancelAfter(TimeSpan.FromSeconds(2));
+                try
+                {
+                    var addresses = await Dns.GetHostAddressesAsync(host, dnsTimeout.Token).ConfigureAwait(false);
+                    resolved.AddRange(addresses.Where(ProductionDirectCandidateCollector.IsAllowedHostAddress)
+                        .Select(address => new ProductionDirectNativeEndpoint(address, port)));
+                }
+                catch (SocketException) { /* STUN DNS must not disable host/LAN candidates. */ }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
             }
+            cancellationToken.ThrowIfCancellationRequested();
+            var routes = resolved.Select(value => ProductionDirectInterfaceSelection.RouteSource(value.Address, value.Port))
+                .Where(value => value != null).ToHashSet();
+            var selected = selection.Select(peer, interfaces, peerHosts, routes);
+            var address = selected.Address;
+            var targets = peerHosts.Concat(resolved.Select(value => value.Address))
+                .Where(value => value.AddressFamily == address.AddressFamily).Distinct().ToArray();
+            var initialRoutes = targets.Select(value => ProductionDirectInterfaceSelection.RouteSource(value, 3478)).ToArray();
             return new ProductionDirectGatherPlatform
             {
                 LocalBind = new ProductionDirectNativeEndpoint(address, 0),
                 AdvertisedLocalAddress = address,
-                StunServers = resolved.AsReadOnly()
+                PrefixLength = selected.PrefixLength,
+                IsNetworkCurrent = () => ProductionDirectInterfaceSelection.Capture().Any(value =>
+                    value.Address.Equals(address) && value.PrefixLength == selected.PrefixLength) &&
+                    initialRoutes.SequenceEqual(targets.Select(value => ProductionDirectInterfaceSelection.RouteSource(value, 3478))),
+                StunServers = resolved.Where(value => value.Address.AddressFamily == address.AddressFamily)
+                    .GroupBy(value => (value.Address, value.Port)).Select(group => group.First()).Take(2).ToArray()
             };
         }
 

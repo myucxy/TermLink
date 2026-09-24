@@ -66,6 +66,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                 ValidateEpochRateAndFailureCooldown();
                 ValidatePeerIsolationAndStaleGenerationCallbacks();
                 ValidateCandidateFilteringAndSocketLease();
+                await ProductionDirectInterfaceSelectionValidation.ValidateAsync().ConfigureAwait(false);
                 ValidateStunTransactionAndXorMappedAddress();
                 ValidateCanonicalTicketCrossLanguageVector();
                 DirectTransportCryptoVectorValidation.Validate();

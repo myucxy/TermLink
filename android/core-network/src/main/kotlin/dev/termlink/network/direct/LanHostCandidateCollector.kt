@@ -156,10 +156,15 @@ internal object DirectAddressPolicy {
 
     internal fun sameSubnet(local: DirectCandidate, remote: DirectCandidate): Boolean {
         val prefix = local.prefixLength ?: return false
-        val left = local.address.address
-        val right = remote.address.address
+        if (!isCandidateEndpoint(remote.address, remote.port)) return false
+        return sameSubnet(local.address, remote.address, prefix)
+    }
+
+    internal fun sameSubnet(local: InetAddress, remote: InetAddress, prefix: Int): Boolean {
+        val left = local.address
+        val right = remote.address
         if (left.size != right.size || prefix !in 1..(left.size * Byte.SIZE_BITS) ||
-            !isCandidateEndpoint(remote.address, remote.port)
+            !isCandidateEndpoint(remote, 49_152)
         ) return false
         val completeBytes = prefix / Byte.SIZE_BITS
         val remainingBits = prefix % Byte.SIZE_BITS
@@ -172,7 +177,7 @@ internal object DirectAddressPolicy {
                 return false
             }
         }
-        return remote.address !is Inet4Address || isIpv4UnicastHost(right, prefix)
+        return remote !is Inet4Address || isIpv4UnicastHost(right, prefix)
     }
 
     private fun isIpv4UnicastHost(address: ByteArray, prefixLength: Int): Boolean {
