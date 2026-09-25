@@ -44,11 +44,27 @@ UP 又清除捕获标志，仅向 GestureDetector 传入 UP，无法形成完整
 
 ## 构建、上传与回滚
 
-构建/上传待源码固定后执行，以下状态由实际结果补充，不将测试成功视为已发布。
+2026-09-25 已完成 Production 构建、独立校验、AppShip stable 发布和公开更新接口复核。
+最终制品源码 revision：`7b7858d8b9b61ccd9c6164355cac6f07f11a30c5`；构建时工作树干净，
+HEAD 与 origin/main 相同。后续仅补充本发布记录。
 
-计划制品：`artifacts/release/0.2.65-121/TermLink-Android-0.2.65-121.apk`。
-Production 必须通过统一构建、独立签名校验和仓库 AppShip 包装器，验证旧 build `optional`、
-新 build `no_update`、artifact `ready`、哈希/大小/签名一致。
+正式制品：`artifacts/release/0.2.65-121/TermLink-Android-0.2.65-121.apk`。
+
+- 大小：38,059,930 bytes。
+- SHA-256：`b574c0191bee4eaec4a6d47eeb0886d5fb799430dbaf672557961f98ffba003a`。
+- apksigner 验证：唯一 signer、APK Signature Scheme v2；连续性指纹与上文一致。
+- 正式 APK DEX 也无 Termux 类引用；四个 ABI 的 `libtermlink_terminal_jni.so` 与 0.2.64/120
+  逐字节 SHA-256 相同，因此本次不需要 Windows core 或 Server 同步升级。
+- AppShip application：`4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`。
+- release：`c384332c-727f-43fb-9d7f-f740e306ff5c`，`published`。
+- artifact：`f14652b2-d9da-4130-a85a-0f22a236611a`，`ready`、`manual_approved`。
+- build 120 返回 `optional`，build 121 返回 `no_update`；公开 artifact 的 hash、大小和 signer
+  与本地产物完全一致。发布状态保留于 `.appship/termlink-android-stable-0.2.65-build121-signature-approved.json`。
+- 证据：`artifacts/validation/release-121-production-build.log`、`release-121-apksigner.txt`、
+  `release-121-package-check.json`、`release-121-appship-publish.log`、`release-121-public-after.json`。
+
+模拟器已覆盖升级同源码 Debug 0.2.65/121 并完成 HOME-PC 回归。未将 Debug 包上传 AppShip；
+实体 Android 手机、真实物理鼠标和其他 IME 的现场测试没有在本轮执行。
 
 回滚：可即时关闭触摸鼠标开关。0.2.64/120 制品和 AppShip 历史均保留；若代码回归，以该已验证
 源码作基础发布更高 build 的修复版，避免 Android 降级或卸载丢失登录与设备密钥。本版没有迁移。
