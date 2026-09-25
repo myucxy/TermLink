@@ -7400,7 +7400,6 @@ private fun safeSnapshotFailureLocation(error: Throwable): String {
     }
     for (cause in chain.asReversed()) {
         val frame = cause.stackTrace.firstOrNull { value ->
-            value.className.startsWith("com.termux.") ||
                 value.className.startsWith("dev.termlink.terminal.")
         } ?: cause.stackTrace.firstOrNull { value ->
             value.className.startsWith("dev.termlink.") &&

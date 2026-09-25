@@ -10,11 +10,13 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
+import android.text.Selection
 import android.text.SpannableStringBuilder
 import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.ActionMode
 import android.view.GestureDetector
+import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.Menu
@@ -71,7 +73,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var transcriptTopInset = 0f
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG)
     private val shapePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val imeEditable = SpannableStringBuilder()
+    private val imeEditable = SpannableStringBuilder().apply { Selection.setSelection(this, 0) }
     private var combiningAccent = 0
     private val pressedCharacterKeys = HashMap<Int, Pair<Int, Int?>>()
     private val boundedLineSpacing = lineSpacingMultiplier.coerceIn(0.8f, 1.8f)
@@ -110,6 +112,9 @@ internal class NativeTerminalView @JvmOverloads constructor(
     @Volatile
     private var lastHistoryWorkerThreadName: String? = null
     private var mouseCaptured = false
+    private var mousePressed = false
+    private var mouseButton = TerminalMouseButton.LEFT
+    private var pendingKeyboardShow = false
     private var selectionAnchor: CellPoint? = null
     private var selectionExtent: CellPoint? = null
     private var selectionActionMode: ActionMode? = null
@@ -310,6 +315,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         saveTranscriptPresentation()
+        pendingKeyboardShow = false
         detached = true
         scroller.forceFinished(true)
         engine?.beginHistoryNavigation()
@@ -322,6 +328,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     internal fun detachEngine() {
+        pendingKeyboardShow = false
         detached = true
         scroller.forceFinished(true)
         engine?.beginHistoryNavigation()
@@ -497,6 +504,55 @@ internal class NativeTerminalView @JvmOverloads constructor(
         if (detached) return false
         val owner = engine
         if (owner == null && transcript == null) return false
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            // Pin routing for the entire gesture. A TUI enabling mouse reports must not
+            // silently take ownership of fingers; real mice remain independent.
+            mouseCaptured = owner != null && (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+                owner.touchMouseEnabled && owner.mouseReporting.value && owner.canAcceptInput())
+            mousePressed = false
+            mouseButton = when {
+                event.isButtonPressed(MotionEvent.BUTTON_SECONDARY) -> TerminalMouseButton.RIGHT
+                event.isButtonPressed(MotionEvent.BUTTON_TERTIARY) -> TerminalMouseButton.MIDDLE
+                else -> TerminalMouseButton.LEFT
+            }
+            if (mouseCaptured) {
+                dismissSelection()
+                scroller.forceFinished(true)
+                cancelQueuedHistoryRequests()
+                requestFocus()
+            }
+        }
+        if (mouseCaptured) {
+            val position = mousePosition(event.x, event.y)
+            val modifiers = eventModifiers(event)
+            fun release() {
+                if (mousePressed) safeSubmit {
+                    owner?.submitMouse(TerminalMouseInput.Release(mouseButton, position, modifiers = modifiers)) == true
+                }
+                mousePressed = false
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> mousePressed = safeSubmit {
+                    owner?.submitMouse(TerminalMouseInput.Press(mouseButton, position,
+                        TerminalMouseButtons(left = mouseButton == TerminalMouseButton.LEFT,
+                            middle = mouseButton == TerminalMouseButton.MIDDLE,
+                            right = mouseButton == TerminalMouseButton.RIGHT), modifiers)) == true
+                }
+                MotionEvent.ACTION_MOVE -> if (mousePressed) safeSubmit {
+                    owner?.submitMouse(TerminalMouseInput.Move(position,
+                        TerminalMouseButtons(left = mouseButton == TerminalMouseButton.LEFT,
+                            middle = mouseButton == TerminalMouseButton.MIDDLE,
+                            right = mouseButton == TerminalMouseButton.RIGHT), modifiers)) == true
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> release()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    release()
+                    mouseCaptured = false
+                }
+            }
+            // Never feed an orphan UP into the gesture recognizer or open the IME.
+            return true
+        }
         transcriptScale?.let { scale ->
             if (event.actionMasked == MotionEvent.ACTION_DOWN) transcriptPinching = false
             scale.onTouchEvent(event)
@@ -542,41 +598,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
                 if (hasSelectionState()) dismissSelection()
             }
         }
-        val position = mousePosition(event.x, event.y)
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                if (owner != null) requestFocus()
-                mouseCaptured = owner?.submitMouse(
-                    TerminalMouseInput.Press(
-                        button = TerminalMouseButton.LEFT,
-                        position = position,
-                        buttonsHeld = TerminalMouseButtons(left = true),
-                        modifiers = eventModifiers(event),
-                    ),
-                ) == true
-            }
-            MotionEvent.ACTION_MOVE -> if (mouseCaptured) {
-                owner?.submitMouse(
-                    TerminalMouseInput.Move(
-                        position = position,
-                        buttonsHeld = TerminalMouseButtons(left = true),
-                        modifiers = eventModifiers(event),
-                    ),
-                )
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (mouseCaptured) {
-                owner?.submitMouse(
-                    TerminalMouseInput.Release(
-                        button = TerminalMouseButton.LEFT,
-                        position = position,
-                        buttonsHeld = TerminalMouseButtons(),
-                        modifiers = eventModifiers(event),
-                    ),
-                )
-                mouseCaptured = false
-            }
-        }
-        val handled = if (mouseCaptured) true else gestures.onTouchEvent(event) || super.onTouchEvent(event)
+        val handled = gestures.onTouchEvent(event) || super.onTouchEvent(event)
         if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
             scrollAxis = ScrollAxis.UNDECIDED
             selectionDragActive = false
@@ -757,14 +779,25 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun performClick(): Boolean {
         super.performClick()
-        if (transcript != null || engine == null) return true
-        if (!hasFocus()) requestFocus()
-        // ViewRoot commits focus ownership after the touch callback. Posting
-        // prevents IMEs from rejecting this view as not yet served.
-        post {
-            if (!detached && isAttachedToWindow && hasFocus()) showKeyboard()
-        }
+        requestKeyboard(true)
         return true
+    }
+
+    internal fun requestKeyboard(visible: Boolean) {
+        pendingKeyboardShow = visible && transcript == null && engine?.canAcceptInput() == true
+        val manager = context.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+        if (!visible) {
+            manager?.hideSoftInputFromWindow(windowToken, 0)
+        } else if (pendingKeyboardShow) {
+            requestFocus()
+            post { showPendingKeyboard() }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        // Dropdown dismissal returns window focus asynchronously.
+        if (hasWindowFocus && pendingKeyboardShow) post { showPendingKeyboard() }
     }
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
@@ -820,6 +853,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
             private fun flushImeEditable(fallback: String): Boolean {
                 val text = imeEditable.toString().ifEmpty { fallback }
                 imeEditable.clear()
+                Selection.setSelection(imeEditable, 0)
                 return text.isEmpty() || safeSubmit { engine?.submitText(text) == true }
             }
 
@@ -845,9 +879,12 @@ internal class NativeTerminalView @JvmOverloads constructor(
         engine?.submitFocus(gainFocus)
     }
 
-    private fun showKeyboard() {
+    private fun showPendingKeyboard() {
+        if (!pendingKeyboardShow || detached || !isAttachedToWindow || !hasWindowFocus() || !hasFocus()) return
+        pendingKeyboardShow = false
+        if (engine?.canAcceptInput() != true) return
         context.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
-            ?.showSoftInput(this, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            ?.showSoftInput(this, 0)
     }
 
     private inline fun safeSubmit(block: () -> Boolean): Boolean = try {

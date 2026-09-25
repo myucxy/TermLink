@@ -55,6 +55,9 @@ class NativeTerminalEngine(
     private val inputChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private val mutableSize = MutableStateFlow(initialSize)
     private val mutableTitle = MutableStateFlow("")
+    private val mutableMouseReporting = MutableStateFlow(false)
+    @Volatile internal var touchMouseEnabled = false
+        private set
     private val mutableFrame: MutableStateFlow<TerminalRenderFrameV3>
     private val mainHandler = Handler(Looper.getMainLooper())
     private var terminal = createTerminal(initialSize)
@@ -90,6 +93,7 @@ class NativeTerminalEngine(
     override val sizeEvents: Flow<TerminalSize> = emptyFlow()
     override val authoritativeSize: StateFlow<TerminalSize> = mutableSize.asStateFlow()
     override val title: StateFlow<String> = mutableTitle.asStateFlow()
+    override val mouseReporting: StateFlow<Boolean> = mutableMouseReporting.asStateFlow()
     internal val frames: StateFlow<TerminalRenderFrameV3> = mutableFrame.asStateFlow()
 
     data class InstalledCheckpoint(
@@ -101,8 +105,8 @@ class NativeTerminalEngine(
     fun installCheckpoint(checkpoint: ByteArray): InstalledCheckpoint {
         require(checkpoint.isNotEmpty()) { "Native terminal checkpoint must not be empty" }
         val replacement = NativeTerminalHandle.importCheckpoint(bridge, checkpoint, limits)
-        val frame = try {
-            replacement.renderV3AtScrollback(0)
+        val (frame, reporting) = try {
+            replacement.renderV3AtScrollback(0) to reportsMouse(replacement)
         } catch (error: Throwable) {
             runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
             throw error
@@ -116,6 +120,7 @@ class NativeTerminalEngine(
                 checkActive()
                 val owned = terminal
                 terminal = replacement
+                mutableMouseReporting.value = reporting
                 historyNavigationGeneration.incrementAndGet()
                 failedClosed = false
                 readOnly = true
@@ -174,6 +179,7 @@ class NativeTerminalEngine(
                 if (error.status != NativeTerminalStatus.GAP) throw error
             } finally {
                 readOnly = true
+                mutableMouseReporting.value = false
             }
         }
     }
@@ -206,6 +212,15 @@ class NativeTerminalEngine(
         }
     }
 
+    override fun setTouchMouseEnabled(enabled: Boolean) {
+        touchMouseEnabled = enabled
+    }
+
+    override fun setKeyboardVisible(visible: Boolean) {
+        val view = synchronized(lock) { if (disposed) null else viewReference?.get() } ?: return
+        view.requestKeyboard(visible)
+    }
+
     override fun clear() {
         synchronized(lock) {
             checkActive()
@@ -219,6 +234,7 @@ class NativeTerminalEngine(
         val owned = synchronized(lock) {
             if (disposed) return
             disposed = true
+            mutableMouseReporting.value = false
             listenerGeneration = Math.addExact(listenerGeneration, 1)
             historyNavigationGeneration.incrementAndGet()
             acceptedInputListener = null
@@ -565,6 +581,7 @@ class NativeTerminalEngine(
             check(!failedClosed) { "Native terminal renderer is failed closed" }
             try {
                 discardMirrorHostEffects(apply(terminal))
+                mutableMouseReporting.value = reportsMouse(terminal)
                 historyFrameCache.clear()
                 try {
                     val live = terminal.renderV3AtScrollback(0)
@@ -601,6 +618,7 @@ class NativeTerminalEngine(
             } catch (error: Throwable) {
                 failedClosed = true
                 readOnly = true
+                mutableMouseReporting.value = false
                 throw error
             }
         }
@@ -624,6 +642,7 @@ class NativeTerminalEngine(
             throw error
         }
         terminal = replacement
+        mutableMouseReporting.value = false
         historyNavigationGeneration.incrementAndGet()
         historyFrameCache.clear()
         acceptScrollbackFrame(frame)
@@ -653,6 +672,16 @@ class NativeTerminalEngine(
         mutableTitle.value = frame.title.take(MAX_TITLE_CHARACTERS)
         if (notify) notifyView()
     }
+
+    /** Pure core encoding probe: no output is queued and no remote mode is guessed from text. */
+    private fun reportsMouse(handle: NativeTerminalHandle): Boolean =
+        handle.encodeMouse(
+            TerminalMouseInput.Press(
+                TerminalMouseButton.LEFT,
+                TerminalMousePosition(TerminalCellPosition(0, 0), TerminalPixelPosition(0, 0)),
+                TerminalMouseButtons(left = true),
+            ),
+        ).isNotEmpty()
 
     private fun acceptScrollbackFrame(frame: NativeScrollbackFrameV3) {
         scrollbackAvailableRows = frame.availableRows
@@ -705,7 +734,7 @@ class NativeTerminalEngine(
         }
     }
 
-    private fun canAcceptInput(): Boolean = synchronized(lock) { canAcceptInputLocked() }
+    internal fun canAcceptInput(): Boolean = synchronized(lock) { canAcceptInputLocked() }
 
     private fun canAcceptInputLocked(): Boolean = !disposed && !readOnly && !failedClosed
 

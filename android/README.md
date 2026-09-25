@@ -3,19 +3,12 @@
 Android 产品页和内嵌登录页允许系统截图、录屏及最近任务缩略图，不再设置
 `FLAG_SECURE`；旧版 `secure_screen` 设置不再读取，设置页也已移除该开关。
 此策略只影响 Android 窗口，不改变终端渲染、协议或 Windows core。
-参考核对：`termux/termux-app` 提交 `3df69d1da197dd9bd71a3bafd902dffd720576b4`
-的 `app/src/main/java/com/termux/app/TermuxActivity.java` 未设置 `FLAG_SECURE`；
-仓库固定的 terminal 模块、补丁和 `terminal-engine-termux` 也不负责窗口截图策略。
-这里只参考窗口行为，使用 Android 默认行为，无需复制 Termux 代码。
-
-阶段 0/1 Android 工程包含：
+当前 Android 工程包含：
 
 - `terminal-engine-api`：不依赖 Termux、WebView 或业务 UI 的稳定引擎边界；
 - `terminal-engine-replay`：严格校验 Golden Stream V1 和 LAN Replay V1；
 - `terminal-engine-native`：把各 ABI 打包的 terminal-core JNI 库、严格 frame decoder、语义输入和
   自研 View 接入 production renderer；
-- `terminal-engine-termux`：保留 Termux-derived emulator/view 作为 Harness、旧归档 CHUNK 查看与
-  差分测试适配层，不承担 live renderer、ACK 或恢复的 production authority；
 - `core-session`：与 Termux、Compose 和具体网络实现解耦的 `RemoteTerminalSession`；
 - `core-network`：生产 HTTPS/OIDC/API 与 Protobuf realtime client；另以独立包保留
   Phase 1 临时双向测试 Relay 适配；
@@ -25,22 +18,16 @@ Android 产品页和内嵌登录页允许系统截图、录屏及最近任务缩
 - `app`：Compose 产品页面与 Harness，以分段模式隔离本地 Bundle、只读 LAN Replay 和
   临时双向会话；生产页面由 terminal-core native View 渲染，测试路径仍保持各自的隔离夹具。
 
-浏览器侧的固定 xterm.js 对照位于
-[`terminal-reference/xterm-harness`](../terminal-reference/xterm-harness/README.md)。
-`:terminal-engine-termux:testDebugUnitTest` 会把带 `capture_id` 和最终序号的 Termux 草案
-网格写入 `terminal-engine-termux/build/termlink-reference/`；对照器会先严格校验两份网格
-确实来自同一 Golden Stream，再比较可见行、样式段、光标和公共模式。
+产品、调试 Harness 和测试均使用自有引擎，不再直接引用 Termux 或将 Termux 检测作为门禁。
+`android/terminal-engine-termux/`、`terminal-forks/termux-terminal/`、补丁和同步脚本仅保留为
+历史来源归档，已从 Android Gradle 构建图移除；原有许可证和署名继续保留。
+需要时可以参考上游代码行为，再结合 Windows ConPTY、远程协议和控制租约自行实现。
 
-Termux 源码固定到 `termux/termux-app` 提交
-`3df69d1da197dd9bd71a3bafd902dffd720576b4`。仓库只导入 emulator 核心、view、资源和
-上游 emulator 测试，明确排除 `TerminalSession`、JNI、本地 PTY、Shell 和 Termux App。
-`terminal-forks/termux-patches` 保存远程 Session Port 补丁；可用以下命令从精确提交重建
-一份不覆盖检入源码的检查目录：
+会话云朵菜单提供按会话保存的“触摸作为鼠标”开关，默认关闭。默认手指点击打开输入法，
+滑动/长按用于本地浏览/选择；开关有效时手指操作发送远端鼠标事件，不自动唤起输入法。
+真实鼠标保持独立，菜单也提供显式“显示/隐藏键盘”。只读或远端未启用鼠标报告时开关禁用。
 
-```powershell
-.\terminal-forks\Sync-TermuxTerminal.ps1 `
-  -Destination "$env:TEMP\termlink-termux-sync-check"
-```
+以下上游核对记录仅说明历史设计来源，不构成当前构建或测试依赖。
 
 锁屏与前后台恢复设计还核对了上述固定提交中的 `TermuxActivity`、`TermuxService`，以及
 `termux/termux-app` issues

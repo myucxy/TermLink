@@ -1,29 +1,18 @@
 package dev.termlink.product
 
-import android.app.Activity
 import android.content.Context
 import android.content.res.Configuration
-import android.os.Looper
 import android.view.KeyEvent
-import android.view.inputmethod.EditorInfo
 import androidx.test.core.app.ApplicationProvider
-import dev.termlink.terminal.termux.TermuxTerminalEngine
 import java.util.Locale
-import kotlinx.coroutines.flow.take
-import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.junit.After
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -157,36 +146,6 @@ class TerminalShortcutInputTest {
         assertEquals("Delete", localizedActionLabel(Locale.US, TerminalAction.DELETE))
         assertEquals("退格键", localizedActionLabel(Locale.SIMPLIFIED_CHINESE, TerminalAction.BACKSPACE))
         assertEquals("删除键", localizedActionLabel(Locale.SIMPLIFIED_CHINESE, TerminalAction.DELETE))
-    }
-
-    @Test
-    fun bothImeDeletionApisEmitBackspaceAndForwardDeleteBytes() {
-        val controller = Robolectric.buildActivity(Activity::class.java).setup()
-        val activity = controller.get()
-        val engine = TermuxTerminalEngine()
-        engine.setReadOnly(false)
-        val view = engine.createView(activity)
-        activity.setContentView(view)
-        view.requestFocus()
-        shadowOf(Looper.getMainLooper()).idle()
-        val connection = requireNotNull(view.onCreateInputConnection(EditorInfo()))
-
-        connection.deleteSurroundingText(2, 1)
-        connection.deleteSurroundingTextInCodePoints(1, 2)
-        shadowOf(Looper.getMainLooper()).idle()
-
-        val events = runBlocking {
-            withTimeout(1_000) { engine.inputEvents.take(6).toList() }
-        }
-        assertArrayEquals(byteArrayOf(0x7f), events[0])
-        assertArrayEquals(byteArrayOf(0x7f), events[1])
-        assertArrayEquals("\u001b[3~".encodeToByteArray(), events[2])
-        assertArrayEquals(byteArrayOf(0x7f), events[3])
-        assertArrayEquals("\u001b[3~".encodeToByteArray(), events[4])
-        assertArrayEquals("\u001b[3~".encodeToByteArray(), events[5])
-
-        engine.dispose()
-        controller.destroy()
     }
 
     private fun localizedActionLabel(locale: Locale, action: TerminalAction): String {

@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="session_input_title">Terminal input</string>
+    <string name="session_touch_mouse">Touch as mouse</string>
+    <string name="session_input_read_only">Acquire control to use terminal input</string>
+    <string name="session_mouse_unavailable">Mouse reporting is not enabled by this terminal</string>
+    <string name="session_mouse_enabled_detail">Tap and drag operate the mouse; use the menu to open the keyboard</string>
+    <string name="session_mouse_disabled_detail">Tap opens the keyboard; swipe browses content</string>
+    <string name="session_show_keyboard">Show keyboard</string>
+    <string name="session_hide_keyboard">Hide keyboard</string>
     <string name="cleanup_interrupted">The batch could not be confirmed; later batches were stopped. Check the connection and upgrade both Windows and Server, then refresh the list before retrying.</string>
     <string name="app_name">TermLink</string>
     <string name="product_title">TermLink</string>

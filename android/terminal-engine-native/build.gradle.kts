@@ -123,13 +123,8 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("androidx.test:core-ktx:1.6.1")
     testImplementation("org.robolectric:robolectric:4.14.1")
-    // Reference renderer is a test oracle only; never package it in the production native module.
-    testImplementation(project(":terminal-engine-termux"))
-    testImplementation(project(":termux-terminal-view"))
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
-    androidTestImplementation(project(":terminal-engine-termux"))
-    androidTestImplementation(project(":termux-terminal-view"))
 }
 
 tasks.named("preBuild").configure {

@@ -14,6 +14,15 @@ interface TerminalViewportEngine : TerminalEngine {
     val authoritativeSize: StateFlow<TerminalSize>
     val title: StateFlow<String>
 
+    /** Current core mouse-reporting capability; null for non-interactive projections. */
+    val mouseReporting: StateFlow<Boolean>? get() = null
+
+    /** Local finger routing only; never changes the host's terminal modes. */
+    fun setTouchMouseEnabled(enabled: Boolean) = Unit
+
+    /** Local IME action; never emits terminal text, mouse input or a resize. */
+    fun setKeyboardVisible(visible: Boolean) = Unit
+
     fun createView(
         context: Context,
         textSizeSp: Float = 13f,

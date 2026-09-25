@@ -37,36 +37,89 @@ import kotlinx.coroutines.withTimeoutOrNull
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
     @Test
-    fun alternateScrollHintMatchesTermuxAndRestoresCheckpoint() {
-        val output = object : com.termux.terminal.TerminalOutput() {
-            override fun write(data: ByteArray?, offset: Int, count: Int) = Unit
-            override fun titleChanged(oldTitle: String?, newTitle: String?) = Unit
-            override fun onCopyTextToClipboard(text: String?) = Unit
-            override fun onPasteTextFromClipboard() = Unit
-            override fun onBell() = Unit
-            override fun onColorsChanged() = Unit
+    fun coreMouseCapabilityTracksSplitModesCheckpointAndResetWithoutSendingProbeInput() = kotlinx.coroutines.runBlocking {
+        val engine = NativeTerminalEngine(TerminalSize(80, 24))
+        try {
+            assertFalse(engine.mouseReporting.value)
+            var sequence = 1L
+            "\u001b[?1003;1006h".encodeToByteArray().forEach {
+                engine.feed(sequence++, ByteBuffer.wrap(byteArrayOf(it)))
+            }
+            assertTrue(engine.mouseReporting.value)
+            engine.feed(sequence++, ByteBuffer.wrap("\u001b[?1003l".encodeToByteArray()))
+            assertFalse(engine.mouseReporting.value)
+            val checkpoint = NativeTerminalHandle.create(JniNativeBridge, TerminalSize(80, 24), 1).use {
+                it.feed(1, "\u001b[?1002;1016h".encodeToByteArray())
+                it.exportCheckpoint().copyPayload()
+            }
+            engine.installCheckpoint(checkpoint)
+            assertTrue(engine.mouseReporting.value)
+            engine.clear()
+            assertFalse(engine.mouseReporting.value)
+            assertEquals(null, withTimeoutOrNull(100) { engine.inputEvents.first() })
+        } finally { engine.dispose() }
+    }
+
+    @Test
+    fun codexMouseModeRequiresFingerOptInAndKeyboardActionNeverSendsInput() = kotlinx.coroutines.runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val activity = instrumentation.startActivitySync(
+            android.content.Intent(instrumentation.context, ViewportTestActivity::class.java)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+        val engine = NativeTerminalEngine(TerminalSize(80, 24))
+        try {
+            engine.feed(1, ByteBuffer.wrap("\u001b[?1003;1006h".encodeToByteArray()))
+            engine.setReadOnly(false)
+            var clicks = 0
+            instrumentation.runOnMainSync {
+                val view = engine.createView(activity) as NativeTerminalView
+                activity.setContentView(view)
+                view.layout(0, 0, 500, 500)
+                view.setOnClickListener { clicks++ }
+                fun tap() {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    for ((action, time) in listOf(MotionEvent.ACTION_DOWN to now, MotionEvent.ACTION_UP to now + 20)) {
+                        val event = MotionEvent.obtain(now, time, action, 16f, 16f, 0)
+                        try { assertTrue(view.dispatchTouchEvent(event)) } finally { event.recycle() }
+                    }
+                }
+                tap()
+                assertEquals(1, clicks)
+                engine.setTouchMouseEnabled(true)
+                tap()
+                assertEquals(1, clicks)
+                engine.setKeyboardVisible(true)
+                engine.setKeyboardVisible(false)
+                assertEquals(TerminalSize(80, 24), engine.authoritativeSize.value)
+            }
+            val reports = kotlinx.coroutines.withTimeout(1_000) { engine.inputEvents.take(2).toList() }
+                .map { it.decodeToString() }
+            assertTrue(reports[0].startsWith("\u001b[<0;") && reports[0].endsWith("M"))
+            assertTrue(reports[1].endsWith("m"))
+            assertEquals(null, withTimeoutOrNull(100) { engine.inputEvents.first() })
+        } finally {
+            instrumentation.runOnMainSync { engine.dispose(); activity.finish() }
         }
-        val reference = com.termux.terminal.TerminalEmulator(output, 8, 2, 1, 1, 0, null)
+    }
+
+    @Test
+    fun alternateScrollHintSurvivesSplitInputAndRestoresCheckpoint() {
         val prefix = "MAIN".encodeToByteArray()
         val suffix = "\u001b[?1049h\u001b[?1007h\u001b[1;1H\u001b[JALT".encodeToByteArray()
         NativeTerminalHandle.create(JniNativeBridge, TerminalSize(8, 2), 1).use { terminal ->
             terminal.feedWithHostEffectsV2(1, prefix)
-            reference.append(prefix, prefix.size)
             val checkpoint = terminal.exportCheckpoint().copyPayload()
             NativeTerminalHandle.importCheckpoint(JniNativeBridge, checkpoint).use { restored ->
                 suffix.forEachIndexed { index, byte ->
                     restored.feedWithHostEffectsV2(index + 2L, byteArrayOf(byte))
-                    reference.append(byteArrayOf(byte), 1)
                 }
                 assertEquals("ALT", frameText(restored.renderV3().renderFrame).trim())
-                assertEquals(reference.screen.transcriptText.trim(), frameText(restored.renderV3().renderFrame).trim())
                 val alternate = restored.exportCheckpoint().copyPayload()
                 NativeTerminalHandle.importCheckpoint(JniNativeBridge, alternate).use { reopened ->
                     val leave = "\u001b[?1007l\u001b[?1049l".encodeToByteArray()
                     reopened.feedWithHostEffectsV2(suffix.size + 2L, leave)
-                    reference.append(leave, leave.size)
                     assertEquals("MAIN", frameText(reopened.renderV3().renderFrame).trim())
-                    assertEquals(reference.screen.transcriptText.trim(), frameText(reopened.renderV3().renderFrame).trim())
                 }
             }
         }
@@ -239,6 +292,12 @@ class JniNativeBridgeInstrumentedTest {
 
             val editable = connection.editable
             assertNotNull(editable)
+
+            // Deletion must also work immediately after connection, before any composition sets a cursor.
+            instrumentation.runOnMainSync { assertTrue(connection.deleteSurroundingTextInCodePoints(1, 1)) }
+            val initialDeletes = kotlinx.coroutines.withTimeout(1_000) { engine.inputEvents.take(2).toList() }
+            assertArrayEquals(byteArrayOf(0x7f), initialDeletes[0])
+            assertArrayEquals("\u001b[3~".encodeToByteArray(), initialDeletes[1])
 
             val singleCommit = async(start = CoroutineStart.UNDISPATCHED) { engine.inputEvents.first() }
             instrumentation.runOnMainSync {

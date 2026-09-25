@@ -59,7 +59,7 @@ import dev.termlink.network.testrelay.Phase1TestScenario
 import dev.termlink.network.testrelay.Phase1TestSessionClient
 import dev.termlink.network.testrelay.Phase1TestSessionConfig
 import dev.termlink.terminal.replay.GoldenStreamReplayer
-import dev.termlink.terminal.termux.TermuxTerminalEngine
+import dev.termlink.terminal.nativecore.NativeTerminalEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -85,7 +85,7 @@ class MainActivity : ComponentActivity() {
     private fun GoldenStreamHarness() {
         val scope = rememberCoroutineScope()
         val engine = remember {
-            TermuxTerminalEngine().also {
+            NativeTerminalEngine().also {
                 it.applyTheme(TERMINAL_THEME)
                 it.setReadOnly(true)
             }

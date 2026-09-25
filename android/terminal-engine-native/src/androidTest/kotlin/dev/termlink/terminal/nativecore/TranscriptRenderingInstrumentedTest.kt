@@ -7,18 +7,16 @@ import android.view.View
 import android.view.inputmethod.EditorInfo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import com.termux.view.TerminalView
 import dev.termlink.terminal.api.*
-import dev.termlink.terminal.termux.TermuxTranscriptViewport
 import java.io.File
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class TranscriptParityInstrumentedTest {
+class TranscriptRenderingInstrumentedTest {
     @Test
-    fun realAndroidCanvasMatchesReferenceAndHistoryNeverCreatesInputConnection() {
+    fun realAndroidCanvasRendersStylesAndHistoryNeverCreatesInputConnection() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val activity = instrumentation.startActivitySync(
             Intent(instrumentation.context, ViewportTestActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -52,14 +50,10 @@ class TranscriptParityInstrumentedTest {
                 for (font in listOf(14f, 23f)) for (spacing in listOf(0.8f, 1.4f)) {
                     val selectedTheme = theme.copy(fontFamilyHint = family)
                     val native = NativeTranscriptViewport()
-                    val reference = TermuxTranscriptViewport()
                     try {
                         native.applyTheme(selectedTheme)
-                        reference.applyTheme(selectedTheme)
                         native.replacePages(listOf(page), 80)
-                        reference.replacePages(listOf(page), 80)
                         val view = native.createView(activity, font, spacing, {}, {}) as NativeTerminalView
-                        val oracle = reference.createView(activity, font, spacing, {}, {}) as TerminalView
                         activity.setContentView(view)
                         fun render(target: View): Bitmap {
                             target.measure(View.MeasureSpec.makeMeasureSpec(640, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY))
@@ -71,20 +65,20 @@ class TranscriptParityInstrumentedTest {
                             }
                         }
                         val actual = render(view)
-                        val expected = render(oracle)
-                        assertEquals("$family/$font/$spacing rows=${oracle.visibleRows}/${view.transcriptVisibleRows()} size=${oracle.textSizePixels}/${view.transcriptTextSizePixels()} metrics=${view.transcriptMetricsForTest()}", reference.debugState().firstVisibleLineId, native.debugState().firstVisibleLineId)
+                        assertEquals(80, native.debugState().columns)
+                        assertTrue(native.debugState().visibleText.endsWith("中e\u0301"))
+                        val pixels = IntArray(actual.width * actual.height)
+                        actual.getPixels(pixels, 0, actual.width, 0, 0, actual.width, actual.height)
+                        assertTrue("Android Canvas must paint styled glyphs", pixels.toSet().size > 8)
                         assertNull(view.onCreateInputConnection(EditorInfo()))
                         assertFalse(view.onCheckIsTextEditor())
-                        val directory = File(instrumentation.context.filesDir, "transcript-parity").apply { mkdirs() }
+                        val directory = File(instrumentation.context.filesDir, "transcript-rendering").apply { mkdirs() }
                         val label = "${family.substringAfter(':')}-$font-$spacing"
                         File(directory, "native-$label.png").outputStream().use { actual.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                        File(directory, "termux-$label.png").outputStream().use { expected.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                        assertTrue("Android Canvas differs at $label", actual.sameAs(expected))
                         assertTrue(native.scrollToLineId(10))
                         assertEquals(10L, native.debugState().firstVisibleLineId)
                     } finally {
                         native.close()
-                        reference.close()
                     }
                 }
             } finally { activity.finish() }

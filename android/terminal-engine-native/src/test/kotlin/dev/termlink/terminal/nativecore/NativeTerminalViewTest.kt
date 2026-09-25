@@ -23,6 +23,10 @@ import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import java.nio.ByteBuffer
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -37,6 +41,91 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class NativeTerminalViewTest {
+    @Test
+    fun fingerRoutingIsExplicitAndPinnedUntilReleaseWhilePhysicalMouseStaysIndependent() = runBlocking {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val engine = NativeTerminalEngine(TerminalSize(80, 24), FakeNativeBridge())
+        try {
+            engine.feed(1, ByteBuffer.wrap("\u001b[?1003;1006h".encodeToByteArray()))
+            engine.setReadOnly(false)
+            assertTrue(engine.mouseReporting.value)
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 600)
+            var clicks = 0
+            view.setOnClickListener { clicks++ }
+            var time = 0L
+            fun event(action: Int, mouse: Boolean = false) {
+                val event = MotionEvent.obtain(0, time, action, 16f, 16f, 0)
+                time += 20L
+                if (mouse) event.source = android.view.InputDevice.SOURCE_MOUSE
+                try { assertTrue(view.dispatchTouchEvent(event)) } finally { event.recycle() }
+            }
+            // Default finger taps are local even while Codex enables all-motion reporting.
+            event(MotionEvent.ACTION_DOWN)
+            event(MotionEvent.ACTION_UP)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, clicks)
+            assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
+
+            engine.setTouchMouseEnabled(true)
+            event(MotionEvent.ACTION_DOWN)
+            event(MotionEvent.ACTION_MOVE)
+            engine.setTouchMouseEnabled(false) // Changing the preference cannot reroute half a gesture.
+            event(MotionEvent.ACTION_CANCEL)
+            event(MotionEvent.ACTION_DOWN, mouse = true)
+            event(MotionEvent.ACTION_UP, mouse = true)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, clicks)
+            val reports = withTimeout(1_000) { engine.inputEvents.take(5).toList() }.map { it.decodeToString() }
+            assertTrue(reports[0].startsWith("\u001b[<0;") && reports[0].endsWith("M"))
+            assertTrue(reports[1].startsWith("\u001b[<32;") && reports[1].endsWith("M"))
+            assertTrue(reports[2].endsWith("m"))
+            assertEquals(reports[0], reports[3])
+            assertEquals(reports[2], reports[4])
+            assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
+
+            engine.setTouchMouseEnabled(true)
+            event(MotionEvent.ACTION_DOWN)
+            engine.setReadOnly(true)
+            event(MotionEvent.ACTION_UP)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, clicks)
+            withTimeout(1_000) { engine.inputEvents.first() } // Only the press before losing the lease.
+            assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
+    fun bothImeDeletionApisSubmitBackspaceAndForwardDeleteKeys() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        val engine = NativeTerminalEngine(TerminalSize(80, 24), FakeNativeBridge())
+        engine.setReadOnly(false)
+        val view = engine.createView(activity)
+        activity.setContentView(view)
+        view.requestFocus()
+        shadowOf(Looper.getMainLooper()).idle()
+        val connection = requireNotNull(view.onCreateInputConnection(EditorInfo()))
+
+        connection.deleteSurroundingText(2, 1)
+        connection.deleteSurroundingTextInCodePoints(1, 2)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val events = runBlocking {
+            withTimeout(1_000) { engine.inputEvents.take(6).toList() }
+        }
+        assertEquals(listOf(3, 3, 6, 3, 6, 6).map { "kitty:$it:0:1:0" },
+            events.map { it.decodeToString() })
+
+        engine.dispose()
+        controller.destroy()
+    }
+
+
     @Test
     @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
     @Config(sdk = [35])

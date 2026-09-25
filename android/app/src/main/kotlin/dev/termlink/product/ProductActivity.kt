@@ -88,6 +88,10 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Mouse
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.ui.window.PopupProperties
 import androidx.compose.material.icons.filled.LaptopWindows
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
@@ -2832,6 +2836,7 @@ internal fun saveProductSessionTabs(
         runCatching { java.util.UUID.fromString(stored) }.isSuccess
     }
     val selected = selectedSessionId?.takeIf(normalized::contains)
+    retainTouchMouseSessions(context, normalized)
     context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
         .edit()
         .putString(PRODUCT_OPENED_SESSION_IDS_KEY, JSONArray(normalized).toString())
@@ -4567,6 +4572,9 @@ private fun SessionDetail(
     shortcutPreferences: TerminalShortcutPreferences,
     modifier: Modifier,
 ) {
+    val context = LocalContext.current
+    var touchMouseEnabled by remember(session.id) { mutableStateOf(loadTouchMouseEnabled(context, session.id)) }
+    SideEffect { engine?.setTouchMouseEnabled(touchMouseEnabled) }
     Surface(
         modifier = modifier,
         color = MaterialTheme.colorScheme.surface,
@@ -4603,6 +4611,11 @@ private fun SessionDetail(
                     SessionConnectionStatusMenu(
                         sessionId = session.id,
                         engine = engine,
+                        touchMouseEnabled = touchMouseEnabled,
+                        onTouchMouseChanged = {
+                            touchMouseEnabled = it
+                            saveTouchMouseEnabled(context, session.id, it)
+                        },
                         statusLabel = statusLabel,
                         remoteState = remoteState,
                         sessionOnline = sessionOnline,
@@ -4650,10 +4663,13 @@ private fun SessionDetail(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SessionConnectionStatusMenu(
     sessionId: java.util.UUID,
     engine: TerminalViewportEngine?,
+    touchMouseEnabled: Boolean,
+    onTouchMouseChanged: (Boolean) -> Unit,
     statusLabel: String,
     remoteState: RemoteSessionState?,
     sessionOnline: Boolean,
@@ -4680,6 +4696,9 @@ private fun SessionConnectionStatusMenu(
     val menuTitle = stringResource(R.string.session_connection_menu_title)
     val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
     val canReleaseControl = remoteState is RemoteSessionState.Controlling
+    val mouseReporting = engine?.mouseReporting?.collectAsState()?.value ?: false
+    val keyboardVisible = WindowInsets.isImeVisible
+    BackHandler(enabled = expanded) { expanded = false }
     val canCheckNetwork = sessionOnline && directRoutingPolicy == DirectRoutingPolicy.AUTO &&
         networkCheckState?.lan != DirectNetworkCheckStatus.CHECKING &&
         networkCheckState?.nat != DirectNetworkCheckStatus.CHECKING
@@ -4702,10 +4721,15 @@ private fun SessionConnectionStatusMenu(
                 maxLines = 1,
             )
             PcCarrierIcon(carrier = carrier)
+            if (touchMouseEnabled && mouseReporting && canReleaseControl) {
+                Icon(Icons.Filled.Mouse, contentDescription = stringResource(R.string.session_touch_mouse),
+                    tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+            }
         }
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
+            properties = PopupProperties(focusable = false),
             modifier = Modifier.widthIn(min = 280.dp, max = 320.dp),
         ) {
             Column(
@@ -4742,6 +4766,17 @@ private fun SessionConnectionStatusMenu(
                     onClick = { expanded = false; onReleaseControl() },
                 )
             }
+            SessionInputMenuItems(
+                controlling = canReleaseControl && engine != null,
+                mouseReporting = mouseReporting,
+                touchMouseEnabled = touchMouseEnabled,
+                keyboardVisible = keyboardVisible,
+                onTouchMouseChanged = onTouchMouseChanged,
+                onKeyboardToggle = {
+                    expanded = false
+                    engine?.setKeyboardVisible(!keyboardVisible)
+                },
+            )
             SessionWindowSizeMenuItems(
                 sessionId = sessionId,
                 metrics = resizeMetrics,

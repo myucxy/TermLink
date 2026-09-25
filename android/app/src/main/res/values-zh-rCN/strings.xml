@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="session_input_title">终端输入</string>
+    <string name="session_touch_mouse">触摸作为鼠标</string>
+    <string name="session_input_read_only">获取控制权限后可使用终端输入</string>
+    <string name="session_mouse_unavailable">当前终端未启用鼠标支持</string>
+    <string name="session_mouse_enabled_detail">点击和拖动操作鼠标；键盘可通过菜单打开</string>
+    <string name="session_mouse_disabled_detail">轻点打开键盘，滑动浏览内容</string>
+    <string name="session_show_keyboard">显示键盘</string>
+    <string name="session_hide_keyboard">收起键盘</string>
     <string name="cleanup_interrupted">本批次结果未确认，已停止后续批次。请检查连接并确认 Windows 和服务端均已升级，刷新列表后再重试。</string>
     <string name="app_name">TermLink</string>
     <string name="product_title">TermLink</string>

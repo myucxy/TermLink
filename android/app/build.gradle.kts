@@ -422,9 +422,6 @@ androidComponents {
 dependencies {
     implementation(project(":terminal-engine-api"))
     implementation(project(":terminal-engine-replay"))
-    // Termux is retained only as the legacy debug replay/reference implementation.
-    debugImplementation(project(":terminal-engine-termux"))
-    testImplementation(project(":terminal-engine-termux"))
     implementation(project(":terminal-engine-native"))
     implementation(project(":core-session"))
     implementation(project(":core-network"))

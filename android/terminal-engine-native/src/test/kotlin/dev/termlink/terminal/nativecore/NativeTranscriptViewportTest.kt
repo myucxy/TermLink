@@ -6,10 +6,7 @@ import android.graphics.Canvas
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import androidx.test.core.app.ApplicationProvider
-import com.termux.view.TerminalView
 import dev.termlink.terminal.api.*
-import dev.termlink.terminal.termux.TermuxTranscriptViewport
-import java.io.File
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -25,59 +22,47 @@ class NativeTranscriptViewportTest {
     private val theme = NativeTerminalEngine.DEFAULT_THEME
 
     @Test
-    fun pixelsAndMetricsMatchPinnedTermuxForFontsStylesAndWideCells() {
+    fun fontsSpacingAndWideCellsPreserveHistoryAndPaintContent() {
         for (font in listOf(14f, 23f)) for (spacing in listOf(0.8f, 1f, 1.4f)) {
-            val pages = listOf(page(101L..140L))
             val native = NativeTranscriptViewport()
-            val reference = TermuxTranscriptViewport()
-            native.applyTheme(theme)
-            reference.applyTheme(theme)
-            native.replacePages(pages, 48)
-            reference.replacePages(pages, 48)
-            val actual = native.createView(context, font, spacing, {}, {}) as NativeTerminalView
-            val expected = reference.createView(context, font, spacing, {}, {}) as TerminalView
-            layout(actual, 640, 240)
-            layout(expected, 640, 240)
-            assertEquals(expected.textSizePixels.toFloat(), native.debugState().appliedTextSizePixels)
-            assertEquals("$font/$spacing rows=${expected.visibleRows}/${actual.transcriptVisibleRows()} line=${expected.mRenderer.fontLineSpacing} native=${actual.transcriptMetricsForTest()}", reference.debugState().firstVisibleLineId, native.debugState().firstVisibleLineId)
-            val actualImage = render(actual)
-            val expectedImage = render(expected)
-            val directory = File("build/reports/transcript-parity").apply { mkdirs() }
-            val label = "$font-$spacing"
-            File(directory, "native-$label.png").outputStream().use { actualImage.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            File(directory, "termux-$label.png").outputStream().use { expectedImage.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            val actualPixels = IntArray(640 * 240)
-            val expectedPixels = IntArray(actualPixels.size)
-            actualImage.getPixels(actualPixels, 0, 640, 0, 0, 640, 240)
-            expectedImage.getPixels(expectedPixels, 0, 640, 0, 0, 640, 240)
-            val differences = actualPixels.indices.count { actualPixels[it] != expectedPixels[it] }
-            assertEquals("Pixel differences for font=$font spacing=$spacing", 0, differences)
-            native.close()
-            reference.close()
+            try {
+                native.applyTheme(theme)
+                native.replacePages(listOf(page(101L..140L)), 48)
+                val view = native.createView(context, font, spacing, {}, {}) as NativeTerminalView
+                layout(view, 640, 240)
+                val state = native.debugState()
+                assertEquals(40, state.rowCount)
+                assertEquals(48, state.columns)
+                assertEquals(140L, state.firstVisibleLineId!! + state.visibleText.lines().size - 1)
+                assertTrue(state.visibleText.endsWith("中e\u0301"))
+                assertTrue(native.scrollToLineId(120))
+                assertTrue(native.debugState().visibleText.startsWith("L120 Aa0+-_= 中e\u0301"))
+                val pixels = IntArray(640 * 240)
+                render(view).getPixels(pixels, 0, 640, 0, 0, 640, 240)
+                assertTrue("Styled history must paint visible glyphs", pixels.toSet().size > 8)
+                assertNull(view.onCreateInputConnection(EditorInfo()))
+            } finally { native.close() }
         }
     }
 
     @Test
-    fun narrowTinyAndShortHistoryPreserveReferenceLayout() {
+    fun narrowTinyAndShortHistoryStayBoundedAndReadOnly() {
         for ((width, height) in listOf(1 to 320, 20 to 1, 1200 to 600, 240 to 120)) {
             for (count in listOf(4L, 30L)) {
                 val native = NativeTranscriptViewport(initialColumns = 240, initialRows = 4)
-                val reference = TermuxTranscriptViewport(initialColumns = 240, initialRows = 4)
-                native.applyTheme(theme)
-                reference.applyTheme(theme)
-                val pages = listOf(page(101L until 101L + count))
-                native.replacePages(pages, 240)
-                reference.replacePages(pages, 240)
-                val actual = native.createView(context, 30f, 1f, {}, {}) as NativeTerminalView
-                val expected = reference.createView(context, 30f, 1f, {}, {}) as TerminalView
-                layout(actual, width, height)
-                layout(expected, width, height)
-                val label = "$width/$height/$count"
-                assertEquals(label, expected.textSizePixels.toFloat(), native.debugState().appliedTextSizePixels)
-                assertEquals(label, reference.debugState().firstVisibleLineId, native.debugState().firstVisibleLineId)
-                assertTrue(label, render(expected).sameAs(render(actual)))
-                native.close()
-                reference.close()
+                try {
+                    native.applyTheme(theme)
+                    native.replacePages(listOf(page(101L until 101L + count)), 240)
+                    val view = native.createView(context, 30f, 1f, {}, {}) as NativeTerminalView
+                    layout(view, width, height)
+                    assertEquals(240, native.debugState().columns)
+                    assertTrue(native.debugState().firstVisibleLineId in 101L until 101L + count)
+                    assertTrue(native.debugState().appliedTextSizePixels >= 1f)
+                    assertTrue(view.transcriptVisibleRows() >= 1)
+                    assertEquals(width, render(view).width)
+                    assertFalse(view.onCheckIsTextEditor())
+                    assertNull(view.onCreateInputConnection(EditorInfo()))
+                } finally { native.close() }
             }
         }
     }
