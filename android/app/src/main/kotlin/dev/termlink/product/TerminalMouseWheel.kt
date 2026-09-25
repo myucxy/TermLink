@@ -1,15 +1,17 @@
 package dev.termlink.product
 
 import android.content.Context
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.InsetDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.TextView
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
@@ -54,17 +56,18 @@ internal class TerminalMouseWheelView(context: Context) : LinearLayout(context) 
     }
     // The activity uses platform Theme.Material (API 26+), not an AppCompat theme.
     @android.annotation.SuppressLint("AppCompatCustomView")
-    private val handle = object : TextView(context) {
+    private val handle = object : ImageButton(context) {
         override fun performClick(): Boolean {
             super.performClick()
             stop()
             return true
         }
     }.apply {
-        text = "↕"
-        textSize = 24f
-        setTextColor(Color.WHITE)
-        gravity = Gravity.CENTER
+        setImageResource(R.drawable.ic_terminal_wheel_grip)
+        setPadding(dp(15), dp(3), dp(15), dp(3))
+        setColorFilter(0xEBFFFFFF.toInt())
+        setBackgroundColor(Color.TRANSPARENT)
+        isFocusable = false
         contentDescription = context.getString(R.string.session_wheel_drag)
     }
     private val repeat = object : Runnable {
@@ -82,13 +85,16 @@ internal class TerminalMouseWheelView(context: Context) : LinearLayout(context) 
     init {
         orientation = VERTICAL
         gravity = Gravity.CENTER
-        background = GradientDrawable().apply {
-            setColor(0x55303030)
-            cornerRadius = 24f * density
-        }
-        addView(arrow(android.R.drawable.arrow_up_float, R.string.session_wheel_up, TerminalMouseWheelDirection.UP))
-        addView(handle, LayoutParams(dp(48), dp(48)))
-        addView(arrow(android.R.drawable.arrow_down_float, R.string.session_wheel_down, TerminalMouseWheelDirection.DOWN))
+        // Match the Dock surface; inset only the drawing, not the arrow hit targets.
+        background = InsetDrawable(GradientDrawable().apply {
+            setColor(0x9E000000.toInt())
+            cornerRadius = 7f * density
+        }, dp(6), dp(6), dp(6), dp(6))
+        // InsetDrawable contributes padding; keep the 48 dp buttons edge to edge.
+        setPadding(0, 0, 0, 0)
+        addView(arrow(R.drawable.ic_terminal_wheel_up, R.string.session_wheel_up, TerminalMouseWheelDirection.UP))
+        addView(handle, LayoutParams(dp(48), dp(24)))
+        addView(arrow(R.drawable.ic_terminal_wheel_down, R.string.session_wheel_down, TerminalMouseWheelDirection.DOWN))
         handle.setOnTouchListener { _, event ->
             when {
                 event.pointerCount != 1 -> stop()
@@ -99,7 +105,7 @@ internal class TerminalMouseWheelView(context: Context) : LinearLayout(context) 
                 }
                 event.actionMasked == MotionEvent.ACTION_MOVE && originY != null -> {
                     displacementDp = (event.rawY - originY!!) / density
-                    handle.translationY = displacementDp.coerceIn(-12f, 12f) * density
+                    handle.translationY = displacementDp.coerceIn(-6f, 6f) * density
                     if (wheelRepeatMillis(displacementDp) == null) {
                         mainHandler.removeCallbacks(repeat)
                         repeating = false
@@ -118,8 +124,17 @@ internal class TerminalMouseWheelView(context: Context) : LinearLayout(context) 
     private fun arrow(icon: Int, label: Int, direction: TerminalMouseWheelDirection) = ImageButton(context).apply {
         layoutParams = LayoutParams(dp(48), dp(48))
         setImageResource(icon)
-        setColorFilter(Color.WHITE)
-        setBackgroundColor(Color.TRANSPARENT)
+        setColorFilter(0xEBFFFFFF.toInt())
+        background = InsetDrawable(RippleDrawable(
+            ColorStateList.valueOf(0x33FFFFFF),
+            GradientDrawable().apply {
+                setColor(0x17FFFFFF)
+                setStroke(dp(1).coerceAtLeast(1), 0x57FFFFFF)
+                cornerRadius = 5f * density
+            },
+            GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = 5f * density },
+        ), dp(9))
+        setPadding(dp(15), dp(15), dp(15), dp(15))
         contentDescription = context.getString(label)
         isFocusable = false // Leave IME focus with the terminal; accessibility clicks still work.
         setOnClickListener { stop(); send(direction) }

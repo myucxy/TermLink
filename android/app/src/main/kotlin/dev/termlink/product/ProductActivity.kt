@@ -5688,8 +5688,8 @@ private fun TerminalSurface(
                 key(session.id, activeEngine) {
                     TerminalMouseWheel(
                         engine = activeEngine!!,
-                        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 4.dp)
-                            .width(48.dp).height(144.dp).testTag("terminal-mouse-wheel:${session.id}"),
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                            .width(48.dp).height(120.dp).testTag("terminal-mouse-wheel:${session.id}"),
                     )
                 }
             }
