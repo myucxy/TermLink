@@ -57,8 +57,64 @@ Production builds use `scripts/Build-Release.ps1`; independent verification uses
 `release/Verify-LocalRelease.ps1`. Uploads use only
 `scripts/Publish-AppShipProduction.ps1`, preserving the per-platform resumable
 state in `.appship/`. Source revision, artifact hashes and publication IDs are
-recorded below after the final gates finish.
+recorded below.
 
 Rollback uses a strictly newer build with the same app identities and signers.
 Do not overwrite published artifacts or uninstall/clear user data to force an
 upgrade. Returning to the previous core also restores its 1007 limitation.
+
+## Publication record
+
+Both clients were published to AppShip stable at `https://appship.kget.cc:8910`
+on 2026-09-25. The binary source revision is
+`69ec9392b21f2ffc383e63247650528619a0c431`; the subsequent documentation commit
+only records publication results and does not change the published artifacts.
+Windows ProductVersion is
+`0.2.64.120+69ec9392b21f2ffc383e63247650528619a0c431`.
+
+Artifacts are retained under `artifacts/release/0.2.64-120/`, alongside
+`artifact-manifest.json`:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `TermLink-Android-0.2.64-120.apk` | 38039678 | `619406d3abd8b346f61cf04d6e11397b6a0fc27a3b1f820b47fa1bbb20c37464` |
+| `TermLink-Setup-0.2.64.120-x64.exe` | 182468832 | `0fc931324b2efc04867b8b97e2496df1794450e1783d60b80400fff74d29ddc2` |
+
+| AppShip field | Windows | Android |
+| --- | --- | --- |
+| Slug | `termlink-win64` | `termlink-android` |
+| Application ID | `0ae760b3-294e-48e8-a793-95d162f685e2` | `4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2` |
+| Release ID | `78c16893-b30b-48fd-aa32-327806529c0b` | `f81934c4-58c8-4047-a85e-74cce5955927` |
+| Artifact ID | `b38172c9-ab5f-4c07-b485-ed2e3681ce03` | `5abfea31-89b5-45bf-8bae-ee70c57376de` |
+| Published at (UTC) | `2026-09-25T02:45:07.57649Z` | `2026-09-25T02:45:48.419457Z` |
+
+Both releases are `published`; their artifacts are `ready`, `manual_approved`
+and download-enabled. The published signer fingerprints match the identities
+above. Android's certificate is valid through 2053-12-03. Windows Setup and
+payload signature checks passed with the existing development certificate and
+Microsoft RFC 3161 timestamps.
+
+The public stable update endpoints were checked for each app: builds 118 and
+119 return `optional` with latest version 0.2.64/build 120; build 120 returns
+`no_update`. Download metadata matches the local artifact sizes, SHA-256 hashes
+and signer identities. Sanitized evidence is retained in
+`artifacts/validation/release-120-appship-public.json`.
+
+Final production-package checks also passed:
+
+- Production build and independent `Verify-LocalRelease.ps1` gates, including
+  versions and signatures: `artifacts/validation/release-120-gates.json` and
+  `artifacts/validation/release-120-production-build.log`.
+- The core DLL extracted from the signed Windows package executed the 1007
+  sequence and snapshot roundtrip successfully:
+  `artifacts/validation/release-120-packaged-core.json`.
+- The final Android APK contains no Termux DEX descriptors. Its four ABI JNI
+  libraries match the tested instrumentation APK libraries byte-for-byte after
+  Gradle symbol stripping:
+  `artifacts/validation/release-120-apk-content.json`.
+- Publication logs: `artifacts/validation/release-120-appship-windows.log` and
+  `artifacts/validation/release-120-appship-android.log`.
+
+The installed local Windows client, emulator product app and Server were not
+upgraded by this publication. No Docker image, Git release tag or GitHub Release
+was created.
