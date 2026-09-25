@@ -13,6 +13,21 @@ import org.robolectric.annotation.Config
 @Config(sdk = [26])
 class SessionInputPreferencesTest {
     @Test
+    fun wheelSideDefaultsRightPersistsGloballyAndSurvivesClosingAllTabs() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val anotherContext = context.createConfigurationContext(context.resources.configuration)
+        try {
+            assertFalse(loadWheelOnLeft(context))
+            saveWheelOnLeft(context, true)
+            assertTrue(loadWheelOnLeft(anotherContext))
+            retainTouchMouseSessions(context, emptyList())
+            assertTrue(loadWheelOnLeft(context))
+            saveWheelOnLeft(anotherContext, false)
+            assertFalse(loadWheelOnLeft(context))
+        } finally { saveWheelOnLeft(context, false) }
+    }
+
+    @Test
     fun mousePreferenceDefaultsOffPersistsPerSessionAndIsPrunedWithTabs() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val first = UUID.randomUUID()

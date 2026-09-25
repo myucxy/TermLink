@@ -4573,6 +4573,7 @@ private fun SessionDetail(
 ) {
     val context = LocalContext.current
     var touchMouseEnabled by remember(session.id) { mutableStateOf(loadTouchMouseEnabled(context, session.id)) }
+    val wheelOnLeft by rememberWheelOnLeft(context)
     SideEffect { engine?.setTouchMouseEnabled(touchMouseEnabled) }
     Surface(
         modifier = modifier,
@@ -4615,6 +4616,8 @@ private fun SessionDetail(
                             touchMouseEnabled = it
                             saveTouchMouseEnabled(context, session.id, it)
                         },
+                        wheelOnLeft = wheelOnLeft,
+                        onWheelSideChanged = { saveWheelOnLeft(context, it) },
                         statusLabel = statusLabel,
                         remoteState = remoteState,
                         sessionOnline = sessionOnline,
@@ -4638,6 +4641,7 @@ private fun SessionDetail(
                     engine = engine,
                     sessionOnline = sessionOnline,
                     touchMouseEnabled = touchMouseEnabled,
+                    wheelOnLeft = wheelOnLeft,
                     remoteState = remoteState,
                     terminalPreferences = terminalPreferences,
                     shortcutPreferences = shortcutPreferences,
@@ -4671,6 +4675,8 @@ private fun SessionConnectionStatusMenu(
     engine: TerminalViewportEngine?,
     touchMouseEnabled: Boolean,
     onTouchMouseChanged: (Boolean) -> Unit,
+    wheelOnLeft: Boolean,
+    onWheelSideChanged: (Boolean) -> Unit,
     statusLabel: String,
     remoteState: RemoteSessionState?,
     sessionOnline: Boolean,
@@ -4761,6 +4767,8 @@ private fun SessionConnectionStatusMenu(
                 mouseReporting = mouseReporting,
                 touchMouseEnabled = touchMouseEnabled,
                 onTouchMouseChanged = onTouchMouseChanged,
+                wheelOnLeft = wheelOnLeft,
+                onWheelSideChanged = onWheelSideChanged,
             )
             SessionWindowSizeMenuItems(
                 sessionId = sessionId,
@@ -5351,6 +5359,7 @@ private fun TerminalSurface(
     engine: TerminalViewportEngine?,
     sessionOnline: Boolean,
     touchMouseEnabled: Boolean,
+    wheelOnLeft: Boolean,
     remoteState: RemoteSessionState?,
     transcriptState: TranscriptViewportState?,
     liveAcknowledgement: ULong?,
@@ -5685,10 +5694,12 @@ private fun TerminalSurface(
                 }
             }
             if (canInput && mouseReporting && !touchMouseEnabled && !overlayVisible) {
-                key(session.id, activeEngine) {
+                // Replacing the View cancels an active drag before moving to the other edge.
+                key(session.id, activeEngine, wheelOnLeft) {
                     TerminalMouseWheel(
                         engine = activeEngine!!,
-                        modifier = Modifier.align(Alignment.CenterEnd)
+                        modifier = Modifier.align(if (wheelOnLeft) androidx.compose.ui.AbsoluteAlignment.CenterLeft
+                            else androidx.compose.ui.AbsoluteAlignment.CenterRight)
                             .width(48.dp).height(120.dp).testTag("terminal-mouse-wheel:${session.id}"),
                     )
                 }

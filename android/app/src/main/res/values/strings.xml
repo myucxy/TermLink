@@ -5,7 +5,11 @@
     <string name="session_input_read_only">Acquire control to use terminal input</string>
     <string name="session_mouse_unavailable">Mouse reporting is not enabled by this terminal</string>
     <string name="session_mouse_enabled_detail">Tap to click, swipe to scroll, hold to drag. Use the first dock button to show or hide the keyboard.</string>
-    <string name="session_mouse_disabled_detail">Tap to open the keyboard; swipe to browse content. In mouse mode, use the right-side arrows or drag their center handle to send wheel input.</string>
+    <string name="session_mouse_disabled_detail">Tap to open the keyboard; swipe to browse content. In mouse mode, use the side arrows or drag their center handle to send wheel input.</string>
+    <string name="session_wheel_side">Wheel side</string>
+    <string name="session_wheel_left">Left</string>
+    <string name="session_wheel_right">Right</string>
+    <string name="session_wheel_side_hint">Shown in mouse mode</string>
     <string name="session_show_keyboard">Show keyboard</string>
     <string name="session_hide_keyboard">Hide keyboard</string>
     <string name="cleanup_interrupted">The batch could not be confirmed; later batches were stopped. Check the connection and upgrade both Windows and Server, then refresh the list before retrying.</string>

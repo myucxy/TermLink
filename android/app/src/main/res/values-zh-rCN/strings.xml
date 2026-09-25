@@ -5,7 +5,11 @@
     <string name="session_input_read_only">获取控制权限后可使用终端输入</string>
     <string name="session_mouse_unavailable">当前终端未启用鼠标支持</string>
     <string name="session_mouse_enabled_detail">轻点发送鼠标点击，滑动滚轮，长按拖动。使用快捷栏第一个键盘按钮显示或收起输入法。</string>
-    <string name="session_mouse_disabled_detail">轻点打开键盘，滑动浏览内容。终端启用鼠标模式时，可点按右侧箭头或上下拖动中间手柄发送滚轮。</string>
+    <string name="session_mouse_disabled_detail">轻点打开键盘，滑动浏览内容。终端启用鼠标模式时，可点按侧边箭头或上下拖动中间手柄发送滚轮。</string>
+    <string name="session_wheel_side">滚轮位置</string>
+    <string name="session_wheel_left">左侧</string>
+    <string name="session_wheel_right">右侧</string>
+    <string name="session_wheel_side_hint">鼠标模式下显示</string>
     <string name="session_show_keyboard">显示键盘</string>
     <string name="session_hide_keyboard">收起键盘</string>
     <string name="cleanup_interrupted">本批次结果未确认，已停止后续批次。请检查连接并确认 Windows 和服务端均已升级，刷新列表后再重试。</string>
