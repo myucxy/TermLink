@@ -114,6 +114,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var mouseCaptured = false
     private var mousePressed = false
     private var mouseButton = TerminalMouseButton.LEFT
+    private var physicalMouse = false
+    private var mouseGestureCancelled = false
+    private var mouseX = 0f
+    private var mouseY = 0f
+    private var mouseModifiers = TerminalInputModifiers()
+    private var mouseWheelPixels = 0f
+    private var mouseScrollAxis = ScrollAxis.UNDECIDED
     private var pendingKeyboardShow = false
     private var selectionAnchor: CellPoint? = null
     private var selectionExtent: CellPoint? = null
@@ -145,6 +152,77 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var fontFamilyInitialized = false
 
     private enum class SelectionHandle { START, END }
+
+    // Fingers defer the press until a tap or long press is confirmed. A swipe
+    // therefore cannot click the application before becoming a wheel gesture.
+    private val mouseGestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(event: MotionEvent): Boolean = true
+
+        override fun onSingleTapUp(event: MotionEvent): Boolean {
+            pressMouse()
+            releaseMouse()
+            return true
+        }
+
+        override fun onLongPress(event: MotionEvent) {
+            if (!mouseCaptured || mouseGestureCancelled || detached) return
+            pressMouse()
+            if (mousePressed) performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+        }
+
+        override fun onScroll(first: MotionEvent?, current: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+            if (mouseGestureCancelled) return true
+            if (mouseScrollAxis == ScrollAxis.UNDECIDED) {
+                mouseScrollAxis = if (abs(distanceX) > abs(distanceY)) ScrollAxis.HORIZONTAL else ScrollAxis.VERTICAL
+            }
+            // Natural scrolling: moving a finger down reveals earlier content.
+            val horizontal = mouseScrollAxis == ScrollAxis.HORIZONTAL
+            mouseWheelPixels += if (horizontal) distanceX else distanceY
+            val step = max(touchSlop, if (horizontal) cellWidth else cellHeight)
+            val detents = (mouseWheelPixels / step).toInt()
+            mouseWheelPixels -= detents * step
+            val direction = if (horizontal) {
+                if (detents > 0) TerminalMouseWheelDirection.RIGHT else TerminalMouseWheelDirection.LEFT
+            } else {
+                if (detents > 0) TerminalMouseWheelDirection.DOWN else TerminalMouseWheelDirection.UP
+            }
+            // Bound a coalesced MOVE without retaining a delayed remote-scroll backlog.
+            repeat(abs(detents).coerceAtMost(32)) {
+                if (!safeSubmit { engine?.submitMouse(TerminalMouseInput.Wheel(
+                        direction, mousePosition(mouseX, mouseY), modifiers = mouseModifiers)) == true }) {
+                    cancelMouseGesture()
+                    return true
+                }
+            }
+            return true
+        }
+    }).apply { setOnDoubleTapListener(null) } // Forward both taps; the remote application owns double-clicks.
+
+    private fun heldMouseButtons() = TerminalMouseButtons(
+        left = mouseButton == TerminalMouseButton.LEFT,
+        middle = mouseButton == TerminalMouseButton.MIDDLE,
+        right = mouseButton == TerminalMouseButton.RIGHT,
+    )
+
+    private fun pressMouse() {
+        mousePressed = safeSubmit { engine?.submitMouse(TerminalMouseInput.Press(
+            mouseButton, mousePosition(mouseX, mouseY), heldMouseButtons(), mouseModifiers)) == true }
+        if (!mousePressed) mouseGestureCancelled = true
+    }
+
+    private fun releaseMouse() {
+        if (mousePressed) safeSubmit { engine?.submitMouse(TerminalMouseInput.Release(
+            mouseButton, mousePosition(mouseX, mouseY), modifiers = mouseModifiers)) == true }
+        mousePressed = false
+    }
+
+    private fun cancelMouseGesture() {
+        if (!mouseCaptured) return
+        mouseGestureCancelled = true
+        releaseMouse()
+        val cancel = MotionEvent.obtain(0, android.os.SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, mouseX, mouseY, 0)
+        try { mouseGestures.onTouchEvent(cancel) } finally { cancel.recycle() }
+    }
 
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(event: MotionEvent): Boolean {
@@ -314,6 +392,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     override fun onDetachedFromWindow() {
+        cancelMouseGesture()
         saveTranscriptPresentation()
         pendingKeyboardShow = false
         detached = true
@@ -328,6 +407,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     internal fun detachEngine() {
+        cancelMouseGesture()
         pendingKeyboardShow = false
         detached = true
         scroller.forceFinished(true)
@@ -507,9 +587,14 @@ internal class NativeTerminalView @JvmOverloads constructor(
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             // Pin routing for the entire gesture. A TUI enabling mouse reports must not
             // silently take ownership of fingers; real mice remain independent.
-            mouseCaptured = owner != null && (event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+            cancelMouseGesture()
+            physicalMouse = event.isFromSource(InputDevice.SOURCE_MOUSE)
+            mouseCaptured = owner != null && (physicalMouse ||
                 owner.touchMouseEnabled && owner.mouseReporting.value && owner.canAcceptInput())
             mousePressed = false
+            mouseGestureCancelled = false
+            mouseWheelPixels = 0f
+            mouseScrollAxis = ScrollAxis.UNDECIDED
             mouseButton = when {
                 event.isButtonPressed(MotionEvent.BUTTON_SECONDARY) -> TerminalMouseButton.RIGHT
                 event.isButtonPressed(MotionEvent.BUTTON_TERTIARY) -> TerminalMouseButton.MIDDLE
@@ -523,32 +608,26 @@ internal class NativeTerminalView @JvmOverloads constructor(
             }
         }
         if (mouseCaptured) {
-            val position = mousePosition(event.x, event.y)
-            val modifiers = eventModifiers(event)
-            fun release() {
-                if (mousePressed) safeSubmit {
-                    owner?.submitMouse(TerminalMouseInput.Release(mouseButton, position, modifiers = modifiers)) == true
+            mouseX = event.x
+            mouseY = event.y
+            mouseModifiers = eventModifiers(event)
+            if (event.actionMasked == MotionEvent.ACTION_CANCEL || event.pointerCount > 1 ||
+                owner?.canAcceptInput() != true || !owner.mouseReporting.value) cancelMouseGesture()
+            if (!mouseGestureCancelled) {
+                if (physicalMouse) {
+                    if (event.actionMasked == MotionEvent.ACTION_DOWN) pressMouse()
+                } else if (!mousePressed) {
+                    mouseGestures.onTouchEvent(event)
                 }
-                mousePressed = false
+                if (event.actionMasked == MotionEvent.ACTION_MOVE && mousePressed) {
+                    if (!safeSubmit { owner?.submitMouse(TerminalMouseInput.Move(
+                            mousePosition(mouseX, mouseY), heldMouseButtons(), mouseModifiers)) == true })
+                        cancelMouseGesture()
+                }
             }
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> mousePressed = safeSubmit {
-                    owner?.submitMouse(TerminalMouseInput.Press(mouseButton, position,
-                        TerminalMouseButtons(left = mouseButton == TerminalMouseButton.LEFT,
-                            middle = mouseButton == TerminalMouseButton.MIDDLE,
-                            right = mouseButton == TerminalMouseButton.RIGHT), modifiers)) == true
-                }
-                MotionEvent.ACTION_MOVE -> if (mousePressed) safeSubmit {
-                    owner?.submitMouse(TerminalMouseInput.Move(position,
-                        TerminalMouseButtons(left = mouseButton == TerminalMouseButton.LEFT,
-                            middle = mouseButton == TerminalMouseButton.MIDDLE,
-                            right = mouseButton == TerminalMouseButton.RIGHT), modifiers)) == true
-                }
-                MotionEvent.ACTION_POINTER_DOWN -> release()
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    release()
-                    mouseCaptured = false
-                }
+            if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                cancelMouseGesture()
+                mouseCaptured = false
             }
             // Never feed an orphan UP into the gesture recognizer or open the IME.
             return true
@@ -796,6 +875,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
+        if (!hasWindowFocus) cancelMouseGesture()
         // Dropdown dismissal returns window focus asynchronously.
         if (hasWindowFocus && pendingKeyboardShow) post { showPendingKeyboard() }
     }

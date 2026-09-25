@@ -1,6 +1,5 @@
 using System;
 using System.Collections;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -429,6 +428,7 @@ namespace TermLink.SessionHost
         private const uint Utf8CodePage = 65001;
         private const uint ThreadTerminate = 0x0001;
         private const ushort KeyEvent = 0x0001;
+        private const ushort MouseEvent = 0x0002;
         private const uint RightAltPressed = 0x0001;
         private const uint LeftAltPressed = 0x0002;
         private const uint RightCtrlPressed = 0x0004;
@@ -891,12 +891,10 @@ namespace TermLink.SessionHost
 
         internal static uint BuildOuterInputMode(uint mode)
         {
-            // SessionHost consumes key records so local and remote writes can be
-            // serialized, but it does not consume mouse records. Advertising
-            // ENABLE_MOUSE_INPUT made Windows Terminal send selection, right
-            // click, and wheel actions into a path that discarded them. Keep the
-            // front-end's Quick Edit/VT flags intact and explicitly disable mouse
-            // reporting so Terminal retains copy, paste, selection, and scroll.
+            // Do not request unconditional Win32 mouse capture from the frontend.
+            // The child's projected VT modes select application mouse reporting;
+            // those reports still arrive as MOUSE_EVENT records through ConPTY.
+            // With reporting off, Terminal retains copy/paste/selection/scroll.
             return (mode & ~(EnableProcessedInput | EnableLineInput |
                     EnableEchoInput | EnableMouseInput)) |
                 EnableExtendedFlags | EnableWindowInput;
@@ -952,7 +950,10 @@ namespace TermLink.SessionHost
         private void BridgeConsoleInput(IntPtr outerInput)
         {
             var records = new INPUT_RECORD[128];
-            var resolved = new ConcurrentQueue<KEY_EVENT_RECORD>();
+            var mouseInput = new WindowsConsoleMouseInput();
+            // Queue records in arrival order, including keys still awaiting reply
+            // classification. A mouse report must not overtake a pending Escape.
+            var resolved = new Queue<(KEY_EVENT_RECORD Key, WindowsConsoleMouseRecord? Mouse, PendingConsoleKey Resolution)>();
             var resolutionSync = new object();
             var pendingByPhysicalKey = new Dictionary<uint, List<PendingConsoleKey>>();
             while (!stopInput)
@@ -961,7 +962,7 @@ namespace TermLink.SessionHost
                 if (wait == WaitTimeout)
                 {
                     outerReplySuppressor.Filter(Array.Empty<byte>(), 0);
-                    if (!WriteResolvedConsoleKeys(resolved)) break;
+                    if (!WriteResolvedConsoleInput(resolved, resolutionSync, mouseInput)) break;
                     continue;
                 }
                 if (wait != WaitObject0)
@@ -987,6 +988,18 @@ namespace TermLink.SessionHost
                     for (var index = 0; index < recordsRead; index++)
                     {
                         var record = records[index];
+                        if (record.EventType == MouseEvent)
+                        {
+                            if (input.Length != 0)
+                            {
+                                var pending = Encoding.UTF8.GetBytes(input.ToString());
+                                input.Clear();
+                                var pass = outerReplySuppressor.Filter(pending, pending.Length);
+                                if (pass.Length != 0 && !WriteLocalInput(pass, pass.Length)) return;
+                            }
+                            if (!WriteConsoleMouse(mouseInput, record.MouseEvent)) return;
+                            continue;
+                        }
                         if (record.EventType != KeyEvent || !record.KeyEvent.KeyDown) continue;
                         AppendKeyInput(input, record.KeyEvent);
                     }
@@ -1000,6 +1013,11 @@ namespace TermLink.SessionHost
                 for (var index = 0; index < recordsRead; index++)
                 {
                     var record = records[index];
+                    if (record.EventType == MouseEvent)
+                    {
+                        resolved.Enqueue((default, record.MouseEvent, null));
+                        continue;
+                    }
                     if (record.EventType != KeyEvent) continue;
                     var key = record.KeyEvent;
                     var signature = PhysicalKeySignature(key);
@@ -1021,9 +1039,9 @@ namespace TermLink.SessionHost
                                 if (pending != null)
                                 {
                                     pending.KeyUp = key;
+                                    resolved.Enqueue((key, null, pending));
                                     if (pending.IsResolved)
                                     {
-                                        if (pending.PassThrough) resolved.Enqueue(key);
                                         pendingKeys.Remove(pending);
                                         if (pendingKeys.Count == 0)
                                             pendingByPhysicalKey.Remove(signature);
@@ -1031,7 +1049,7 @@ namespace TermLink.SessionHost
                                     continue;
                                 }
                             }
-                            resolved.Enqueue(key);
+                            resolved.Enqueue((key, null, null));
                         }
                         continue;
                     }
@@ -1039,11 +1057,12 @@ namespace TermLink.SessionHost
                     var projection = EncodeCompatibilityKey(key);
                     if (projection.Length == 0)
                     {
-                        resolved.Enqueue(key);
+                        resolved.Enqueue((key, null, null));
                         continue;
                     }
 
-                    var pendingKey = new PendingConsoleKey(key);
+                    var pendingKey = new PendingConsoleKey();
+                    resolved.Enqueue((key, null, pendingKey));
                     lock (resolutionSync)
                     {
                         if (!pendingByPhysicalKey.TryGetValue(signature, out var pendingKeys))
@@ -1062,10 +1081,8 @@ namespace TermLink.SessionHost
                             {
                                 pendingKey.IsResolved = true;
                                 pendingKey.PassThrough = passThrough;
-                                if (passThrough) resolved.Enqueue(pendingKey.KeyDown);
                                 if (pendingKey.KeyUp.HasValue)
                                 {
-                                    if (passThrough) resolved.Enqueue(pendingKey.KeyUp.Value);
                                     if (pendingByPhysicalKey.TryGetValue(signature, out var pendingKeys))
                                     {
                                         pendingKeys.Remove(pendingKey);
@@ -1076,14 +1093,28 @@ namespace TermLink.SessionHost
                             }
                         });
                 }
-                if (!WriteResolvedConsoleKeys(resolved)) break;
+                if (!WriteResolvedConsoleInput(resolved, resolutionSync, mouseInput)) break;
             }
         }
 
-        private bool WriteResolvedConsoleKeys(ConcurrentQueue<KEY_EVENT_RECORD> resolved)
+        private bool WriteResolvedConsoleInput(
+            Queue<(KEY_EVENT_RECORD Key, WindowsConsoleMouseRecord? Mouse, PendingConsoleKey Resolution)> resolved,
+            object resolutionSync, WindowsConsoleMouseInput mouseInput)
         {
-            while (resolved.TryDequeue(out var key))
+            while (resolved.TryPeek(out var record))
             {
+                lock (resolutionSync)
+                {
+                    if (record.Resolution != null && !record.Resolution.IsResolved) return true;
+                    resolved.Dequeue();
+                    if (record.Resolution != null && !record.Resolution.PassThrough) continue;
+                }
+                if (record.Mouse.HasValue)
+                {
+                    if (!WriteConsoleMouse(mouseInput, record.Mouse.Value)) return false;
+                    continue;
+                }
+                var key = record.Key;
                 var nativeKey = new NativeTerminalWin32KeyEvent(
                     key.VirtualKeyCode,
                     key.VirtualScanCode,
@@ -1094,6 +1125,29 @@ namespace TermLink.SessionHost
                 if (!terminalAuthority.EncodeAndWriteConsoleKey(nativeKey, bytes =>
                     WriteLocalInput(bytes, bytes.Length)))
                     return false;
+            }
+            return true;
+        }
+
+        private bool WriteConsoleMouse(WindowsConsoleMouseInput decoder, WindowsConsoleMouseRecord record)
+        {
+            if (!GetConsoleScreenBufferInfo(outerConsoleOutput, out var outer)) return true;
+            COORD size;
+            lock (resizeSync) size = innerSize;
+            foreach (var input in decoder.Decode(record, outer.srWindow.Left, outer.srWindow.Top, size.X, size.Y))
+            {
+                bool Write(byte[] bytes) => WindowsConsoleMouseInput.IsUserAction(input)
+                    ? WriteLocalInput(bytes, bytes.Length) : WriteInput(bytes, bytes.Length);
+                if (terminalAuthority != null)
+                {
+                    if (!terminalAuthority.EncodeAndWriteConsoleMouse(input, Write)) return false;
+                }
+                else
+                {
+                    var encoded = WindowsConsoleMouseInput.EncodeStandalone(input);
+                    var filtered = outerReplySuppressor.Filter(encoded, encoded.Length);
+                    if (filtered.Length != 0 && !Write(filtered)) return false;
+                }
             }
             return true;
         }
@@ -1723,12 +1777,16 @@ namespace TermLink.SessionHost
         {
             [FieldOffset(0)] public ushort EventType;
             [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent;
+            [FieldOffset(4)] public WindowsConsoleMouseRecord MouseEvent;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct KEY_EVENT_RECORD
         {
-            [MarshalAs(UnmanagedType.Bool)] public bool KeyDown;
+            // Keep the union blittable: a managed bool shifts the overlapping
+            // mouse fields even when MarshalAs expands it to a Win32 BOOL.
+            public int KeyDownValue;
+            public bool KeyDown => KeyDownValue != 0;
             public ushort RepeatCount;
             public ushort VirtualKeyCode;
             public ushort VirtualScanCode;
@@ -1738,12 +1796,6 @@ namespace TermLink.SessionHost
 
         private sealed class PendingConsoleKey
         {
-            internal PendingConsoleKey(KEY_EVENT_RECORD keyDown)
-            {
-                KeyDown = keyDown;
-            }
-
-            internal KEY_EVENT_RECORD KeyDown { get; }
             internal KEY_EVENT_RECORD? KeyUp { get; set; }
             internal bool IsResolved { get; set; }
             internal bool PassThrough { get; set; }

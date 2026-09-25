@@ -10,6 +10,10 @@ using TermLink.LocalIpc;
 using TermLink.SessionHost;
 using TermLink.TerminalCore;
 
+if (args.Length == 1 && args[0] == "--mouse-probe-child") { MouseBridgeValidation.Child(); return; }
+MouseInputValidation.Run();
+MouseBridgeValidation.Run();
+
 var encodedCommand = Convert.ToBase64String(Encoding.UTF8.GetBytes("cmd.exe"));
 var firstOptions = SessionHostOptions.Parse(new[] { "--command-base64", encodedCommand, "--managed-shell", "custom" });
 var secondOptions = SessionHostOptions.Parse(new[] { "--command-base64", encodedCommand, "--managed-shell", "custom" });

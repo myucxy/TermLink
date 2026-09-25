@@ -167,6 +167,26 @@ namespace TermLink.SessionHost
             }
         }
 
+        public bool EncodeAndWriteConsoleMouse(
+            NativeTerminalMouseEvent input, Func<byte[], bool> writer)
+        {
+            if (writer == null) throw new ArgumentNullException(nameof(writer));
+            lock (sync)
+            {
+                ThrowIfUnavailable();
+                byte[] encoded;
+                try { encoded = terminal.EncodeMouse(input); }
+                // A resize can make a queued cell stale. Win32 cell records also cannot
+                // represent mode 1016 pixels; legacy encodings have a coordinate ceiling.
+                // Never invent coordinates or kill a session for these local records.
+                catch (NativeTerminalException error) when (
+                    error.Status == NativeTerminalStatus.InvalidArgument ||
+                    error.Status == NativeTerminalStatus.LimitExceeded)
+                { return true; }
+                return encoded.Length == 0 || writer(encoded);
+            }
+        }
+
         private void WritePtyReplies(
             ulong sourceSequence,
             NativeTerminalHostEffectFrameV2 effects)

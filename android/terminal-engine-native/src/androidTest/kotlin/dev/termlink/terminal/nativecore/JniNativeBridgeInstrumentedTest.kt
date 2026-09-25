@@ -88,19 +88,79 @@ class JniNativeBridgeInstrumentedTest {
                 assertEquals(1, clicks)
                 engine.setTouchMouseEnabled(true)
                 tap()
+                tap()
                 assertEquals(1, clicks)
                 engine.setKeyboardVisible(true)
                 engine.setKeyboardVisible(false)
                 assertEquals(TerminalSize(80, 24), engine.authoritativeSize.value)
             }
-            val reports = kotlinx.coroutines.withTimeout(1_000) { engine.inputEvents.take(2).toList() }
+            val reports = kotlinx.coroutines.withTimeout(1_000) { engine.inputEvents.take(4).toList() }
                 .map { it.decodeToString() }
             assertTrue(reports[0].startsWith("\u001b[<0;") && reports[0].endsWith("M"))
             assertTrue(reports[1].endsWith("m"))
+            assertEquals(reports.take(2), reports.drop(2))
             assertEquals(null, withTimeoutOrNull(100) { engine.inputEvents.first() })
         } finally {
             instrumentation.runOnMainSync { engine.dispose(); activity.finish() }
         }
+    }
+
+    @Test
+    fun fingerWheelAndHoldDragUseRealCoreAndMouseResetRestoresLocalTouch() = kotlinx.coroutines.runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val activity = instrumentation.startActivitySync(android.content.Intent(instrumentation.context,
+            ViewportTestActivity::class.java).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        val engine = NativeTerminalEngine(TerminalSize(80, 24))
+        lateinit var view: NativeTerminalView
+        var down = 0L
+        var clicks = 0
+        fun event(action: Int, y: Float = 100f) = instrumentation.runOnMainSync {
+            val now = android.os.SystemClock.uptimeMillis()
+            if (action == MotionEvent.ACTION_DOWN) down = now
+            val input = MotionEvent.obtain(down, now, action, 100f, y, 0)
+            try { assertTrue(view.dispatchTouchEvent(input)) } finally { input.recycle() }
+        }
+        suspend fun drain(): List<String> {
+            val reports = mutableListOf<String>()
+            while (true) reports += (withTimeoutOrNull(80) { engine.inputEvents.first() } ?: break).decodeToString()
+            return reports
+        }
+        try {
+            engine.feed(1, ByteBuffer.wrap("\u001b[?1003;1006h".encodeToByteArray()))
+            engine.setReadOnly(false)
+            engine.setTouchMouseEnabled(true)
+            instrumentation.runOnMainSync {
+                view = engine.createView(activity) as NativeTerminalView
+                activity.setContentView(view)
+                view.layout(0, 0, 500, 500)
+                view.setOnClickListener { clicks++ }
+            }
+            instrumentation.waitForIdleSync()
+            event(MotionEvent.ACTION_DOWN)
+            assertTrue(drain().isEmpty())
+            event(MotionEvent.ACTION_MOVE, 320f)
+            event(MotionEvent.ACTION_UP, 320f)
+            val wheels = drain()
+            assertTrue(wheels.isNotEmpty())
+            assertTrue(wheels.all { it.startsWith("\u001b[<64;") && it.endsWith("M") })
+            assertEquals(0, clicks)
+            event(MotionEvent.ACTION_DOWN)
+            android.os.SystemClock.sleep(android.view.ViewConfiguration.getLongPressTimeout().toLong() + 100)
+            instrumentation.waitForIdleSync()
+            event(MotionEvent.ACTION_MOVE, 150f)
+            event(MotionEvent.ACTION_CANCEL, 150f)
+            val drag = drain()
+            assertEquals(3, drag.size)
+            assertTrue(drag[0].startsWith("\u001b[<0;") && drag[0].endsWith("M"))
+            assertTrue(drag[1].startsWith("\u001b[<32;"))
+            assertTrue(drag[2].endsWith("m"))
+            engine.feed(2, ByteBuffer.wrap("\u001b[?1003l".encodeToByteArray()))
+            assertFalse(engine.mouseReporting.value)
+            event(MotionEvent.ACTION_DOWN)
+            event(MotionEvent.ACTION_UP)
+            assertEquals(1, clicks)
+            assertTrue(drain().isEmpty())
+        } finally { instrumentation.runOnMainSync { engine.dispose(); activity.finish() } }
     }
 
     @Test

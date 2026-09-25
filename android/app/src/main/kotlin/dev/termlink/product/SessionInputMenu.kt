@@ -49,6 +49,7 @@ internal fun SessionInputMenuItems(
     onTouchMouseChanged: (Boolean) -> Unit,
     onKeyboardToggle: () -> Unit,
 ) {
+    val mouseToggleEnabled = touchMouseEnabled || controlling && mouseReporting
     HorizontalDivider()
     Text(stringResource(R.string.session_input_title),
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).semantics { heading() },
@@ -67,8 +68,8 @@ internal fun SessionInputMenuItems(
         },
         leadingIcon = { Icon(Icons.Filled.Mouse, contentDescription = null) },
         trailingIcon = { Switch(checked = touchMouseEnabled, onCheckedChange = null,
-            enabled = controlling && mouseReporting) },
-        enabled = controlling && mouseReporting,
+            enabled = mouseToggleEnabled) },
+        enabled = mouseToggleEnabled,
         onClick = { onTouchMouseChanged(!touchMouseEnabled) },
     )
     DropdownMenuItem(

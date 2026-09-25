@@ -67,22 +67,22 @@ class NativeTerminalViewTest {
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(1, clicks)
             assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
-
             engine.setTouchMouseEnabled(true)
             event(MotionEvent.ACTION_DOWN)
-            event(MotionEvent.ACTION_MOVE)
+            assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
             engine.setTouchMouseEnabled(false) // Changing the preference cannot reroute half a gesture.
-            event(MotionEvent.ACTION_CANCEL)
+            event(MotionEvent.ACTION_UP)
             event(MotionEvent.ACTION_DOWN, mouse = true)
-            event(MotionEvent.ACTION_UP, mouse = true)
+            event(MotionEvent.ACTION_MOVE, mouse = true)
+            event(MotionEvent.ACTION_CANCEL, mouse = true)
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(1, clicks)
             val reports = withTimeout(1_000) { engine.inputEvents.take(5).toList() }.map { it.decodeToString() }
             assertTrue(reports[0].startsWith("\u001b[<0;") && reports[0].endsWith("M"))
-            assertTrue(reports[1].startsWith("\u001b[<32;") && reports[1].endsWith("M"))
-            assertTrue(reports[2].endsWith("m"))
-            assertEquals(reports[0], reports[3])
-            assertEquals(reports[2], reports[4])
+            assertTrue(reports[1].endsWith("m"))
+            assertEquals(reports[0], reports[2])
+            assertTrue(reports[3].startsWith("\u001b[<32;") && reports[3].endsWith("M"))
+            assertEquals(reports[1], reports[4])
             assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
 
             engine.setTouchMouseEnabled(true)
@@ -91,12 +91,99 @@ class NativeTerminalViewTest {
             event(MotionEvent.ACTION_UP)
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(1, clicks)
-            withTimeout(1_000) { engine.inputEvents.first() } // Only the press before losing the lease.
+            assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
+            engine.setReadOnly(false)
+            engine.feed(2, ByteBuffer.wrap("\u001b[?1003l".encodeToByteArray()))
+            time += 500L // Outside the existing local double-tap recognition window.
+            event(MotionEvent.ACTION_DOWN)
+            event(MotionEvent.ACTION_UP)
+            assertEquals(2, clicks) // saved ON preference cannot capture a non-mouse program
             assertEquals(null, kotlinx.coroutines.withTimeoutOrNull(50) { engine.inputEvents.first() })
         } finally {
             engine.dispose()
             controller.destroy()
         }
+    }
+
+    @Test
+    fun mouseSwipesSendOnlyWheelsAndHoldDragReleasesOnInterrupt() = runBlocking {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val engine = NativeTerminalEngine(TerminalSize(80, 24), FakeNativeBridge())
+        try {
+            engine.feed(1, ByteBuffer.wrap("\u001b[?1003;1006h".encodeToByteArray()))
+            engine.setReadOnly(false)
+            engine.setTouchMouseEnabled(true)
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 600, 600)
+            var clicks = 0
+            view.setOnClickListener { clicks++ }
+            var down = 0L
+            fun event(action: Int, x: Float = 120f, y: Float = 120f, pointers: Int = 1) {
+                val now = android.os.SystemClock.uptimeMillis()
+                if (action == MotionEvent.ACTION_DOWN) down = now
+                val properties = Array(pointers) { MotionEvent.PointerProperties().apply { id = it; toolType = MotionEvent.TOOL_TYPE_FINGER } }
+                val coords = Array(pointers) { MotionEvent.PointerCoords().apply { this.x = x + it * 20; this.y = y; pressure = 1f; size = 1f } }
+                val input = MotionEvent.obtain(down, now, action, pointers, properties, coords,
+                    0, 0, 1f, 1f, 0, 0, android.view.InputDevice.SOURCE_TOUCHSCREEN, 0)
+                try { assertTrue(view.dispatchTouchEvent(input)) } finally { input.recycle() }
+            }
+            suspend fun drain(): List<String> {
+                val result = mutableListOf<String>()
+                while (true) result += (kotlinx.coroutines.withTimeoutOrNull(30) { engine.inputEvents.first() }
+                    ?: break).decodeToString()
+                return result
+            }
+            fun waitHold() = shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(
+                android.view.ViewConfiguration.getLongPressTimeout().toLong() + 10))
+            for ((x, y, code) in listOf(Triple(120f, 380f, 64), Triple(120f, 20f, 65),
+                    Triple(380f, 120f, 66), Triple(20f, 120f, 67))) {
+                event(MotionEvent.ACTION_DOWN)
+                assertTrue(drain().isEmpty())
+                event(MotionEvent.ACTION_MOVE, x, y)
+                event(MotionEvent.ACTION_UP, x, y)
+                val reports = drain()
+                assertTrue(reports.isNotEmpty())
+                assertTrue(reports.all { it.startsWith("\u001b[<$code;") && it.endsWith("M") })
+            }
+            assertEquals(0L, engine.historyOffsetRowsForTest())
+            assertEquals(0, clicks)
+
+            repeat(2) { event(MotionEvent.ACTION_DOWN); event(MotionEvent.ACTION_UP) }
+            val doubleClick = drain()
+            assertEquals(4, doubleClick.size)
+            assertTrue(doubleClick[0].endsWith("M") && doubleClick[1].endsWith("m"))
+            assertEquals(doubleClick.take(2), doubleClick.drop(2))
+
+            event(MotionEvent.ACTION_DOWN)
+            waitHold()
+            event(MotionEvent.ACTION_MOVE, y = 200f)
+            event(MotionEvent.ACTION_CANCEL, y = 200f)
+            val drag = drain()
+            assertEquals(3, drag.size)
+            assertTrue(drag[0].startsWith("\u001b[<0;") && drag[0].endsWith("M"))
+            assertTrue(drag[1].startsWith("\u001b[<32;"))
+            assertTrue(drag[2].endsWith("m"))
+
+            event(MotionEvent.ACTION_DOWN)
+            event(MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT), pointers = 2)
+            waitHold()
+            event(MotionEvent.ACTION_UP)
+            assertTrue(drain().isEmpty())
+
+            event(MotionEvent.ACTION_DOWN)
+            waitHold()
+            view.onWindowFocusChanged(false)
+            event(MotionEvent.ACTION_UP)
+            assertEquals(2, drain().size) // one press and one release, no click after focus loss
+
+            event(MotionEvent.ACTION_DOWN)
+            engine.setReadOnly(true)
+            event(MotionEvent.ACTION_MOVE, y = 200f)
+            engine.setReadOnly(false)
+            event(MotionEvent.ACTION_UP, y = 200f)
+            assertTrue(drain().isEmpty()) // do not resume half a gesture under a new lease
+        } finally { engine.dispose(); controller.destroy() }
     }
 
     @Test
@@ -569,7 +656,7 @@ class NativeTerminalViewTest {
     }
 
     @Test
-    fun verticalDragBrowsesLocalHistoryInBothDirections() {
+    fun verticalDragBrowsesLocalHistoryInBothDirections() = runBlocking {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
         val bridge = FakeNativeBridge().apply {
             forcedScrollbackAvailableRows = 12
@@ -580,6 +667,10 @@ class NativeTerminalViewTest {
             bridge = bridge,
         )
         try {
+            engine.setTouchMouseEnabled(true)
+            engine.setReadOnly(false)
+            engine.feed(1, ByteBuffer.wrap("\u001b[?1003;1006h\u001b[?1003l".encodeToByteArray()))
+            assertFalse(engine.mouseReporting.value)
             val view = engine.createView(controller.get()) as NativeTerminalView
             controller.get().setContentView(view)
             view.layout(0, 0, 400, 600)
