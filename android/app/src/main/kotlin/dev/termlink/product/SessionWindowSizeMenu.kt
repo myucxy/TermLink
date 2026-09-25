@@ -1,6 +1,5 @@
 package dev.termlink.product
 
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -74,16 +73,13 @@ internal fun SessionWindowSizeMenuItems(
     }
     HorizontalDivider()
     Text(stringResource(R.string.session_window_size_title),
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).semantics { heading() },
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp).semantics { heading() },
         style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     DropdownMenuItem(
-        text = {
-            Column {
-                Text(stringResource(R.string.session_resize_fit))
-                Text(metrics?.let { stringResource(R.string.session_resize_preview,
-                    it.size.columns, it.size.rows, it.widthPx, it.heightPx) }
-                    ?: stringResource(R.string.session_resize_unmeasured), style = MaterialTheme.typography.bodySmall)
-            }
+        text = { Text(stringResource(R.string.session_resize_fit)) },
+        trailingIcon = {
+            Text(metrics?.let { stringResource(R.string.session_resize_preview, it.size.columns, it.size.rows) }
+                ?: stringResource(R.string.session_resize_unmeasured), style = MaterialTheme.typography.labelSmall)
         },
         modifier = Modifier.testTag("session-resize-fit:$sessionId"),
         enabled = enabled && !busy && metrics != null,
@@ -97,7 +93,7 @@ internal fun SessionWindowSizeMenuItems(
     )
     val feedback = if (busy) stringResource(R.string.session_resize_pending) else result
         ?: if (!enabled) stringResource(R.string.session_resize_control_required) else null
-    feedback?.let { Text(it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+    feedback?.let { Text(it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
         .semantics { liveRegion = LiveRegionMode.Polite }
         .testTag("session-resize-result:$sessionId"), style = MaterialTheme.typography.bodySmall) }
     HorizontalDivider()

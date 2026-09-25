@@ -118,6 +118,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var mouseGestureCancelled = false
     private var mouseX = 0f
     private var mouseY = 0f
+    private var lastTerminalTouch: android.graphics.PointF? = null
     private var mouseModifiers = TerminalInputModifiers()
     private var mouseWheelPixels = 0f
     private var mouseScrollAxis = ScrollAxis.UNDECIDED
@@ -584,6 +585,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
         if (detached) return false
         val owner = engine
         if (owner == null && transcript == null) return false
+        if (event.pointerCount == 1 && (event.actionMasked == MotionEvent.ACTION_DOWN ||
+                event.actionMasked == MotionEvent.ACTION_MOVE || event.actionMasked == MotionEvent.ACTION_UP)) {
+            lastTerminalTouch = android.graphics.PointF(event.x, event.y)
+        }
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             // Pin routing for the entire gesture. A TUI enabling mouse reports must not
             // silently take ownership of fingers; real mice remain independent.
@@ -1466,6 +1471,14 @@ internal class NativeTerminalView @JvmOverloads constructor(
             )
             canvas.drawCircle(x, y + selectionHandleRadius, selectionHandleRadius, selectionHandlePaint)
         }
+    }
+
+    internal fun submitMouseWheel(direction: TerminalMouseWheelDirection): Boolean {
+        if (detached || width <= 0 || height <= 0) return false
+        val target = lastTerminalTouch
+        val x = (target?.x ?: width / 2f).coerceIn(0f, (width - 1).toFloat())
+        val y = (target?.y ?: height / 2f).coerceIn(0f, (height - 1).toFloat())
+        return safeSubmit { engine?.submitMouse(TerminalMouseInput.Wheel(direction, mousePosition(x, y))) == true }
     }
 
     private fun mousePosition(x: Float, y: Float) = cellAt(x, y).let { cell ->

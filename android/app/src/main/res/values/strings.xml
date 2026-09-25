@@ -4,8 +4,8 @@
     <string name="session_touch_mouse">Touch as mouse</string>
     <string name="session_input_read_only">Acquire control to use terminal input</string>
     <string name="session_mouse_unavailable">Mouse reporting is not enabled by this terminal</string>
-    <string name="session_mouse_enabled_detail">Tap to click, swipe to scroll, hold to drag; open the keyboard from the menu</string>
-    <string name="session_mouse_disabled_detail">Tap opens the keyboard; swipe browses content</string>
+    <string name="session_mouse_enabled_detail">Tap to click, swipe to scroll, hold to drag. Use the first dock button to show or hide the keyboard.</string>
+    <string name="session_mouse_disabled_detail">Tap to open the keyboard; swipe to browse content. In mouse mode, use the right-side arrows or drag their center handle to send wheel input.</string>
     <string name="session_show_keyboard">Show keyboard</string>
     <string name="session_hide_keyboard">Hide keyboard</string>
     <string name="cleanup_interrupted">The batch could not be confirmed; later batches were stopped. Check the connection and upgrade both Windows and Server, then refresh the list before retrying.</string>
@@ -297,7 +297,7 @@
     <string name="terminal_waiting_lease">Terminals stay read only until a server control lease is granted.</string>
     <string name="terminal_key_escape">Esc</string><string name="terminal_key_tab">Tab</string><string name="terminal_key_enter">Enter</string><string name="terminal_key_ctrl_c">Ctrl+C</string>
     <string name="arrow_left">Left arrow</string><string name="arrow_up">Up arrow</string><string name="arrow_down">Down arrow</string><string name="arrow_right">Right arrow</string>
-    <string name="terminal_dock_hide">Hide shortcut dock</string><string name="terminal_dock_show">Show shortcut dock</string>
+
     <string name="settings_appearance_title">Appearance</string>
     <string name="settings_appearance_copy">Choose the app chrome theme. Terminal ANSI colors stay unchanged.</string>
     <string name="settings_screen_title">Screen</string>
@@ -602,7 +602,7 @@
     <string name="session_window_size_title">Session window</string>
     <string name="session_resize_fit">Fit session to phone window</string>
     <string name="session_resize_restore">Restore desktop window size</string>
-    <string name="session_resize_preview">%1$d columns × %2$d rows · %3$d × %4$d px</string>
+    <string name="session_resize_preview">%1$d × %2$d</string>
     <string name="session_resize_unmeasured">Terminal viewport is not ready</string>
     <string name="session_resize_applied">Windows applied %1$d columns × %2$d rows.</string>
     <string name="session_resize_pending">Waiting for Windows to apply the size…</string>
@@ -616,4 +616,7 @@
     <string name="session_resize_busy">Another window resize is in progress. Try again shortly.</string>
     <string name="session_resize_server_upgrade">Update the server to enable window resizing.</string>
     <string name="session_resize_expired">The request expired or its size was invalid. Check both device clocks and the connection.</string>
+    <string name="session_wheel_up">Mouse wheel up</string>
+    <string name="session_wheel_down">Mouse wheel down</string>
+    <string name="session_wheel_drag">Drag up or down to scroll; drag farther for faster scrolling</string>
 </resources>

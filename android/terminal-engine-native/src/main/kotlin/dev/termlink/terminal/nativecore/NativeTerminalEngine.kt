@@ -221,6 +221,14 @@ class NativeTerminalEngine(
         view.requestKeyboard(visible)
     }
 
+    override fun submitMouseWheel(direction: dev.termlink.terminal.api.TerminalMouseWheelDirection): Boolean {
+        val view = synchronized(lock) {
+            if (!canAcceptInputLocked() || touchMouseEnabled || !mouseReporting.value) return false
+            viewReference?.get()
+        } ?: return false
+        return view.submitMouseWheel(direction)
+    }
+
     override fun clear() {
         synchronized(lock) {
             checkActive()

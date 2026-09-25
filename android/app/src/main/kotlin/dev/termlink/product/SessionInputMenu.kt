@@ -1,23 +1,25 @@
 package dev.termlink.product
 
 import android.content.Context
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.Mouse
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.heading
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.unit.dp
 import dev.termlink.harness.R
 import java.util.UUID
 
@@ -45,37 +47,35 @@ internal fun SessionInputMenuItems(
     controlling: Boolean,
     mouseReporting: Boolean,
     touchMouseEnabled: Boolean,
-    keyboardVisible: Boolean,
     onTouchMouseChanged: (Boolean) -> Unit,
-    onKeyboardToggle: () -> Unit,
 ) {
+    var showHelp by remember { mutableStateOf(false) }
     val mouseToggleEnabled = touchMouseEnabled || controlling && mouseReporting
     HorizontalDivider()
-    Text(stringResource(R.string.session_input_title),
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).semantics { heading() },
-        style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    DropdownMenuItem(
-        text = {
-            Column {
-                Text(stringResource(R.string.session_touch_mouse))
-                Text(stringResource(when {
-                    !controlling -> R.string.session_input_read_only
-                    !mouseReporting -> R.string.session_mouse_unavailable
-                    touchMouseEnabled -> R.string.session_mouse_enabled_detail
-                    else -> R.string.session_mouse_disabled_detail
-                }), style = MaterialTheme.typography.bodySmall)
-            }
-        },
-        leadingIcon = { Icon(Icons.Filled.Mouse, contentDescription = null) },
-        trailingIcon = { Switch(checked = touchMouseEnabled, onCheckedChange = null,
-            enabled = mouseToggleEnabled) },
-        enabled = mouseToggleEnabled,
-        onClick = { onTouchMouseChanged(!touchMouseEnabled) },
-    )
-    DropdownMenuItem(
-        text = { Text(stringResource(if (keyboardVisible) R.string.session_hide_keyboard else R.string.session_show_keyboard)) },
-        leadingIcon = { Icon(Icons.Filled.Keyboard, contentDescription = null) },
-        enabled = controlling || keyboardVisible,
-        onClick = onKeyboardToggle,
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        DropdownMenuItem(
+            modifier = Modifier.weight(1f),
+            text = { Text(stringResource(R.string.session_touch_mouse)) },
+            trailingIcon = { Switch(checked = touchMouseEnabled, onCheckedChange = null, enabled = mouseToggleEnabled) },
+            enabled = mouseToggleEnabled,
+            onClick = { onTouchMouseChanged(!touchMouseEnabled) },
+        )
+        IconButton(onClick = { showHelp = true }) {
+            Icon(Icons.AutoMirrored.Filled.HelpOutline,
+                contentDescription = stringResource(R.string.session_input_title))
+        }
+    }
+    if (showHelp) AlertDialog(
+        onDismissRequest = { showHelp = false },
+        title = { Text(stringResource(R.string.session_input_title)) },
+        text = { Text(stringResource(when {
+            !controlling -> R.string.session_input_read_only
+            !mouseReporting -> R.string.session_mouse_unavailable
+            touchMouseEnabled -> R.string.session_mouse_enabled_detail
+            else -> R.string.session_mouse_disabled_detail
+        })) },
+        confirmButton = { TextButton(onClick = { showHelp = false }) {
+            Text(stringResource(android.R.string.ok))
+        } },
     )
 }

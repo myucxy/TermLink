@@ -86,6 +86,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Mouse
@@ -294,9 +295,7 @@ private val TerminalDockHorizontalContentPadding = 8.dp
  */
 internal fun terminalDockHeight(
     layout: TerminalShortcutDockLayout,
-    expanded: Boolean,
 ): Dp = when {
-    !expanded -> 34.dp
     layout == TerminalShortcutDockLayout.ONE_ROW -> 34.dp
     else -> 67.dp
 }
@@ -4637,6 +4636,8 @@ private fun SessionDetail(
                 TerminalSurface(
                     session = session,
                     engine = engine,
+                    sessionOnline = sessionOnline,
+                    touchMouseEnabled = touchMouseEnabled,
                     remoteState = remoteState,
                     terminalPreferences = terminalPreferences,
                     shortcutPreferences = shortcutPreferences,
@@ -4697,7 +4698,6 @@ private fun SessionConnectionStatusMenu(
     val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
     val canReleaseControl = remoteState is RemoteSessionState.Controlling
     val mouseReporting = engine?.mouseReporting?.collectAsState()?.value ?: false
-    val keyboardVisible = WindowInsets.isImeVisible
     BackHandler(enabled = expanded) { expanded = false }
     val canCheckNetwork = sessionOnline && directRoutingPolicy == DirectRoutingPolicy.AUTO &&
         networkCheckState?.lan != DirectNetworkCheckStatus.CHECKING &&
@@ -4732,25 +4732,15 @@ private fun SessionConnectionStatusMenu(
             properties = PopupProperties(focusable = false),
             modifier = Modifier.widthIn(min = 280.dp, max = 320.dp),
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
+            Text(
+                "$statusLabel · ${stringResource(carrier.labelResource())}",
+                modifier = Modifier.fillMaxWidth()
                     .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Text(
-                    menuTitle,
-                    modifier = Modifier.semantics { heading() },
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    "$statusLabel · ${stringResource(carrier.labelResource())}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .semantics { heading() },
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+            )
             HorizontalDivider()
             if (canRequestControl) {
                 DropdownMenuItem(
@@ -4767,15 +4757,10 @@ private fun SessionConnectionStatusMenu(
                 )
             }
             SessionInputMenuItems(
-                controlling = canReleaseControl && engine != null,
+                controlling = sessionOnline && canReleaseControl && engine != null,
                 mouseReporting = mouseReporting,
                 touchMouseEnabled = touchMouseEnabled,
-                keyboardVisible = keyboardVisible,
                 onTouchMouseChanged = onTouchMouseChanged,
-                onKeyboardToggle = {
-                    expanded = false
-                    engine?.setKeyboardVisible(!keyboardVisible)
-                },
             )
             SessionWindowSizeMenuItems(
                 sessionId = sessionId,
@@ -4788,7 +4773,7 @@ private fun SessionConnectionStatusMenu(
                     Text(
                         stringResource(R.string.session_network_checks_title),
                         modifier = Modifier
-                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
                             .semantics { heading() },
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.SemiBold,
@@ -4831,7 +4816,7 @@ private fun SessionConnectionStatusMenu(
                             else -> R.string.session_direct_policy_loading
                         },
                     ),
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -4933,8 +4918,9 @@ private fun TerminalActionBar(
     onCustomShortcut: (TerminalCustomShortcut) -> Unit,
     onPasteRequested: () -> Unit,
     shortcutPreferences: TerminalShortcutPreferences,
-    expanded: Boolean,
-    onExpandedChanged: (Boolean) -> Unit,
+    keyboardVisible: Boolean,
+    keyboardEnabled: Boolean,
+    onKeyboardToggle: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val value = shortcutPreferences.normalized
@@ -4946,42 +4932,6 @@ private fun TerminalActionBar(
             .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(7.dp))
             .padding(horizontal = 3.dp, vertical = 2.dp),
     ) {
-        if (!expanded) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(3.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TerminalDockButton(
-                    onClick = { onExpandedChanged(true) },
-                    modifier = Modifier
-                        .width(TerminalDockButtonSize)
-                        .testTag(terminalCommandTestTag("dock-toggle")),
-                ) {
-                    color -> Icon(
-                        Icons.Filled.KeyboardArrowUp,
-                        contentDescription = stringResource(R.string.terminal_dock_show),
-                        tint = color,
-                        modifier = Modifier.size(18.dp),
-                    )
-                }
-                TerminalDockButton(
-                    onClick = onPasteRequested,
-                    enabled = enabled,
-                    modifier = Modifier
-                        .width(TerminalDockButtonSize)
-                        .testTag(terminalCommandTestTag("paste")),
-                ) {
-                    color -> Icon(
-                        Icons.Filled.ContentPaste,
-                        contentDescription = stringResource(R.string.action_paste),
-                        tint = color,
-                        modifier = Modifier.size(17.dp),
-                    )
-                }
-            }
-            return@Column
-        }
         if (value.dockLayout == TerminalShortcutDockLayout.ONE_ROW) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -4989,15 +4939,16 @@ private fun TerminalActionBar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 TerminalDockButton(
-                    onClick = { onExpandedChanged(false) },
+                    onClick = onKeyboardToggle,
+                    enabled = keyboardEnabled || keyboardVisible,
                     modifier = Modifier
                         .width(TerminalDockButtonSize)
-                        .testTag(terminalCommandTestTag("dock-toggle")),
+                        .testTag(terminalCommandTestTag("keyboard-toggle")),
                 ) {
                     color -> Icon(
-                        Icons.Filled.KeyboardArrowDown,
-                        contentDescription = stringResource(R.string.terminal_dock_hide),
-                        tint = color,
+                        Icons.Filled.Keyboard,
+                        contentDescription = stringResource(if (keyboardVisible) R.string.session_hide_keyboard else R.string.session_show_keyboard),
+                        tint = if (keyboardVisible) MaterialTheme.colorScheme.primary else color,
                         modifier = Modifier.size(18.dp),
                     )
                 }
@@ -5048,15 +4999,16 @@ private fun TerminalActionBar(
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 TerminalDockButton(
-                    onClick = { onExpandedChanged(false) },
+                    onClick = onKeyboardToggle,
+                    enabled = keyboardEnabled || keyboardVisible,
                     modifier = Modifier
                         .width(TerminalDockButtonSize)
-                        .testTag(terminalCommandTestTag("dock-toggle")),
+                        .testTag(terminalCommandTestTag("keyboard-toggle")),
                 ) {
                     color -> Icon(
-                        Icons.Filled.KeyboardArrowDown,
-                        contentDescription = stringResource(R.string.terminal_dock_hide),
-                        tint = color,
+                        Icons.Filled.Keyboard,
+                        contentDescription = stringResource(if (keyboardVisible) R.string.session_hide_keyboard else R.string.session_show_keyboard),
+                        tint = if (keyboardVisible) MaterialTheme.colorScheme.primary else color,
                         modifier = Modifier.size(18.dp),
                     )
                 }
@@ -5392,10 +5344,13 @@ internal fun SessionSummary.resolveDisplayedRemoteState(actual: RemoteSessionSta
     else -> actual
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TerminalSurface(
     session: SessionSummary,
     engine: TerminalViewportEngine?,
+    sessionOnline: Boolean,
+    touchMouseEnabled: Boolean,
     remoteState: RemoteSessionState?,
     transcriptState: TranscriptViewportState?,
     liveAcknowledgement: ULong?,
@@ -5572,7 +5527,7 @@ private fun TerminalSurface(
     SideEffect {
         val theme = productTerminalTheme(terminalPreferences)
         activeEngine?.applyTheme(theme)
-        activeEngine?.setReadOnly(remoteState !is RemoteSessionState.Controlling)
+        activeEngine?.setReadOnly(!sessionOnline || remoteState !is RemoteSessionState.Controlling)
         transcriptViewport.applyTheme(theme)
     }
     LaunchedEffect(
@@ -5613,7 +5568,10 @@ private fun TerminalSurface(
     DisposableEffect(transcriptViewport) {
         onDispose { transcriptViewport.close() }
     }
-    var dockExpanded by rememberSaveable(session.id) { mutableStateOf(true) }
+    val keyboardVisible = WindowInsets.isImeVisible
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val canInput = sessionOnline && remoteState is RemoteSessionState.Controlling && activeEngine != null
+    val mouseReporting = activeEngine?.mouseReporting?.collectAsState()?.value ?: false
     Column(
         modifier = modifier
             .clipToBounds()
@@ -5726,17 +5684,36 @@ private fun TerminalSurface(
                     }
                 }
             }
+            if (canInput && mouseReporting && !touchMouseEnabled && !overlayVisible) {
+                key(session.id, activeEngine) {
+                    TerminalMouseWheel(
+                        engine = activeEngine!!,
+                        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 4.dp)
+                            .width(48.dp).height(144.dp).testTag("terminal-mouse-wheel:${session.id}"),
+                    )
+                }
+            }
         }
         TerminalActionBar(
-            enabled = remoteState is RemoteSessionState.Controlling,
+            enabled = canInput,
             onAction = onTerminalAction,
             onCustomShortcut = onTerminalCustomShortcut,
             onPasteRequested = onPasteRequested,
             shortcutPreferences = shortcutPreferences,
-            expanded = dockExpanded,
-            onExpandedChanged = { dockExpanded = it },
+            keyboardVisible = keyboardVisible,
+            keyboardEnabled = canInput,
+            onKeyboardToggle = {
+                if (keyboardVisible) {
+                    activeEngine?.setKeyboardVisible(false)
+                    keyboardController?.hide()
+                }
+                else if (canInput) {
+                    returnToLiveTail()
+                    activeEngine?.setKeyboardVisible(true)
+                }
+            },
             modifier = Modifier
-                .height(terminalDockHeight(shortcutPreferences.normalized.dockLayout, dockExpanded))
+                .height(terminalDockHeight(shortcutPreferences.normalized.dockLayout))
                 .padding(horizontal = 6.dp)
                 .clipToBounds()
                 .zIndex(1f)

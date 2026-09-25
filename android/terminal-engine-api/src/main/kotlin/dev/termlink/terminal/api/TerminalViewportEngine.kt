@@ -23,6 +23,9 @@ interface TerminalViewportEngine : TerminalEngine {
     /** Local IME action; never emits terminal text, mouse input or a resize. */
     fun setKeyboardVisible(visible: Boolean) = Unit
 
+    /** Auxiliary wheel, at the last viewport touch (or its center). UI thread; false if rejected. */
+    fun submitMouseWheel(direction: TerminalMouseWheelDirection): Boolean = false
+
     fun createView(
         context: Context,
         textSizeSp: Float = 13f,

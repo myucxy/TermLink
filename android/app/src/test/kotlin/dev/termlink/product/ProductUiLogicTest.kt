@@ -311,9 +311,8 @@ class ProductUiLogicTest {
 
     @Test
     fun terminalDockReservesStableHeightForEachVisibleLayout() {
-        assertEquals(34f, terminalDockHeight(TerminalShortcutDockLayout.ONE_ROW, expanded = true).value, 0f)
-        assertEquals(67f, terminalDockHeight(TerminalShortcutDockLayout.TWO_ROWS, expanded = true).value, 0f)
-        assertEquals(34f, terminalDockHeight(TerminalShortcutDockLayout.TWO_ROWS, expanded = false).value, 0f)
+        assertEquals(34f, terminalDockHeight(TerminalShortcutDockLayout.ONE_ROW).value, 0f)
+        assertEquals(67f, terminalDockHeight(TerminalShortcutDockLayout.TWO_ROWS).value, 0f)
     }
 
     @Test

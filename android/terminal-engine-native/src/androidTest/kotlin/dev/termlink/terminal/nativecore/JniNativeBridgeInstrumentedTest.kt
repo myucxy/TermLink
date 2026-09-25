@@ -27,6 +27,8 @@ import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
@@ -36,6 +38,47 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
+    @Test
+    fun auxiliaryWheelUsesViewportTargetAndCoreModesWithoutClicks() = runBlocking {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val activity = instrumentation.startActivitySync(android.content.Intent(
+            instrumentation.context, ViewportTestActivity::class.java,
+        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        val engine = NativeTerminalEngine(TerminalSize(80, 24))
+        val up = dev.termlink.terminal.api.TerminalMouseWheelDirection.UP
+        val down = dev.termlink.terminal.api.TerminalMouseWheelDirection.DOWN
+        suspend fun next() = withTimeout(1000) { engine.inputEvents.first() }.decodeToString()
+        try {
+            engine.feed(1, ByteBuffer.wrap("\u001b[?1003;1016h".encodeToByteArray()))
+            engine.setReadOnly(false)
+            instrumentation.runOnMainSync {
+                val view = engine.createView(activity) as NativeTerminalView
+                activity.setContentView(view)
+                view.layout(0, 0, 500, 500)
+                assertTrue(engine.submitMouseWheel(up))
+                val touch = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 100f, 150f, 0)
+                val cancel = MotionEvent.obtain(0, 1, MotionEvent.ACTION_CANCEL, 100f, 150f, 0)
+                try { view.dispatchTouchEvent(touch); view.dispatchTouchEvent(cancel) }
+                finally { touch.recycle(); cancel.recycle() }
+                assertTrue(engine.submitMouseWheel(down))
+                engine.setReadOnly(true)
+                assertFalse(engine.submitMouseWheel(up))
+                engine.setReadOnly(false)
+                engine.setTouchMouseEnabled(true)
+                assertFalse(engine.submitMouseWheel(up))
+                engine.setTouchMouseEnabled(false)
+            }
+            assertEquals("\u001b[<64;251;251M", next())
+            assertEquals("\u001b[<65;101;151M", next())
+            engine.feed(2, ByteBuffer.wrap("\u001b[?1016l\u001b[?1006h".encodeToByteArray()))
+            instrumentation.runOnMainSync { assertTrue(engine.submitMouseWheel(up)) }
+            assertTrue(next().matches(Regex("\u001b\\[<64;[0-9]+;[0-9]+M")))
+            engine.feed(3, ByteBuffer.wrap("\u001b[?1003l".encodeToByteArray()))
+            instrumentation.runOnMainSync { assertFalse(engine.submitMouseWheel(up)) }
+            assertEquals(null, withTimeoutOrNull(80) { engine.inputEvents.first() })
+        } finally { instrumentation.runOnMainSync { engine.dispose(); activity.finish() } }
+    }
+
     @Test
     fun coreMouseCapabilityTracksSplitModesCheckpointAndResetWithoutSendingProbeInput() = kotlinx.coroutines.runBlocking {
         val engine = NativeTerminalEngine(TerminalSize(80, 24))
