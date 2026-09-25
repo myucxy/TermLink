@@ -31,7 +31,26 @@ Dock 对齐、上下 48 dp 点击范围及键盘开关；未向用户终端发�
 日志：`artifacts/validation/release-124-tests-debug.log`。此次没有改动 native/JNI，前版协议测试不冒充本轮重跑。
 
 源码和本说明提交推送后，使用 Build-Release / Verify-LocalRelease / Publish-AppShipProduction 完成正式发布。
-本段为预检记录，正式 revision、制品哈希、AppShip 状态及升级证据在执行后补记。
+构建时工作树干净，HEAD 与 origin/main 均为 `6136721ab5f0467ca8b96d07d7632a3b35620a86`。
+
+## 正式产物与上线证据
+
+Production APK 构建、独立签名校验、AppShip stable 发布及公开下载复核均已完成。
+
+- APK：`artifacts/release/0.2.68-124/TermLink-Android-0.2.68-124.apk`，38,062,422 字节。
+- SHA-256：`bb3899538bf0ac37bd461ee1702f7a6b08db25c7589088368864874547475a52`。
+- APK 唯一 signer 与上述连续性指纹一致，v2 签名通过；applicationId、版本 0.2.68、build 124 均通过独立核验。
+- application ID：`4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`。
+- release ID：`58062d56-d678-4aca-b9bd-07fc4bb4e11c`，状态 `published`。
+- artifact ID：`6bd5957f-d712-4e4d-8d0e-2e597bc4a618`，状态 `ready`、`manual_approved`。
+- Android build 123 返回 `optional` 指向 0.2.68/124；build 124 返回 `no_update`。
+  公开下载 APK 的哈希及大小与本地 manifest 完全一致。Windows build 122 仍为 `no_update`。
+- 发布恢复状态：`.appship/termlink-android-stable-0.2.68-build124-signature-approved.json`。
+- 构建、上传、公开更新接口和下载核对证据：ignored 的 `artifacts/validation/release-124-*`。
+
+模拟器原装为 Debug signer，已原地安装同源码 0.2.68/124 Debug APK；appId=10224、
+firstInstallTime=`2026-09-19 10:16:29` 保持。账号和数据保留，HOME-PC 既有 Codex 会话恢复为“控制中”，
+紧凑滚轮、Dock 和键盘按钮显示正常；未向用户终端发送命令或鼠标操作。本机 Windows、Server/Docker 未部署。
 
 ## 回滚与限制
 
