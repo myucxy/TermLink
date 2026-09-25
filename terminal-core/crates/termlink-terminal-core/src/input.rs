@@ -2357,12 +2357,7 @@ mod tests {
         };
         assert_eq!(
             kitty_encode(
-                kitty_event(
-                    KittyKey::Character('a'),
-                    caps,
-                    KittyKeyEventType::Press,
-                    "",
-                ),
+                kitty_event(KittyKey::Character('a'), caps, KittyKeyEventType::Press, "",),
                 0,
             ),
             Ok(b"A".to_vec()),
@@ -2370,7 +2365,10 @@ mod tests {
 
         let mut shifted = kitty_event(
             KittyKey::Character('a'),
-            KittyModifiers { shift: true, ..caps },
+            KittyModifiers {
+                shift: true,
+                ..caps
+            },
             KittyKeyEventType::Press,
             "",
         );

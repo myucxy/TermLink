@@ -3921,6 +3921,65 @@ fn xtversion_query_has_one_canonical_v2_reply_and_strict_parameters() {
 }
 
 #[test]
+fn alternate_scroll_hint_preserves_replay_snapshot_and_input_modes() {
+    // HOME-PC H122: entering the alternate screen emitted this exact prefix.
+    let bytes = b"\x1b[?1049h\x1b[?1007h\x1b[1;1H\x1b[JALT\x1b[?1007l";
+    let mut baseline = Terminal::new(8, 2).expect("terminal");
+    output(&mut baseline, 0, b"MAIN").expect("primary content");
+    let checkpoint = baseline.export_snapshot_v2().expect("pre-error checkpoint");
+    output(&mut baseline, 1, b"\x1b[?1049h\x1b[1;1H\x1b[JALT").expect("baseline alternate screen");
+
+    let mut terminal = Terminal::import_snapshot_v2(&checkpoint).expect("old checkpoint");
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 1,
+            bytes,
+        })
+        .expect("alternate scroll hint must not retire the renderer");
+    assert!(host_effect_payloads(prepared.host_effect_frame_v2()).is_empty());
+    prepared.commit_with(|_| Ok::<(), ()>(())).expect("commit");
+    assert_eq!(row_text(&terminal, 0), row_text(&baseline, 0));
+    assert_eq!(terminal.cursor(), baseline.cursor());
+    assert_eq!(terminal.modes, baseline.modes);
+    assert_snapshot_self_closure(&terminal);
+
+    for split in 0..=bytes.len() {
+        let mut restored = Terminal::import_snapshot_v2(&checkpoint).expect("checkpoint");
+        output(&mut restored, 1, &bytes[..split]).expect("prefix");
+        output(&mut restored, 2, &bytes[split..]).expect("suffix");
+        assert_eq!(row_text(&restored, 0), "ALT     ");
+        assert_eq!(restored.modes, baseline.modes);
+        output(&mut restored, 3, b"\x1b[?1049l").expect("leave alternate screen");
+        assert_eq!(row_text(&restored, 0), "MAIN    ");
+        assert_snapshot_self_closure(&restored);
+    }
+
+    let prepared = terminal
+        .prepare_event_with_host_effects_v2(Event::Output {
+            source_sequence: 2,
+            bytes: b"\x1b[?1007;1004h\x1b[?1007$p\x1b[?1004$p",
+        })
+        .expect("hint in a supported mode list");
+    assert_eq!(
+        host_effect_payloads(prepared.host_effect_frame_v2()),
+        [b"\x1b[?1007;0$y".as_slice(), b"\x1b[?1004;1$y".as_slice()]
+    );
+    prepared.commit_with(|_| Ok::<(), ()>(())).expect("commit");
+
+    for final_byte in *b"hl" {
+        let mut unknown = Terminal::new(8, 2).expect("terminal");
+        let mut mixed = b"\x1b[?1007;9999".to_vec();
+        mixed.push(final_byte);
+        assert_eq!(
+            output(&mut unknown, 0, &mixed),
+            Err(TerminalError::Unsupported("private mode"))
+        );
+        assert!(unknown.is_failed_closed());
+        assert_eq!(unknown.next_source_sequence(), 0);
+    }
+}
+
+#[test]
 fn openconsole_startup_preserves_faint_and_color_queries() {
     let bytes =
         b"\x1b[1t\x1b[c\x1b[?1004h\x1b[?9001h\x1b[2mF\x1b[22mN\x1b]10;?\x1b\\\x1b]11;?\x1b\\";

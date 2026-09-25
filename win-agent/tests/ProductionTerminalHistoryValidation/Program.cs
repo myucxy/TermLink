@@ -165,6 +165,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidateTerminalHistoryLifecycleGate(root, pcDeviceId);
                 ValidateNoOutputSnapshotEligibility(root, pcDeviceId);
                 ValidateTerminalCoreSnapshotV2(root, pcDeviceId);
+                ValidateAlternateScrollCheckpointRecovery(root, pcDeviceId);
                 ValidateTerminalCoreTransientPrefixReconciliation(root, pcDeviceId);
                 ValidateTerminalCoreHostEffectV2Replay(root, pcDeviceId);
                 ValidateTerminalCoreAuthorityMigration(root, pcDeviceId);
@@ -1998,6 +1999,43 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     CryptographicOperations.ZeroMemory(prepared.SealedObject);
                 CryptographicOperations.ZeroMemory(recipient.PairwiseKey);
             }
+        }
+
+        private static void ValidateAlternateScrollCheckpointRecovery(string root, Guid pcDeviceId)
+        {
+            var store = new ProductionTerminalHistoryStore(
+                Path.Combine(root, "alternate-scroll-recovery"), pcDeviceId);
+            var sessionId = Guid.NewGuid();
+            store.AppendCommittedFrame(new LocalFrame(LocalFrameType.Output, sessionId, 1,
+                Encoding.UTF8.GetBytes("MAIN")));
+            store.AppendCommittedFrame(new LocalFrame(LocalFrameType.Output, sessionId, 2,
+                Encoding.UTF8.GetBytes("\x1b[?1049h\x1b[?1007h\x1b[1;1H\x1b[JALT")));
+            // Simulate the persisted checkpoint left by the pre-fix Windows core.
+            store.SaveCheckpoint(new ProductionTerminalHistoryCheckpoint
+            {
+                SessionId = sessionId,
+                LastSequence = 2,
+                AuthorityVersion = 2,
+                SnapshotEligible = false,
+                IneligibilityCode = "NATIVE_UNSUPPORTED"
+            });
+            using var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId,
+                terminalCoreShadowEnabled: false, terminalCoreSnapshotAuthorityEnabled: true,
+                terminalCoreShadowObserver: null);
+            var result = producer.ProcessSession(sessionId);
+            Require(result.SnapshotEligible && result.LastSequence == 2,
+                "Alternate scroll must recover the old rejected checkpoint from its WAL.");
+            var checkpoint = store.LoadCheckpoint(sessionId);
+            try
+            {
+                using var restored = NativeTerminalCoreV2.ImportSnapshot(checkpoint.SnapshotPlaintext);
+                Require(restored.GetPresentationInfo().NextSourceSequence == 3,
+                    "Recovered alternate-scroll checkpoint lost its replay cursor.");
+                restored.ApplyOutputWithHostEffectsV2(3, Encoding.UTF8.GetBytes("\x1b[?1007l\x1b[?1049l"));
+                Require(restored.GetPresentationInfo().NextSourceSequence == 4,
+                    "Recovered checkpoint cannot leave the alternate screen.");
+            }
+            finally { CryptographicOperations.ZeroMemory(checkpoint.SnapshotPlaintext); }
         }
 
         private static void ValidateTerminalCoreTransientPrefixReconciliation(

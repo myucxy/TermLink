@@ -296,8 +296,6 @@
     <string name="settings_screen_copy">Control whether TermLink may let the display time out while it is visible.</string>
     <string name="settings_keep_screen_on">Keep screen on</string>
     <string name="settings_keep_screen_on_copy">Prevent automatic screen timeout while TermLink is in the foreground. You can still turn the screen off manually.</string>
-    <string name="settings_secure_screen">Secure screen</string>
-    <string name="settings_secure_screen_copy">Hide terminal content from screenshots, recents thumbnails and screen recordings. Terminal content is sensitive; disable only temporarily for debugging.</string>
     <string name="settings_terminal_title">Terminal display</string>
     <string name="settings_terminal_copy">Choose a terminal font scheme, size, line spacing, and colors.</string>
     <string name="settings_terminal_font_size">Preferred font size %1$.0fsp</string>

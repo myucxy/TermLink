@@ -52,10 +52,6 @@ internal class EmbeddedOidcActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setFlags(
-            android.view.WindowManager.LayoutParams.FLAG_SECURE,
-            android.view.WindowManager.LayoutParams.FLAG_SECURE,
-        )
         val launch = runCatching { EmbeddedOidcContract.readLaunch(intent) }.getOrElse {
             finishWithInvalidRequest()
             return

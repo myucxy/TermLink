@@ -37,6 +37,42 @@ import kotlinx.coroutines.withTimeoutOrNull
 @RunWith(AndroidJUnit4::class)
 class JniNativeBridgeInstrumentedTest {
     @Test
+    fun alternateScrollHintMatchesTermuxAndRestoresCheckpoint() {
+        val output = object : com.termux.terminal.TerminalOutput() {
+            override fun write(data: ByteArray?, offset: Int, count: Int) = Unit
+            override fun titleChanged(oldTitle: String?, newTitle: String?) = Unit
+            override fun onCopyTextToClipboard(text: String?) = Unit
+            override fun onPasteTextFromClipboard() = Unit
+            override fun onBell() = Unit
+            override fun onColorsChanged() = Unit
+        }
+        val reference = com.termux.terminal.TerminalEmulator(output, 8, 2, 1, 1, 0, null)
+        val prefix = "MAIN".encodeToByteArray()
+        val suffix = "\u001b[?1049h\u001b[?1007h\u001b[1;1H\u001b[JALT".encodeToByteArray()
+        NativeTerminalHandle.create(JniNativeBridge, TerminalSize(8, 2), 1).use { terminal ->
+            terminal.feedWithHostEffectsV2(1, prefix)
+            reference.append(prefix, prefix.size)
+            val checkpoint = terminal.exportCheckpoint().copyPayload()
+            NativeTerminalHandle.importCheckpoint(JniNativeBridge, checkpoint).use { restored ->
+                suffix.forEachIndexed { index, byte ->
+                    restored.feedWithHostEffectsV2(index + 2L, byteArrayOf(byte))
+                    reference.append(byteArrayOf(byte), 1)
+                }
+                assertEquals("ALT", frameText(restored.renderV3().renderFrame).trim())
+                assertEquals(reference.screen.transcriptText.trim(), frameText(restored.renderV3().renderFrame).trim())
+                val alternate = restored.exportCheckpoint().copyPayload()
+                NativeTerminalHandle.importCheckpoint(JniNativeBridge, alternate).use { reopened ->
+                    val leave = "\u001b[?1007l\u001b[?1049l".encodeToByteArray()
+                    reopened.feedWithHostEffectsV2(suffix.size + 2L, leave)
+                    reference.append(leave, leave.size)
+                    assertEquals("MAIN", frameText(reopened.renderV3().renderFrame).trim())
+                    assertEquals(reference.screen.transcriptText.trim(), frameText(reopened.renderV3().renderFrame).trim())
+                }
+            }
+        }
+    }
+
+    @Test
     fun measuredPhoneViewportRespectsFontScaleSpacingAndKeyboardArea() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val intent = android.content.Intent(instrumentation.context, ViewportTestActivity::class.java)

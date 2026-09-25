@@ -343,7 +343,6 @@ private val productLightColors = lightColorScheme(
 private const val PRODUCT_PREFERENCES = "termlink_product_preferences"
 private const val PRODUCT_THEME_KEY = "theme_preference"
 private const val PRODUCT_KEEP_SCREEN_ON_KEY = "keep_screen_on"
-private const val PRODUCT_SECURE_SCREEN_KEY = "secure_screen"
 private const val PRODUCT_PRIMARY_DESTINATION_KEY = "primary_destination"
 private const val PRODUCT_SELECTED_SESSION_ID_KEY = "selected_session_id"
 private const val PRODUCT_OPENED_SESSION_IDS_KEY = "opened_session_ids_v1"
@@ -762,28 +761,6 @@ internal fun applyKeepScreenOn(window: Window, enabled: Boolean) {
     }
 }
 
-internal fun loadSecureScreenPreference(context: android.content.Context): Boolean =
-    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
-        .getBoolean(PRODUCT_SECURE_SCREEN_KEY, true)
-
-internal fun saveSecureScreenPreference(context: android.content.Context, enabled: Boolean) {
-    context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
-        .edit()
-        .putBoolean(PRODUCT_SECURE_SCREEN_KEY, enabled)
-        .apply()
-}
-
-internal fun applySecureScreen(window: Window, enabled: Boolean) {
-    if (enabled) {
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE,
-        )
-    } else {
-        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-    }
-}
-
 internal fun shouldHideProductStatusBar(orientation: Int): Boolean =
     orientation == Configuration.ORIENTATION_LANDSCAPE
 
@@ -855,11 +832,6 @@ class ProductActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // The terminal renders remote shell content (tokens, keys, source);
-        // keep it out of system screenshots, recents thumbnails and recordings
-        // unless the user explicitly disables the protection in Settings.
-        val initialSecureScreen = loadSecureScreenPreference(this)
-        applySecureScreen(window, initialSecureScreen)
         repositoryOwner = ViewModelProvider(
             this,
             ProductRepositoryViewModel.Factory(applicationContext),
@@ -875,7 +847,6 @@ class ProductActivity : ComponentActivity() {
             val context = LocalContext.current
             var themePreference by rememberSaveable { mutableStateOf(loadThemePreference(context)) }
             var keepScreenOn by remember { mutableStateOf(initialKeepScreenOn) }
-            var secureScreen by remember { mutableStateOf(initialSecureScreen) }
             var terminalPreferences by remember { mutableStateOf(loadTerminalDisplayPreferences(context)) }
             var shortcutPreferences by remember { mutableStateOf(loadTerminalShortcutPreferences(context)) }
             val systemDark = isSystemInDarkTheme()
@@ -890,7 +861,6 @@ class ProductActivity : ComponentActivity() {
                 controller.isAppearanceLightStatusBars = !dark
                 controller.isAppearanceLightNavigationBars = !dark
                 applyKeepScreenOn(window, keepScreenOn)
-                applySecureScreen(window, secureScreen)
             }
             MaterialTheme(colorScheme = colors) {
                 ProductApp(
@@ -907,12 +877,6 @@ class ProductActivity : ComponentActivity() {
                         keepScreenOn = it
                         applyKeepScreenOn(window, it)
                         saveKeepScreenOnPreference(context, it)
-                    },
-                    secureScreen = secureScreen,
-                    onSecureScreenChanged = {
-                        secureScreen = it
-                        applySecureScreen(window, it)
-                        saveSecureScreenPreference(context, it)
                     },
                     terminalPreferences = terminalPreferences,
                     onTerminalPreferencesChanged = {
@@ -1056,8 +1020,6 @@ fun ProductApp(
     onThemePreferenceChanged: (ProductThemePreference) -> Unit = {},
     keepScreenOn: Boolean = false,
     onKeepScreenOnChanged: (Boolean) -> Unit = {},
-    secureScreen: Boolean = true,
-    onSecureScreenChanged: (Boolean) -> Unit = {},
     terminalPreferences: TerminalDisplayPreferences = TerminalDisplayPreferences(),
     onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit = {},
     shortcutPreferences: TerminalShortcutPreferences = TerminalShortcutPreferences(),
@@ -1671,8 +1633,6 @@ fun ProductApp(
                     onThemePreferenceChanged = onThemePreferenceChanged,
                     keepScreenOn = keepScreenOn,
                     onKeepScreenOnChanged = onKeepScreenOnChanged,
-                    secureScreen = secureScreen,
-                    onSecureScreenChanged = onSecureScreenChanged,
                     onSignIn = { runOperation(repository::signIn) },
                     onSignOut = { signOutConfirmation = true },
                     onCheckForUpdate = { runOperation { repository.checkForUpdate(force = true) } },
@@ -3189,8 +3149,6 @@ private fun ProductContent(
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
     keepScreenOn: Boolean,
     onKeepScreenOnChanged: (Boolean) -> Unit,
-    secureScreen: Boolean,
-    onSecureScreenChanged: (Boolean) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
     shortcutPreferences: TerminalShortcutPreferences,
@@ -3392,8 +3350,6 @@ private fun ProductContent(
                 onThemePreferenceChanged = onThemePreferenceChanged,
                 keepScreenOn = keepScreenOn,
                 onKeepScreenOnChanged = onKeepScreenOnChanged,
-                secureScreen = secureScreen,
-                onSecureScreenChanged = onSecureScreenChanged,
                 terminalPreferences = terminalPreferences,
                 onTerminalPreferencesChanged = onTerminalPreferencesChanged,
                 shortcutPreferences = shortcutPreferences,
@@ -5992,8 +5948,6 @@ private fun SettingsPage(
     onThemePreferenceChanged: (ProductThemePreference) -> Unit,
     keepScreenOn: Boolean,
     onKeepScreenOnChanged: (Boolean) -> Unit,
-    secureScreen: Boolean,
-    onSecureScreenChanged: (Boolean) -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit,
     shortcutPreferences: TerminalShortcutPreferences,
@@ -6143,38 +6097,6 @@ private fun SettingsPage(
                 checked = keepScreenOn,
                 onCheckedChange = onKeepScreenOnChanged,
             )
-        }
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable { onSecureScreenChanged(!secureScreen) }
-                .padding(14.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    Text(
-                        stringResource(R.string.settings_secure_screen),
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Text(
-                        stringResource(R.string.settings_secure_screen_copy),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Switch(
-                    checked = secureScreen,
-                    onCheckedChange = onSecureScreenChanged,
-                )
-            }
         }
     }
 

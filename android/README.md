@@ -1,5 +1,13 @@
 # TermLink Android
 
+Android 产品页和内嵌登录页允许系统截图、录屏及最近任务缩略图，不再设置
+`FLAG_SECURE`；旧版 `secure_screen` 设置不再读取，设置页也已移除该开关。
+此策略只影响 Android 窗口，不改变终端渲染、协议或 Windows core。
+参考核对：`termux/termux-app` 提交 `3df69d1da197dd9bd71a3bafd902dffd720576b4`
+的 `app/src/main/java/com/termux/app/TermuxActivity.java` 未设置 `FLAG_SECURE`；
+仓库固定的 terminal 模块、补丁和 `terminal-engine-termux` 也不负责窗口截图策略。
+这里只参考窗口行为，使用 Android 默认行为，无需复制 Termux 代码。
+
 阶段 0/1 Android 工程包含：
 
 - `terminal-engine-api`：不依赖 Termux、WebView 或业务 UI 的稳定引擎边界；

@@ -2063,6 +2063,11 @@ impl Terminal {
                 1048 if enabled => self.save_active_cursor(),
                 1048 => self.restore_active_cursor(),
                 1049 => self.set_saved_alternate_buffer(enabled)?,
+                // Alternate-scroll is a frontend wheel-to-key policy, not a grid
+                // mutation. We do not implement that policy: consume this hint
+                // (as pinned Termux does) without changing input or snapshots.
+                // DECRQM still reports it as unrecognized, not falsely enabled.
+                1007 => {}
                 69 => {
                     let changed = self.modes.set_private_mode(parameter, enabled);
                     debug_assert!(changed);
