@@ -41,10 +41,40 @@ emulator-5554 / Android 16 上 20 项真实 JNI/Canvas/触摸仪器测试通过�
 开关切换正常，恢复关闭后轻点可以显示浮动输入法；没有向用户会话输入命令或远端鼠标操作。
 非鼠标模式开关保持 ON 时的点击、滚动恢复以及取消、失焦、双击由自动化测试覆盖。
 
-Production 构建、上传与公开接口复核结果将在完成后补录；此预发布记录不表示已经上线。
+Production 构建、独立签名校验、双端 AppShip stable 发布及公开更新接口复核均已完成。
 
 证据放在 ignored 的 `artifacts/validation/release-122-*`。源码、说明提交推送后才构建 Production。
-APK/Setup、凭据和 `.appship` 状态不提交。最终制品源码 revision 以构建 manifest 为准。
+APK/Setup、凭据和 `.appship` 状态不提交。最终制品源码 revision 为
+`b10ebc11d7be0ac2a56f967fce14acb05026ac44`；构建时 HEAD 与 origin/main 相同，工作树干净。
+Windows ProductVersion 为 `0.2.66.122+b10ebc11d7be0ac2a56f967fce14acb05026ac44`。
+
+## 正式产物与上线证据
+
+| 平台 | 产物 | 大小 | SHA-256 |
+| --- | --- | ---: | --- |
+| Android | `artifacts/release/0.2.66-122/TermLink-Android-0.2.66-122.apk` | 38,059,958 | `8c38eb11f0fcf3084afd7f8314d3fad525c368622219f335fe3824682f676d02` |
+| Windows x64 | `artifacts/release/0.2.66-122/TermLink-Setup-0.2.66.122-x64.exe` | 182,470,880 | `398960145999552148e27ef5bfc698dd7db6148a151f2aedfefb7a06aba292b1` |
+
+APK 唯一 signer 与既有签名一致；Windows Setup 和内嵌 TermLink 程序均为有效原 signer，
+具备 RFC 3161 时间戳。双端 `Verify-LocalRelease.ps1` 独立验证通过。
+APK DEX 无 Termux 类引用，四个 ABI 的 terminal JNI 库与 0.2.65/121 完全相同。
+
+- Windows application：`0ae760b3-294e-48e8-a793-95d162f685e2`；
+  release：`a5c44928-1d59-41da-843d-fd1452743eea`；artifact：`786ab91a-bcaf-4fc7-86a0-8d1bce2b2eb1`。
+- Android application：`4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`；
+  release：`47b5bf17-3b28-4bf7-9d9b-d3dfe7327170`；artifact：`b65290a1-5aed-489f-a49c-38466b67e6ea`。
+- 双端 release 均为 `published`，artifact 均为 `ready`、`manual_approved`。
+  Windows build 120 与 Android build 121 均返回 `optional` 指向 0.2.66/122；build 122 均返回 `no_update`。
+  公共接口的哈希、大小与本地 manifest 一致。
+- 状态文件：`.appship/termlink-win64-stable-0.2.66-build122-signature-approved.json`、
+  `.appship/termlink-android-stable-0.2.66-build122-signature-approved.json`。
+- 证据：`release-122-production-build.log`、`release-122-setup-signature.json`、
+  `release-122-apk-content.json`、`release-122-appship-*.log`、`release-122-*-public-after.json`。
+
+构建的首次尝试因为把实际 cargo 二进制传给了要求 `+1.97.1` 的脚本而退出，尚未产生正式 manifest；
+改为已有 rustup 代理 `D:/Dev/Env/Rust/cargo/bin/cargo.exe` 后成功，不改动源码或工具版本。
+Windows 签名期间仅暂时导入同一私钥证书到 CurrentUser/My，使用 thumbprint 签名，结束后移除新增项；
+没有把 PFX 密码传给 SignTool 命令参数。
 
 ## 回滚和限制
 
