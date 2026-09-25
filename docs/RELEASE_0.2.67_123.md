@@ -28,8 +28,30 @@ Android 16 模拟器真实 JNI/触摸/Canvas 测试 21 项通过；新增辅助�
 恢复两行 Dock、触摸鼠标关闭、键盘关闭。没有向用户 Codex 会话发送命令或鼠标输入。
 日志和截图保存在 ignored 的 `artifacts/validation/wheel-*`。
 
-源码和本说明提交、推送后才构建 Production。正式 APK、签名验证和 AppShip 上线证据将在完成后补记；
-本段预检记录不代表已发布。发布操作使用仓库 Build-Release / Verify-LocalRelease / Publish-AppShipProduction 入口。
+源码和本说明提交、推送后才构建 Production，构建时工作树干净，HEAD 与 origin/main 均为
+`27089f02ece9acf81541b99998edf9879efa9374`。发布操作使用仓库 Build-Release / Verify-LocalRelease /
+Publish-AppShipProduction 入口。
+
+## 正式发布结果
+
+Production 构建、独立验证、AppShip stable 上传发布、更新决策和公开下载复核均已完成。
+
+- APK：`artifacts/release/0.2.67-123/TermLink-Android-0.2.67-123.apk`，38,060,686 字节。
+- SHA-256：`f953447f09630a655b373146fe5f65b9fb8048c62c356b3a816ccfc0e3f01d30`。
+- 唯一 Android signer 与上述连续性指纹一致，v2 签名验证通过，证书有效至 2053-12-03。
+  版本/applicationId 核验通过；四个 ABI 的 JNI 等原生库与 build 122 字节一致，DEX 未引用 Termux 类。
+- application ID：`4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`。
+- release ID：`aa010f2d-2399-4e81-9eb6-c46643852656`，状态 `published`。
+- artifact ID：`83087ad4-cfb8-4250-83d7-67fa284a8ff5`，状态 `ready`，签名审核 `manual_approved`。
+- Android build 122 返回 `optional` 指向 0.2.67/123；build 123 返回 `no_update`。
+  公开下载 APK 的 SHA-256 和大小与本地 Production manifest 一致。Windows build 122 仍为 `no_update`。
+- 恢复状态保存在 `.appship/termlink-android-stable-0.2.67-build123-signature-approved.json`。
+  构建、上传、下载校验及模拟器证据在 ignored 的 `artifacts/validation/release-123-*`。
+
+模拟器原装为 Debug signer，已从同一源码构建 0.2.67/123 Debug APK 并原地覆盖；
+`appId=10224`、`firstInstallTime=2026-09-19 10:16:29` 保持，账号和数据未清理。
+升级后 HOME-PC 既有 Codex 会话画面恢复，状态为 Controlling，辅助滚轮及键盘按钮显示正常。
+本机 Windows、Server 和 Docker 未升级。
 
 ## 回滚与限制
 
