@@ -46,9 +46,21 @@ Ensure-DevEnv 核验已安装 JDK 21.0.7 / Android SDK；Build-Release -Plan 仅
 
 ## 发布状态
 
-源码及本说明固定提交后，按 Build-Release / Verify-LocalRelease / Publish-AppShipProduction
-执行 Production 构建、独立核验、AppShip stable 发布和公开更新/下载哈希复核。
-实际 revision、制品和发布 ID 将在完成后补录；本节当前不代表上传完成。
+Production 构建、独立核验、AppShip stable 发布和公开更新/下载哈希复核均已完成。
+构建时工作树干净，HEAD 与 origin/main 均为 `3720b14e166008a833338a86c6b5f0f4499b5a36`。
+
+- APK：`artifacts/release/0.2.69-125/TermLink-Android-0.2.69-125.apk`，38,064,178 字节。
+- SHA-256：`b4364235833f40549d063005272557ea5511e8a8f0de55b84d9fd545589167fa`。
+- 独立验证 applicationId=`dev.termlink.harness`、versionName=0.2.69、versionCode=125；
+  唯一 signer 与上述连续性指纹一致，APK v2 签名通过。
+- AppShip application ID：`4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2`。
+- release ID：`b9d5c8cc-304d-44c9-a107-b57159b68470`，状态 `published`。
+- artifact ID：`acf17173-f56c-4190-9ca7-8f7949a40eff`，状态 `ready`、`manual_approved`。
+- Android build 124 返回 `optional` 并指向 0.2.69/125；build 125 返回 `no_update`。
+  公开下载的 APK 大小、SHA-256 与 Production manifest 一致。Windows build 122 仍为 `no_update`。
+- 幂等发布状态：`.appship/termlink-android-stable-0.2.69-build125-signature-approved.json`。
+- 最终模拟器会话已恢复，滚轮切回默认右侧；本轮测试开始后的 crash buffer 无记录。
+  模拟器使用同源码 Debug APK，未卸载或清数据；没有部署 Windows 或 Server。
 
 ## 回滚
 
