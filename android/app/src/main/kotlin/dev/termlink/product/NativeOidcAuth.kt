@@ -283,20 +283,8 @@ internal class NativeOidcClient(
     private fun parseTokenResponse(body: String): NativeTokenPayload {
         val document = parseObject(body, NativeOidcFailure.TOKEN_REQUEST_FAILED)
         val errorCode = document["error"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-        val errorDescription = document["error_description"]?.jsonPrimitive?.contentOrNull?.lowercase(Locale.US).orEmpty()
         if (errorCode.isNotEmpty()) {
-            val actionRequired = errorCode in BROWSER_REQUIRED_ERRORS ||
-                errorDescription.contains("required action") ||
-                errorDescription.contains("verify") ||
-                errorDescription.contains("setup")
-            val reason = if (actionRequired) {
-                NativeOidcFailure.ACCOUNT_SETUP_REQUIRED
-            } else if (errorCode == "invalid_grant") {
-                NativeOidcFailure.INVALID_CREDENTIALS
-            } else {
-                NativeOidcFailure.TOKEN_REQUEST_FAILED
-            }
-            throw NativeOidcException(reason)
+            throw NativeOidcException(tokenFailure(document))
         }
         val accessToken = document["access_token"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
         if (accessToken.isEmpty()) throw NativeOidcException(NativeOidcFailure.TOKEN_REQUEST_FAILED)
@@ -327,14 +315,9 @@ internal class NativeOidcClient(
                     // Read only enough to classify an OAuth error.  The body is
                     // dropped immediately and never included in an exception.
                     val bounded = body?.let { readBoundedOidcResponse(it, maxResponseBytes, failure) }.orEmpty()
-                    if (failure == NativeOidcFailure.TOKEN_REQUEST_FAILED && bounded.isNotBlank()) {
+                    if (failure == NativeOidcFailure.TOKEN_REQUEST_FAILED && response.code in 400..401 && bounded.isNotBlank()) {
                         runCatching { parseObject(bounded, failure) }.getOrNull()?.let { document ->
-                            val code = document["error"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                            val description = document["error_description"]?.jsonPrimitive?.contentOrNull?.lowercase(Locale.US).orEmpty()
-                            if (code in BROWSER_REQUIRED_ERRORS || description.contains("required action") || description.contains("setup") || description.contains("verify")) {
-                                throw NativeOidcException(NativeOidcFailure.ACCOUNT_SETUP_REQUIRED)
-                            }
-                            if (code == "invalid_grant") throw NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS)
+                            throw NativeOidcException(tokenFailure(document))
                         }
                     }
                     throw NativeOidcException(failure)
@@ -345,6 +328,18 @@ internal class NativeOidcClient(
             throw error
         } catch (error: Exception) {
             throw NativeOidcException(NativeOidcFailure.NETWORK, cause = error)
+        }
+    }
+
+    private fun tokenFailure(document: JsonObject): NativeOidcFailure {
+        val code = document["error"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+        val description = document["error_description"]?.jsonPrimitive?.contentOrNull?.lowercase(Locale.US).orEmpty()
+        return when {
+            code in BROWSER_REQUIRED_ERRORS || code == "invalid_grant" &&
+                (description.contains("required action") || description.contains("setup") || description.contains("verify")) ->
+                NativeOidcFailure.ACCOUNT_SETUP_REQUIRED
+            code == "invalid_grant" -> NativeOidcFailure.INVALID_CREDENTIALS
+            else -> NativeOidcFailure.TOKEN_REQUEST_FAILED
         }
     }
 

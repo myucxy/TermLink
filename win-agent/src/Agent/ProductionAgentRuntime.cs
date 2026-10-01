@@ -1018,6 +1018,7 @@ namespace TermLink.Agent
 
         private void StartDirectRuntimesSafely()
         {
+            if (IsReauthenticationRequired || Volatile.Read(ref disposed) != 0) return;
             if (directDataRuntime == null || directShadowRuntime == null) return;
             TryStartSharedDirectRuntimes(
                 directDataRuntime.Start,
@@ -1151,6 +1152,12 @@ namespace TermLink.Agent
                     : () => directDataRuntime.DisposeAsync()).ConfigureAwait(false);
         }
 
+        private void BeginDirectRuntimeCleanup()
+        {
+            lock (lifecycleSync)
+                directShadowCleanupTask ??= Task.Run(DisposeDirectRuntimesSafelyAsync);
+        }
+
         internal static async Task DisposeSharedDirectRuntimesInOrderAsync(
             Func<ValueTask> disposeShadow,
             Action detachSignalingObserver,
@@ -1189,10 +1196,11 @@ namespace TermLink.Agent
 
         private async Task DirectRoutingPolicyLoopAsync()
         {
-            while (!cancellation.IsCancellationRequested)
+            while (!cancellation.IsCancellationRequested && !IsReauthenticationRequired)
             {
                 await Task.Delay(DirectRoutingPolicyRefreshInterval, cancellation.Token)
                     .ConfigureAwait(false);
+                if (IsReauthenticationRequired) return;
                 var snapshot = directSignaling?.Snapshot;
                 if (snapshot?.State == ProductionDirectSignalingLaneState.Connected)
                     await RefreshDirectServerConfigAsync(snapshot.Generation, cancellation.Token)
@@ -4481,6 +4489,10 @@ namespace TermLink.Agent
                 {
                     return;
                 }
+                catch (ProductionReauthenticationRequiredException)
+                {
+                    return;
+                }
                 catch (Exception error) when (
                     error is HttpRequestException ||
                     error is IOException ||
@@ -4942,6 +4954,7 @@ namespace TermLink.Agent
             ProductionDirectPathFenceV5 carrierPath,
             CancellationToken token)
         {
+            if (IsReauthenticationRequired || Volatile.Read(ref disposed) != 0) return;
             if (ingress == null) throw new ArgumentNullException(nameof(ingress));
             var envelope = ingress.Envelope;
             var senderId = GuidFromBytes(envelope.SenderDeviceId.Span); var sessionId = GuidFromBytes(envelope.SessionId.Span);
@@ -8188,7 +8201,21 @@ namespace TermLink.Agent
                 };
                 using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
                 if (response.StatusCode == HttpStatusCode.BadRequest || response.StatusCode == HttpStatusCode.Unauthorized)
-                    throw ReauthenticationRequired();
+                {
+                    // Only a credential rejection is terminal; proxy/configuration errors may recover.
+                    try
+                    {
+                        using var rejection = JsonDocument.Parse(
+                            await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
+                        if (rejection.RootElement.ValueKind == JsonValueKind.Object &&
+                            rejection.RootElement.TryGetProperty("error", out var reason) &&
+                            reason.ValueKind == JsonValueKind.String &&
+                            reason.GetString() is "invalid_grant" or "interaction_required" or
+                                "login_required" or "account_setup_required" or "user_inactive")
+                            throw ReauthenticationRequired();
+                    }
+                    catch (JsonException) { }
+                }
                 response.EnsureSuccessStatusCode();
                 using var tokens = JsonDocument.Parse(
                     await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false));
@@ -8215,13 +8242,18 @@ namespace TermLink.Agent
 
         private void MarkReauthenticationRequired()
         {
-            Interlocked.Exchange(ref reauthenticationRequired, 1);
+            if (Interlocked.Exchange(ref reauthenticationRequired, 1) != 0) return;
             statusExpiresUtc = DateTime.MaxValue;
             SetRelayState(ProductionRelayState.Failed, "ACCOUNT_REAUTH_REQUIRED");
             ClientWebSocket active;
             lock (lifecycleSync) active = socket;
             try { active?.Abort(); }
             catch (ObjectDisposedException) { }
+            // Signalling also owns a server presence entry. Retire every remote lane,
+            // while leaving the local session registry and terminal processes intact.
+            try { directPeerRoutes?.RetireAllDirect("ACCOUNT_REAUTH_REQUIRED"); }
+            catch (Exception error) when (error is not OutOfMemoryException) { }
+            BeginDirectRuntimeCleanup();
         }
 
         private void AddProofHeaders(HttpRequestHeaders headers, HttpMethod method, string target, byte[] body)
@@ -8470,8 +8502,7 @@ namespace TermLink.Agent
             ObserveDirectRelayConnectedSafely(false);
             try { directPeerRoutes.RetireAllDirect("ACCOUNT_RUNTIME_STOPPED"); }
             catch (Exception error) when (error is not OutOfMemoryException) { }
-            if (directShadowRuntime != null || directDataRuntime != null)
-                directShadowCleanupTask = DisposeDirectRuntimesSafelyAsync();
+            BeginDirectRuntimeCleanup();
             commonIngressQueue.Writer.TryComplete();
             pendingSessions.Clear();
 

@@ -419,6 +419,8 @@ class ProductionRealtimeSessionClient(
     private val rendererFatalObserver: (ProductionRendererFatalFailure) -> Unit = {},
     private val sessionDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     private val controlDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
+    authenticationRefresher: ((rejectedToken: String) -> String)? = null,
+    onAuthenticationRejected: (rejectedToken: String) -> Unit = {},
 ) : RemoteSessionOutbound, Closeable, SemanticInputRelayReplay {
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     // JNI parsing/rendering and long replay are serialized per session away
@@ -490,6 +492,8 @@ class ProductionRealtimeSessionClient(
         identity = identity,
         httpClient = httpClient,
         allowCleartextForLocalTest = allowCleartextForLocalTest,
+        authenticationRefresher = authenticationRefresher,
+        onAuthenticationRejected = onAuthenticationRejected,
     )
     private val incomingJob: Job
     private var transportStateJob: Job? = null

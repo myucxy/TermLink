@@ -102,6 +102,52 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun leaseAuthenticationRejectionUsesSharedRefreshAndInvalidation(): Unit = runBlocking {
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val sessionId = UUID.randomUUID()
+        server.enqueue(MockResponse().setResponseCode(401))
+        server.enqueue(MockResponse().setResponseCode(401))
+        var refreshes = 0
+        val rejected = CopyOnWriteArrayList<String>()
+        val client = ProductionRealtimeSessionClient(
+            engine = RecordingEngine(CopyOnWriteArrayList()),
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "old-token" },
+                androidDeviceId = UUID.randomUUID(),
+                pcDeviceId = UUID.randomUUID(),
+                sessionId = sessionId,
+                keyEpoch = 1,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = GenerationRaceSessionTransport(),
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+            authenticationRefresher = { refreshes++; "fresh-token" },
+            onAuthenticationRejected = { rejected += it },
+        )
+        try {
+            assertFailsWith<TermLinkApiException> { client.requestControl() }
+            assertEquals(1, refreshes)
+            assertEquals(listOf("fresh-token"), rejected)
+            assertEquals(2, server.requestCount)
+            val first = server.takeRequest()
+            val retry = server.takeRequest()
+            assertEquals("/v1/sessions/$sessionId/lease", first.path)
+            assertEquals(first.getHeader("Idempotency-Key"), retry.getHeader("Idempotency-Key"))
+            assertEquals("Bearer fresh-token", retry.getHeader("Authorization"))
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun sessionUpsertOptionalTitleIsOneOrderedEventAndLegacyLifecycleStillWorks() {
         val titled = SessionUpsertPayload.newBuilder()
             .setLifecycle("CHANGED")

@@ -951,6 +951,9 @@ class ProductContractsTest {
 
     @Test
     fun onlyRejectedRefreshCredentialsExpireAnEstablishedAuthentication() {
+        assertTrue(isAuthenticationRefreshRejection(NativeOidcException(NativeOidcFailure.ACCOUNT_SETUP_REQUIRED)))
+        assertFalse(isAuthenticationRefreshRejection(NativeOidcException(NativeOidcFailure.TOKEN_REQUEST_FAILED)))
+        assertFalse(isAuthenticationRefreshRejection(NativeOidcException(NativeOidcFailure.INVALID_CONFIGURATION)))
         assertTrue(
             isAuthenticationRefreshRejection(
                 NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS),

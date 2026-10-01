@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Channels;
@@ -17,6 +19,7 @@ namespace TermLink.ProductionDirectTransport.Validation
     {
         internal static async Task ValidateAsync()
         {
+            await ValidateAccountRejectionClosesDirectAsync().ConfigureAwait(false);
             await ValidateExactFallbackAndPeerIsolationAsync().ConfigureAwait(false);
             await ValidateStalePathCannotReplaceSuccessorAsync().ConfigureAwait(false);
             await ValidateFencedRetirementCannotRemoveSuccessorAsync().ConfigureAwait(false);
@@ -2064,6 +2067,42 @@ namespace TermLink.ProductionDirectTransport.Validation
                 "Retirement did not drain exact recovery actions or accepted a stale path fence.");
         }
 
+        private static async Task ValidateAccountRejectionClosesDirectAsync()
+        {
+            var signaling = new FakeSignaling();
+            var native = new FakeNative();
+            await using var direct = new ProductionDirectDataRuntime(Guid.NewGuid(), signaling, Options());
+            Require(direct.Start(), "Test signaling did not start.");
+            Require(await direct.RegisterPeerAsync(Registration(Guid.NewGuid(), 1, native)),
+                "Test Direct peer was not registered.");
+
+            var type = typeof(ProductionAgentRuntime);
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var agent = RuntimeHelpers.GetUninitializedObject(type);
+            type.GetField("lifecycleSync", flags).SetValue(agent, new object());
+            type.GetField("statusSync", flags).SetValue(agent, new object());
+            type.GetField("directDataRuntime", flags).SetValue(agent, direct);
+            var reject = type.GetMethod("MarkReauthenticationRequired", flags);
+            reject.Invoke(agent, null);
+            var cleanup = (Task)type.GetField("directShadowCleanupTask", flags).GetValue(agent);
+            Require(cleanup != null, "Authentication rejection did not schedule Direct cleanup.");
+            await cleanup.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            Require(signaling.DisposeCalls == 1 && native.DisposeCalls == 1 && direct.Snapshot().Count == 0,
+                "Authentication rejection left a signaling presence or native peer alive.");
+            reject.Invoke(agent, null);
+            type.GetMethod("BeginDirectRuntimeCleanup", flags).Invoke(agent, null);
+            Require(ReferenceEquals(cleanup, type.GetField("directShadowCleanupTask", flags).GetValue(agent)) &&
+                    signaling.DisposeCalls == 1,
+                "Repeated rejection/shutdown started competing cleanup workers.");
+            Require((int)type.GetField("disposed", flags).GetValue(agent) == 0,
+                "Authentication rejection disposed the entire local account runtime.");
+            // No queued input/catalog request may run after rejection, even before socket teardown completes.
+            await ((Task)type.GetMethod("HandleIncomingAsync", flags).Invoke(agent, new object[]
+            {
+                null, null, ProductionDirectIngressSourceV5.Direct, Guid.Empty, null, CancellationToken.None
+            })).ConfigureAwait(false);
+        }
+
         private static ProductionDirectDataRuntimeOptions Options(
             ConcurrentQueue<byte[]> relay = null,
             ConcurrentQueue<byte[]> delivered = null,
@@ -2273,6 +2312,7 @@ namespace TermLink.ProductionDirectTransport.Validation
                 Channel.CreateUnbounded<TransportSignalEnvelopeV1>();
             private Exception failure;
             internal int ReaderCount;
+            internal int DisposeCalls;
             internal readonly ConcurrentQueue<TransportSignalEnvelopeV1> Sent = new();
             internal bool SendAllowed = true;
 
@@ -2315,6 +2355,7 @@ namespace TermLink.ProductionDirectTransport.Validation
             }
             public ValueTask DisposeAsync()
             {
+                Interlocked.Increment(ref DisposeCalls);
                 incoming.Writer.TryComplete();
                 return ValueTask.CompletedTask;
             }

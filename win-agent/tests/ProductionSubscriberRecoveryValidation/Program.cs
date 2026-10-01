@@ -41,6 +41,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 ValidateLeaseReleaseDoesNotSwallowUnexpectedFailures(runtimeType);
                 ValidateRepeatedUnauthorizedRequiresReauthentication(runtimeType);
                 ValidateRejectedRefreshTokenStabilizesRuntime(runtimeType);
+                ValidateTransientRefreshFailuresPreserveAuthentication(runtimeType);
                 ValidateForbiddenIdentityEndpointsRequireReauthentication(runtimeType);
                 Console.WriteLine("Production subscriber recovery validation passed.");
                 return 0;
@@ -291,6 +292,8 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             SetField(runtimeType, runtime, "connectionSupervisor", supervisor);
             SetField(runtimeType, runtime, "socket", socket);
             SetField(runtimeType, runtime, "relayErrorCode", "unchanged-relay-state");
+            SetField(runtimeType, runtime, "subscriberAuthoritySync", new object());
+            SetField(runtimeType, runtime, "directAuthorityKeyEpoch", 7L);
 
             var authorizedRecipients = NewRuntimeField(runtimeType, "authorizedRecipients");
             var subscribers = NewRuntimeField(runtimeType, "subscribers");
@@ -504,6 +507,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             }
 
             var emptyRuntime = RuntimeHelpers.GetUninitializedObject(runtimeType);
+            SetField(runtimeType, emptyRuntime, "subscriberAuthoritySync", new object());
             SetField(
                 runtimeType,
                 emptyRuntime,
@@ -759,6 +763,11 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 routes,
                 new[] { (object)routeKey, subscriber });
             Require(added, "The retained subscriber route could not be arranged.");
+            SetField(runtimeType, runtime, "subscriberAuthoritySync", new object());
+            SetField(runtimeType, runtime, "directAuthorityKeyEpoch", 7L);
+            var authorities = NewRuntimeField(runtimeType, "authorizedRecipients");
+            Require(TryAdd(authorities, deviceId, subscriber), "The retained route authority could not be arranged.");
+            SetField(runtimeType, runtime, "authorizedRecipients", authorities);
 
             var task = (Task)getSubscriber.Invoke(
                 runtime,
@@ -894,7 +903,10 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 Require(request.Method == HttpMethod.Post &&
                     request.RequestUri.AbsolutePath == "/token",
                     "Rejected refresh-token validation used an unexpected endpoint.");
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)
+                {
+                    Content = new StringContent("{\"error\":\"invalid_grant\"}")
+                });
             });
             using var context = CreateAuthenticationRuntime(
                 runtimeType,
@@ -922,6 +934,32 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             RequireAuthenticationTerminalState(runtimeType, context.Runtime);
             Require(handler.RequestCount == 1,
                 "Authentication terminal state allowed another token request or manual reconnect.");
+        }
+
+        private static void ValidateTransientRefreshFailuresPreserveAuthentication(Type runtimeType)
+        {
+            var getAccessToken = runtimeType.GetMethod("GetAccessTokenAsync", InstanceFlags);
+            foreach (var failure in new[]
+            {
+                (HttpStatusCode.BadRequest, ""),
+                (HttpStatusCode.Unauthorized, "<html>proxy failure</html>"),
+                (HttpStatusCode.BadRequest, "{\"error\":\"invalid_client\"}"),
+                (HttpStatusCode.ServiceUnavailable, "")
+            })
+            {
+                var handler = new ScriptedHandler((_, _) => Task.FromResult(
+                    new HttpResponseMessage(failure.Item1) { Content = new StringContent(failure.Item2) }));
+                using var context = CreateAuthenticationRuntime(runtimeType, handler,
+                    refreshToken: "unit-test-refresh", tokenEndpoint: "https://oidc.unit.test/token");
+                for (var attempt = 0; attempt < 2; attempt++)
+                {
+                    var error = CaptureAsyncFailure(getAccessToken, context.Runtime, true, CancellationToken.None);
+                    Require(error is HttpRequestException &&
+                            (int)GetField(runtimeType, context.Runtime, "reauthenticationRequired") == 0,
+                        "A transient/configuration refresh failure signed the user out.");
+                }
+                Require(handler.RequestCount == 2, "Transient refresh failure prevented a later retry.");
+            }
         }
 
         private static void ValidateSharedAccountLeaseInput(Type runtimeType)
@@ -1261,6 +1299,8 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             SetField(runtimeType, runtime, "connectionSubscriberRoutes", NewRuntimeField(runtimeType, "connectionSubscriberRoutes"));
             SetField(runtimeType, runtime, "authorizedRecipientGate", new SemaphoreSlim(1, 1));
             SetField(runtimeType, runtime, "authorityExpiresUtc", DateTime.UtcNow.AddMinutes(5));
+            SetField(runtimeType, runtime, "subscriberAuthoritySync", new object());
+            SetField(runtimeType, runtime, "directAuthorityKeyEpoch", 1L);
 
             var createAuthorized = runtimeType.GetMethod(
                 "CreateAuthorizedSubscriberWithSigningKey",

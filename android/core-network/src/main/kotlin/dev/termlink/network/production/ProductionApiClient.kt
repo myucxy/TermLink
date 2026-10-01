@@ -7,8 +7,8 @@ import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -26,6 +26,8 @@ class ProductionApiClient(
     private val identity: DeviceIdentity,
     private val httpClient: OkHttpClient = OkHttpClient(),
     allowCleartextForLocalTest: Boolean = false,
+    private val authenticationRefresher: ((rejectedToken: String) -> String)? = null,
+    private val onAuthenticationRejected: (rejectedToken: String) -> Unit = {},
 ) : Closeable {
     private val root = normalizeRoot(rootUrl, allowCleartextForLocalTest)
     private val json = Json { ignoreUnknownKeys = false; explicitNulls = false }
@@ -57,7 +59,27 @@ class ProductionApiClient(
     private fun execute(method: String, path: String, bodyElement: JsonElement, idempotencyKey: String? = null, includeDeviceProof: Boolean = true): JsonElement {
         require(path.startsWith("/v1/") && !path.contains("#"))
         val body = if (method == "GET" || method == "DELETE") ByteArray(0) else json.encodeToString(JsonElement.serializer(), bodyElement).encodeToByteArray()
-        val builder = Request.Builder().url(root + path).header("Authorization", "Bearer ${tokenProvider.accessToken()}")
+        var token = tokenProvider.accessToken()
+        for (attempt in 0..1) {
+            try {
+                return executeOnce(method, path, body, idempotencyKey, includeDeviceProof, token)
+            } catch (error: TermLinkApiException) {
+                if (error.status != 401 || error.code !in setOf("UNAUTHENTICATED", "HTTP_401") ||
+                    authenticationRefresher == null) throw error
+                if (attempt == 1) {
+                    onAuthenticationRejected(token)
+                    throw error
+                }
+                // Retry only this request, retaining its body/idempotency key and renewing its proof.
+                token = authenticationRefresher.invoke(token)
+                require(token.isNotBlank()) { "OIDC access token is unavailable" }
+            }
+        }
+        error("Authentication retry exhausted")
+    }
+
+    private fun executeOnce(method: String, path: String, body: ByteArray, idempotencyKey: String?, includeDeviceProof: Boolean, token: String): JsonElement {
+        val builder = Request.Builder().url(root + path).header("Authorization", "Bearer $token")
         if (idempotencyKey != null) builder.header("Idempotency-Key", idempotencyKey)
         if (includeDeviceProof) {
             val proof = DeviceProof.create(identity, deviceId.toString(), method, path, body)
@@ -76,12 +98,13 @@ class ProductionApiClient(
         }
         httpClient.newCall(builder.build()).execute().use { response ->
             val raw = response.body?.string().orEmpty()
-            val decoded = if (raw.isBlank()) JsonNull else json.parseToJsonElement(raw)
             if (!response.isSuccessful) {
-                val error = decoded.jsonObject["error"]?.jsonObject
+                // A proxy may return HTML or an empty body. Preserve the HTTP status either way.
+                val decoded = runCatching { json.parseToJsonElement(raw) }.getOrNull() as? JsonObject
+                val error = decoded?.get("error") as? JsonObject
                 throw TermLinkApiException(response.code, error?.get("code")?.toString()?.trim('"') ?: "HTTP_${response.code}", error?.get("trace_id")?.toString()?.trim('"'))
             }
-            return decoded
+            return if (raw.isBlank()) JsonNull else json.parseToJsonElement(raw)
         }
     }
 

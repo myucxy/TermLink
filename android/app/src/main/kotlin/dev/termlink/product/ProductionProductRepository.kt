@@ -429,9 +429,12 @@ internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set
 internal fun hasHostHistoryAuthority(capabilities: Set<String>): Boolean =
     PcCapabilityIds.HOST_HISTORY_V1 in capabilities
 
-/** Only a rejected refresh credential terminates an established sign-in. */
+/** Network/configuration failures are recoverable; rejected credentials require interactive login. */
 internal fun isAuthenticationRefreshRejection(error: Throwable): Boolean =
-    error is NativeOidcException && error.reason == NativeOidcFailure.INVALID_CREDENTIALS
+    error is NativeOidcException && error.reason in setOf(
+        NativeOidcFailure.INVALID_CREDENTIALS,
+        NativeOidcFailure.ACCOUNT_SETUP_REQUIRED,
+    )
 
 /** An outer refresh catch must not replace the actionable expiry message. */
 internal fun shouldPreserveAuthenticationExpiredFailure(
@@ -2272,6 +2275,12 @@ internal class ProductionProductRepository(
                 transport = transport,
                 httpClient = http,
                 allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+                authenticationRefresher = { token ->
+                    refreshRejectedAccessToken(token, realtime.owner.authenticationGeneration, realtime.owner)
+                },
+                onAuthenticationRejected = { token ->
+                    rejectAccessToken(token, realtime.owner.authenticationGeneration, realtime.owner)
+                },
                 inputSequenceProvider = ReservedInputSequenceProvider {
                     sessionStore.reserveInputSequenceRange(sessionId)
                 },
@@ -2767,6 +2776,12 @@ internal class ProductionProductRepository(
                 transport = transport,
                 httpClient = http,
                 allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+                authenticationRefresher = { token ->
+                    refreshRejectedAccessToken(token, realtime.owner.authenticationGeneration, realtime.owner)
+                },
+                onAuthenticationRejected = { token ->
+                    rejectAccessToken(token, realtime.owner.authenticationGeneration, realtime.owner)
+                },
                 inputSequenceProvider = ReservedInputSequenceProvider {
                     sessionStore.reserveInputSequenceRange(session.id)
                 },
@@ -4081,18 +4096,27 @@ internal class ProductionProductRepository(
         val root = currentServerUrl()
         val initial = captureAuthenticationState(expectedGeneration = expectedGeneration)
         diagnostic?.invoke("access_token_started")
-        val token = freshAccessToken(expectedGeneration = initial.authenticationGeneration)
+        freshAccessToken(expectedGeneration = initial.authenticationGeneration)
         diagnostic?.invoke("access_token_completed")
         val refreshed = captureAuthenticationState(expectedGeneration = initial.authenticationGeneration)
         check(refreshed.accountScope == initial.accountScope) { "Authentication account scope changed" }
         val identity = identity(initial.accountScope)
         ProductionApiClient(
             root,
-            AccessTokenProvider { token },
+            AccessTokenProvider {
+                captureAuthenticationState(expectedGeneration = initial.authenticationGeneration)
+                    .authState.accessToken ?: error("OIDC access token is unavailable")
+            },
             identity.deviceId,
             identity.identity,
             httpClient,
             allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
+            authenticationRefresher = { rejectedToken ->
+                refreshRejectedAccessToken(rejectedToken, initial.authenticationGeneration)
+            },
+            onAuthenticationRejected = { rejectedToken ->
+                rejectAccessToken(rejectedToken, initial.authenticationGeneration)
+            },
         ).use { api ->
             diagnostic?.invoke("device_registration_started")
             ensureRegistered(api, identity)
@@ -4102,6 +4126,36 @@ internal class ProductionProductRepository(
             block(api, initial.authenticationGeneration).also {
                 requireCurrentAuthentication(initial.authenticationGeneration)
                 diagnostic?.invoke("api_request_completed")
+            }
+        }
+    }
+
+    // Synchronous HTTP callbacks run on IO; REST and live-session leases share the same refresh lane.
+    private fun refreshRejectedAccessToken(
+        rejectedToken: String,
+        generation: Long,
+        owner: RealtimeAuthenticationOwner? = null,
+    ): String = kotlinx.coroutines.runBlocking {
+        tokenRefresh.serially {
+            val current = captureAuthenticationState(expectedGeneration = generation, expectedRuntimeOwner = owner)
+            // Another request may already have refreshed this token while we waited.
+            requestFreshAccessToken(
+                force = current.authState.accessToken == rejectedToken,
+                expectedGeneration = generation,
+                expectedRuntimeOwner = owner,
+            )
+        }
+    }
+
+    private fun rejectAccessToken(
+        rejectedToken: String,
+        generation: Long,
+        owner: RealtimeAuthenticationOwner? = null,
+    ) = kotlinx.coroutines.runBlocking {
+        tokenRefresh.serially {
+            val current = captureAuthenticationState(expectedGeneration = generation, expectedRuntimeOwner = owner)
+            if (current.authState.accessToken == rejectedToken) {
+                invalidateAuthentication(generation, current.authState, owner)
             }
         }
     }
@@ -4236,15 +4290,16 @@ internal class ProductionProductRepository(
                 check(published) { "Authentication lifecycle changed" }
                 return current
             }
-            val refreshToken = state.refreshToken ?: error("OIDC refresh token is unavailable")
+            val refreshToken = state.refreshToken?.takeIf { it.isNotBlank() }
+                ?: throw NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS)
             val payload = withContext(Dispatchers.IO) { nativeOidc.refresh(configuration, refreshToken) }
             val refreshedSubject = OidcJwtClaims.accessTokenSubject(
                 payload.accessToken,
                 configuration.issuer,
                 configuration.clientId,
             )
-            check(expectedAccountScope == AccountScope.canonical(configuration.issuer, refreshedSubject)) {
-                "OIDC refresh changed account identity"
+            if (expectedAccountScope != AccountScope.canonical(configuration.issuer, refreshedSubject)) {
+                throw NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS)
             }
             val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
                 // Metadata only. A real refresh request here would require
