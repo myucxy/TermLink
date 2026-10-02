@@ -121,6 +121,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
@@ -1141,6 +1142,7 @@ internal class ProductionProductRepository(
         ),
     )
     override val snapshot: StateFlow<ProductSnapshot> = mutableSnapshot.asStateFlow()
+    private val catalogRefreshRequests = Channel<Unit>(Channel.CONFLATED)
 
     override fun onAppBackgrounded(elapsedRealtimeMillis: Long) {
         if (closed) return
@@ -1162,6 +1164,7 @@ internal class ProductionProductRepository(
             ).also { realtimeLifecycleState = it.state }
         }
         if (!observation.accepted) return
+        catalogRefreshRequests.trySend(Unit)
         val backgroundDurationMillis = observation.backgroundDurationMillis ?: return
         if (!isRealtimeNetworkUsable()) {
             synchronized(realtimeLifecycleLock) {
@@ -1198,7 +1201,11 @@ internal class ProductionProductRepository(
     }
     private val sessionCatalogPollJob = scope.launch {
         while (isActive) {
-            delay(SESSION_CATALOG_POLL_INTERVAL_MILLIS)
+            val foreground = synchronized(realtimeLifecycleLock) { realtimeLifecycleState.earliestBackgroundAtMillis == null }
+            withTimeoutOrNull(if (foreground) SESSION_CATALOG_POLL_INTERVAL_MILLIS else 30_000L) {
+                catalogRefreshRequests.receive()
+            }
+            if (synchronized(realtimeLifecycleLock) { realtimeLifecycleState.earliestBackgroundAtMillis != null }) continue
             if (!mutableSnapshot.value.signedIn ||
                 mutableSnapshot.value.enrollmentState == ProductEnrollmentState.REVOKED
             ) continue
@@ -1920,6 +1927,12 @@ internal class ProductionProductRepository(
             freshAccessToken()
             openSession(sessionId)
             val live = liveSessions.getValue(sessionId)
+            val product = mutableSnapshot.value
+            val session = product.sessions.firstOrNull { it.id == sessionId }
+                ?: throw sessionOpenException(SessionOpenFailureCode.SESSION_UNAVAILABLE)
+            if (session.pcId in product.pcSessionCatalogErrors && live.client.sessionState.value !is RemoteSessionState.Controlling) {
+                throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
+            }
             val acquired = live.controlRequestLock.withLock {
                 acquireControlLeaseWithRetry(
                     remoteState = { live.client.sessionState.value },
@@ -3828,7 +3841,7 @@ internal class ProductionProductRepository(
         // any untrusted metadata reaches Room. Refreshes are serialized so a
         // slower response cannot overwrite a newer validated snapshot.
         validateAuthoritativePcKeyTransitions(devices, pcs)
-        closeLiveSessionsForChangedPcIdentities(pcs, sessions)
+        closeLiveSessionsForChangedPcIdentities(pcs, sessions, hostCatalogObservations)
         validateLiveSessionKeys(devices, pcs, sessions)
         historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
         sessions.forEach { historyRepository.upsertSession(it) }
@@ -3883,6 +3896,7 @@ internal class ProductionProductRepository(
                     ),
                     sessions = runtimeSessions,
                     pcSessionCatalogErrors = hostCatalogErrors.toMap(),
+                    pcSessionCatalogObservations = hostCatalogObservations,
                     sessionStates = current.sessionStates.filterKeys(retainedSessionIds::contains),
                     sessionOpenFailures = current.sessionOpenFailures.filterKeys(retainedSessionIds::contains),
                     sessionTitles = reconcileSessionDirectoryTitles(
@@ -3931,6 +3945,7 @@ internal class ProductionProductRepository(
 
     private val hostCatalogTitles = mutableMapOf<UUID, String>()
     private val hostCatalogErrors = mutableMapOf<UUID, String>()
+    private var hostCatalogObservations = emptyMap<UUID, SessionCatalogObservation>()
 
     private suspend fun requestHostCatalog(
         pc: PcSummary,
@@ -3957,6 +3972,7 @@ internal class ProductionProductRepository(
     ): List<SessionSummary> {
         validateAuthoritativePcKeyTransitions(devices, pcs)
         val result = mutableListOf<SessionSummary>()
+        val observations = mutableSnapshot.value.pcSessionCatalogObservations.toMutableMap()
         for (pc in pcs) {
             val device = devices.firstOrNull { it.id == pc.deviceId && it.trustState == DeviceTrustState.TRUSTED }
             try {
@@ -3964,6 +3980,9 @@ internal class ProductionProductRepository(
                     PcCapabilityIds.HOST_SESSION_CATALOG_V1 in pc.capabilities) { "Host catalog unavailable" }
                 val catalog = requestHostCatalog(pc, device, authenticationGeneration)
                 requireCurrentAuthentication(authenticationGeneration)
+                observations[pc.id] = advanceSessionCatalogObservation(observations[pc.id], SessionCatalogObservation(
+                    pc.deviceId, pc.keyEpoch, uuidFromBytes(catalog.hostInstanceId.toByteArray()), catalog.observedAtMs,
+                ))
                 catalog.sessionsList.forEach { item ->
                     val id = uuidFromBytes(item.sessionId.toByteArray())
                     if (id !in deletedSessionIds) {
@@ -3985,6 +4004,8 @@ internal class ProductionProductRepository(
             }
         }
         hostCatalogErrors.keys.retainAll(pcs.mapTo(hashSetOf(), PcSummary::id))
+        observations.keys.retainAll(pcs.mapTo(hashSetOf(), PcSummary::id))
+        hostCatalogObservations = observations.toMap()
         val retained = retainTimedOutCatalogSessions(mutableSnapshot.value, devices, pcs, result, hostCatalogErrors, deletedSessionIds)
         hostCatalogTitles.keys.retainAll(retained.mapTo(hashSetOf(), SessionSummary::id))
         return retained
@@ -4002,7 +4023,7 @@ internal class ProductionProductRepository(
             authenticationStateMutationLock.withLock {
                 requireCurrentAuthentication(authenticationGeneration)
                 validateAuthoritativePcKeyTransitions(devices, pcs)
-                closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions)
+                closeLiveSessionsForChangedPcIdentities(pcs, catalogSessions, hostCatalogObservations)
                 validateLiveSessionKeys(devices, pcs, catalogSessions)
                 historyRepository.persistAuthoritativeKeyMetadata(devices, pcs)
                 catalogSessions.forEach { historyRepository.upsertSession(it) }
@@ -4041,6 +4062,7 @@ internal class ProductionProductRepository(
                         )
                         reconciled.copy(
                             pcSessionCatalogErrors = hostCatalogErrors.toMap(),
+                            pcSessionCatalogObservations = hostCatalogObservations,
                             pcCarrierStates = retainAuthoritativePcCarrierStates(
                                 reconciled.pcCarrierStates,
                                 devices,
@@ -4588,6 +4610,8 @@ internal class ProductionProductRepository(
                 accountLabel = accountDisplayLabel(),
                 devices = listOf(self),
                 pcs = emptyList(),
+                pcSessionCatalogErrors = emptyMap(),
+                pcSessionCatalogObservations = emptyMap(),
                 pcCarrierStates = emptyMap(),
                 sessionCarrierStates = emptyMap(),
                 sessions = emptyList(),
@@ -4795,13 +4819,15 @@ internal class ProductionProductRepository(
     private suspend fun closeLiveSessionsForChangedPcIdentities(
         incomingPcs: List<PcSummary>,
         incomingSessions: List<SessionSummary>,
+        incomingObservations: Map<UUID, SessionCatalogObservation> = mutableSnapshot.value.pcSessionCatalogObservations,
     ) {
         val storedPcs = historyRepository.pcs()
+        val changedHosts = changedSessionCatalogPcIds(mutableSnapshot.value.pcSessionCatalogObservations, incomingObservations)
         val affected = changedPcDeviceIdentitySessionIds(
             storedPcs = storedPcs,
             incomingPcs = incomingPcs,
             sessions = mutableSnapshot.value.sessions + incomingSessions,
-        )
+        ) + (mutableSnapshot.value.sessions + incomingSessions).filter { it.pcId in changedHosts }.map { it.id }
         if (affected.isEmpty()) return
         sessionAuthorityTransitionFences.addAll(affected)
         affected.forEach { sessionId ->
@@ -6741,7 +6767,16 @@ internal class ProductionProductRepository(
         val product = mutableSnapshot.value
         val pc = product.pcs.singleOrNull { it.id == initialSession.pcId } ?: return@withAuthenticatedApi null
         val device = product.devices.singleOrNull { it.id == pc.deviceId } ?: return@withAuthenticatedApi null
-        requestHostCatalog(pc, device, generation).sessionsList
+        val expectedHost = product.pcSessionCatalogObservations[pc.id]
+        val catalog = requestHostCatalog(pc, device, generation)
+        val incoming = SessionCatalogObservation(pc.deviceId, pc.keyEpoch,
+            uuidFromBytes(catalog.hostInstanceId.toByteArray()), catalog.observedAtMs)
+        advanceSessionCatalogObservation(expectedHost, incoming)
+        if (expectedHost != null && expectedHost.hostInstanceId != incoming.hostInstanceId) {
+            catalogRefreshRequests.trySend(Unit)
+            throw sessionOpenException(SessionOpenFailureCode.PC_UNAVAILABLE)
+        }
+        catalog.sessionsList
             .singleOrNull { uuidFromBytes(it.sessionId.toByteArray()) == initialSession.id }
             ?.lastOutputSeq?.toULong()
     }

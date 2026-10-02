@@ -913,6 +913,7 @@ data class ProductSnapshot(
     val sessionCarrierStates: Map<UUID, PcCarrierState> = emptyMap(),
     val directRoutingPolicy: DirectRoutingPolicy = DirectRoutingPolicy.UNKNOWN,
     val pcSessionCatalogErrors: Map<UUID, String> = emptyMap(),
+    val pcSessionCatalogObservations: Map<UUID, SessionCatalogObservation> = emptyMap(),
     val directNetworkChecks: Map<UUID, DirectNetworkCheckState> = emptyMap(),
     val sessions: List<SessionSummary> = emptyList(),
     val remoteFileBrowser: RemoteFileBrowserState = RemoteFileBrowserState(),

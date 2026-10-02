@@ -17,6 +17,8 @@ namespace TermLink.Agent
     {
         private readonly Guid catalogHostInstance = Guid.NewGuid();
         private readonly object catalogSync = new();
+        private readonly object catalogObservationSync = new();
+        private long catalogObservedAtMs;
         private sealed class CatalogMetadata
         {
             public readonly SessionCatalogEntry Entry = new()
@@ -99,6 +101,13 @@ namespace TermLink.Agent
 
         private SessionCatalogResponsePayload BuildSessionCatalog(ByteString requestId)
         {
+            // REST snapshots and encrypted requests share the same observation order.
+            // Keep this separate from catalogSync to preserve the registry/history lock order.
+            lock (catalogObservationSync) return BuildSessionCatalogObservation(requestId);
+        }
+
+        private SessionCatalogResponsePayload BuildSessionCatalogObservation(ByteString requestId)
+        {
             // No history/registry lock may be acquired while holding catalogSync:
             // background recovery publishes metadata in the opposite order.
             var summaries = registry.GetCatalogSummaries().ToDictionary(item => item.SessionId);
@@ -111,7 +120,8 @@ namespace TermLink.Agent
                 {
                     RequestId = requestId,
                     HostInstanceId = ByteString.CopyFrom(GuidBytes(catalogHostInstance)),
-                    ObservedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    ObservedAtMs = catalogObservedAtMs = Math.Max(
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), checked(catalogObservedAtMs + 1))
                 };
                 foreach (var old in catalogEntries.Keys.Where(id => !retained.Contains(id)).ToArray())
                 {

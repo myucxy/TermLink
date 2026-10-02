@@ -3815,9 +3815,10 @@ private fun PcRow(
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     sessions.forEach { session ->
-                        val active = catalogConfirmed && isDeviceSessionActive(session.online)
-                        val statusLabel = if (catalogConfirmed) session.state.localizedLabel()
-                            else stringResource(R.string.session_status_unconfirmed)
+                        val displayState = resolveSessionDisplayState(session, pc,
+                            catalogError = if (catalogConfirmed) null else "UNCONFIRMED")
+                        val active = displayState == SessionDisplayState.RUNNING_CONNECTED
+                        val statusLabel = displayState.localizedLabel()
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -3953,6 +3954,10 @@ private fun SessionsPage(
             snapshot.pcs.any { pc -> pc.id == it.pcId && pc.online }
     }
     val pcsById = snapshot.pcs.associateBy(PcSummary::id)
+    val displayStates = openedSessions.associate { session ->
+        session.id to resolveSessionDisplayState(session, pcsById[session.pcId],
+            snapshot.pcSessionCatalogErrors[session.pcId], snapshot.sessionStates[session.id])
+    }
     val readOnlyOpenableSessionIds = openedSessions.asSequence()
         .filter { session ->
             isSessionTabOpenable(
@@ -4048,6 +4053,7 @@ private fun SessionsPage(
                 ) {
                     SessionList(
                         sessions = activeSessions,
+                        displayStates = displayStates,
                         sessionTitles = snapshot.sessionTitles,
                         selectedId = selected.id,
                         onSessionSelected = onSessionSelected,
@@ -4065,6 +4071,7 @@ private fun SessionsPage(
                     )
                     SessionDetail(
                         session = selected,
+                        displayState = displayStates.getValue(selected.id),
                         displayTitle = displaySessionTitle(selected, snapshot.sessionTitles[selected.id]),
                         pcLabel = pcLabel(selected),
                         carrier = snapshot.carrierForSession(selected),
@@ -4100,6 +4107,7 @@ private fun SessionsPage(
             } else {
                 MobileSessionContent(
                     sessions = activeSessions,
+                    displayStates = displayStates,
                     sessionTitles = snapshot.sessionTitles,
                     selectedId = selected.id,
                     onSessionSelected = onSessionSelected,
@@ -4143,6 +4151,7 @@ private fun SessionsPage(
 @Composable
 private fun MobileSessionContent(
     sessions: List<SessionSummary>,
+    displayStates: Map<java.util.UUID, SessionDisplayState>,
     sessionTitles: Map<java.util.UUID, String>,
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
@@ -4204,6 +4213,7 @@ private fun MobileSessionContent(
         }
         SessionDetail(
             session = session,
+            displayState = displayStates.getValue(session.id),
             displayTitle = displaySessionTitle(session, sessionTitles[session.id]),
             pcLabel = pcLabel(session),
             carrier = resolvePcCarrierForSession(
@@ -4422,6 +4432,7 @@ internal fun sessionImeAvoidance(imeBottom: Int, scaffoldBottom: Int): SessionIm
 @Composable
 private fun SessionList(
     sessions: List<SessionSummary>,
+    displayStates: Map<java.util.UUID, SessionDisplayState>,
     sessionTitles: Map<java.util.UUID, String>,
     selectedId: java.util.UUID,
     onSessionSelected: (java.util.UUID) -> Unit,
@@ -4444,6 +4455,7 @@ private fun SessionList(
                 if (index > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
                 SessionListRow(
                     session = session,
+                    displayState = displayStates.getValue(session.id),
                     displayTitle = displaySessionTitle(session, sessionTitles[session.id]),
                     selected = session.id == selectedId,
                     pcLabel = pcLabel(session),
@@ -4460,6 +4472,7 @@ private fun SessionList(
 @Composable
 private fun SessionListRow(
     session: SessionSummary,
+    displayState: SessionDisplayState,
     displayTitle: String,
     selected: Boolean,
     pcLabel: String,
@@ -4470,11 +4483,7 @@ private fun SessionListRow(
     var actionMenuExpanded by remember(session.id) { mutableStateOf(false) }
     val destructiveAction = sessionDestructiveAction(session.online)
     val destructiveActionLabel = destructiveAction.localizedActionLabel()
-    val stateColor = when (session.state) {
-        SessionState.RUNNING -> MaterialTheme.colorScheme.secondary
-        SessionState.INTERRUPTED -> MaterialTheme.colorScheme.tertiary
-        SessionState.EXITED -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
+    val stateColor = displayState.statusColor()
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -4505,7 +4514,7 @@ private fun SessionListRow(
                         stringResource(
                             R.string.session_summary,
                             pcLabel,
-                            session.state.localizedLabel(),
+                            displayState.localizedLabel(),
                             session.columns,
                             session.rows,
                         ),
@@ -4544,6 +4553,7 @@ private fun SessionListRow(
 @Composable
 private fun SessionDetail(
     session: SessionSummary,
+    displayState: SessionDisplayState,
     displayTitle: String,
     pcLabel: String,
     carrier: PcCarrierState,
@@ -4583,7 +4593,9 @@ private fun SessionDetail(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.Top,
         ) {
-            val statusLabel = remoteState.localizedTerminalStatus()
+            val statusLabel = if (displayState == SessionDisplayState.RUNNING_CONNECTED) {
+                remoteState.localizedTerminalStatus()
+            } else displayState.localizedLabel()
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -4596,7 +4608,7 @@ private fun SessionDetail(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     StatusDot(
-                        color = sessionStatusColor(session.state, sessionOnline, remoteState),
+                        color = displayState.statusColor(),
                         contentDescription = statusLabel,
                     )
                     Text(
@@ -4619,6 +4631,7 @@ private fun SessionDetail(
                         wheelOnLeft = wheelOnLeft,
                         onWheelSideChanged = { saveWheelOnLeft(context, it) },
                         statusLabel = statusLabel,
+                        catalogConfirmed = displayState == SessionDisplayState.RUNNING_CONNECTED,
                         remoteState = remoteState,
                         sessionOnline = sessionOnline,
                         carrier = carrier,
@@ -4678,6 +4691,7 @@ private fun SessionConnectionStatusMenu(
     wheelOnLeft: Boolean,
     onWheelSideChanged: (Boolean) -> Unit,
     statusLabel: String,
+    catalogConfirmed: Boolean,
     remoteState: RemoteSessionState?,
     sessionOnline: Boolean,
     carrier: PcCarrierState,
@@ -4701,7 +4715,7 @@ private fun SessionConnectionStatusMenu(
         }
     }
     val menuTitle = stringResource(R.string.session_connection_menu_title)
-    val canRequestControl = sessionOnline && remoteState is RemoteSessionState.ReadOnly
+    val canRequestControl = catalogConfirmed && sessionOnline && remoteState is RemoteSessionState.ReadOnly
     val canReleaseControl = remoteState is RemoteSessionState.Controlling
     val mouseReporting = engine?.mouseReporting?.collectAsState()?.value ?: false
     BackHandler(enabled = expanded) { expanded = false }
@@ -5213,19 +5227,23 @@ private fun TerminalDockButton(
     }
 }
 
-private fun sessionStatusColor(
-    state: SessionState,
-    sessionOnline: Boolean,
-    remoteState: RemoteSessionState?,
-): Color = when {
-    state == SessionState.EXITED -> ProductMuted
-    remoteState is RemoteSessionState.Exited -> ProductMuted
-    isEstablishingSessionConnection(remoteState) -> ProductWarning
-    remoteState is RemoteSessionState.Reconnecting || remoteState is RemoteSessionState.HistoryGap -> ProductDanger
-    state == SessionState.INTERRUPTED -> ProductDanger
-    !sessionOnline -> ProductMuted
-    else -> ProductPositive
+private fun SessionDisplayState.statusColor(): Color = when (this) {
+    SessionDisplayState.RUNNING_CONNECTED -> ProductPositive
+    SessionDisplayState.RUNNING_UNCONFIRMED, SessionDisplayState.RECONNECTING -> ProductWarning
+    SessionDisplayState.INTERRUPTED, SessionDisplayState.HISTORY_GAP -> ProductDanger
+    SessionDisplayState.EXITED, SessionDisplayState.HOST_OFFLINE -> ProductMuted
 }
+
+@Composable
+private fun SessionDisplayState.localizedLabel(): String = stringResource(when (this) {
+    SessionDisplayState.RUNNING_CONNECTED -> R.string.session_running
+    SessionDisplayState.RUNNING_UNCONFIRMED -> R.string.session_status_unconfirmed
+    SessionDisplayState.HOST_OFFLINE -> R.string.pc_offline_accessibility
+    SessionDisplayState.INTERRUPTED -> R.string.session_interrupted
+    SessionDisplayState.EXITED -> R.string.session_exited
+    SessionDisplayState.RECONNECTING -> R.string.terminal_reconnecting
+    SessionDisplayState.HISTORY_GAP -> R.string.terminal_history_gap
+})
 
 @Composable
 private fun RemoteSessionState?.localizedTerminalStatus(): String = stringResource(

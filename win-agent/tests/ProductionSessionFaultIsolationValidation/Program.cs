@@ -54,7 +54,7 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
                 var type = typeof(ProductionAgentRuntime);
                 var runtime = RuntimeHelpers.GetUninitializedObject(type);
-                foreach (var name in new[] { "catalogSync", "catalogEntries", "destroyedHistorySessions" })
+                foreach (var name in new[] { "catalogSync", "catalogObservationSync", "catalogEntries", "destroyedHistorySessions" })
                 {
                     var field = type.GetField(name, flags);
                     field.SetValue(runtime, Activator.CreateInstance(field.FieldType));
@@ -71,6 +71,12 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 var request = ByteString.CopyFrom(Guid.NewGuid().ToByteArray());
                 var build = type.GetMethod("BuildSessionCatalog", flags);
                 var catalog = (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
+                var futureObservation = catalog.ObservedAtMs + 60_000;
+                type.GetField("catalogObservedAtMs", flags).SetValue(runtime, futureObservation);
+                var afterClockRollback = (SessionCatalogResponsePayload)build.Invoke(runtime, new object[] { request });
+                Require(afterClockRollback.ObservedAtMs == futureObservation + 1 &&
+                    afterClockRollback.HostInstanceId == catalog.HostInstanceId,
+                    "Catalog observation went backwards when the wall clock changed.");
                 Require(catalog.RequestId == request && catalog.Sessions.Count == 1 &&
                     !catalog.Sessions[0].ProcessAlive && catalog.Sessions[0].Lifecycle == "INTERRUPTED" &&
                     catalog.Sessions[0].LastOutputSeq == 2,
