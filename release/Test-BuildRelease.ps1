@@ -164,6 +164,37 @@ $msixBuilderSource = Get-Content -LiteralPath $msixBuilderPath -Raw
 $installerValidatorSource = Get-Content -LiteralPath $installerValidatorPath -Raw
 $directNativeBuilderSource = Get-Content -LiteralPath $directNativeBuilderPath -Raw
 $agentProjectSource = Get-Content -LiteralPath $agentProjectPath -Raw
+& {
+    $setupAst = [Management.Automation.Language.Parser]::ParseInput($setupBuilderSource, [ref]$null, [ref]$null)
+    $invokeToolAst = $setupAst.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Tool'
+    }, $false)
+    . ([scriptblock]::Create($invokeToolAst.Extent.Text))
+    $probe = @{ Calls = 0; Failures = 0; Message = ''; Sleeps = 0 }
+    function signtool.exe {
+        $probe.Calls++
+        $global:LASTEXITCODE = if ($probe.Calls -le $probe.Failures) { 1 } else { 0 }
+        if ($LASTEXITCODE -ne 0) { $probe.Message }
+    }
+    function Start-Sleep { param([int]$Seconds) $probe.Sleeps++ }
+    $timestampError = 'SignTool Error: The specified timestamp server either could not be reached or returned an invalid response.'
+    foreach ($case in @(
+        @{ Failures = 2; Message = $timestampError; Args = @('sign', '/tr', 'http://timestamp.invalid'); Calls = 3; Throws = $false },
+        @{ Failures = 10; Message = $timestampError; Args = @('sign', '/tr', 'http://timestamp.invalid'); Calls = 4; Throws = $true },
+        @{ Failures = 10; Message = 'No certificates were found'; Args = @('sign', '/tr', 'http://timestamp.invalid'); Calls = 1; Throws = $true },
+        @{ Failures = 10; Message = $timestampError; Args = @('verify', '/pa'); Calls = 1; Throws = $true },
+        @{ Failures = 10; Message = $timestampError; Args = @('sign', '/tr', 'http://timestamp.invalid', '/as'); Calls = 1; Throws = $true }
+    )) {
+        $probe.Calls = 0; $probe.Sleeps = 0; $probe.Failures = $case.Failures; $probe.Message = $case.Message
+        $threw = $false
+        try { Invoke-Tool -FilePath signtool.exe -Arguments $case.Args -Quiet }
+        catch { $threw = $true }
+        Assert-True ($probe.Calls -eq $case.Calls -and $threw -eq $case.Throws -and $probe.Sleeps -eq ($case.Calls - 1)) `
+            "Timestamp retry boundary failed: $($case.Args -join ' ') / $($case.Message)"
+    }
+    $global:LASTEXITCODE = 0
+}
 Assert-True ($releaseScriptSource.Contains('status --porcelain --untracked-files=normal')) `
     'Server source identity does not inspect the worktree status.'
 Assert-True ($releaseScriptSource.Contains('$serverSourceRevision-dirty')) `

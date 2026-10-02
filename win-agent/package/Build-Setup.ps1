@@ -64,13 +64,23 @@ function Invoke-Tool {
         [Parameter(Mandatory)][string[]]$Arguments,
         [switch]$Quiet
     )
-    $output = @(& $FilePath @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    if (-not $Quiet -or $exitCode -ne 0) {
-        $output | ForEach-Object { Write-Host $_ }
-    }
-    if ($exitCode -ne 0) {
-        throw "$([IO.Path]::GetFileName($FilePath)) failed with exit code $exitCode."
+    for ($attempt = 1; ; $attempt++) {
+        $output = @(& $FilePath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        if (-not $Quiet -or $exitCode -ne 0) {
+            $output | ForEach-Object { Write-Host $_ }
+        }
+        if ($exitCode -eq 0) { return }
+        # Signing without /as replaces the signature, so a timestamp retry is safe.
+        $retryTimestamp = [IO.Path]::GetFileName($FilePath) -ieq 'signtool.exe' -and
+            $Arguments[0] -eq 'sign' -and $Arguments -contains '/tr' -and
+            $Arguments -notcontains '/as' -and
+            ($output -join "`n").Contains('The specified timestamp server either could not be reached or')
+        if (-not $retryTimestamp -or $attempt -ge 4) {
+            throw "$([IO.Path]::GetFileName($FilePath)) failed with exit code $exitCode."
+        }
+        Write-Warning "Timestamp service failed; retrying signature (attempt $($attempt + 1)/4)."
+        Start-Sleep -Seconds (2 * $attempt)
     }
 }
 

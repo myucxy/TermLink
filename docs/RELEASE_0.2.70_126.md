@@ -7,7 +7,8 @@ This release contains the combined Windows and Android authentication recovery f
 - Android: 0.2.70 / build 126
 - Windows: 0.2.70.126
 - Server/Docker: not included
-- Artifact source revision: to be filled after the source commit is created
+- Android source revision: `e2680facc666b650baa3f55c700f2b6b1f983f7d`
+- Windows source revision: recorded after the packaging retry fix is committed; product code is unchanged from the Android source revision.
 
 ## Changes
 
@@ -15,6 +16,7 @@ This release contains the combined Windows and Android authentication recovery f
 - Android treats only explicit credential or interaction failures as sign-out conditions; transient HTTP, proxy, and service failures remain recoverable.
 - Android session lease/control requests use the same authentication refresh and invalidation path as REST catalog requests.
 - Windows authentication loss closes Relay, Direct signalling, and Direct data runtimes while retaining local terminal state.
+- Windows packaging retries only explicit RFC 3161 service failures (at most four attempts); certificate errors, signature verification, and exhausted retries still stop the build.
 
 ## Validation
 
