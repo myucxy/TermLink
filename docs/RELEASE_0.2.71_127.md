@@ -1,6 +1,8 @@
-# TermLink 0.2.71 / 127 candidate
+# TermLink 0.2.71 / 127 release evidence
 
-Status: joint emulator/Windows acceptance passed; Production build, independent verification and publication pending.
+Status: tests, joint emulator/Windows acceptance, Production build, independent verification, AppShip publication and local Production installation passed.
+
+Production source revision: `a488a4747068e9ae7838ef97b35b7f355a024e97`; the worktree was clean and HEAD equaled origin/main before building both artifacts. This later documentation update does not change product code.
 
 ## Scope and behavior
 
@@ -32,7 +34,28 @@ Status: joint emulator/Windows acceptance passed; Production build, independent 
 - Existing Codex history (`分析历史会话 | TermLink`) restored its final screen. Inspection found that the read-only renderer's synthetic Exited state masked the authoritative Interrupted lifecycle; the display precedence and regression assertion were corrected. Full app tests/lint and signed APK were rerun; a second in-place install confirmed the final label is Interrupted (`catalog-final-interrupted.xml`).
 - UI evidence: `artifacts/validation/catalog-joint-{created,open,restart,resumed,exited,host-offline,host-offline-session,online-restored}.xml`, `catalog-joint-open.png`, `catalog-joint-history.png`, and fixture output `catalog-joint-host.stdout.log`.
 - No physical LAN/NAT matrix or live credential revocation was exercised; existing deterministic Direct/auth tests passed. The original emulator corruption is unrelated to the app and remains unresolved.
-- Record final source revision, exact candidate hashes, independent signature/timestamp verification, joint acceptance evidence, AppShip release/artifact IDs and old/new update decisions here when completed. No Git release tag or Docker deployment is planned.
+- Final Production APK/Setup were independently verified and installed over the acceptance builds before upload. Android retained appId, firstInstallTime and login; Windows retained the existing install root/account and connected Relay. The existing Codex history screen restored with the correct Interrupted label (`catalog-production-history.png`). No Git release tag or Docker deployment was created.
+
+## Production artifacts and publication
+
+| Platform | File | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| Android | `artifacts/release/0.2.71-127/TermLink-Android-0.2.71-127.apk` | 38,080,562 | `6bc7a8c3fdbebaee34ab6727d1886d6057d461681d2b412973b4431b192ce728` |
+| Windows | `artifacts/release/0.2.71-127/TermLink-Setup-0.2.71.127-x64.exe` | 182,484,664 | `38f5f82ae0f2eac8b06a249220f4ab611aac3f8acf1ce118aff54c91f0b25184` |
+
+- Independent `Verify-LocalRelease.ps1`: passed for the combined Production manifest. Android has one approved v2 signer; Windows has Valid Authenticode, the approved signer, verified RFC 3161 timestamp OID `1.3.6.1.4.1.311.3.3.1`, and 17 verified payload binaries.
+- Windows ProductVersion: `0.2.71.127+a488a4747068e9ae7838ef97b35b7f355a024e97`; FileVersion: `0.2.71.127`. Timestamp service: `http://timestamp.sectigo.com` with explicit HTTP opt-in and mandatory cryptographic verification.
+- Android was published first, then Windows, using `scripts/Publish-AppShipProduction.ps1` and the reviewed `appship-publish` skill.
+
+| Platform | Application ID | Release ID | Artifact ID | Published UTC |
+| --- | --- | --- | --- | --- |
+| Android | `4759ec79-a6a2-45d1-9eb9-7ea16b2a3fb2` | `1c65fab1-1ead-4f3b-adf1-43967547f088` | `a4a2b660-e38d-4b44-a47d-bb11c7fcda4f` | 2026-10-02 14:10:33 |
+| Windows | `0ae760b3-294e-48e8-a793-95d162f685e2` | `9230d8f1-ca6a-4b0d-9d11-3f926b0ee3df` | `9f7e711a-c95b-41c5-a1a6-9dbc71950a19` | 2026-10-02 14:12:00 |
+
+- Authenticated online verification confirms both stable releases are `published`, both artifacts `ready`.
+- Both public download endpoints returned the exact local file size/SHA-256. Both platforms return `optional` for build 126 and `no_update` for build 127.
+- Retained idempotency states: `.appship/termlink-android-stable-0.2.71-build127-signature-approved.json` and `.appship/termlink-win64-stable-0.2.71-build127-signature-approved.json`.
+- Verification/publication logs: `artifacts/validation/catalog-production-build.log`, `catalog-production-independent-verification.json`, `catalog-appship-published.json`, `catalog-public-update-checks.json`, and `catalog-joint-acceptance.json`.
 
 ## Rollback
 
