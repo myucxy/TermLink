@@ -7,9 +7,10 @@
 
 现场 AppShip 两端 stable 为 0.3.1/129，发布状态为 published/ready，nextBuildNumber=130；
 Docker Hub 最高版本为 0.3.0，远端 v0.3* tag 为空。本轮固定 **0.3.2/130**，重试不重新加号。
-源码 revision 以本文件首次提交及 Production artifact-manifest 中的完整 revision 为准。
+Production 源码 revision 为 `b697751c4634108fa4c9b9d442f84b21a6787724`，已推送 origin/main，
+构建时工作树干净；Windows ProductVersion 绑定此完整 revision。后续记录提交不改变制品来源。
 
-当前状态：功能及影响范围测试已完成，等待从已提交且推送的干净 revision 构建 Production 制品。
+当前状态：功能及影响范围测试、Production 双端构建与独立校验完成，等待精确制品的人工签名审核，尚未上传 AppShip。
 构建、签名审核、AppShip 上传与客户端部署分别记录，不能把候选构建当成已发布。
 
 ## 发布内容
@@ -44,7 +45,17 @@ Docker Hub 最高版本为 0.3.0，远端 v0.3* tag 为空。本轮固定 **0.3.
 使用既有 Android signer SHA-256 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`、
 Windows signer SHA-1 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466`，构建时重新核对有效期与私钥、
 独立验证制品哈希/版本/签名连续性及 RFC 3161 时间戳。Windows 为既有自签发布者，非公开 CA 信任。
-AppShip 精确制品签名审核见 artifacts/release/0.3.2-130/REVIEW.md（构建完成后生成）。
+AppShip 精确制品签名审核见 artifacts/release/0.3.2-130/REVIEW.md。
+
+| 制品 | 大小（字节） | SHA-256 |
+| --- | ---: | --- |
+| TermLink-Android-0.3.2-130.apk | 38854089 | `7c798dce077f3e2d0caef096f991258c96c8dfe71200f7027569ecac4a9fcb4b` |
+| TermLink-Setup-0.3.2.130-x64.exe | 182638616 | `443440cd1feedd16b06b303b6fb07b6755f5a33c13e73c092043a553900786cf` |
+
+APK v2 唯一 signer、Windows AuthentiCode Valid、17 个载荷二进制、RFC 3161 时间戳及哈希/版本均通过。
+首轮 Microsoft 时间戳服务重试失败，保留日志；同源码/同版本使用 Sectigo 重试成功，未跳过门禁。
+模拟器正式包从 0.3.0/128 无损覆盖至本候选 0.3.2/130，成功启动并保留登录，DEV 仍独立保留。
+签名校验是机器验证，尚不代表人工审核通过；两端上传计划已只读验证。
 
 回滚使用保留的 0.3.1/129 制品及既有签名；Android 不卸载清数据，版本降级限制需要走兼容的
 更高 build 修复发布或受控测试流程。Windows 保留用户数据及安装器回滚证据；Server 不变。
