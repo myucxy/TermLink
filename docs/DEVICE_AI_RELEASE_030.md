@@ -45,6 +45,10 @@
 模拟器 HOME-PC 卡片实际顺序为 +CLI、AI 聊天、文件，点击 AI 聊天可打开绑定 HOME-PC 的创建面板。
 截图与 UI 层级保留在 `artifacts/validation/device-actions-order-*`。
 
+最终按用户要求去掉 CLI 前的 `+`，顺序为 CLI、AI 聊天、文件。旧 HT-LPC-1326 卡片的 AI 入口与
+升级提示已实测；HOME-PC 创建面板和文件入口实测通过。最终发布/本地安装状态见
+[0.3.0 / 128 记录](RELEASE_0.3.0_128.md)，客户端仍暂缓 AppShip，Docker 已按本轮签名例外发布。
+
 ## 发布门禁与回滚
 
 2026-10-04 现场 AppShip 双端 published=0.2.71/127、nextBuild=128；Docker Hub 最新 v0.2.61，
