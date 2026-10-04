@@ -7,6 +7,7 @@ internal static class TimelineValidation
 {
     internal static async Task Run(string directory)
     {
+        await ClaudeBlockFinals(directory);
         var viewer = Guid.NewGuid();
         using var claude = new AiAgentSession(new AiAgentInstallation("claude", "Claude", Environment.ProcessPath!, "", "1", "claude", "available"), directory, viewer);
         await Receive(claude, "ReceiveClaudeAsync", new { type = "stream_event", @event = new { type = "message_start", message = new { id = "m1" } } });
@@ -76,6 +77,52 @@ internal static class TimelineValidation
         var ending = JsonSerializer.SerializeToElement(await endingWatch.WaitAsync(TimeSpan.FromSeconds(2)), AiSessionManager.Json);
         Check(ending.GetProperty("state").GetString() == "interrupted", "Agent exit must return a terminal snapshot, not a transport failure");
         Console.WriteLine("PASS timeline: protocol delta/final merging, public reasoning, watch wake/cancel, reset, stable history after retention, plan, search");
+    }
+
+    private static async Task ClaudeBlockFinals(string directory)
+    {
+        var viewer = Guid.NewGuid();
+        using var session = new AiAgentSession(new AiAgentInstallation("claude", "Claude", Environment.ProcessPath!, "", "1", "claude", "available"), directory, viewer);
+        Task Event(object e) => Receive(session, "ReceiveClaudeAsync", new { type = "stream_event", @event = e });
+        Task Final(string id, string uuid, params object[] content) => Receive(session, "ReceiveClaudeAsync", new { type = "assistant", uuid, message = new { id, content } });
+        async Task Block(int index, string type, string text) {
+            await Event(new { type = "content_block_start", index, content_block = new { type, text = "", thinking = "" } });
+            await Event(new { type = "content_block_delta", index, delta = new { type = type == "thinking" ? "thinking_delta" : "text_delta", text, thinking = text } });
+            await Event(new { type = "content_block_stop", index });
+        }
+        await Event(new { type = "message_start", message = new { id = "blocks" } });
+        await Block(0, "thinking", "Summary");
+        await Final("blocks", "thought-final", new { type = "thinking", thinking = "Summary" });
+        var before = Snap(session, viewer);
+        await Block(1, "text", "Hello");
+        await Final("blocks", "text-final", new { type = "text", text = "Hello" });
+        var changed = JsonSerializer.SerializeToElement(session.Changes(viewer, before.GetProperty("streamId").GetString(), before.GetProperty("cursor").GetString()), AiSessionManager.Json);
+        Check(changed.GetProperty("messages").GetArrayLength() == 1 && changed.GetProperty("messages")[0].GetProperty("id").GetString() == "blocks/1", "Claude singleton final must update its stream block, not overwrite thought /0");
+        var snapshot = Snap(session, viewer).GetProperty("messages");
+        Check(snapshot.GetArrayLength() == 2 && snapshot[0].GetProperty("kind").GetString() == "reasoning" && snapshot[0].GetProperty("text").GetString() == "Summary", "Claude thought must survive the text final");
+        Check(snapshot[1].GetProperty("text").GetString() == "Hello", "Claude text final duplicated");
+
+        // A later block may legitimately say the same thing. Replaying the earlier
+        // envelope must still target its original index, never de-duplicate by text.
+        await Block(2, "text", "Hello");
+        await Final("blocks", "text-final-2", new { type = "text", text = "Hello" });
+        await Final("blocks", "text-final", new { type = "text", text = "Hello corrected" });
+        snapshot = Snap(session, viewer).GetProperty("messages");
+        Check(snapshot.GetArrayLength() == 3 && snapshot[1].GetProperty("text").GetString() == "Hello corrected" && snapshot[2].GetProperty("text").GetString() == "Hello", "Claude replay identity or legitimate equal-text blocks lost");
+        await Final("blocks", "whole-final", new { type = "thinking", thinking = "Summary" }, new { type = "text", text = "Hello corrected" }, new { type = "text", text = "Hello" });
+        Check(Snap(session, viewer).GetProperty("messages").GetArrayLength() == 3, "Whole Claude snapshots duplicated streamed blocks");
+
+        await Event(new { type = "message_start", message = new { id = "next" } });
+        await Event(new { type = "content_block_start", index = 0, content_block = new { type = "tool_use", id = "tool-one" } });
+        await Event(new { type = "content_block_stop", index = 0 });
+        await Final("next", "tool-final", new { type = "tool_use", id = "tool-one", name = "Read", input = new { file_path = "note.txt" } });
+        await Block(1, "text", "Hello");
+        await Final("next", "next-text", new { type = "text", text = "Hello" });
+        snapshot = Snap(session, viewer).GetProperty("messages");
+        Check(snapshot.GetArrayLength() == 5 && snapshot[3].GetProperty("id").GetString() == "tool-tool-one" && snapshot[4].GetProperty("id").GetString() == "next/1", "Tool blocks or message boundary changed Claude indices");
+        await Final("final-only", "final-only-event", new { type = "text", text = "No partial events" });
+        Check(Snap(session, viewer).GetProperty("messages")[5].GetProperty("id").GetString() == "final-only/0", "Final-only provider fallback changed");
+        Console.WriteLine("PASS Claude block finals: thinking/text, deltas, replay UUID, equal text, full snapshots, tools, next message, final-only fallback");
     }
 
     private static JsonElement Snap(AiAgentSession session, Guid viewer) => JsonSerializer.SerializeToElement(session.Snapshot(viewer, true), AiSessionManager.Json);

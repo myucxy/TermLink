@@ -26,6 +26,7 @@ internal fun aiAgentName(id: String): String = when (id) {
     "codex" -> "Codex"
     "claude" -> "Claude Code"
     "zcode" -> "ZCode"
+    "grok" -> "Grok Build"
     else -> id.ifBlank { "AI" }
 }
 

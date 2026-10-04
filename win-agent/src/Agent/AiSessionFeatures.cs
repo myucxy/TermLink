@@ -32,9 +32,9 @@ internal sealed partial class AiAgentSession
     private object Capabilities() => new {
         changes = true, watch = true, search = true, artifacts = true, diffRead = true, configure = CurrentConfiguration().ModelSwitch || CurrentConfiguration().PermissionSwitch,
         configuration = CurrentConfiguration(), steer = agent.Protocol == "codex",
-        resume = agent.Protocol is "codex" or "claude" && threadId.Length > 0,
+        resume = (agent.Protocol is "codex" or "claude" || agent.Protocol == "acp" && acpLoadSession) && threadId.Length > 0,
         fork = agent.Protocol == "codex", history = true, attachments = true, fileReferences = true,
-        nativeImages = agent.Protocol is "codex" or "claude",
+        nativeImages = agent.Protocol is "codex" or "claude" || agent.Protocol == "acp" && acpImages,
         maxFileBytes = MaxFile, maxTotalBytes = MaxAttachments, maxFiles = 5, chunkBytes = 24 * 1024,
         modes = Modes(agent.Protocol)
     };
@@ -46,6 +46,7 @@ internal sealed partial class AiAgentSession
             if (state != "idle" || pending.Count > 0) throw new AiOperationException("AGENT_BUSY");
             if (request.ExpectedSettingsVersion != settingsVersion) throw new AiOperationException("SETTINGS_CHANGED");
         }
+        if (agent.Protocol == "acp") { await ConfigureAcpAsync(request); return; }
         if (agent.Protocol == "zcode" && AdvancedConfiguration(agent)) {
             var previous = (modelId, providerId, permissionMode, reasoningEffort);
             ReadZcodeConfiguration(await RpcAsync("session/read", new { sessionId = threadId, messageLimit = 1 }));
@@ -153,6 +154,8 @@ internal sealed partial class AiAgentSession
             Id = record.Id, threadId = record.NativeId, title = record.Title, permissionMode = record.Mode,
             settingsVersion = record.Version, state = caller == Guid.Empty ? "suspended" : "starting", archive = store, defaultModelId = record.DefaultModel ?? "", reasoningEffort = record.ReasoningEffort ?? "", nativePermissions = record.NativePermissions
         };
+        // A restored Grok record can attempt load; initialize rechecks the native capability.
+        session.acpLoadSession = agent.Protocol == "acp" && agent.Id == "grok";
         session.settingsNotice = "恢复时沿用历史授权；不支持的授权会明确报错。";
         session.messages.AddRange(record.Messages);
         return session;
@@ -279,7 +282,7 @@ internal sealed partial class AiAgentSession
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or AiOperationException) { }
         }
     }
-    private string AttachmentPrompt(string text, Attachment[] files) => text + string.Concat(files.Where(a => !a.IsImage || agent.Protocol == "zcode")
+    private string AttachmentPrompt(string text, Attachment[] files) => text + string.Concat(files.Where(a => !a.IsImage || agent.Protocol == "zcode" || agent.Protocol == "acp" && !acpImages)
         .Select(a => "\nAttached local file (user supplied content): " + JsonSerializer.Serialize(a.Name) + " at " + JsonSerializer.Serialize(a.Path)));
 }
 

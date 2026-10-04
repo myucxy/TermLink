@@ -110,10 +110,10 @@ internal fun AiModelPicker(
     val effortLabel = reasoningEffort.ifBlank { selectedReasoning.defaultValue }.ifBlank { "默认" }
 
     Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-        Box(Modifier.weight(1f)) {
+        Box(Modifier.weight(1f, fill = compact)) {
             Row(
                 Modifier
-                    .fillMaxWidth()
+                    .then(if (compact) Modifier.fillMaxWidth() else Modifier)
                     .heightIn(min = 48.dp)
                     .clickable(enabled = online && (modelSwitch || listing), role = Role.Button) {
                         effortExpanded = false
@@ -125,7 +125,7 @@ internal fun AiModelPicker(
                 if (!compact) Text("模型", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
                     label,
-                    Modifier.weight(1f).padding(horizontal = if (compact) 4.dp else 8.dp),
+                    Modifier.weight(1f, fill = compact).padding(horizontal = if (compact) 4.dp else 8.dp),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodyMedium,

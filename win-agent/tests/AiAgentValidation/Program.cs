@@ -2,6 +2,7 @@ using System.Text.Json;
 using TermLink.Agent;
 using TermLink.Ai;
 
+if (args.Contains("stdio") && args.Contains("agent")) { await AcpValidation.Fixture(); return; }
 if (args.Contains("--fixture")) {
     if (args.Contains("--help")) { Console.WriteLine("app-server stream-json"); return; }
     if (args.Contains("--version")) { Console.WriteLine(Environment.GetEnvironmentVariable("TERMLINK_AI_FIXTURE_CONFIGURATION") == "1" ? "codex-cli 0.160.0" : "fixture 1"); return; }
@@ -11,6 +12,11 @@ if (args.Contains("app-server") || args.Contains("-p")) { await Fixture(); retur
 
 var directory = Path.Combine(Path.GetTempPath(), "termlink-ai-validation-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
+if (args.Contains("--acp-only")) { await AcpValidation.Run(directory); return; }
+if (args.Contains("--grok-probe")) { await AcpValidation.ProbeInstalled(); return; }
+if (args.Contains("--real-grok")) { await GrokRealValidation.Run(directory); return; }
+if (args.Contains("--real-grok-permissions")) { await GrokRealValidation.Permissions(directory); return; }
+if (args.Length == 2 && args[0] == "--real-grok-resume") { await GrokRealValidation.Resume(args[1]); return; }
 if (args.Contains("--timeline-only")) { await TimelineValidation.Run(directory); return; }
 if (args.Contains("--artifacts-only")) { ArtifactValidation.Run(directory); return; }
 if (args.Contains("--real-native-history")) { await NativeHistoryValidation.Real(directory, args.Contains("--only-claude") ? "claude" : args.Contains("--only-codex") ? "codex" : ""); return; }
@@ -90,9 +96,13 @@ if (args.Contains("--real-smoke")) {
                 await session.ApplyAsync(owner, new("send", OperationId: Guid.NewGuid().ToString(), Text: "Reply exactly TERMLINK_AI_SMOKE_OK. Do not use tools, read files or run commands.", ControlVersion: 1));
                 await Wait(() => Snapshot(session, owner).GetProperty("state").GetString() != "running", 90_000);
                 var result = Snapshot(session, owner);
+                var replyCount = result.GetProperty("messages").EnumerateArray().Count(m =>
+                    m.GetProperty("role").GetString() == "assistant" && m.GetProperty("kind").GetString() == "text" && m.GetProperty("text").GetString().Contains("TERMLINK_AI_SMOKE_OK"));
+                if (installation.Protocol == "claude" && replyCount != 1) Environment.ExitCode = 1;
                 if (result.GetProperty("error").GetString().Length > 0 || !result.GetProperty("messages").EnumerateArray().Any(m =>
                     m.GetProperty("role").GetString() == "assistant" && m.GetProperty("text").GetString().Contains("TERMLINK_AI_SMOKE_OK"))) Environment.ExitCode = 1;
                 Console.WriteLine($"TURN {installation.Id}: state={result.GetProperty("state")} error={result.GetProperty("error")} messages={result.GetProperty("messages").GetArrayLength()} replyMatched={result.GetProperty("messages").EnumerateArray().Any(m => m.GetProperty("role").GetString() == "assistant" && m.GetProperty("text").GetString().Contains("TERMLINK_AI_SMOKE_OK"))}");
+                Console.WriteLine($"TURN {installation.Id}: matching text replies={replyCount}");
             }
         } catch (Exception e) { Console.WriteLine($"FAILED {installation.Id}: {e.GetType().Name} {e.Message}"); Environment.ExitCode = 1; }
     }
@@ -274,6 +284,7 @@ await TimelineValidation.Run(directory);
 ArtifactValidation.Run(directory);
 await ConfigurationValidation.Run(directory);
 await NativeHistoryValidation.Run(directory);
+await AcpValidation.Run(directory);
 Console.WriteLine("AI VALIDATION PASS");
 
 static JsonElement Snapshot(AiAgentSession session, Guid viewer) => JsonSerializer.SerializeToElement(session.Snapshot(viewer, true), AiSessionManager.Json);

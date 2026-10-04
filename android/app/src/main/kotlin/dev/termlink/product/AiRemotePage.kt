@@ -62,14 +62,14 @@ internal fun AiRemotePage(workspace: AiWorkspace, entry: AiOpened, pcName: Strin
         }
     }
     Column(modifier.fillMaxWidth()) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 52.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { workspace.selected = null }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回 AI 列表") }
+        Row(Modifier.fillMaxWidth().heightIn(min = 40.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { workspace.selected = null }, modifier = Modifier.width(40.dp).height(36.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回 AI 列表", Modifier.size(20.dp)) }
             Column(Modifier.weight(1f)) {
                 Text("ZCode", style = MaterialTheme.typography.titleSmall)
                 Text("$pcName · 桌面远控", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall)
             }
             Box {
-                IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "ZCode 远控菜单") }
+                IconButton(onClick = { menu = true }, modifier = Modifier.width(40.dp).height(36.dp)) { Icon(Icons.Default.MoreVert, "ZCode 远控菜单", Modifier.size(20.dp)) }
                 DropdownMenu(menu, { menu = false }) {
                     DropdownMenuItem(text = { Text("重新获取地址") }, enabled = online, onClick = { menu = false; generation++ })
                     DropdownMenuItem(text = { Text("在浏览器打开") }, enabled = address != null, onClick = {

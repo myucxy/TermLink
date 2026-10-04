@@ -874,7 +874,12 @@ internal fun aiErrorLabel(code: String): String = when (code) {
     "AGENT_TIMEOUT", "SEND_OUTCOME_UNKNOWN" -> "Agent 未及时确认操作；请检查电脑端状态。"
     "AGENT_REPORTED_ERROR", "AGENT_REQUEST_REJECTED" -> "Agent 返回错误，请检查电脑端模型、认证或网络。"
     "AGENT_DESKTOP_AUTH_REQUIRED" -> "此模型需要 ZCode 桌面授权；当前桥接仅支持电脑上独立配置的 CLI API 模型。"
+    "AGENT_AUTH_REQUIRED" -> "Agent 尚未登录，请先在电脑端完成登录后重试；Grok 可运行 grok login。"
+    "PERMISSION_REQUIRES_NEW_SESSION" -> "此 Agent 的授权方式需在新建对话时设置。"
+    "APPROVAL_OPTION_UNSUPPORTED" -> "Agent 未提供单次允许选项，可拒绝本次请求；不会自动授予永久权限。"
+    "CANCEL_OUTCOME_UNKNOWN" -> "Agent 未确认停止，连接已结束；可重新打开或恢复会话。"
     "AGENT_NETWORK_RETRY" -> "Agent 正在重试模型网络请求，可等待或中断。"
+    "AGENT_RATE_LIMITED" -> "模型服务限流或额度不足，Agent 正在重试；可停止后稍候重试，或在电脑端检查账号额度。"
     "AGENT_EXITED", "AGENT_STREAM_LOST", "AGENT_START_FAILED", "AGENT_OPERATION_FAILED" -> "Agent 已断开或启动失败，请检查电脑端安装与配置。"
     else -> "电脑未能完成请求，请刷新后重试。"
 }

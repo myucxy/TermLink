@@ -78,6 +78,60 @@ test('English locale translates conversation actions and file directory control'
   await expect(page.getByRole('button',{name:'Open containing folder · note.txt'})).toBeVisible();
   await expect(page.getByRole('button',{name:'Save note.txt'})).toBeVisible();
 });
+test('model retry is visible and Stop remains available',async({page})=>{
+  await open(page,[],{...session,phase:'retrying',error:'AGENT_RATE_LIMITED',language:'en',plan:[]});
+  await expect(page.getByRole('status')).toContainText('Waiting to retry model service');
+  await page.getByRole('button',{name:'Stop',exact:true}).click();
+  expect(await page.evaluate(()=>(window as any).calls.some((c:any)=>c.action==='interrupt'))).toBe(true);
+});
+test('compact tools remain reachable on narrow screens with large text and a fixed Stop',async({page})=>{
+  await open(page,[msg('m1','Hello')],{...session,language:'en',plan:[]});
+  const toolbar=page.getByRole('navigation',{name:'Conversation tools'});
+  await expect(page.locator('[data-message-id="m1"]')).toBeVisible();
+  expect((await toolbar.boundingBox())!.height).toBeLessThanOrEqual(38);
+  await page.screenshot({path:'test-results/compact-toolbar.png'});
+  await page.setViewportSize({width:320,height:740});
+  await page.evaluate(session=>(window as any).termlinkUpdate({session,messages:[],reset:false}),{...session,language:'en',fontScale:2,plan:[]});
+  const stop=toolbar.getByRole('button',{name:'Stop',exact:true});
+  const stopBounds=(await stop.boundingBox())!;
+  const tools=toolbar.locator('.tool-links');
+  expect(await tools.evaluate(el=>el.scrollWidth>el.clientWidth)).toBe(true);
+  expect(await toolbar.evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+  for(const [button,panel] of [['⌕ Search','Search conversation'],['▱ Files','Workspace files'],['± Changes','File changes'],['Usage','Context and usage']]) {
+    await toolbar.getByRole('button',{name:button,exact:true}).click();
+    await expect(page.locator('.panel-title strong')).toHaveText(panel);
+    const bounds=(await stop.boundingBox())!;
+    expect(bounds.x).toBeCloseTo(stopBounds.x,0);expect(bounds.x+bounds.width).toBeLessThanOrEqual(320);
+    await expect(stop).toBeInViewport();
+  }
+  await stop.click();
+  expect(await page.evaluate(()=>(window as any).calls.filter((r:any)=>r.action==='interrupt').length)).toBe(1);
+  await page.screenshot({path:'test-results/compact-toolbar-large-font.png'});
+});
+test('user bubbles fit short prompts and keep actions accessible outside long content',async({page})=>{
+  const idle={...session,state:'idle',plan:[],dark:true,language:'en'};
+  await open(page,[msg('u1','hi','user'),msg('a1','Hi! 有什么我可以帮你的吗？')],idle);
+  const user=page.locator('[data-message-id="u1"]');
+  const bubble=user.locator('.user-bubble');
+  const bounds=(await bubble.boundingBox())!;
+  expect(bounds.width).toBeLessThan(90);
+  expect(bounds.x+bounds.width).toBeCloseTo(381,0);
+  await user.getByRole('button',{name:'Copy',exact:true}).click();
+  await user.getByRole('button',{name:'Append to draft',exact:true}).click();
+  expect(await page.evaluate(()=>(window as any).calls.filter((r:any)=>r.action==='copy'||r.action==='edit').map((r:any)=>[r.action,r.text]))).toEqual([['copy','hi'],['edit','hi']]);
+  for(const button of await user.getByRole('button').all()) {const box=(await button.boundingBox())!;expect(box.width).toBeGreaterThanOrEqual(44);expect(box.height).toBeGreaterThanOrEqual(44);expect(box.y).toBeGreaterThanOrEqual(bounds.y+bounds.height);}
+  await page.screenshot({path:'test-results/user-bubble-dark.png'});
+  await page.setViewportSize({width:320,height:740});
+  const long='长内容保持换行 '.repeat(16)+'\n\n```text\n'+('long_path_without_spaces/'.repeat(30))+'\n```';
+  for(const dark of [true,false]) {
+    await page.evaluate(({session,message})=>(window as any).termlinkUpdate({session,messages:[message],reset:false}),{session:{...idle,dark,fontScale:2},message:msg('u1',long,'user')});
+    const scroller=page.locator('[data-virtuoso-scroller]');await scroller.evaluate(el=>{el.scrollTop=0;});
+    await expect(bubble).toContainText('长内容保持换行');
+    expect(await bubble.evaluate(el=>el.scrollWidth<=el.clientWidth+1)).toBe(true);
+    const box=(await bubble.boundingBox())!;expect(box.x).toBeGreaterThanOrEqual(12);expect(box.x+box.width).toBeLessThanOrEqual(308);
+  }
+  await page.screenshot({path:'test-results/user-bubble-large-font.png'});
+});
 test('compact transcript exposes plan, thought, usage and per-file diff',async({page})=>{
   await open(page,[msg('m1','检查公开事件并执行测试','assistant','reasoning'),msg('m2','## 已完成\n\n| 功能 | 状态 |\n|---|---|\n| 预览 | 通过 |')]);
   await expect(page.getByText('思考中',{exact:true})).toBeVisible();

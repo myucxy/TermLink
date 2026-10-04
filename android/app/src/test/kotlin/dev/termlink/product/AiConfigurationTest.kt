@@ -12,6 +12,22 @@ import java.util.UUID
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class AiConfigurationTest {
+    @Test fun acpAgentUsesAdvertisedCapabilitiesAndKeepsLegacyFallbackDisabled() {
+        val modes = JSONArray().put(JSONObject().put("id", "ask").put("label", "默认审批"))
+            .put(JSONObject().put("id", "full-access").put("label", "完全访问").put("requiresConfirmation", true))
+        val advertised = JSONObject().put("modelListing", true).put("modelSwitch", true)
+            .put("reasoningSwitch", true).put("reasoningScope", "session").put("permissionSwitch", true).put("permissionModes", modes)
+        val create = parseAgentConfiguration(advertised, "grok", legacyModelListing = false, legacyModes = emptyList())
+        assertTrue(AiAgentOption("grok", "Grok Build", "1.0.46", "available", configuration = create).supported)
+        assertFalse(AiAgentOption("grok", "Grok Build", "", "missing").supported)
+        assertTrue(create.modelListing)
+        assertTrue(create.reasoningSwitch)
+        assertTrue(create.permissionModes.last().requiresConfirmation)
+        assertFalse(parseAgentConfiguration(null, "grok", legacyModelListing = true, legacyModes = listOf("full-access")).hasPermissionControl)
+        val live = parseAgentConfiguration(advertised.put("permissionSwitch", false), "grok", false, emptyList())
+        assertFalse(live.hasPermissionControl)
+        assertTrue(live.modelSwitch)
+    }
     @Test fun claudeEffortIsSelectableOnlyDuringCreation() {
         assertTrue(aiCanChooseEffort(true, false, "new_session", false))
         assertFalse(aiCanChooseEffort(true, false, "new_session", true))

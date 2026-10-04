@@ -48,7 +48,7 @@ public static class AiAgentDiscovery
         var candidates = new[] {
             new AiAgentInstallation("codex", "Codex", Find("codex.exe") ?? Find("codex.cmd") ?? "", "", "", "codex", "missing"),
             new AiAgentInstallation("claude", "Claude Code", Find("claude.exe") ?? Existing(System.IO.Path.Combine(home, ".local", "bin", "claude.exe")) ?? "", "", "", "claude", "missing"),
-            new AiAgentInstallation("grok", "Grok Build", Find("grok.exe") ?? Find("grok.cmd") ?? "", "", "", "", "missing"),
+            new AiAgentInstallation("grok", "Grok Build", Find("grok.exe") ?? Find("grok.cmd") ?? Existing(System.IO.Path.Combine(home, ".grok", "bin", "grok.exe")) ?? "", "", "", "acp", "missing"),
             new AiAgentInstallation("zcode", "ZCode", script ?? zcode ?? "", script == null ? "" : Find("node.exe") ?? "", "", "zcode", "missing"),
         };
         return await Task.WhenAll(candidates.Select(async candidate => {
@@ -56,13 +56,14 @@ public static class AiAgentDiscovery
             if (candidate.Path.EndsWith(".cjs", StringComparison.OrdinalIgnoreCase) && candidate.RuntimePath.Length == 0)
                 return candidate with { Status = "runtime_missing" };
             try {
-                var output = await ProbeAsync(candidate, "--help", token).ConfigureAwait(false);
+                var output = await ProbeAsync(candidate, token, candidate.Protocol == "acp" ? new[] { "agent", "--help" } : new[] { "--help" }).ConfigureAwait(false);
                 var supported = candidate.Protocol switch {
                     "codex" or "zcode" => output.Contains("app-server", StringComparison.Ordinal),
                     "claude" => output.Contains("stream-json", StringComparison.Ordinal),
+                    "acp" => candidate.Id == "grok" && output.Contains("stdio", StringComparison.Ordinal),
                     _ => false,
                 };
-                var version = await ProbeAsync(candidate, "--version", token).ConfigureAwait(false);
+                var version = await ProbeAsync(candidate, token, "--version").ConfigureAwait(false);
                 version = version.Trim().Split('\n')[0].Trim();
                 return candidate with { Version = version[..Math.Min(version.Length, 120)],
                     Status = supported ? "available" : "incompatible" };
@@ -81,6 +82,7 @@ public static class AiAgentDiscovery
             RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
             StandardOutputEncoding = System.Text.Encoding.UTF8, StandardErrorEncoding = System.Text.Encoding.UTF8,
         };
+        if (agent.Id == "grok") start.Environment["GROK_DISABLE_AUTOUPDATER"] = "1";
         if (agent.Id == "zcode" && agent.RuntimePath.Length > 0) {
             var config = System.IO.Path.GetFullPath(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(agent.Path), "..", "config", "provider", "zcode-builtin.json"));
             if (File.Exists(config)) {
@@ -102,11 +104,11 @@ public static class AiAgentDiscovery
         return start;
     }
 
-    private static async Task<string> ProbeAsync(AiAgentInstallation agent, string argument, CancellationToken token)
+    private static async Task<string> ProbeAsync(AiAgentInstallation agent, CancellationToken token, params string[] arguments)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
         timeout.CancelAfter(TimeSpan.FromSeconds(8));
-        using var process = Process.Start(StartInfo(agent, System.IO.Path.GetTempPath(), argument))
+        using var process = Process.Start(StartInfo(agent, System.IO.Path.GetTempPath(), arguments))
             ?? throw new IOException("Agent probe failed.");
         try {
             var stdout = ReadBoundedAsync(process.StandardOutput, 64 * 1024, timeout.Token);

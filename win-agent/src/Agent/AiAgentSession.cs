@@ -87,11 +87,13 @@ internal sealed partial class AiAgentSession : IDisposable
             } else if (agent.Protocol == "claude") {
                 if (modelId.Length > 0) await ClaudeControlAsync(new { subtype = "set_model", model = modelId });
                 if (threadId.Length == 0) threadId = Id;
+            } else if (agent.Protocol == "acp") {
+                await StartAcpSessionAsync();
             }
             if (threadId.Length == 0) throw new AiOperationException("AGENT_PROTOCOL_INCOMPATIBLE");
             lock (sync) { if (state == "starting") state = "idle"; SaveArchive(); }
-        } catch {
-            Fail("AGENT_START_FAILED");
+        } catch (Exception failure) {
+            Fail(failure is AiOperationException known ? known.Code : "AGENT_START_FAILED");
             throw;
         }
     }
@@ -101,6 +103,7 @@ internal sealed partial class AiAgentSession : IDisposable
             var args = agent.Protocol == "claude" ? new[] { "-p", "--verbose", "--input-format", "stream-json",
                 "--output-format", "stream-json", "--include-partial-messages", "--permission-prompt-tool", "stdio", "--permission-mode", ClaudeMode(permissionMode),
                 threadId.Length == 0 ? "--session-id" : "--resume", threadId.Length == 0 ? Id : threadId }
+                : agent.Protocol == "acp" ? new[] { "--permission-mode", permissionMode == "full-access" ? "bypassPermissions" : "default", "agent", "--no-leader", "stdio" }
                 : new[] { "app-server" };
             if (agent.Protocol == "claude" && AdvancedConfiguration(agent)) args = args.Concat(new[] { "--allow-dangerously-skip-permissions" }).ToArray();
             if (agent.Protocol == "claude" && reasoningEffort.Length > 0) args = args.Concat(new[] { "--effort", reasoningEffort }).ToArray();
@@ -122,6 +125,8 @@ internal sealed partial class AiAgentSession : IDisposable
                 var commands = P(initialized, "commands");
                 if (commands.ValueKind == JsonValueKind.Array) slashCommands = commands.EnumerateArray().Select(c => S(c, "name")).Where(c => c.Length is > 0 and < 80 && !c.Any(char.IsControl)).Take(100).ToArray();
                 return initialized;
+            } else if (agent.Protocol == "acp") {
+                return await InitializeAcpAsync();
             } else throw new AiOperationException("AGENT_PROTOCOL_UNSUPPORTED");
             return default;
     }
@@ -132,7 +137,7 @@ internal sealed partial class AiAgentSession : IDisposable
     // Reuse the protocol reader without creating a conversation, workspace, or user turn.
     internal static async Task<ModelList> ListModelsAsync(AiAgentInstallation agent, CancellationToken token)
     {
-        if (agent.Strategy != "native" || agent.Protocol is not ("codex" or "claude"))
+        if (agent.Strategy != "native" || agent.Protocol is not ("codex" or "claude" or "acp"))
             throw new AiOperationException("MODEL_LIST_UNSUPPORTED");
         using var probe = new AiAgentSession(agent, Path.GetTempPath(), Guid.Empty) { discovering = true };
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -150,6 +155,7 @@ internal sealed partial class AiAgentSession : IDisposable
 
     private async Task<ModelList> ReadModelsAsync(JsonElement initialized)
     {
+            if (agent.Protocol == "acp") return ParseAcpModels(P(P(initialized, "_meta"), "modelState"));
             var models = new List<ModelOption>();
             var keys = new HashSet<string>(StringComparer.Ordinal);
             var responseBytes = 0;
@@ -207,7 +213,8 @@ internal sealed partial class AiAgentSession : IDisposable
                 pending = content ? pending.Values.Select(p => new { p.Id, p.Kind, p.Detail, p.Questions,
                     title = ToolPresentation(p.Parameters.GetRawText(), p.Method).Title,
                     summary = ToolPresentation(p.Parameters.GetRawText(), p.Method).Summary,
-                    canApprove = p.Parameters.GetRawText().Length <= 8000,
+                    canApprove = p.Parameters.GetRawText().Length <= 8000 && (p.Method != "session/request_permission" ||
+                        P(p.Parameters, "options").ValueKind == JsonValueKind.Array && P(p.Parameters, "options").EnumerateArray().Any(o => S(o, "kind") == "allow_once" && ValidOption(S(o, "optionId"), 512))),
                     expiresAtMs = new DateTimeOffset(p.Expires).ToUnixTimeMilliseconds() }).ToArray() : null };
         }
     }
@@ -262,6 +269,8 @@ internal sealed partial class AiAgentSession : IDisposable
                             turnId = S(P(started, "turn"), "id");
                         } else if (agent.Protocol == "zcode") {
                             await RpcAsync("session/send", new { sessionId = threadId, content = prompt, inputId = request.OperationId });
+                        } else if (agent.Protocol == "acp") {
+                            await SendAcpPromptAsync(prompt, selectedAttachments);
                         } else {
                             var content = new List<object> { new { type = "text", text = prompt } };
                             content.AddRange(selectedAttachments.Where(a => a.IsImage).Select(a => (object)new { type = "image", source = new { type = "base64", media_type = a.Mime, data = Convert.ToBase64String(File.ReadAllBytes(a.Path)) } }));
@@ -272,6 +281,7 @@ internal sealed partial class AiAgentSession : IDisposable
                 case "interrupt":
                     if (agent.Protocol == "codex") await RpcAsync("turn/interrupt", new { threadId, turnId });
                     else if (agent.Protocol == "zcode") await RpcAsync("session/stop", new { sessionId = threadId });
+                    else if (agent.Protocol == "acp") await CancelAcpPromptAsync();
                     else await ClaudeControlAsync(new { subtype = "interrupt" });
                     break;
                 case "answer":
@@ -298,11 +308,13 @@ internal sealed partial class AiAgentSession : IDisposable
 
     private async Task<JsonElement> RpcAsync(string method, object parameters)
     {
-        var id = "tl-" + Interlocked.Increment(ref nextCall);
+        var sequence = Interlocked.Increment(ref nextCall);
+        var id = agent.Protocol == "acp" ? sequence.ToString(System.Globalization.CultureInfo.InvariantCulture) : "tl-" + sequence;
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!calls.TryAdd(id, completion)) throw new InvalidOperationException();
         try {
-            await WriteAsync(new { id, method, @params = parameters });
+            if (agent.Protocol == "acp") await WriteAsync(new { jsonrpc = "2.0", id = sequence, method, @params = parameters });
+            else await WriteAsync(new { id, method, @params = parameters });
             return await completion.Task.WaitAsync(TimeSpan.FromSeconds(30), lifetime.Token).ConfigureAwait(false);
         } catch (TimeoutException) { throw new AiOperationException("AGENT_TIMEOUT"); }
         finally { calls.TryRemove(id, out _); }
@@ -356,6 +368,7 @@ internal sealed partial class AiAgentSession : IDisposable
     {
         lock (sync) if (disposed || state == "interrupted") return;
         if (agent.Protocol == "claude") { await ReceiveClaudeAsync(value); return; }
+        if (agent.Protocol == "acp") { await ReceiveAcpAsync(value); return; }
         var id = P(value, "id"); var method = S(value, "method"); var parameters = P(value, "params");
         if (id.ValueKind != JsonValueKind.Undefined && method.Length == 0 && calls.TryGetValue(id.ToString(), out var call)) {
             if (P(value, "error").ValueKind != JsonValueKind.Undefined) call.TrySetException(new AiOperationException("AGENT_REQUEST_REJECTED"));
@@ -435,7 +448,7 @@ internal sealed partial class AiAgentSession : IDisposable
         } else if (type == "assistant") {
             var message = P(value, "message"); var content = P(message, "content"); var index = 0;
             if (content.ValueKind == JsonValueKind.Array) foreach (var part in content.EnumerateArray()) {
-                var key = S(message, "id") + "/" + index++;
+                var key = S(message, "id") + "/" + ClaudeFinalBlockIndex(value, message, part, index++, content.GetArrayLength());
                 if (S(part, "type") == "text") Put(key, "assistant", S(part, "text"));
                 else if (S(part, "type") == "thinking") Put(key, "assistant", S(part, "thinking"), kind: "reasoning", status: "completed");
                 else if (S(part, "type") == "tool_use") Put("tool-" + S(part, "id"), "tool", part.GetRawText(), kind: "tool_use", status: "running");
@@ -530,6 +543,10 @@ internal sealed partial class AiAgentSession : IDisposable
             item.Questions.Any(q => !answers.TryGetValue(q.Id, out var a) || a == null || a.Length is < 1 or > 16 || a.Any(s => string.IsNullOrWhiteSpace(s) || s.Length > 4000))))
             throw new AiOperationException("ANSWER_REQUIRED");
         object response;
+        if (item.Method == "session/request_permission") {
+            await AnswerAcpPermissionAsync(item.RpcId, item.Parameters, allow);
+            return;
+        }
         if (item.Method == "claude/tool") {
             var input = P(item.Parameters, "input");
             var updated = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(input.GetRawText()) ?? new();
@@ -635,8 +652,10 @@ internal sealed partial class AiAgentSession : IDisposable
             using var document = JsonDocument.Parse(text);
             var value = document.RootElement;
             var type = kind.Length == 0 ? S(value, "type") : kind;
+            if (type == "session/request_permission") value = P(value, "toolCall");
             var name = First(value, "tool_name", "toolName", "name", "tool");
             var title = type switch {
+                "acp" or "session/request_permission" => S(value, "title").Length > 0 ? S(value, "title") : "工具操作",
                 "commandExecution" => "运行命令",
                 "fileChange" => "修改文件",
                 "mcpToolCall" => "调用 MCP 工具",
@@ -680,7 +699,7 @@ internal sealed partial class AiAgentSession : IDisposable
     private void Fail(string code)
     {
         lock (sync) {
-            if (disposed) return; state = "interrupted"; error = code; pending.Clear(); owner = Guid.Empty; SettleUnconfirmedTools();
+            if (disposed || state == "interrupted") return; state = "interrupted"; error = code; pending.Clear(); owner = Guid.Empty; SettleUnconfirmedTools();
             for (var i = messages.Count - 1; i >= 0; i--) if (messages[i].Role == "user") { if (messages[i].Status == "accepted") ReplaceMessage(i, messages[i] with { Status = "uncertain" }); break; }
             PublishChange();
             SaveArchive();

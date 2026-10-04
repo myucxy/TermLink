@@ -2,6 +2,10 @@
 
 ## 本轮实施更新
 
+后续 Grok ACP 开发进展：已增加 Windows 适配及模拟协议验证，真实握手/模型查询、回复/配置/取消/恢复与隔离审批通过；
+模拟器已完成 Grok 真实 Relay 基本链路。用户指定双端发布后再适配其他 Agent，不要求登录。其他 Agent 尚未接入，N2 不算全部完成。
+详见 [Grok ACP 接入记录](AI_GROK_ACP_20261004.md)。
+
 用户确认实施 O1、O2、O3 的分页部分，以及设备卡片 文件/AI 对话/+CLI 同级入口。
 O1 已增加有界连续工具组和运行/失败摘要，保留逐项详情及独立审批；O2 已接入账号隔离的
 Keystore 加密 UI 状态，按电脑/host/session/request 校验，支持问答、阅读锚点与展开状态恢复。
@@ -37,7 +41,7 @@ O3 已接通 50 条分页、截断/空结果提示、旧搜索响应隔离及工
 | 编号 | 未实现部分 | 参考与证据范围 | TermLink 的具体补齐方向 | 优先级 |
 | --- | --- | --- | --- | --- |
 | N1 | 可靠后台推送及无界面审批 | HAPI 原生应用说明；Happier inbox/push 文档声明 | 接小米/FCM、Token 生命周期、Server 投递、冷启动事件校验、后台动作和真机投递。当前无推送项目；已有通知按钮不能代替通道。胶囊另按厂商准入处理 | P1，依赖外部项目 |
-| N2 | ACP 和更多原生 Agent | Happier 的 manifest/ACP backend 源码；HAPI 支持矩阵；Agmente 配置模型 | Windows 增加共享 ACP 适配，先验一个实际安装的 Agent，再扩展 OpenCode/Kimi/Qwen 等；不能只增加名字。Grok 目前只有探测候选，无结构化适配 | P2 |
+| N2 | ACP 和更多原生 Agent | Happier 的 manifest/ACP backend 源码；HAPI 支持矩阵；Agmente 配置模型 | Grok ACP 已完成开发态接入、模型查询、模拟协议和真实基本聊天/审批验证；模拟器 Relay 已验收。OpenCode/Kimi/Qwen 等尚未接入，不能只增加名字 | P2 |
 | N3 | 更细的单次请求授权 | HAPI PermissionFooter 源码明确区分 approved_for_session、工具规则和拒绝原因 | 在协议支持时提供本会话允许、指定工具/命令规则及拒绝原因。不能把当前会话的“完全访问”模式当成这一项已完成 | P1 |
 | N4 | 从指定消息重试、分支、回退 | CC Pocket rewind 设计及对应 UI/测试路径；需按具体协议验证 | 保存原生 turn/message 标识，提供目标消息选择和能力校验。当前“编辑”为草稿、“fork”为当前上下文，均不是回到指定消息 | P2 |
 | N5 | Skills / MCP 管理 | HAPI useSkills 参考；Happier/AionUi 的管理能力声明 | 显示电脑实际配置和可用状态；按 Agent 支持启用/停用、查看失败原因。当前 slash 命令建议不等于管理页 | P2 |

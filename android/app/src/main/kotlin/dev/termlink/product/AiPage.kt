@@ -318,15 +318,16 @@ private fun AiConversationHeader(workspace: AiWorkspace, session: AiConversation
     var showDetails by remember { mutableStateOf(false) }
     var showActions by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(onClick = { workspace.selected = null }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.ai_back_list), Modifier.size(20.dp)) }
+    Row(Modifier.fillMaxWidth().heightIn(min = 40.dp).padding(end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        // As in the CLI header, compact layout retains Compose's expanded touch targets.
+        IconButton(onClick = { workspace.selected = null }, modifier = Modifier.width(40.dp).height(36.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.ai_back_list), Modifier.size(20.dp)) }
         Column(Modifier.weight(1f).clickable(enabled = session != null && online) { showDetails = true }) {
             Text(if (online && session != null) aiConversationTitle(session) else stringResource(R.string.ai_chats_title), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
             Text(listOfNotNull(session?.agent, pc?.name, session?.takeIf { online }?.directory?.let(::aiDirectoryName)).joinToString(" · "),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
         }
         Box {
-            IconButton(onClick = { menu = true }) { Icon(if (online) Icons.Default.Cloud else Icons.Default.CloudOff, stringResource(R.string.ai_chat_menu), Modifier.size(20.dp)) }
+            IconButton(onClick = { menu = true }, modifier = Modifier.width(40.dp).height(36.dp)) { Icon(if (online) Icons.Default.Cloud else Icons.Default.CloudOff, stringResource(R.string.ai_chat_menu), Modifier.size(20.dp)) }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 AiMenuLabel("连接 · ${if (online) "服务端中转" else "状态待确认"}")
                 DropdownMenuItem(text = { Text("重新确认连接", style = MaterialTheme.typography.bodyMedium) }, enabled = pc != null && !workspace.busy && !workspace.uncertain,
@@ -636,8 +637,8 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                     workspace.unavailable[pcId] == true -> Text(stringResource(R.string.ai_ui_cap_failed), style = MaterialTheme.typography.bodySmall)
                     catalog == null -> Text(stringResource(R.string.ai_ui_cap_loading), style = MaterialTheme.typography.bodySmall)
                     options.isEmpty() -> Text(stringResource(R.string.ai_ui_no_agents), style = MaterialTheme.typography.bodySmall)
-                    else -> FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        options.forEach { option -> AiAction(option.name, filled = option.id == agent?.id,
+                    else -> FlowRow(Modifier.selectableGroup(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        options.forEach { option -> AiAgentChoice(option.id, option.name, selected = option.id == agent?.id,
                             enabled = ready && editable, onClick = { agentId = option.id }) }
                     }
                 }
@@ -685,7 +686,7 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                             }, onEffortSelect = { reasoningEffort = it })
                     }
                     if (agentConfiguration.permissionSwitch && permissionModes.size > 1)
-                        AiChoice("授权", permissionModes.map { it.id to aiPermissionLabel(it) }, mode, editable) { candidate ->
+                        AiChoice("授权", permissionModes.map { it.id to aiPermissionLabel(it) }, mode, editable, Icons.Default.Security) { candidate ->
                             permissionModes.firstOrNull { it.id == candidate }?.let { selected ->
                                 if (selected.id != mode) {
                                     confirmedMode = null
@@ -734,13 +735,41 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
 }
 
 @Composable
-private fun AiChoice(label: String, options: List<Pair<String, String>>, selected: String, enabled: Boolean, onSelect: (String) -> Unit) {
+private fun AiAgentChoice(id: String, name: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val dark = MaterialTheme.colorScheme.surface.luminance() < .5f
+    val accent = when (aiAgentId(id)) {
+        "codex" -> if (dark) Color(0xFF72DBBE) else Color(0xFF116859)
+        "claude" -> if (dark) Color(0xFFFFB595) else Color(0xFF954727)
+        "zcode" -> if (dark) Color(0xFFCBB8FF) else Color(0xFF6248A8)
+        "grok" -> if (dark) Color(0xFF9BCBFF) else Color(0xFF305F96)
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val color = accent.copy(alpha = if (enabled) 1f else .5f)
+    Box(Modifier.heightIn(min = 48.dp).widthIn(min = 48.dp)
+        .selectable(selected, enabled, Role.RadioButton, onClick), contentAlignment = Alignment.CenterStart) {
+        Surface(shape = RoundedCornerShape(50), color = color.copy(alpha = if (selected) .18f else .08f),
+            border = BorderStroke(1.dp, color.copy(alpha = if (selected) .7f else .2f))) {
+            Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                AiAgentProductIcon(id, Modifier.size(18.dp))
+                Text(name, Modifier.weight(1f, fill = false), color = color, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelMedium)
+                if (selected) Icon(Icons.Default.Check, null, Modifier.size(14.dp), tint = color)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AiChoice(label: String, options: List<Pair<String, String>>, selected: String, enabled: Boolean,
+    icon: ImageVector = Icons.Default.LaptopWindows, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
-        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = enabled && options.isNotEmpty()) { expanded = true }, verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.LaptopWindows, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
-            Text("$label · ${options.firstOrNull { it.first == selected }?.second ?: "请选择"}", Modifier.weight(1f).padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyMedium)
-            Icon(Icons.Default.ExpandMore, "选择执行电脑", Modifier.size(18.dp))
+        Row(Modifier.heightIn(min = 48.dp).clickable(enabled = enabled && options.isNotEmpty(), role = Role.Button) { expanded = true }, verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+            Text("$label · ${options.firstOrNull { it.first == selected }?.second ?: "请选择"}", Modifier.weight(1f, fill = false).padding(horizontal = 8.dp),
+                maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+            Icon(Icons.Default.ExpandMore, "选择$label", Modifier.size(18.dp))
         }
         DropdownMenu(expanded, { expanded = false }) {
             options.forEach { (id, name) -> DropdownMenuItem(text = { Text(name) }, onClick = { onSelect(id); expanded = false }) }

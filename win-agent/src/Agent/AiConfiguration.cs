@@ -39,6 +39,10 @@ internal sealed partial class AiAgentSession
         if (installation.Strategy != "native" || installation.Status != "available")
             return new(false, false, false, false, "", Array.Empty<PermissionOption>());
         var protocol = installation.Protocol;
+        if (protocol == "acp" && installation.Id == "grok") return new(true, true, true, true, "session", new[] {
+            new PermissionOption("ask", "默认审批", "使用 Grok 默认权限规则，需要确认的工具交由手机批准或拒绝。"),
+            new PermissionOption("full-access", "完全访问", "使用 Grok 原生 always-approve；拒绝规则和管理员限制仍生效。仅在新建会话时设置。", true),
+        });
         var advanced = AdvancedConfiguration(installation);
         var modes = new List<PermissionOption>();
         if (protocol == "codex") {
@@ -73,6 +77,9 @@ internal sealed partial class AiAgentSession
     private ConfigurationOptions CurrentConfiguration()
     {
         var config = ConfigurationFor(agent);
+        // Grok ACP modes are reasoning settings, not permission grants. Until a
+        // native permission-change ACK is available, keep live grants immutable.
+        if (agent.Protocol == "acp") config = config with { PermissionSwitch = false, ReasoningSwitch = acpEffortConfig, ModelSwitch = acpModelConfig };
         if (agent.Protocol == "codex") config = config with { PermissionModes = config.PermissionModes.Where(m => CodexModeAllowed(m.Id)).ToArray() };
         if (nativePermissions != null) config = config with { PermissionModes = new[] { new PermissionOption("historical", "历史授权", "沿用 Codex 原生恢复返回的审批、沙箱和审核方式。") }.Concat(config.PermissionModes).ToArray() };
         return config;
@@ -111,7 +118,7 @@ internal sealed partial class AiAgentSession
     }
     private async Task InitializeConfigurationAsync(JsonElement initialized)
     {
-        if (agent.Protocol is "codex" or "claude") {
+        if (agent.Protocol is "codex" or "claude" or "acp") {
             try { var listed = await ReadModelsAsync(initialized); lock (sync) modelOptions = listed.Models; }
             catch (AiOperationException) { settingsNotice = "模型能力暂时不可用，可重试读取；未套用其他模型的推理档位。"; }
         }
@@ -124,7 +131,9 @@ internal sealed partial class AiAgentSession
             } catch (AiOperationException) { requirementsKnown = false; }
             if (!importNative && nativePermissions == null && !CodexModeAllowed(permissionMode)) throw new AiOperationException("PERMISSION_MODE_UNAVAILABLE");
         }
-        if (!importNative && nativePermissions == null && reasoningEffort.Length > 0 && agent.Protocol != "zcode" && !ReasoningFor(modelId, providerId).Options.Any(o => o.Value == reasoningEffort))
+        // ACP session/new reports the authoritative options; initialize metadata
+        // can be incomplete or differ from the session's current model catalog.
+        if (!importNative && nativePermissions == null && reasoningEffort.Length > 0 && agent.Protocol is not ("zcode" or "acp") && !ReasoningFor(modelId, providerId).Options.Any(o => o.Value == reasoningEffort))
             throw new AiOperationException("INVALID_REASONING_EFFORT");
         if (agent.Protocol == "zcode" && reasoningEffort.Length > 0 && !AdvancedConfiguration(agent))
             throw new AiOperationException("INVALID_REASONING_EFFORT");

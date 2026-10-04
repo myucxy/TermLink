@@ -16,6 +16,9 @@ internal sealed partial class AiAgentSession
     private readonly Dictionary<string, long> messageRevisions = new(StringComparer.Ordinal);
     private long revision, historyFloor, historyBase, messageCharacters, turnStartedAtMs, lastActivityAtMs;
     private string phase = "idle", claudeStreamingMessage = "";
+    private readonly Dictionary<int, string> claudeStreamBlocks = new();
+    private readonly Dictionary<string, int> claudeFinalBlocks = new(StringComparer.Ordinal);
+    private int claudeStoppedBlock = -1;
     private JsonElement? plan;
     private string diffVersion = "";
     private bool diffTruncated;
@@ -145,23 +148,48 @@ internal sealed partial class AiAgentSession
     private void ReceiveClaudeStream(JsonElement value)
     {
         var e = P(value, "event"); var type = S(e, "type");
-        if (type == "message_start") { claudeStreamingMessage = S(P(e, "message"), "id"); return; }
+        if (type == "message_start") {
+            claudeStreamingMessage = S(P(e, "message"), "id");
+            claudeStreamBlocks.Clear(); claudeFinalBlocks.Clear(); claudeStoppedBlock = -1;
+            return;
+        }
         if (claudeStreamingMessage.Length == 0) return;
         var index = P(e, "index").ValueKind == JsonValueKind.Number ? P(e, "index").GetInt32() : -1;
         if (index is < 0 or > 1024) return;
         var key = claudeStreamingMessage + "/" + index;
         if (type == "content_block_start") {
             var block = P(e, "content_block");
+            claudeStoppedBlock = -1;
+            claudeStreamBlocks[index] = S(block, "type");
             if (S(block, "type") == "text") Put(key, "assistant", S(block, "text"));
             else if (S(block, "type") == "thinking") Put(key, "assistant", S(block, "thinking"), kind: "reasoning", status: "running");
         } else if (type == "content_block_delta") {
             var delta = P(e, "delta");
+            // Some compatible providers omit block_start; retain the stream index anyway.
+            if (S(delta, "type") == "text_delta") claudeStreamBlocks[index] = "text";
+            else if (S(delta, "type") == "thinking_delta") claudeStreamBlocks[index] = "thinking";
             if (S(delta, "type") == "text_delta") Put(key, "assistant", S(delta, "text"), true);
             else if (S(delta, "type") == "thinking_delta") Put(key, "assistant", S(delta, "thinking"), true, "reasoning", "running");
             // Signatures/redacted blocks and private protocol metadata are not thoughts.
         } else if (type == "content_block_stop") {
+            claudeStoppedBlock = index;
             lock (sync) { EnsureMessageIndex(); if (messageIndex.TryGetValue(key, out var at)) ReplaceMessage(at, messages[at] with { Status = "completed" }); }
         }
+    }
+
+    private int ClaudeFinalBlockIndex(JsonElement value, JsonElement message, JsonElement part, int index, int count)
+    {
+        // Claude stream-json emits an assistant envelope for EACH completed block.
+        // Its singleton content[0] still belongs to the original stream index (e.g.
+        // thinking /0, text /1). Full multi-block snapshots retain their own indices.
+        if (count != 1 || S(message, "id") != claudeStreamingMessage) return index;
+        var uuid = S(value, "uuid");
+        if (uuid.Length > 0 && claudeFinalBlocks.TryGetValue(uuid, out var known)) return known;
+        var type = S(part, "type");
+        var resolved = claudeStreamBlocks.GetValueOrDefault(claudeStoppedBlock) == type ? claudeStoppedBlock
+            : claudeStreamBlocks.Where(b => b.Value == type).Select(b => b.Key).DefaultIfEmpty(index).Max();
+        if (uuid.Length > 0 && claudeFinalBlocks.Count < 1025) claudeFinalBlocks[uuid] = resolved;
+        return resolved;
     }
 
     private void CodexReasoning(JsonElement item)

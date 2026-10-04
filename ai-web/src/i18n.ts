@@ -1,4 +1,5 @@
 const english: Record<string, string> = {
+  '等待模型服务重试':'Waiting to retry model service',
   '打开所在目录':'Open containing folder',
   '等待 Agent':'Waiting for Agent','思考中':'Thinking','正在回复':'Responding','执行工具':'Running tools','等待处理':'Needs attention','压缩上下文':'Compacting context','正在启动':'Starting','已完成':'Completed','正在生成':'Generating',
   '加载更早消息':'Load earlier messages','已到历史保留边界':'End of retained history','完整消息':'Full message','消息内容':'Message','页面状态尚未保存，请保留当前页面并重试':'Page state was not saved. Keep this page open and retry.',

@@ -315,7 +315,7 @@ internal sealed class AiSessionManager : IDisposable
                 }
                 var record = request.Action == "fork" ? await source.ForkAsync(caller, request.ControlVersion) : source.ArchiveRecord();
                 var agent = (await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore)).FirstOrDefault(a => a.Id == record.AgentId && a.Strategy == "native" && a.Status == "available");
-                if (agent == null || agent.Protocol is not ("codex" or "claude") || record.NativeId.Length == 0) return Error("RESUME_UNAVAILABLE");
+                if (agent == null || agent.Protocol is not ("codex" or "claude" or "acp") || record.NativeId.Length == 0) return Error("RESUME_UNAVAILABLE");
                 lock (sync) {
                     if (disposed || authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
                     if (request.Action == "resume" && (!sessions.TryGetValue(source.Id, out var current) || !ReferenceEquals(source, current) || source.IsAlive)) return Error("AGENT_BUSY");

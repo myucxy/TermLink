@@ -12,7 +12,7 @@ import {CodeBlock} from './CodeBlock';
 type Preview = {name: string; text?: string; mime: string; url?: string; fileId?: string};
 type Artifact = {id: string; name: string; mime: string; size: number; version: string};
 function FolderIcon(){return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" aria-hidden="true"><path d="M3 7V5a1 1 0 0 1 1-1h5l3 3h8a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/></svg>;}
-const labels: Record<string,string> = {waiting:'等待 Agent', thinking:'思考中', generating:'正在回复', tool:'执行工具', approval:'等待处理', compacting:'压缩上下文', starting:'正在启动', idle:'已完成', running:'正在生成'};
+const labels: Record<string,string> = {waiting:'等待 Agent', thinking:'思考中', generating:'正在回复', tool:'执行工具', approval:'等待处理', compacting:'压缩上下文', starting:'正在启动', idle:'已完成', running:'正在生成', retrying:'等待模型服务重试'};
 type Actions=(action:string,args?:Record<string,unknown>)=>Promise<any>;
 type TimelineContext={session:Session;act:Actions;ui:UiState;save:(next:UiState)=>void};
 // Stable component identities preserve approval input during streaming updates.
@@ -155,11 +155,13 @@ function App() {
   const elapsed=session.turnStartedAtMs>0?Math.max(0,Math.floor((now-session.turnStartedAtMs)/1000)):0;
   return <main>
     <nav className="tools" aria-label={t('会话工具')}>
+      <div className="tool-links">
       {session.search&&<button onClick={()=>setPanel(panel==='search'?null:'search')}>{t('⌕ 搜索')}</button>}
       {session.artifacts&&<button onClick={openFiles}>{t('▱ 文件')}</button>}
       <button onClick={()=>setPanel(panel==='diff'?null:'diff')}>{t('± 变更')}</button>
       {session.usage&&<button onClick={()=>setPanel(panel==='usage'?null:'usage')}>{t('用量')}</button>}
-      <span className="grow"/>{session.state==='running'&&<button className="danger" disabled={!session.canControl||session.busy||session.uncertain} onClick={()=>act('interrupt')}>{t('停止')}</button>}
+      </div>
+      {session.state==='running'&&<button className="danger" disabled={!session.canControl||session.busy||session.uncertain} onClick={()=>act('interrupt')}>{t('停止')}</button>}
     </nav>
     {(session.state==='running'||session.pending.length>0)&&<div className="status" role="status"><i className={session.pending.length?'dot':'dot pulse'}/><span>{session.pending.length?`${t('等待处理')} · ${session.pending.length} ${t('项')}`:t(labels[session.phase])||t('正在生成')}</span>{session.state==='running'&&<time>{Math.floor(elapsed/60)}:{String(elapsed%60).padStart(2,'0')}</time>}</div>}
     {session.plan?.length>0&&<details className="plan"><summary>{t('计划')} · {session.plan.filter(s=>s.status==='completed').length}/{session.plan.length}</summary>{session.plan.map((s,i)=><p key={i}><span>{s.status==='completed'?'✓':s.status==='in_progress'?'◉':'○'}</span> {s.step}</p>)}</details>}
@@ -191,13 +193,19 @@ function App() {
 
 const MessageCard=memo(function MessageCard({message:m,agent,onAction,onPreview,open,onExpand}:{message:Message;agent:string;onAction:(action:string,args?:Record<string,unknown>)=>Promise<any>;onPreview:(text:string)=>void;open:boolean;onExpand:(open:boolean)=>void}) {
   const content=<RichText text={m.text} onAction={onAction} onPreview={onPreview}/>;
-  return <article className={`message ${m.role}`} data-message-id={m.id}>
+  return <article className={`message ${m.role}`} data-message-id={m.id} aria-label={m.role==='user'?t('你'):undefined}>
     {m.kind==='reasoning'?<details className="reasoning" open={open} onToggle={e=>onExpand(e.currentTarget.open)}><summary><i className={m.status==='running'?'dot pulse':'dot'}/>{t('思考摘要')}</summary>{content}</details>:
       m.role==='tool'?<details className="tool" open={open} onToggle={e=>onExpand(e.currentTarget.open)}><summary>{{running:'◉',failed:'!',completed:'✓',cancelled:'×'}[m.status]||'?'} {m.title||t('工具操作')}<small>{m.summary}</small></summary><pre>{m.text}</pre></details>:
-      <><div className="message-head"><span>{m.role==='user'?t('你'):agent}</span><button onClick={()=>onAction('copy',{text:m.text})}>{t('复制')}</button><button onClick={()=>onAction(m.role==='user'?'edit':'quote',{text:m.text})}>{m.role==='user'?t('追加到草稿'):t('引用')}</button></div>{content}</>}
+      m.role==='user'?<><div className="user-bubble">{content}</div><div className="message-actions"><button aria-label={t('复制')} title={t('复制')} onClick={()=>onAction('copy',{text:m.text})}><MessageActionIcon/></button><button aria-label={t('追加到草稿')} title={t('追加到草稿')} onClick={()=>onAction('edit',{text:m.text})}><MessageActionIcon append/></button></div></>:
+      <><div className="message-head"><span>{agent}</span><button onClick={()=>onAction('copy',{text:m.text})}>{t('复制')}</button><button onClick={()=>onAction('quote',{text:m.text})}>{t('引用')}</button></div>{content}</>}
     {m.fullLength>m.text.length&&<button onClick={async()=>{const text=await onAction('message',{messageId:m.id});if(text)await onAction('show-text',{text});}}>{t('查看完整内容')}</button>}
   </article>;
 });
+function MessageActionIcon({append=false}:{append?:boolean}) {
+  return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    {append?<path d="M13 3H5v18h14V9Z M13 3v6h6 M12 12v6 M9 15h6"/>:<><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>}
+  </svg>;
+}
 function RichText({text,onAction,onPreview}:{text:string;onAction:(action:string,args?:Record<string,unknown>)=>Promise<any>;onPreview:(text:string)=>void}) {
   return <Markdown remarkPlugins={[remarkGfm]} components={{
     a:({href,children})=><button className="link" onClick={()=>onAction('open-link',{url:href})}>{children}</button>,
