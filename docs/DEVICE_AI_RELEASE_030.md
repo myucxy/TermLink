@@ -1,10 +1,11 @@
 # 设备入口与 AI 会话完善 / 0.3.0 候选
 
-用户确认范围：设备卡片 文件、AI 对话、+CLI 同级紧凑按钮；CLI 独立默认目录；Web 工具汇总、
+用户确认范围：设备卡片按 +CLI、AI 聊天、文件 排列同级紧凑按钮；CLI 独立默认目录；Web 工具汇总、
 问答/阅读状态恢复、搜索分页。CLI 页面主体布局保持原样。既有未发布 AI 功能随本轮一并集成。
 
 ## 实现与边界
 
+- AI 聊天入口保留；旧 Windows 未上报 AI 能力时点击提示升级电脑端，不隐藏入口或进入无效创建流程。
 - +CLI 只列 Windows 实际广告的终端命令；默认目录为安装目录 `AiWorkspaces/cli_时间戳_UUID`，
   AI 仍为 `agent_时间戳_随机标识`。共用根沿用升级/回滚/卸载保护。可浏览选择已有目录。
 - Windows 只为受信根直属的严格 CLI 命名空间创建目录，拒绝链接祖先，不创建任意远程路径；
@@ -40,15 +41,23 @@
 
 日志/截图保留在 ignored `artifacts/validation/device-ai-*`、`device-cli*`，不提交用户会话数据。
 
+按钮修正追加验证：Android app Debug 单测 365 项通过；DEV 保持 `0.2.71/127` 原地覆盖。
+模拟器 HOME-PC 卡片实际顺序为 +CLI、AI 聊天、文件，点击 AI 聊天可打开绑定 HOME-PC 的创建面板。
+截图与 UI 层级保留在 `artifacts/validation/device-actions-order-*`。
+
 ## 发布门禁与回滚
 
 2026-10-04 现场 AppShip 双端 published=0.2.71/127、nextBuild=128；Docker Hub 最新 v0.2.61，
 未使用 0.3.0。固定本轮候选版本 **0.3.0 / 128**。此记录不是已发布声明。
 
+用户随后要求暂缓客户端 AppShip 发布，但明确接受本轮 Docker 无 Cosign 签名并发布。
+按钮顺序与 AI 入口修正后，原先从 `a153d00` 构建的客户端候选不再代表最新源码；恢复客户端
+发布时必须重新构建、验证并审核最终制品。Docker 从修正后的固定提交本机构建，核验后推送 Hub。
+
 Android 与 Windows Production 将从最终已提交 revision 构建，验证既有 Android signer 和 Windows
 Authenticode/RFC3161 连续性，再记录人工签名审核结论并依次上传 AppShip（Android 在前）。
-Docker 按用户指定本地编译直推 Hub，先完成多架构候选和 provenance/SBOM 验证；缺少本地 Cosign
-密钥/工具时签名门禁未完成，不能冒称 GitHub keyless 已通过。latest 不能提前替换。
+Docker 按用户指定本地编译直推 Hub，完成多架构候选和 provenance/SBOM 验证；本轮用户已明确
+接受无 Cosign 签名发布，记录为本轮例外，不冒称 GitHub keyless 已通过。latest 不能提前替换。
 
 回滚参照上版 Production 0.2.71/127 原制品和 manifest、Docker v0.2.61 的已核验 digest。
 Windows 工作目录及 AI DPAPI 归档必须保留，禁止清数据/卸载安卓解决签名问题；本轮无数据库迁移。

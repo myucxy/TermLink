@@ -28,14 +28,25 @@ internal fun cliWorkspacePath(root: String, time: Date = Date(), id: UUID = UUID
 internal fun DeviceSessionActions(workspace: AiWorkspace, pc: PcSummary, opening: Boolean,
     onFiles: () -> Unit, onAi: () -> Unit, onLaunch: (UUID, String, TerminalCommandCapability) -> Unit) {
     var create by rememberSaveable(pc.id.toString()) { mutableStateOf(false) }
+    var aiUpgradeRequired by rememberSaveable(pc.id.toString()) { mutableStateOf(false) }
     val online = pc.online && pc.remoteRoutingEnabled
     val commands = supportedRemoteTerminalCommands(pc)
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction("文件", Icons.Default.Folder, online, filled = true, onClick = onFiles)
-        if ("ai_agent_v1" in pc.capabilities) AiAction("AI 对话", Icons.Default.AutoAwesome, online, filled = true, onClick = {
-            workspace.createPcLocked = true; workspace.createPc = pc.id; onAi()
+        if (commands.isNotEmpty() && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(if (opening) "启动中…" else "+CLI", Icons.Default.Terminal, online && !opening, filled = true, onClick = { create = true })
+        AiAction("AI 聊天", Icons.Default.AutoAwesome, online, filled = true, onClick = {
+            if ("ai_agent_v1" in pc.capabilities) {
+                workspace.createPcLocked = true; workspace.createPc = pc.id; onAi()
+            } else {
+                aiUpgradeRequired = true
+            }
         })
-        if (commands.isNotEmpty() && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(if (opening) "启动中…" else "+ CLI", Icons.Default.Terminal, online && !opening, filled = true, onClick = { create = true })
+        if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction("文件", Icons.Default.Folder, online, filled = true, onClick = onFiles)
+    }
+    if (aiUpgradeRequired) {
+        AlertDialog(onDismissRequest = { aiUpgradeRequired = false },
+            title = { Text("需要升级电脑端", style = MaterialTheme.typography.titleMedium) },
+            text = { Text("${pc.name} 尚未提供 AI 聊天能力。请升级该设备的 Windows 客户端，并在设置中检测 AI Agent 后重试。") },
+            confirmButton = { TextButton(onClick = { aiUpgradeRequired = false }) { Text("知道了") } })
     }
     if (create) {
         var commandId by rememberSaveable(pc.id.toString()) { mutableStateOf(commands.firstOrNull { it.id == "powershell-7" }?.id ?: commands.firstOrNull()?.id.orEmpty()) }

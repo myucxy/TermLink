@@ -305,9 +305,9 @@ GET /api/v1/apps/termlink-win64/updates?platform=windows&arch=x64&channel=stable
 
 上一 build 应返回 `status=optional` 和当前 version/build；当前 build 应返回 `status=no_update`。
 
-## 6. Docker Hub 首选路径
+## 6. Docker Hub 历史 GitHub 路径（当前不使用）
 
-首选 `.github/workflows/release.yml`：它登录 `docker.io/myucxy/termlink`，发布 amd64/arm64，生成
+以下为历史流程；当前使用页首规定的本机编译直推。`.github/workflows/release.yml` 登录 `docker.io/myucxy/termlink`，发布 amd64/arm64，生成
 BuildKit provenance、SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 签名 digest 与三类 attestation。
 校验通过后自动更新 Docker Hub `latest`，并复核其 digest 与版本镜像一致；发布任务串行执行。
 `latest` 是可更新别名，版本标签保持不可变。重跑旧版本任务也会更新 `latest`，因此不要通过
