@@ -67,6 +67,7 @@ var optionalCapabilities = []string{
 	"liveness_probe_v1",
 	"host_history_v1",
 	"host_session_catalog_v1",
+	"ai_agent_v1",
 	"host_session_cleanup_v1",
 	"terminal_window_resize_v1",
 }
@@ -679,7 +680,7 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.InputEvent, realtimewire.ResizeRequest,
 			realtimewire.ResumeRequest, realtimewire.LeaseRequest,
 			realtimewire.SessionTerminateRequest,
-			realtimewire.HostHistoryRequest, realtimewire.HostHistoryControl, realtimewire.SessionCatalogRequest, realtimewire.SessionCleanupRequest:
+			realtimewire.HostHistoryRequest, realtimewire.HostHistoryControl, realtimewire.SessionCatalogRequest, realtimewire.SessionCleanupRequest, realtimewire.AiAgentRequest:
 			return true
 		default:
 			return false
@@ -696,7 +697,7 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 			realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
 			realtimewire.ThemeChanged, realtimewire.SessionStarted,
 			realtimewire.SessionInterrupted, realtimewire.SessionEnded,
-			realtimewire.HostHistoryResponse, realtimewire.SessionTerminateResponse, realtimewire.SessionCatalogResponse, realtimewire.SessionCleanupResponse:
+			realtimewire.HostHistoryResponse, realtimewire.SessionTerminateResponse, realtimewire.SessionCatalogResponse, realtimewire.SessionCleanupResponse, realtimewire.AiAgentResponse:
 			return true
 		default:
 			return false

@@ -27,6 +27,7 @@ enum class ProductDestination(val label: String) {
     FILES("Files"),
     DOWNLOADS("Downloads"),
     SESSIONS("Sessions"),
+    AI("AI"),
     ACTIVITY("Activity"),
     HISTORY("History"),
     MEMBERSHIP("Membership"),
@@ -133,6 +134,7 @@ val ProductDestination.isVisibleInProductShell: Boolean
 enum class ProductPrimaryDestination(val label: String) {
     DEVICES("Devices"),
     SESSIONS("Sessions"),
+    AI("AI"),
     SETTINGS("Settings"),
 }
 
@@ -228,6 +230,7 @@ fun ProductDestination.primaryDestination(): ProductPrimaryDestination = when (t
     ProductDestination.DEVICES,
     ProductDestination.FILES,
     ProductDestination.DOWNLOADS -> ProductPrimaryDestination.DEVICES
+    ProductDestination.AI -> ProductPrimaryDestination.AI
     ProductDestination.SESSIONS -> ProductPrimaryDestination.SESSIONS
     // Activity and history remain reachable from secondary actions. Keep the
     // devices destination selected while those pages are open because the
@@ -241,6 +244,7 @@ fun ProductDestination.primaryDestination(): ProductPrimaryDestination = when (t
 
 fun ProductPrimaryDestination.destination(): ProductDestination = when (this) {
     ProductPrimaryDestination.DEVICES -> ProductDestination.DEVICES
+    ProductPrimaryDestination.AI -> ProductDestination.AI
     ProductPrimaryDestination.SESSIONS -> ProductDestination.SESSIONS
     ProductPrimaryDestination.SETTINGS -> ProductDestination.SETTINGS
 }
@@ -996,6 +1000,7 @@ interface ProductRepository : Closeable {
     /** Reconciles realtime once per monotonic foreground generation. */
     fun onAppForegrounded(generation: Long, elapsedRealtimeMillis: Long) = Unit
 
+    suspend fun aiRequest(pcId: UUID, body: String): String = error("AI_UNSUPPORTED")
     suspend fun refresh()
     /** Native username/password login. Password is transient and must be cleared by the caller. */
     suspend fun signIn(username: String, password: CharArray): Unit = signIn()

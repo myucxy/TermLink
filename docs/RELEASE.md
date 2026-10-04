@@ -1,5 +1,9 @@
 # 统一发布构建
 
+2026-10-04 当前 Docker 发布方式：用户指定本机编译后直接 push Docker Hub，不走 GitHub Actions；
+历史 tag 工作流已改为手动入口。镜像版本、源码 revision、架构、digest 和签名/证明证据仍须核验，
+不把 BuildKit 生成的未签名 SBOM/provenance 宣称为 Cosign 已验证。详见运行手册的当前 Docker 发布入口。
+
 仓库根入口为 `scripts/Build-Release.ps1`。它只编排已有的组件构建器并把产物集中到
 `artifacts/release/<Version>-<BuildNumber>/`；本入口不会上传产物，也不会调用外部发布技能。
 
@@ -13,7 +17,16 @@ Android 独占触发的 Windows Agent 自动升级协议、事务、取消与回
 Windows 命令配置、Server 能力同步和 Android 受控启动的兼容契约见
 [远程终端命令协议](REMOTE_TERMINAL_COMMANDS.md)。包含 migration 22 的服务端必须先于自定义命令发布。
 
+当前传输范围（2026-10-04）：CLI 与 AI 仅使用服务器转发（Relay Only）。LAN/NAT 及直连切换测试不属于当前发布门禁，记录为不适用；保留服务器转发相关回归。详见运行手册的“当前传输验收范围”。
+
 ## 版本与目标
+
+版本分配必须遵循 [DEV 与正式发布版本规则](RELEASE_RUNBOOK.md#dev-与正式发布版本规则)：
+
+- 下一轮新正式版本从 `0.3.0` 开始，之后默认自动递增 patch；已有更高发布版本时从现场值继续递增。
+- DEV/Debug 沿用对应平台最后成功发布的 `Version` 与 `BuildNumber`，均不加号，不能提前使用尚未发布的 `0.3.0`。
+- 仅执行正式发布时自动计算下一版本/build；build 延续已用序列，不归零。同轮构建与恢复固定同一组值，发布成功后才更新对应平台的 DEV 基线。
+- 本脚本不自动选号或修改发布基线，版本由发布执行者/编排核对现场后显式传入；直接调用 Gradle/.NET 也须显式传入已核验的 DEV 版本，不能依赖组件默认值。
 
 每次调用只接收一份 `-Version` 和 `-BuildNumber`：
 
@@ -28,10 +41,13 @@ Windows 命令配置、Server 能力同步和 Android 受控启动的兼容契�
 先查看完全无副作用、可机读的计划：
 
 ```powershell
+# $devVersion / $devBuild 为已核验的所选平台最后成功发布值；
+# 平台基线不同则分开构建。DEV 输出目录与正式发布目录隔离。
 & .\scripts\Build-Release.ps1 `
-  -Version 1.4.2 -BuildNumber 107 `
+  -Version $devVersion -BuildNumber $devBuild `
   -ServerImage -WindowsSetup -WindowsMsix -AndroidApk -AndroidAab `
   -ReleaseMode Development `
+  -OutputDirectory "artifacts/release/dev/$devVersion-$devBuild" `
   -Plan
 ```
 
@@ -78,7 +94,7 @@ Setup 等价的完整身份、版本、连续性签名和 RFC 3161 时间戳复�
 秘密不会写入计划、命令行日志或 artifact manifest。传给 Android 的环境变量只在 Gradle
 子进程期间设置，随后恢复原值。
 
-示例（只构建，不上传）：
+正式发布流程中的构建示例（版本/build 已按上述规则固定；此命令只构建，不上传）：
 
 ```powershell
 $windowsPassword = Read-Host 'Windows PFX password' -AsSecureString
@@ -86,7 +102,7 @@ $androidPassword = Read-Host 'Android keystore password' -AsSecureString
 $cosignPassword = Read-Host 'Cosign key password' -AsSecureString
 
 & .\scripts\Build-Release.ps1 `
-  -Version 1.4.2 -BuildNumber 107 `
+  -Version $version -BuildNumber $build `
   -ServerImage -WindowsSetup -AndroidApk -AndroidAab `
   -ServerSigningKeyPath 'D:\ReleaseSecrets\termlink-server.key' `
   -ServerSigningKeyPassword $cosignPassword `
@@ -111,7 +127,8 @@ Server 使用 `docker buildx build --output type=oci,dest=...` 生成本地多�
 没有 `--push`。`-Publish` 是为未来审核后的发布实现预留的显式闸门；当前传入它会立即报错，
 即使同时使用 `-Plan` 也不会调用 registry、AppShip 或其他上传入口。
 
-正式 Server registry 发布由 `.github/workflows/release.yml` 在严格的 `vX.Y.Z` tag 上执行，
+以下为历史 Server registry 工作流说明，当前按页首规则本机直推；`.github/workflows/release.yml` 已取消 tag 自动触发。
+历史工作流曾在严格的 `vX.Y.Z` tag 上执行，
 目标固定为 `docker.io/myucxy/termlink`。工作流使用受保护的 `DOCKERHUB_USERNAME` 与
 `DOCKERHUB_TOKEN` secrets 登录 Docker Hub，构建 `linux/amd64`/`linux/arm64` manifest，生成
 BuildKit provenance 和 SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 对 immutable digest

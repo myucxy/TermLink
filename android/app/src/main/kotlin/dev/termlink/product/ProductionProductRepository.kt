@@ -119,6 +119,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.channels.Channel
@@ -420,6 +421,7 @@ internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set
         add(PcCapabilityIds.HOST_HISTORY_V1)
         add(PcCapabilityIds.HOST_SESSION_CATALOG_V1)
         add(PcCapabilityIds.HOST_SESSION_CLEANUP_V1)
+        add("ai_agent_v1")
         add(PcCapabilityIds.TERMINAL_WINDOW_RESIZE_V1)
         if (dataPlaneEnabled) {
             add(DIRECT_SESSION_CUTOVER_CAPABILITY)
@@ -1053,6 +1055,7 @@ internal class ProductionProductRepository(
     private val refreshStateLock = Mutex()
     private val catalogRequestLock = Mutex()
     private val cleanupRequestLock = Mutex()
+    private val shellLaunchLock = Mutex()
     private val sessionLifecycleLanes = SessionLifecycleLanes<UUID>()
     private val updateCheckLock = Mutex()
     private val updateDownloadLock = Mutex()
@@ -2985,7 +2988,7 @@ internal class ProductionProductRepository(
                 refreshStateLock.withLock {
                     authenticationStateMutationLock.withLock {
                         requireCurrentAuthentication(generation)
-                        results.filterValues { it == "DELETED" }.keys.forEach { id ->
+                        results.filterValues(::isSessionCleanupComplete).keys.forEach { id ->
                             sessionLifecycleLanes.withLock(id) { deleteLocalSession(id) }
                         }
                     }
@@ -2997,15 +3000,17 @@ internal class ProductionProductRepository(
 
     override suspend fun deleteSession(sessionId: UUID) {
         check(!closed) { "Repository is closed" }
+        if (sessionId in deletedSessionIds) return
         val session = mutableSnapshot.value.sessions.firstOrNull { it.id == sessionId }
             ?: error("The selected session is unavailable")
         require(isInactiveSession(session.state, session.online)) { "Close an online session before deleting it" }
         // A one-item native batch also handles host-only history, without a
         // terminal SUBSCRIBE or a Server session row as a prerequisite.
-        when (deleteInactiveSessionBatch(session.pcId, listOf(sessionId))[sessionId]) {
-            "DELETED" -> Unit
-            "SKIPPED_ACTIVE" -> throw TermLinkApiException(409, "SESSION_ACTIVE", null)
-            else -> error("Windows did not confirm session deletion")
+        val outcome = deleteInactiveSessionBatch(session.pcId, listOf(sessionId))[sessionId]
+        when {
+            isSessionCleanupComplete(outcome) -> Unit
+            outcome == "SKIPPED_ACTIVE" -> throw TermLinkApiException(409, "SESSION_ACTIVE", null)
+            else -> throw SessionCleanupFailedException()
         }
     }
 
@@ -3288,6 +3293,7 @@ internal class ProductionProductRepository(
         require(path.isNotBlank() && path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in path) {
             "The Windows directory is invalid"
         }
+        check(shellLaunchLock.tryLock()) { "请等待当前终端启动完成" }
         mutableSnapshot.update { current ->
             current.copy(
                 remoteFileBrowser = reduceRemoteFileBrowser(
@@ -3331,6 +3337,7 @@ internal class ProductionProductRepository(
             }
             return sessionId
         } catch (error: CancellationException) {
+            mutableSnapshot.update { it.copy(remoteFileBrowser = reduceRemoteFileBrowser(it.remoteFileBrowser, RemoteFileBrowserEvent.ShellFinished)) }
             throw error
         } catch (error: Throwable) {
             mutableSnapshot.update { current ->
@@ -3342,6 +3349,8 @@ internal class ProductionProductRepository(
                 )
             }
             throw error
+        } finally {
+            shellLaunchLock.unlock()
         }
     }
 
@@ -3941,6 +3950,34 @@ internal class ProductionProductRepository(
             }
             throw error
         }
+    }
+
+    // Two bounded read/file requests plus an independent ordered command slot.
+    // Envelope sequence routing keeps late/out-of-order replies isolated before decryption.
+    private class AiRequestSlots { val reads = kotlinx.coroutines.sync.Semaphore(2); val commands = kotlinx.coroutines.sync.Semaphore(1) }
+    private val aiRequestSlots = java.util.concurrent.ConcurrentHashMap<UUID, AiRequestSlots>()
+    override suspend fun aiRequest(pcId: UUID, body: String): String {
+        val pc = mutableSnapshot.value.pcs.firstOrNull { it.id == pcId } ?: error("DEVICE_UNAVAILABLE")
+        check(pc.online && pc.remoteRoutingEnabled)
+        val slots = aiRequestSlots.getOrPut(pcId) { AiRequestSlots() }
+        val action = org.json.JSONObject(body).optString("action")
+        val read = action in setOf("catalog", "models", "directories", "files", "remote", "message", "history", "poll", "changes", "watch", "search", "artifacts", "artifact.read", "diff.read", "native-history") || action.startsWith("attachment.")
+        return (if (read) slots.reads else slots.commands).withPermit { requestAiWithCurrentIdentity(pcId, body) }
+    }
+    private suspend fun requestAiWithCurrentIdentity(pcId: UUID, body: String): String {
+        val generation = captureAuthenticationState().authenticationGeneration
+        requireCurrentAuthentication(generation)
+        val pc = mutableSnapshot.value.pcs.firstOrNull { it.id == pcId } ?: error("DEVICE_UNAVAILABLE")
+        val device = mutableSnapshot.value.devices.firstOrNull { it.id == pc.deviceId } ?: error("DEVICE_UNAVAILABLE")
+        check(pc.online && pc.remoteRoutingEnabled && device.type.isPcAgent() && device.trustState == DeviceTrustState.TRUSTED) { "DEVICE_UNAVAILABLE" }
+        check("ai_agent_v1" in pc.capabilities) { "AI_UPGRADE_REQUIRED" }
+        val stored = identity()
+        val realtime = deviceRealtimeRuntime(stored, generation)
+        return dev.termlink.network.production.requestAiAgent(
+            realtime.multiplexer, pc.id, pc.deviceId, stored.deviceId, stored.identity,
+            device.exchangePublicKey, pc.keyEpoch,
+            sessionStore.reserveEnvelopeSequenceRange(pc.id, count = 1).first, body,
+        ).also { requireCurrentAuthentication(generation) }
     }
 
     private val hostCatalogTitles = mutableMapOf<UUID, String>()
@@ -5891,6 +5928,7 @@ internal class ProductionProductRepository(
     override fun close() {
         if (closed) return
         closed = true
+        aiRequestSlots.clear()
         directProductE2EBridgeRegistration?.close()
         directProductE2EBridgeRegistration = null
         authenticationLifecycle.invalidate()

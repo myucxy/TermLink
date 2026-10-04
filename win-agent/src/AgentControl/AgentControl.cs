@@ -334,7 +334,8 @@ namespace TermLink.Agent
         SignOutAccount = 15,
         SaveTerminalCommands = 16,
         BeginAccountAuthorization = 17,
-        ConfigureServer = 18
+        ConfigureServer = 18,
+        DetectAiAgents = 19
     }
 
     public sealed class RegistryRequest
@@ -472,6 +473,7 @@ namespace TermLink.Agent
     public sealed class ProductionStatus
     {
         public Guid PcId { get; set; }
+        public string AiAgentsJson { get; set; }
         public string AgentVersion { get; set; }
         public bool Configured { get; set; }
         public bool AccountLinked { get; set; }
@@ -507,7 +509,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 12;
+        public const byte CurrentVersion = 13;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -525,6 +527,8 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Registry account and command settings require control V8.");
             if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
                 throw new InvalidDataException("Browser account authorization requires control V11.");
+            if (version < 13 && request.Command == RegistryCommand.DetectAiAgents)
+                throw new InvalidDataException("AI discovery requires control V13.");
             if (version < 12 && request.Command == RegistryCommand.ConfigureServer)
                 throw new InvalidDataException("Server configuration requires control V12.");
             request.ProtocolVersion = version;
@@ -695,6 +699,8 @@ namespace TermLink.Agent
             var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
             if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
                 throw new InvalidDataException("Browser account authorization requires control V11.");
+            if (version < 13 && request.Command == RegistryCommand.DetectAiAgents)
+                throw new InvalidDataException("AI discovery requires control V13.");
             if (version < 12 && request.Command == RegistryCommand.ConfigureServer)
                 throw new InvalidDataException("Server configuration requires control V12.");
             switch (request.Command)
@@ -998,6 +1004,7 @@ namespace TermLink.Agent
                 }
             }
             if (version >= 10) WriteString(writer, status.AccountNickname ?? string.Empty);
+            if (version >= 13) WriteString(writer, status.AiAgentsJson ?? "[]");
         }
 
         private static ProductionStatus ReadProductionStatus(BinaryReader reader, byte version)
@@ -1101,6 +1108,7 @@ namespace TermLink.Agent
                 status.TerminalCommands = new List<ProductionTerminalCommandSummary>();
             }
             status.AccountNickname = version >= 10 ? ReadString(reader) : string.Empty;
+            status.AiAgentsJson = version >= 13 ? ReadString(reader) : "[]";
             return status;
         }
 
@@ -1254,8 +1262,11 @@ namespace TermLink.Agent
                 var secret = RegistryControlSecretStore.LoadDefault();
                 try
                 {
-                    RegistryControlAuthentication.Prepare(request, secret, DateTime.UtcNow);
-                    RegistryControlCodec.WriteRequest(pipe, request);
+                    // Existing commands remain usable while a new UI is paired with a V12 Agent during upgrade.
+                    var version = request.ProtocolVersion != 0 ? request.ProtocolVersion :
+                        request.Command == RegistryCommand.DetectAiAgents ? RegistryControlCodec.CurrentVersion : (byte)12;
+                    RegistryControlAuthentication.Prepare(request, secret, DateTime.UtcNow, version);
+                    RegistryControlCodec.WriteRequest(pipe, request, version);
                     var response = RegistryControlCodec.ReadResponse(pipe);
                     if (!RegistryControlAuthentication.VerifyResponse(response, request, secret))
                         throw new InvalidDataException("Registry control response authentication failed.");

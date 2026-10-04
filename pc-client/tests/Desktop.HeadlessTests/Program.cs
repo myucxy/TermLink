@@ -193,6 +193,22 @@ public static class Program
             "The session page did not move its count into the shared header.");
         Require(sessionList.ItemsPanelRoot is VirtualizingStackPanel, "The session list is not virtualized.");
         viewModel.Navigate("settings");
+        viewModel.SelectSettingsSection("agents");
+        await DrainCommandAsync(viewModel.DetectAiAgentsCommand);
+        Dispatcher.UIThread.RunJobs();
+        Require(viewModel.IsAgentsSettingsSelected && viewModel.Settings.AiAgents.Single().Id == "zcode", "AI settings did not discover and display ZCode.");
+        Require(viewModel.CurrentPageSubtitle == "AI Agent", "AI settings header still shows General.");
+        viewModel.DetectAiAgentsCommand.Execute(null);
+        await DrainCommandAsync(viewModel.DetectAiAgentsCommand);
+        Require(viewModel.Settings.AiAgents.Count == 1, "AI rescan duplicated entries.");
+        viewModel.Settings.ZcodeRemoteUrl = "https://zcode.z.ai/remote/v4?pair=fixture-only";
+        viewModel.SaveZcodeRemoteCommand.Execute(null);
+        await DrainCommandAsync(viewModel.SaveZcodeRemoteCommand);
+        Require(client.RemoteConfigured && viewModel.Settings.ZcodeRemoteUrl.Length == 0 &&
+                viewModel.Settings.AiAgents.Single().Strategy == "desktop_remote", "Saving remote config did not clear the input and refresh the strategy.");
+        viewModel.ClearZcodeRemoteCommand.Execute(null);
+        await DrainCommandAsync(viewModel.ClearZcodeRemoteCommand);
+        Require(!client.RemoteConfigured && viewModel.Settings.AiAgents.Single().Strategy == "native", "Clearing config did not restore native strategy.");
         viewModel.SelectSettingsSection("commands");
         Dispatcher.UIThread.RunJobs();
         Require(currentPageTitle.Text == PresentationText.Settings &&
@@ -564,6 +580,14 @@ public static class Program
         public bool BeginAccountAuthorizationCalled { get; private set; }
         public string AuthorizedPcName { get; private set; } = string.Empty;
         public IReadOnlyList<TerminalCommandCapability> SavedTerminalCommands { get; private set; } = Array.Empty<TerminalCommandCapability>();
+        public bool SupportsZcodeRemoteConfiguration => true;
+        public bool RemoteConfigured { get; private set; }
+        public ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken) {
+            RemoteConfigured = url.Length > 0;
+            return ValueTask.CompletedTask;
+        }
+        public ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(new[] { new AiAgentCapability("zcode", "ZCode", "D:\\ZCode\\zcode.exe", "1", "available", RemoteConfigured ? "desktop_remote" : "native") });
         public ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken) =>
             ValueTask.FromResult(snapshot);
 

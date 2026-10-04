@@ -56,7 +56,9 @@ internal suspend fun <T : Any> requestHostDevice(
         var transport: ProductionRealtimeSessionTransport? = null
         try {
             val endpoint = multiplexer.register(pcId, catalogOnly = true,
-                cleanupOnly = requestType == MessageType.SESSION_CLEANUP_REQUEST).also { transport = it }
+                cleanupOnly = requestType == MessageType.SESSION_CLEANUP_REQUEST,
+                aiOnly = requestType == MessageType.AI_AGENT_REQUEST,
+                aiSequence = if (requestType == MessageType.AI_AGENT_REQUEST) sequence else 0).also { transport = it }
             val pendingResponse = async(start = CoroutineStart.UNDISPATCHED) {
                 var result: T? = null
                 endpoint.receivedEnvelopes.first { received ->

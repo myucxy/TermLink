@@ -31,6 +31,15 @@ import org.junit.Test
 
 class ProductSessionDeletionTest {
     @Test
+    fun onlyConfirmedDeletionOrAbsenceCompletesLocalCleanup() {
+        assertTrue(isSessionCleanupComplete("DELETED"))
+        assertTrue(isSessionCleanupComplete("NOT_FOUND"))
+        listOf("SKIPPED_ACTIVE", "FAILED", "TIMEOUT", "", null).forEach {
+            assertFalse(isSessionCleanupComplete(it))
+        }
+    }
+
+    @Test
     fun cleanupSelectsOnlyConfirmedInactiveSessionsOnTheRequestedTrustedOnlinePc() {
         val exited = session()
         val interrupted = session().copy(pcId = exited.pcId, state = SessionState.INTERRUPTED)
@@ -64,7 +73,12 @@ class ProductSessionDeletionTest {
             override suspend fun deleteInactiveSessionBatch(pcId: UUID, sessionIds: List<UUID>): Map<UUID, String> {
                 calls += sessionIds
                 return sessionIds.associateWith {
-                    when (it) { sessions[0].id -> "FAILED"; sessions[1].id -> "SKIPPED_ACTIVE"; else -> "DELETED" }
+                    when (it) {
+                        sessions[0].id -> "FAILED"
+                        sessions[1].id -> "SKIPPED_ACTIVE"
+                        sessions[2].id -> "NOT_FOUND"
+                        else -> "DELETED"
+                    }
                 }
             }
         }
@@ -73,6 +87,7 @@ class ProductSessionDeletionTest {
         assertEquals(InactiveSessionCleanupResult(deleted = 243, failed = 1, skipped = 1), result)
         assertFalse(calls.flatten().contains(extra.id))
         assertEquals(243, deleted.size)
+        assertTrue(deleted.contains(sessions[2].id))
     }
 
     @Test

@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Agent;
 using TermLink.WindowsIntegration;
+using TermLink.UpdateCore;
 
 namespace TermLink.Setup.Validation
 {
@@ -45,6 +46,7 @@ namespace TermLink.Setup.Validation
                 ValidateInstallCommitGate();
                 ValidateCancelButtonBehavior();
                 ValidateFailedUpgradeRestoresPreviousRoot(temporaryRoot);
+                ValidateAiWorkspacePreservation(temporaryRoot);
                 ValidateOldWindowsIsRejected();
                 ValidateMissingTerminalIsOptional(temporaryRoot);
                 ValidateTerminalIntegrationFailureIsPublicSafe(temporaryRoot);
@@ -819,6 +821,8 @@ namespace TermLink.Setup.Validation
             Directory.CreateDirectory(backup);
             File.WriteAllText(Path.Combine(root, "new.txt"), "failed new version", new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(backup, "old.txt"), "working old version", new UTF8Encoding(false));
+            Directory.CreateDirectory(AiWorkspaceStorage.Under(root));
+            File.WriteAllText(Path.Combine(AiWorkspaceStorage.Under(root), "project.txt"), "user work");
 
             Installer.RestorePreviousInstallRootAfterFailure(backup, root, parent);
 
@@ -828,6 +832,26 @@ namespace TermLink.Setup.Validation
                 "The failed new root remained active after previous-version restoration.");
             Assert(!Directory.Exists(backup),
                 "The previous-version backup was not consumed by restoration.");
+            Assert(File.ReadAllText(Path.Combine(AiWorkspaceStorage.Under(root), "project.txt")) == "user work", "Rollback lost AI files.");
+        }
+
+        private static void ValidateAiWorkspacePreservation(string temporaryRoot)
+        {
+            var oldRoot = Path.Combine(temporaryRoot, "workspace-old");
+            var nextRoot = Path.Combine(temporaryRoot, "workspace-next");
+            Directory.CreateDirectory(AiWorkspaceStorage.Under(oldRoot));
+            Directory.CreateDirectory(nextRoot);
+            File.WriteAllText(Path.Combine(AiWorkspaceStorage.Under(oldRoot), "work.txt"), "before upgrade");
+            AiWorkspaceStorage.MoveBetweenInstallRoots(oldRoot, nextRoot);
+            Assert(!Directory.Exists(AiWorkspaceStorage.Under(oldRoot)), "Workspace left in disposable backup.");
+            File.AppendAllText(Path.Combine(AiWorkspaceStorage.Under(nextRoot), "work.txt"), " + new work");
+            AiWorkspaceStorage.MoveBetweenInstallRoots(nextRoot, oldRoot);
+            Assert(File.ReadAllText(Path.Combine(AiWorkspaceStorage.Under(oldRoot), "work.txt")) == "before upgrade + new work", "Remote rollback discarded new work.");
+            Directory.CreateDirectory(AiWorkspaceStorage.Under(nextRoot));
+            try { AiWorkspaceStorage.MoveBetweenInstallRoots(oldRoot, nextRoot); throw new Exception("Conflicting workspaces overwritten."); }
+            catch (IOException) { Assert(File.Exists(Path.Combine(AiWorkspaceStorage.Under(oldRoot), "work.txt")), "Conflict lost original files."); }
+            var preserved = AiWorkspaceStorage.PreserveBeforeUninstall(oldRoot);
+            Assert(File.Exists(Path.Combine(preserved, "work.txt")) && !Directory.Exists(AiWorkspaceStorage.Under(oldRoot)), "Uninstall preservation failed.");
         }
 
         private static void ValidateOldWindowsIsRejected()

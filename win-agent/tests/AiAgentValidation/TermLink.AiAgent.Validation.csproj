@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/Common/AiAgentDiscovery.cs" Link="AiAgentDiscovery.cs" />
+    <Compile Include="../../src/Common/ZcodeRemoteAddressStore.cs" Link="ZcodeRemoteAddressStore.cs" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <Compile Include="../../src/Agent/AiAgentSession.cs" Link="AiAgentSession.cs" />
+    <Compile Include="../../src/Agent/AiSessionTimeline.cs" Link="AiSessionTimeline.cs" />
+    <Compile Include="../../src/Agent/AiSessionArtifacts.cs" Link="AiSessionArtifacts.cs" />
+    <Compile Include="../../src/Agent/AiSessionFeatures.cs" Link="AiSessionFeatures.cs" />
+    <Compile Include="../../src/Agent/AiConfiguration.cs" Link="AiConfiguration.cs" />
+    <Compile Include="../../src/Agent/AiNativeHistory.cs" Link="AiNativeHistory.cs" />
+    <Compile Include="../../src/Agent/AiProcessJob.cs" Link="AiProcessJob.cs" />
+    <Compile Include="../../src/Agent/AiSessionManager.cs" Link="AiSessionManager.cs" />
+    <Compile Include="../../src/Agent/WindowsDirectoryListing.cs" Link="WindowsDirectoryListing.cs" />
+    <Compile Include="../../src/UpdateCore/AiWorkspaceStorage.cs" Link="AiWorkspaceStorage.cs" />
+  </ItemGroup>
+</Project>

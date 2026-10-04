@@ -153,7 +153,7 @@ class ProductUiLogicTest {
     }
 
     @Test
-    fun sessionTabsOpenLiveOrOnlineHostOwnedEndedHistoryOnly() {
+    fun sessionTabsOpenOnlyLiveSessionsEvenWhenEndedHistoryExists() {
         val id = UUID.fromString("00000000-0000-0000-0000-000000000031")
         val online = session(id, SessionState.RUNNING, Instant.EPOCH, online = true)
         val pcId = online.pcId
@@ -164,11 +164,13 @@ class ProductUiLogicTest {
 
         assertTrue(isSessionTabOpenable(online))
         assertFalse(isSessionTabOpenable(online.copy(online = false)))
-        assertTrue(isSessionTabOpenable(ended, onlineHost))
+        assertFalse(isSessionTabOpenable(ended, onlineHost))
         assertFalse(isSessionTabOpenable(ended, onlineHost.copy(online = false)))
         assertFalse(isSessionTabOpenable(ended, onlineHost.copy(capabilities = emptySet())))
         assertFalse(isSessionTabOpenable(ended, onlineHost.copy(online = false), hasReadOnlyRenderer = true))
-        assertTrue(isSessionTabOpenable(ended.copy(state = SessionState.INTERRUPTED), onlineHost))
+        assertFalse(isSessionTabOpenable(ended, onlineHost, hasReadOnlyRenderer = true))
+        assertFalse(isSessionTabOpenable(ended.copy(state = SessionState.INTERRUPTED), onlineHost))
+        assertFalse(isSessionTabOpenable(online, onlineHost.copy(remoteRoutingEnabled = false)))
         assertFalse(isSessionTabOpenable(null))
     }
 

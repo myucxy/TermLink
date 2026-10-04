@@ -171,6 +171,17 @@ public sealed record PcAgentIdentity(
     string PlatformVersion,
     string AgentVersion);
 
+public sealed record AiAgentCapability(string Id, string Name, string Path, string Version, string Status, string Strategy = "native")
+{
+    public string Detail => Strategy == "desktop_remote" ? (Status == "available" ? "桌面远控 · 已配置地址" : "桌面远控 · 请重新保存地址") : $"{Version} · " + (Status switch {
+        "available" => "协议可用 · 认证尚未验证",
+        "missing" => "未检测到安装",
+        "runtime_missing" => "缺少运行时",
+        "incompatible" => "结构化协议未支持",
+        _ => "检测失败，可重试"
+    });
+}
+
 public sealed record TerminalCommandCapability(
     string Id,
     string DisplayName,

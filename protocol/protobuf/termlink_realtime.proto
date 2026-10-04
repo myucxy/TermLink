@@ -73,7 +73,12 @@ enum MessageType {
   // Device-scoped MANAGE operation. Never enters terminal subscription/ACK state.
   SESSION_CLEANUP_REQUEST = 90;
   SESSION_CLEANUP_RESPONSE = 91;
+  AI_AGENT_REQUEST = 92; // Device-scoped MANAGE lane; never a terminal subscription.
+  AI_AGENT_RESPONSE = 93;
 }
+
+message AiAgentRequestPayload { bytes request_id = 1; string json = 2; }
+message AiAgentResponsePayload { bytes request_id = 1; string json = 2; }
 
 message SessionCleanupRequestPayload {
   bytes request_id = 1;

@@ -143,6 +143,7 @@ namespace TermLink.Updater
                     var quarantine = Path.Combine(
                         transactionRoot,
                         "failed-target-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss"));
+                    AiWorkspaceStorage.MoveBetweenInstallRoots(record.InstallRoot, backupPath);
                     if (Directory.Exists(record.InstallRoot)) Directory.Move(record.InstallRoot, quarantine);
                     Directory.Move(backupPath, record.InstallRoot);
                 }

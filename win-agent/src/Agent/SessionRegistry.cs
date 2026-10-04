@@ -251,6 +251,15 @@ namespace TermLink.Agent
             lock (sync) return sessions.ContainsKey(sessionId) || completedSessions.ContainsKey(sessionId);
         }
 
+        // Cleanup must recognize the same durable registrations as the catalog,
+        // even after their managed session and account history have gone away.
+        // ContainsSession remains the operational wrapper check for routing/recovery.
+        internal bool ContainsSessionRecord(Guid sessionId)
+        {
+            lock (sync) return knownRegistrations.ContainsKey(sessionId) || sessions.ContainsKey(sessionId) ||
+                completedSessions.ContainsKey(sessionId) || retiring.Any(item => item.SessionId == sessionId);
+        }
+
         internal bool ContainsActiveSession(Guid sessionId)
         {
             lock (sync) return sessions.ContainsKey(sessionId);
@@ -1154,17 +1163,58 @@ namespace TermLink.Agent
             lock (sync) deletedSessions.UnionWith(ids);
         }
 
-        // Shares the registration lock: a delayed reconnect cannot revive an ID while it is deleted.
-        internal bool DeleteInactiveSession(Guid sessionId, Action persistDeletion)
+        internal bool HasSessionBuffer(Guid sessionId) => SessionBufferPath(sessionId) is string path && Directory.Exists(path);
+
+        private string SessionBufferPath(Guid sessionId)
+        {
+            if (sessionId == Guid.Empty || string.IsNullOrEmpty(bufferRoot)) return null;
+            var path = Path.GetFullPath(Path.Combine(bufferRoot, sessionId.ToString("N")));
+            if (!string.Equals(Path.GetDirectoryName(path), bufferRoot, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Session buffer escaped its root.");
+            return path;
+        }
+
+        internal void DeleteRetiredSessionBuffer(Guid sessionId)
         {
             lock (sync)
             {
+                if (!deletedSessions.Contains(sessionId) || sessions.ContainsKey(sessionId) ||
+                    completedSessions.ContainsKey(sessionId) || retiring.Any(item => item.SessionId == sessionId)) return;
+            }
+            // The durable tombstone fences new registrations. Legacy retired
+            // records can have buffers without a live/completed wrapper to release.
+            var path = SessionBufferPath(sessionId);
+            if (path == null || !Directory.Exists(path)) return;
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) throw new IOException("Session buffer is a reparse point.");
+            foreach (var file in Directory.EnumerateFiles(path)) File.Delete(file);
+            Directory.Delete(path, recursive: false);
+        }
+
+        // Shares the registration lock: a delayed reconnect cannot revive an ID while it is deleted.
+        internal bool DeleteInactiveSession(Guid sessionId, Action persistDeletion, Func<bool, bool> retentionAllowsDeletion = null)
+        {
+            lock (sync)
+            {
+                bool processAlive;
                 if (knownRegistrations.TryGetValue(sessionId, out var registration))
                 {
-                    if (registration.MatchesRunningHost()) return false;
+                    try
+                    {
+                        using (var host = Process.GetProcessById(registration.ExpectedHostProcessId))
+                            processAlive = !host.HasExited && host.StartTime.ToUniversalTime().Ticks == registration.ExpectedHostStartTimeUtc.Ticks;
+                    }
+                    catch (ArgumentException) { processAlive = false; } // PID no longer exists.
+                    catch (Exception error) when (error is System.ComponentModel.Win32Exception || error is InvalidOperationException)
+                    {
+                        return false; // Unreadable process state is not proof of an inactive host.
+                    }
                 }
-                else if (sessions.TryGetValue(sessionId, out var session) &&
-                    session.GetSummary().Lifecycle == SessionAgentLifecycle.Connected) return false;
+                else processAlive = sessions.TryGetValue(sessionId, out var session) &&
+                    session.GetSummary().Lifecycle == SessionAgentLifecycle.Connected;
+                // Recovered/live hosts reset their retention clock under the same
+                // lock that excludes registration and durable deletion.
+                var allowed = retentionAllowsDeletion?.Invoke(processAlive) ?? true;
+                if (processAlive || !allowed) return false;
                 persistDeletion();
                 deletedSessions.Add(sessionId);
                 RetireRegistration(sessionId);
@@ -2198,6 +2248,15 @@ namespace TermLink.Agent
                         restart,
                         "AGENT_RESTART_READY",
                         "AGENT_RESTART_WITH_TIMEOUTS");
+                case RegistryCommand.DetectAiAgents:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    var detected = TermLink.Ai.AiAgentDiscovery.CatalogAsync(true).GetAwaiter().GetResult();
+                    var detectedResponse = Response(true, "AI_AGENTS_DETECTED", detected.Length);
+                    detectedResponse.Production.AiAgentsJson = System.Text.Json.JsonSerializer.Serialize(detected);
+                    return detectedResponse;
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
                 case RegistryCommand.RefreshProductionStatus:
 #if TERMLINK_PRODUCTION_RUNTIME
                     var refreshRuntime = CurrentProductionRuntime();

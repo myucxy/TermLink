@@ -172,6 +172,8 @@ namespace TermLink.Agent
         private const string TranscriptArchiveExtension = ".transcript.dpapi";
         private const string DeleteMarkerPrefix = ".delete-";
         private const string DeleteMarkerSuffix = ".marker";
+        private const string InactiveSinceFileName = "inactive-since.dpapi";
+        internal static readonly TimeSpan InactiveHistoryRetention = TimeSpan.FromDays(7);
         private readonly string root;
         private readonly Guid pcDeviceId;
         private readonly Action<string, byte[]> durableWrite;
@@ -778,6 +780,33 @@ namespace TermLink.Agent
                 if (!File.Exists(marker)) durableWrite(marker, sessionId.ToByteArray());
                 if (!File.Exists(marker))
                     throw new IOException("Terminal history deletion marker was not persisted.");
+            }
+        }
+
+        // Called with the registry's liveness/deletion lock held. Last output time
+        // and filesystem mtimes cannot prove when a shell stopped. Legacy history
+        // starts its grace period at the first confirmed inactive observation.
+        internal bool IsInactiveRetentionExpired(Guid sessionId, bool processAlive, DateTimeOffset now)
+        {
+            ValidateSessionId(sessionId);
+            if (now <= DateTimeOffset.UnixEpoch) throw new ArgumentOutOfRangeException(nameof(now));
+            lock (SessionLock(sessionId))
+            {
+                if (IsSessionDeleted(sessionId)) return false;
+                var path = Path.Combine(ResolveSessionDirectory(sessionId), InactiveSinceFileName);
+                if (processAlive)
+                {
+                    if (File.Exists(path)) File.Delete(path);
+                    return false;
+                }
+                if (!File.Exists(path))
+                {
+                    WriteJson(path, sessionId, "inactive-since", now);
+                    return false;
+                }
+                var since = ReadJson<DateTimeOffset>(path, sessionId, "inactive-since");
+                if (since <= DateTimeOffset.UnixEpoch) throw new InvalidDataException("Invalid history retention timestamp.");
+                return now > since && now - since > InactiveHistoryRetention;
             }
         }
 

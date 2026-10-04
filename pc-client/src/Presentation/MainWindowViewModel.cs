@@ -224,6 +224,11 @@ public sealed class SettingsPageViewModel : PageViewModel
     public string? EditingCommandId { get => editingCommandId; internal set => SetProperty(ref editingCommandId, value); }
     public bool CommandEditorOpen { get => commandEditorOpen; internal set => SetProperty(ref commandEditorOpen, value); }
     public bool HasUnsavedCommands { get => hasUnsavedCommands; internal set => SetProperty(ref hasUnsavedCommands, value); }
+    public ObservableCollection<AiAgentCapability> AiAgents { get; } = new();
+    private string zcodeRemoteUrl = string.Empty;
+    private string zcodeRemoteStatus = "未配置 · 使用本地协议";
+    public string ZcodeRemoteUrl { get => zcodeRemoteUrl; set => SetProperty(ref zcodeRemoteUrl, value); }
+    public string ZcodeRemoteStatus { get => zcodeRemoteStatus; internal set => SetProperty(ref zcodeRemoteStatus, value); }
     public ObservableCollection<TerminalCommandCapability> TerminalCommands { get; } = new();
     internal List<TerminalCommandCapability> RemovedTerminalCommands { get; } = new();
 }
@@ -249,7 +254,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 {
     public static TimeSpan DefaultUpdateCheckInterval => TimeSpan.FromMinutes(30);
 
-    private static readonly string[] SettingsSections = ["general", "account", "commands", "integration", "diagnostics", "about"];
+    private static readonly string[] SettingsSections = ["general", "account", "agents", "commands", "integration", "diagnostics", "about"];
     private readonly AgentStateStore stateStore;
     private readonly IAgentClient client;
     private readonly IDesktopOperations? desktopOperations;
@@ -344,6 +349,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 SetAppearance(preference);
             return Task.CompletedTask;
         });
+        DetectAiAgentsCommand = new AsyncCommand((_, token) => DetectAiAgentsAsync(token));
+        SaveZcodeRemoteCommand = new AsyncCommand((_, token) => ConfigureZcodeRemoteAsync(false, token));
+        ClearZcodeRemoteCommand = new AsyncCommand((_, token) => ConfigureZcodeRemoteAsync(true, token));
         RefreshCommand = new AsyncCommand((_, cancellationToken) => RefreshAsync(cancellationToken));
         SetRemoteAccessCommand = new AsyncCommand((parameter, cancellationToken) =>
             SetRemoteAccessAsync(ParseBoolean(parameter), cancellationToken));
@@ -445,6 +453,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand NavigateCommand { get; }
     public AsyncCommand SelectSettingsSectionCommand { get; }
     public AsyncCommand SetAppearanceCommand { get; }
+    public AsyncCommand DetectAiAgentsCommand { get; }
+    public bool SupportsZcodeRemoteConfiguration => client.SupportsZcodeRemoteConfiguration;
+    public AsyncCommand SaveZcodeRemoteCommand { get; }
+    public AsyncCommand ClearZcodeRemoteCommand { get; }
     public AsyncCommand RefreshCommand { get; }
     public AsyncCommand SetRemoteAccessCommand { get; }
     public AsyncCommand RetryConnectionCommand { get; }
@@ -483,6 +495,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string SettingsSection => settingsSection;
     public bool IsGeneralSettingsSelected => settingsSection == "general";
     public bool IsAccountSettingsSelected => settingsSection == "account";
+    public bool IsAgentsSettingsSelected => settingsSection == "agents";
     public bool IsCommandsSettingsSelected => settingsSection == "commands";
     public bool IsIntegrationSettingsSelected => settingsSection == "integration";
     public bool IsDiagnosticsSettingsSelected => settingsSection == "diagnostics";
@@ -490,6 +503,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string CurrentSettingsSectionTitle => settingsSection switch
     {
         "account" => PresentationText.Account,
+        "agents" => "AI Agent",
         "commands" => PresentationText.Commands,
         "integration" => PresentationText.Integration,
         "diagnostics" => PresentationText.Diagnostics,
@@ -601,6 +615,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsGeneralSettingsSelected));
         RaisePropertyChanged(nameof(IsAccountSettingsSelected));
         RaisePropertyChanged(nameof(IsCommandsSettingsSelected));
+        RaisePropertyChanged(nameof(IsAgentsSettingsSelected));
+        if (IsAgentsSettingsSelected && Settings.AiAgents.Count == 0) DetectAiAgentsCommand.Execute(null);
         RaisePropertyChanged(nameof(IsIntegrationSettingsSelected));
         RaisePropertyChanged(nameof(IsDiagnosticsSettingsSelected));
         RaisePropertyChanged(nameof(IsAboutSettingsSelected));
@@ -664,6 +680,40 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 LocalizeFailure(snapshot.LastErrorCode, snapshot.LastErrorDetail).Detail;
         RaiseStatusProperties();
         RaiseAccountStateProperties();
+    }
+
+    private async Task DetectAiAgentsAsync(CancellationToken cancellationToken)
+    {
+        try {
+            var agents = await client.DetectAiAgentsAsync(cancellationToken).ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() => {
+                Settings.AiAgents.Clear();
+                foreach (var agent in agents) Settings.AiAgents.Add(agent);
+                var zcode = agents.FirstOrDefault(a => a.Id == "zcode");
+                Settings.ZcodeRemoteStatus = zcode?.Strategy == "desktop_remote" ? zcode.Detail : "未配置 · 使用本地协议";
+            }, cancellationToken);
+        } catch (Exception error) when (error is not OperationCanceledException) { await ShowFailureAsync(error); }
+    }
+
+    private bool configuringZcode;
+    private async Task ConfigureZcodeRemoteAsync(bool clear, CancellationToken token)
+    {
+        if (configuringZcode || !SupportsZcodeRemoteConfiguration) return;
+        if (!clear && string.IsNullOrWhiteSpace(Settings.ZcodeRemoteUrl)) {
+            ShowNotice(UiNoticeSeverity.Warning, "请输入 ZCode 桌面远控地址", "清除配置请使用清除按钮。");
+            return;
+        }
+        configuringZcode = true;
+        try {
+            await client.ConfigureZcodeRemoteAsync(clear ? string.Empty : Settings.ZcodeRemoteUrl, token).ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() => {
+                Settings.ZcodeRemoteUrl = string.Empty;
+                Settings.ZcodeRemoteStatus = clear ? "未配置 · 使用本地协议" : "桌面远控 · 已配置地址";
+                ShowNotice(UiNoticeSeverity.Success, clear ? "已清除 ZCode 远控地址" : "已保存 ZCode 远控地址", "安卓重新读取电脑能力后生效。");
+            }, token);
+            await DetectAiAgentsAsync(token).ConfigureAwait(false);
+        } catch (Exception error) when (error is not OperationCanceledException) { await ShowFailureAsync(error); }
+        finally { configuringZcode = false; }
     }
 
     private async Task RefreshAsync(CancellationToken cancellationToken)

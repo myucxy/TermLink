@@ -67,6 +67,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -311,7 +312,7 @@ internal fun homeGreetingPeriod(hourOfDay: Int): HomeGreetingPeriod {
     }
 }
 
-private val productColors = androidx.compose.material3.darkColorScheme(
+internal val productColors = androidx.compose.material3.darkColorScheme(
     primary = ProductPrimary,
     onPrimary = Color(0xFF14203D),
     secondary = ProductPositive,
@@ -835,6 +836,7 @@ class ProductActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        intent.getStringExtra(AI_NOTIFICATION_TICKET)?.let { ViewModelProvider(this)[AiNotificationInbox::class.java].ticket = it }
         repositoryOwner = ViewModelProvider(
             this,
             ProductRepositoryViewModel.Factory(applicationContext),
@@ -896,6 +898,12 @@ class ProductActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra(AI_NOTIFICATION_TICKET)?.let { ViewModelProvider(this)[AiNotificationInbox::class.java].ticket = it }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1032,6 +1040,17 @@ fun ProductApp(
 ) {
     val context = LocalContext.current
     val snapshot by repository.snapshot.collectAsStateCompat()
+    val aiScope = rememberCoroutineScope()
+    val aiOwner = remember(context) { (context as? ComponentActivity)?.let { ViewModelProvider(it)[AiWorkspaceViewModel::class.java] } }
+    val aiWorkspace = remember(repository, snapshot.signedIn, snapshot.accountLabel, snapshot.serverUrl) {
+        val accountKey = aiAccountKey(snapshot)
+        val protectedStore = OidcSessionStore(context)
+        aiOwner?.acquire(context, repository, accountKey) ?: AiWorkspace(repository, aiScope, context.getSharedPreferences("ai-views-$accountKey", android.content.Context.MODE_PRIVATE),
+            seal = { protectedStore.sealAiOperation(accountKey, it) },
+            unseal = { protectedStore.openAiOperation(accountKey, it) })
+    }
+    DisposableEffect(aiWorkspace) { onDispose { if (aiOwner == null) aiWorkspace.retire() } }
+    AiAttentionMonitor(aiWorkspace, snapshot, foreground)
     val remoteDirectoryFavoriteStore = remember(context) {
         SharedPreferencesRemoteDirectoryFavoriteStore(context)
     }
@@ -1050,6 +1069,7 @@ fun ProductApp(
     var destinationName by rememberSaveable {
         mutableStateOf(restoredNavigation.primaryDestination.destination().name)
     }
+    AiNotificationNavigation(aiWorkspace, snapshot) { destinationName = ProductDestination.AI.name }
     val storedDestination = runCatching { ProductDestination.valueOf(destinationName) }
         .getOrDefault(ProductDestination.DEVICES)
     // A destination saved by an older build must not resurrect hidden product
@@ -1124,31 +1144,6 @@ fun ProductApp(
         // open. Do not send a stale close request in that case.
         if (pendingStopSessionId != null && stoppableSessionId == null) {
             pendingStopSessionId = null
-        }
-    }
-
-    LaunchedEffect(
-        snapshot.connectionState,
-        snapshot.sessions.map { Triple(it.id, it.state, it.online) },
-        snapshot.pcs.map { Triple(it.id, it.online, it.capabilities) },
-        openedSessionIds,
-    ) {
-        if (snapshot.connectionState != ProductConnectionState.CONNECTED) return@LaunchedEffect
-        val pcsById = snapshot.pcs.associateBy(PcSummary::id)
-        val available = snapshot.sessions.asSequence()
-            .filter { session ->
-                isSessionTabOpenable(
-                    session = session,
-                    pc = pcsById[session.pcId],
-                    hasReadOnlyRenderer = repository.terminalEngine(session.id) != null,
-                )
-            }
-            .mapTo(hashSetOf()) { it.id.toString() }
-        val retained = openedSessionIds.filter(available::contains)
-        if (retained != openedSessionIds) {
-            openedSessionIds = retained
-            selectedSessionId = selectedSessionId?.takeIf(retained::contains) ?: retained.lastOrNull()
-            saveProductSessionTabs(context, retained, selectedSessionId)
         }
     }
 
@@ -1245,6 +1240,22 @@ fun ProductApp(
                 )
             }
         }
+    }
+
+    LaunchedEffect(
+        snapshot.signedIn,
+        snapshot.connectionState,
+        snapshot.sessions.map { Triple(it.id, it.state, it.online) },
+        snapshot.pcs,
+        snapshot.devices,
+        snapshot.pcSessionCatalogErrors,
+        snapshot.pcSessionCatalogObservations,
+        openedSessionIds,
+    ) {
+        val retained = retainedCliSessionTabs(snapshot, openedSessionIds).toHashSet()
+        // Use the same local close path as a manual tab close: persist selection,
+        // prune per-tab input preferences, and release renderers/subscriptions.
+        openedSessionIds.filterNot(retained::contains).forEach { closeLocalSessionTab(java.util.UUID.fromString(it)) }
     }
 
     val deviceBackExitMessage = stringResource(R.string.devices_back_again_to_exit)
@@ -1418,7 +1429,7 @@ fun ProductApp(
                 }
             },
             bottomBar = {
-                if (!wide) {
+                if (!wide && !(destination == ProductDestination.AI && WindowInsets.ime.getBottom(density) > 0)) {
                     ProductBottomNavigation(destination.primaryDestination(), onDestinationSelected = ::navigateToPrimary)
                 }
             },
@@ -1481,6 +1492,9 @@ fun ProductApp(
                     )
                 }
                 ProductContent(
+                    aiWorkspace = aiWorkspace,
+                    onOpenAi = { navigateTo(ProductDestination.AI) },
+                    onOpenAiDevices = { navigateTo(ProductDestination.DEVICES) },
                     modifier = Modifier.weight(1f),
                     destination = destination,
                     sessionContentBottomPixels = if (destination == ProductDestination.SESSIONS) {
@@ -1765,9 +1779,12 @@ fun ProductApp(
                         throw error
                     } catch (error: Throwable) {
                         snackbarHostState.showSnackbar(
-                            if (error is dev.termlink.network.production.HostDeviceUpgradeRequiredException)
-                                context.getString(R.string.session_cleanup_upgrade_required)
-                            else safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
+                            when (error) {
+                                is dev.termlink.network.production.HostDeviceUpgradeRequiredException ->
+                                    context.getString(R.string.session_cleanup_upgrade_required)
+                                is SessionCleanupFailedException -> context.getString(R.string.session_cleanup_failed)
+                                else -> safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage)
+                            },
                         )
                     }
                 }
@@ -3059,6 +3076,7 @@ private fun ProductBottomNavigation(
 private fun ProductPrimaryDestination.icon(): ImageVector = when (this) {
     ProductPrimaryDestination.DEVICES -> Icons.Filled.Devices
     ProductPrimaryDestination.SESSIONS -> Icons.Filled.Terminal
+    ProductPrimaryDestination.AI -> Icons.Filled.AutoAwesome
     ProductPrimaryDestination.SETTINGS -> Icons.Filled.Settings
 }
 
@@ -3066,6 +3084,7 @@ private fun ProductPrimaryDestination.icon(): ImageVector = when (this) {
 private fun ProductPrimaryDestination.localizedLabel(): String = when (this) {
     ProductPrimaryDestination.DEVICES -> stringResource(R.string.nav_devices)
     ProductPrimaryDestination.SESSIONS -> stringResource(R.string.nav_sessions)
+    ProductPrimaryDestination.AI -> "AI"
     ProductPrimaryDestination.SETTINGS -> stringResource(R.string.nav_settings)
 }
 
@@ -3075,6 +3094,7 @@ private fun ProductDestination.localizedLabel(): String = when (this) {
     ProductDestination.FILES -> stringResource(R.string.nav_files)
     ProductDestination.DOWNLOADS -> stringResource(R.string.nav_downloads)
     ProductDestination.SESSIONS -> stringResource(R.string.nav_sessions)
+    ProductDestination.AI -> "AI"
     ProductDestination.ACTIVITY -> stringResource(R.string.nav_activity)
     ProductDestination.HISTORY -> stringResource(R.string.nav_history)
     // Retained enum values are never exposed by the shell.
@@ -3108,6 +3128,9 @@ internal fun deviceRefreshInProgress(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProductContent(
+    aiWorkspace: AiWorkspace,
+    onOpenAi: () -> Unit,
+    onOpenAiDevices: () -> Unit,
     modifier: Modifier,
     destination: ProductDestination,
     sessionContentBottomPixels: Int,
@@ -3173,6 +3196,10 @@ private fun ProductContent(
     val remotePcId = selectedRemotePcId?.let { value ->
         runCatching { java.util.UUID.fromString(value) }.getOrNull()
     }
+    if (destination == ProductDestination.AI) {
+        AiPage(aiWorkspace, snapshot, foreground, modifier, onOpenAiDevices)
+        return
+    }
     if (destination == ProductDestination.DEVICES) {
         PullToRefreshBox(
             isRefreshing = devicesRefreshing,
@@ -3189,6 +3216,8 @@ private fun ProductContent(
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 DevicesPage(
+                    aiWorkspace = aiWorkspace, onOpenAi = onOpenAi, foreground = foreground,
+                    onOpenRemoteShell = onOpenRemoteShell,
                     snapshot = snapshot,
                     expandedPcIds = expandedPcIds,
                     onTogglePcExpanded = onTogglePcExpanded,
@@ -3319,7 +3348,7 @@ private fun ProductContent(
     ) {
         when (destination) {
             ProductDestination.DEVICES -> Unit
-            ProductDestination.SESSIONS -> Unit
+            ProductDestination.SESSIONS, ProductDestination.AI -> Unit
             ProductDestination.FILES,
             ProductDestination.DOWNLOADS -> EmptyState(
                 icon = Icons.Filled.Folder,
@@ -3404,6 +3433,10 @@ private fun PrimaryHomeHeader(onOpenDownloads: () -> Unit) {
 
 @Composable
 private fun DevicesPage(
+    aiWorkspace: AiWorkspace,
+    onOpenAi: () -> Unit,
+    foreground: Boolean,
+    onOpenRemoteShell: (java.util.UUID, String, TerminalCommandCapability) -> Unit,
     snapshot: ProductSnapshot,
     expandedPcIds: Set<String>,
     onTogglePcExpanded: (java.util.UUID) -> Unit,
@@ -3431,7 +3464,7 @@ private fun DevicesPage(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             pcs.forEach { pc ->
-                val sessions = snapshot.sessions.filter { it.pcId == pc.id }
+                val sessions = visibleDeviceCliSessions(snapshot, pc)
                 val pcKey = pc.id.toString()
                 PcRow(
                     pc = pc,
@@ -3450,6 +3483,11 @@ private fun DevicesPage(
                     onDeleteSessionRequested = onDeleteSessionRequested,
                     onDeleteInactiveSessions = { onDeleteInactiveSessionsRequested(pc) },
                     inactiveSessionCount = snapshot.inactiveSessionIds(pc.id).size,
+                    aiContent = {
+                        DeviceSessionActions(aiWorkspace, pc, snapshot.remoteFileBrowser.openingCommandId != null,
+                            { onBrowsePc(pc) }, onOpenAi, onOpenRemoteShell)
+                        AiDeviceSessions(aiWorkspace, pc, pcKey in expandedPcIds, foreground, onOpenAi)
+                    },
                 )
                 snapshot.pcSessionCatalogErrors[pc.id]?.let { error ->
                     Text(
@@ -3671,6 +3709,7 @@ private fun PcRow(
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteInactiveSessions: (() -> Unit)? = null,
     inactiveSessionCount: Int = 0,
+    aiContent: @Composable () -> Unit = {},
 ) {
     var deviceMenuExpanded by remember { mutableStateOf(false) }
     val deviceMenuDescription = stringResource(R.string.device_menu_accessibility)
@@ -3694,7 +3733,7 @@ private fun PcRow(
                     .combinedClickable(
                         enabled = onToggleExpanded != null || onBrowseFiles != null || onDeleteInactiveSessions != null,
                         onClick = {
-                            if (sessions.isNotEmpty()) onToggleExpanded?.invoke()
+                            if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) onToggleExpanded?.invoke()
                         },
                         onLongClick = { deviceMenuExpanded = true },
                         onLongClickLabel = deviceMenuDescription,
@@ -3734,20 +3773,6 @@ private fun PcRow(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    onBrowseFiles?.let { browse ->
-                        TextButton(
-                            onClick = browse,
-                            modifier = Modifier.heightIn(min = 36.dp),
-                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
-                        ) {
-                            Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                stringResource(R.string.action_browse_files),
-                                style = MaterialTheme.typography.labelMedium,
-                            )
-                        }
-                    }
                 }
                 Box(
                     modifier = Modifier
@@ -3763,7 +3788,7 @@ private fun PcRow(
                         },
                     )
                 }
-                if (sessions.isNotEmpty()) {
+                if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
@@ -3806,6 +3831,7 @@ private fun PcRow(
                     }
                 }
             }
+            aiContent()
             if (expanded && sessions.isNotEmpty()) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
                 Column(
@@ -3897,9 +3923,9 @@ internal fun isSessionTabOpenable(
     hasReadOnlyRenderer: Boolean = false,
 ): Boolean = when {
     session == null -> false
-    pc?.online == false -> false
+    pc?.online == false || pc?.remoteRoutingEnabled == false -> false
     session.state == SessionState.RUNNING -> session.online
-    else -> pc?.online == true && PcCapabilityIds.HOST_HISTORY_V1 in pc.capabilities
+    else -> false
 }
 
 internal enum class SessionDestructiveAction {

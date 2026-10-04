@@ -1,4 +1,5 @@
 import java.net.URI
+import java.security.MessageDigest
 import org.gradle.api.DefaultTask
 import org.gradle.api.provider.Property
 import org.gradle.api.file.DirectoryProperty
@@ -419,6 +420,30 @@ androidComponents {
     }
 }
 
+val verifyAiWebAssets = tasks.register("verifyAiWebAssets") {
+    doLast {
+        val web = rootProject.file("../ai-web")
+        val assets = project.file("src/main/assets/ai-web")
+        val manifest = assets.resolve("manifest.json")
+        check(manifest.isFile) { "AI Web assets missing: run npm ci && npm run build in ai-web" }
+        val value = groovy.json.JsonSlurper().parse(manifest) as Map<*, *>
+        val sourceNames = (listOf("src", "scripts").flatMap { dir -> web.resolve(dir).walkTopDown().filter { it.isFile }.toList() } +
+            listOf("package.json", "package-lock.json", "tsconfig.json", "vite.config.ts", "index.html").map(web::resolve))
+            .map { it.relativeTo(web).invariantSeparatorsPath }.toSet()
+        check(sourceNames == (value["sources"] as Map<*, *>).keys) { "AI Web source set changed. Run npm run build in ai-web." }
+        for ((name, sourceRoot) in listOf("sources" to web, "files" to assets)) {
+            val entries = value[name] as Map<*, *>
+            for ((relative, expected) in entries) {
+                val file = sourceRoot.resolve(relative as String).canonicalFile
+                check(file.toPath().startsWith(sourceRoot.canonicalFile.toPath()) && file.isFile) { "AI Web file missing: $relative" }
+                val actual = MessageDigest.getInstance("SHA-256").digest(file.readBytes()).joinToString("") { "%02x".format(it) }
+                check(actual == expected) { "AI Web assets are stale: $relative. Run npm run build in ai-web." }
+            }
+        }
+    }
+}
+tasks.named("preBuild").configure { dependsOn(verifyAiWebAssets) }
+
 dependencies {
     implementation(project(":terminal-engine-api"))
     implementation(project(":terminal-engine-replay"))
@@ -433,6 +458,7 @@ dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.06.01"))
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
+    implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
@@ -442,6 +468,8 @@ dependencies {
     implementation("net.openid:appauth:0.11.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
+    implementation("org.commonmark:commonmark:0.24.0")
+    implementation("org.commonmark:commonmark-ext-gfm-tables:0.24.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("androidx.test:core-ktx:1.6.1")

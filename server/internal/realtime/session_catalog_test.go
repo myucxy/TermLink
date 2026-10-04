@@ -130,3 +130,57 @@ func TestCatalogRouteUsesDeviceAuthorityWithoutTerminalSubscription(t *testing.T
 		})
 	}
 }
+
+func TestAiRouteRequiresManageAndDoesNotCreateTerminalState(t *testing.T) {
+	for _, mode := range []string{"request", "response", "view-only", "wrong-pc", "wrong-account", "revoked", "stale", "sender-capability", "target-capability", "ack"} {
+		t.Run(mode, func(t *testing.T) {
+			s := &catalogAuthority{user: uuid.New(), android: uuid.New(), pc: uuid.New(), device: uuid.New(), manage: true}
+			h := &Hub{store: s, peers: map[uuid.UUID]*peer{}, observer: noopObserver{}}
+			a, p := testPeer(h, s.android), testPeer(h, s.device)
+			a.role, p.role = "android", "pc"
+			a.principal.UserID, p.principal.UserID = s.user, s.user
+			a.capabilities = map[string]bool{"ai_agent_v1": true}
+			p.capabilities = map[string]bool{"ai_agent_v1": true}
+			h.peers[s.android], h.peers[s.device] = a, p
+			sender, target, pc := a, p, s.pc
+			typ := realtimewire.AiAgentRequest
+			if mode == "response" {
+				sender, target, typ = p, a, realtimewire.AiAgentResponse
+			}
+			envelope := realtimewire.Envelope{MessageType: typ, RecipientDeviceID: target.principal.Device.ID[:], Sequence: 1}
+			switch mode {
+			case "view-only":
+				s.manage = false
+			case "wrong-pc":
+				pc = uuid.New()
+			case "wrong-account":
+				target.principal.UserID = uuid.New()
+			case "revoked":
+				s.denied = true
+			case "stale":
+				h.peers[s.android] = testPeer(h, s.android)
+			case "sender-capability":
+				sender.capabilities = nil
+			case "target-capability":
+				target.capabilities = nil
+			case "ack":
+				envelope.ACK = 1
+			}
+			err := sender.routeSessionCatalog(envelope, pc, []byte("opaque-ai"))
+			allowed := mode == "request" || mode == "response"
+			if allowed && err != nil || !allowed && !errors.Is(err, store.ErrDenied) {
+				t.Fatalf("allowed=%v err=%v", allowed, err)
+			}
+			if allowed && len(target.send) != 1 || !allowed && len(target.send) != 0 {
+				t.Fatal("unexpected forwarding")
+			}
+			if len(a.subscriptions) != 0 || len(p.subscriptions) != 0 || len(a.subscriptionACKs) != 0 {
+				t.Fatal("AI altered terminal state")
+			}
+		})
+	}
+	if !allowedMessage("android", realtimewire.AiAgentRequest) || allowedMessage("pc", realtimewire.AiAgentRequest) ||
+		!allowedMessage("pc", realtimewire.AiAgentResponse) || allowedMessage("android", realtimewire.AiAgentResponse) {
+		t.Fatal("AI direction not enforced")
+	}
+}

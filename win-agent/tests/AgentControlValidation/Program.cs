@@ -40,6 +40,7 @@ Require(registrationResult.Registration.ExpectedHostProcessId == registration.Ex
 Require(registrationResult.Registration.ShellType == ManagedShellType.PowerShell7, "Register shell changed.");
 Require(registrationResult.Registration.HandshakeToken.SequenceEqual(token), "Register token changed.");
 ValidateAuthenticationAndSecretStore();
+ValidateClientWireVersions();
 
 foreach (var command in new[]
 {
@@ -265,7 +266,10 @@ var response = new RegistryResponse
     }
 };
 
+response.Production.AiAgentsJson = "[{\"Id\":\"zcode\",\"Status\":\"available\"}]";
+Require(RoundTripRequest(new RegistryRequest { Command = RegistryCommand.DetectAiAgents }).Command == RegistryCommand.DetectAiAgents, "V13 discovery command changed.");
 var decoded = RoundTripResponse(response);
+Require(decoded.Production.AiAgentsJson == response.Production.AiAgentsJson, "V13 AI catalog changed.");
 Require(decoded.Success && decoded.Code == "OK" && decoded.RemoteAccessEnabled, "Response header changed.");
 Require(decoded.AffectedSessions == 2 && decoded.TimedOutSessions == 1, "Response counts changed.");
 Require(decoded.Summaries.Count == 1 && decoded.Summaries[0].ExitCode == 17, "Session summary changed.");
@@ -391,7 +395,7 @@ using (var legacyV9ResponseStream = new MemoryStream())
         "Pipe V9 response synthesized an account nickname.");
 }
 
-Console.WriteLine("TermLink Agent control Pipe V12 carrier status, V11 browser authorization, V10 account identity, and V9/V8/V7/V6/V5 compatibility validation passed.");
+Console.WriteLine("TermLink Agent control Pipe V13 AI catalog, V12 carrier status, V11 browser authorization, V10 account identity, and V9/V8/V7/V6/V5 compatibility validation passed.");
 
 static RegistryRequest RoundTripRequest(RegistryRequest request)
 {
@@ -407,6 +411,39 @@ static RegistryRequest RoundTripRequest(RegistryRequest request)
         "V7 request authentication changed during codec round trip.");
     Array.Clear(secret, 0, secret.Length);
     return decoded;
+}
+
+static void ValidateClientWireVersions()
+{
+    var root = Path.Combine(Path.GetTempPath(), "termlink-wire-" + Guid.NewGuid().ToString("N"));
+    var previousRoot = Environment.GetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT");
+    var previousCa = Environment.GetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE");
+    Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT", root);
+    Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE", Path.Combine(root, "marker"));
+    var secret = RegistryControlSecretStore.GetOrCreateDefault();
+    try {
+        foreach (var command in new[] { RegistryCommand.List, RegistryCommand.DetectAiAgents }) {
+            var pipeName = "termlink-wire-" + Guid.NewGuid().ToString("N");
+            using var server = new System.IO.Pipes.NamedPipeServerStream(pipeName);
+            var serve = System.Threading.Tasks.Task.Run(() => {
+                server.WaitForConnection();
+                var request = RegistryControlCodec.ReadRequest(server);
+                Require(request.ProtocolVersion == (command == RegistryCommand.List ? 12 : 13), "Wrong client wire version.");
+                Require(RegistryControlAuthentication.Verify(request, secret, DateTime.UtcNow), "Wire version invalidates client proof.");
+                var response = new RegistryResponse { Success = true, Code = "OK" };
+                RegistryControlAuthentication.PrepareResponse(response, request, secret);
+                RegistryControlCodec.WriteResponse(server, response, request.ProtocolVersion);
+            });
+            Require(RegistryControlClient.Send(pipeName, new RegistryRequest { Command = command }, 5000).Success,
+                "Client rejected authenticated version-compatible response.");
+            serve.GetAwaiter().GetResult();
+        }
+    } finally {
+        Array.Clear(secret, 0, secret.Length);
+        Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT", previousRoot);
+        Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE", previousCa);
+        Directory.Delete(root, true);
+    }
 }
 
 static void ValidateAuthenticationAndSecretStore()

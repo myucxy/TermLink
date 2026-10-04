@@ -268,6 +268,23 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         }
     }
 
+    public bool SupportsZcodeRemoteConfiguration => true;
+
+    public ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(url)) TermLink.Ai.ZcodeRemoteAddressStore.Default.Clear();
+        else TermLink.Ai.ZcodeRemoteAddressStore.Default.Save(url);
+        return ValueTask.CompletedTask;
+    }
+
+    public async ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken)
+    {
+        var response = await SendRequiredAsync(new RegistryRequest { Command = RegistryCommand.DetectAiAgents }, 30_000, cancellationToken).ConfigureAwait(false);
+        var agents = System.Text.Json.JsonSerializer.Deserialize<AiAgentCapability[]>(response.Production?.AiAgentsJson ?? "[]");
+        return agents ?? Array.Empty<AiAgentCapability>();
+    }
+
     public async ValueTask SaveTerminalCommandsAsync(
         IReadOnlyList<TerminalCommandCapability> commands,
         CancellationToken cancellationToken)

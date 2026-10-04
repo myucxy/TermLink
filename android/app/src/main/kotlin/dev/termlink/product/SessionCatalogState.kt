@@ -1,6 +1,8 @@
 package dev.termlink.product
 
 import dev.termlink.model.PcSummary
+import dev.termlink.model.DeviceTrustState
+import dev.termlink.model.isPcAgent
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
@@ -62,3 +64,31 @@ internal fun changedSessionCatalogPcIds(
             it.hostInstanceId != observation.hostInstanceId
     } == true
 }.keys
+
+/** Only confirmed Windows lifecycle/catalog facts can retire a saved CLI tab.
+ * Restored tabs store UUIDs only: an absent UUID requires a complete catalog,
+ * otherwise it could belong to a PC whose directory is temporarily unavailable. */
+internal fun retainedCliSessionTabs(snapshot: ProductSnapshot, opened: List<String>): List<String> {
+    if (!snapshot.signedIn || !snapshot.isConnected()) return opened
+    val confirmedPcs = snapshot.pcs.filter(snapshot::hasConfirmedSessionCatalog).mapTo(hashSetOf(), PcSummary::id)
+    val complete = snapshot.pcs.isNotEmpty() && confirmedPcs.size == snapshot.pcs.size
+    val sessions = snapshot.sessions.associateBy { it.id.toString() }
+    return opened.filter { id ->
+        val session = sessions[id]
+        if (session == null) !complete
+        else session.pcId !in confirmedPcs || !isInactiveSession(session.state, session.online)
+    }
+}
+
+internal fun ProductSnapshot.hasConfirmedSessionCatalog(pc: PcSummary): Boolean {
+    val observation = pcSessionCatalogObservations[pc.id]
+    return signedIn && isConnected() && pc.online && pc.remoteRoutingEnabled && pc.id !in pcSessionCatalogErrors &&
+        observation?.deviceId == pc.deviceId && observation.keyEpoch == pc.keyEpoch &&
+        devices.any { it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED }
+}
+
+/** Hide confirmed inactive rows on mobile without deleting Windows' retained history. */
+internal fun visibleDeviceCliSessions(snapshot: ProductSnapshot, pc: PcSummary): List<SessionSummary> {
+    val confirmed = snapshot.hasConfirmedSessionCatalog(pc)
+    return snapshot.sessions.filter { it.pcId == pc.id && (!confirmed || !isInactiveSession(it.state, it.online)) }
+}

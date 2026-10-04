@@ -15,6 +15,7 @@ namespace TermLink.UpdateCore.Validation
                 ValidateBuildIdentity();
                 ValidateTransactionAndReceipt(updateId, root);
                 ValidatePathBoundary(root);
+                ValidateCliWorkspace(root);
                 Console.WriteLine("UpdateCore validation passed.");
                 return 0;
             }
@@ -45,6 +46,27 @@ namespace TermLink.UpdateCore.Validation
                 "string build parsing failed");
             Assert(!WindowsUpdateVersion.TryGetBuild("0.1.latest", out _),
                 "invalid version text was accepted");
+        }
+
+        private static void ValidateCliWorkspace(string root)
+        {
+            var install = Path.Combine(root, "install");
+            var workspace = AiWorkspaceStorage.Under(install);
+            var leaf = "cli_20261004_120000_123_" + Guid.NewGuid().ToString("N");
+            var target = Path.Combine(workspace, leaf);
+            AiWorkspaceStorage.EnsureCliDirectory(install, target);
+            Assert(Directory.Exists(target), "managed CLI directory must be created");
+            File.WriteAllText(Path.Combine(target, "keep.txt"), "retain on retry");
+            AiWorkspaceStorage.EnsureCliDirectory(install, target);
+            Assert(File.ReadAllText(Path.Combine(target, "keep.txt")) == "retain on retry", "retry must preserve CLI contents");
+            foreach (var rejected in new[] { Path.Combine(root, leaf), Path.Combine(workspace, "arbitrary"), Path.Combine(workspace, "nested", leaf) })
+            {
+                AiWorkspaceStorage.EnsureCliDirectory(install, rejected);
+                Assert(!Directory.Exists(rejected), "remote launch cannot create outside the reserved namespace");
+            }
+            var moved = Path.Combine(root, "new-install"); Directory.CreateDirectory(moved);
+            AiWorkspaceStorage.MoveBetweenInstallRoots(install, moved);
+            Assert(File.Exists(Path.Combine(AiWorkspaceStorage.Under(moved), leaf, "keep.txt")), "upgrade must preserve CLI workspaces with AI workspaces");
         }
 
         private static void ValidateTransactionAndReceipt(Guid updateId, string root)

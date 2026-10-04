@@ -1,9 +1,8 @@
 name: Release production server image
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  # Historical fallback only. Current releases build locally and push Docker Hub.
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -606,6 +606,9 @@ namespace TermLink.Agent
         {
             this.config = config;
             this.credentials = credentials;
+            var aiAccountScope = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+                config.ServerUrl + "\n" + config.AccountKey + "\n" + config.PcId)));
+            aiSessions = new AiSessionManager(archiveRoot: System.IO.Path.Combine(ProductionAccountStorage.ResolveLocalApplicationDataRoot(), "TermLink", "ai-history", aiAccountScope));
             directAuthorityKeyEpoch = config.KeyEpoch;
             connectionSupervisor = new ProductionRealtimeConnectionSupervisor(
                 reconnectPreferences ?? throw new ArgumentNullException(nameof(reconnectPreferences)));
@@ -980,6 +983,7 @@ namespace TermLink.Agent
                 priorityHistoryWorker = Task.Run(() => HistoryUploadLoopAsync(allowPersistedBacklog: false));
                 metadataWorker = Task.Run(MetadataUpsertLoopAsync);
                 commonIngressWorker = Task.Run(CommonIngressLoopAsync);
+                historyRetentionWorker = Task.Run(HistoryRetentionLoopAsync);
                 networkAvailabilityHandler = (_, network) =>
                 {
                     DispatchNetworkAvailabilityChange(
@@ -2154,7 +2158,11 @@ namespace TermLink.Agent
                 }
                 finally
                 {
-                    try { registry?.ReleaseBufferedSession(sessionId); }
+                    try
+                    {
+                        registry?.ReleaseBufferedSession(sessionId);
+                        registry?.DeleteRetiredSessionBuffer(sessionId);
+                    }
                     catch (Exception error) when (error is IOException ||
                         error is UnauthorizedAccessException ||
                         error is InvalidOperationException) { }
@@ -2597,7 +2605,7 @@ namespace TermLink.Agent
                 "remote_agent_update_v1",
                 "host_history_v1",
                 "host_session_catalog_v1",
-                "host_session_cleanup_v1",
+                "host_session_cleanup_v1", "ai_agent_v1",
                 "terminal_window_resize_v1"
             };
             if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v2");
@@ -4978,7 +4986,7 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Envelope recipient mismatch.");
             if (envelope.Seq == 0 || envelope.Nonce.Length != 12 || envelope.Ciphertext.Length < 16)
                 throw new InvalidDataException("Located session Envelope metadata is invalid.");
-            if (envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest)
+            if (envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest || envelope.MessageType == MessageType.AiAgentRequest)
             {
                 if (sessionId != config.PcId || envelope.Ack != 0 || registry == null || !registry.RemoteAccessEnabled)
                     throw new InvalidDataException("Catalog route is invalid.");
@@ -5022,15 +5030,19 @@ namespace TermLink.Agent
             CryptographicOperations.ZeroMemory(pairwiseKey);
             CryptographicOperations.ZeroMemory(expectedKeyId);
             byte[] plaintext = null;
-            var deviceRequest = envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest;
+            var deviceRequest = envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest || envelope.MessageType == MessageType.AiAgentRequest;
             var ingressApplied = !deviceRequest;
             try
             {
                 plaintext = SessionCrypto.Decrypt(sessionKey, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), envelope.Ciphertext.ToByteArray());
                 if (!deviceRequest) ObserveAndroidEnvelope(senderId, sessionId, envelope.Seq);
                 TouchSubscriber(subscriber);
-                if (envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest)
+                if (envelope.MessageType == MessageType.SessionCatalogRequest || envelope.MessageType == MessageType.SessionCleanupRequest || envelope.MessageType == MessageType.AiAgentRequest)
                 {
+                    if (envelope.MessageType == MessageType.AiAgentRequest) {
+                        DispatchAiRequest(active, sessionId, subscriber, envelope.Seq, AiAgentRequestPayload.Parser.ParseFrom(plaintext), token);
+                        return;
+                    }
                     if (envelope.MessageType == MessageType.SessionCleanupRequest)
                     {
                         var cleanup = await CleanupSessionsAsync(SessionCleanupRequestPayload.Parser.ParseFrom(plaintext), token).ConfigureAwait(false);
@@ -8243,6 +8255,7 @@ namespace TermLink.Agent
         private void MarkReauthenticationRequired()
         {
             if (Interlocked.Exchange(ref reauthenticationRequired, 1) != 0) return;
+            aiSessions.Dispose();
             statusExpiresUtc = DateTime.MaxValue;
             SetRelayState(ProductionRelayState.Failed, "ACCOUNT_REAUTH_REQUIRED");
             ClientWebSocket active;
@@ -8497,6 +8510,7 @@ namespace TermLink.Agent
                 NetworkChange.NetworkAddressChanged -= addressHandler;
             SetRelayState(ProductionRelayState.Stopped, string.Empty);
             cancellation.Cancel();
+            aiSessions.Dispose();
             CancelAllHostHistoryRequests();
             connectionSupervisor.MarkPhysicalDisconnected();
             ObserveDirectRelayConnectedSafely(false);
@@ -8519,6 +8533,7 @@ namespace TermLink.Agent
         public void Dispose()
         {
             StopAccountSynchronization();
+            aiSessions.Dispose();
             if (Interlocked.Exchange(ref cleanupStarted, 1) != 0) return;
 
             Task activeWorker;
@@ -8572,6 +8587,12 @@ namespace TermLink.Agent
             {
                 try { activeCommonIngressWorker.GetAwaiter().GetResult(); }
                 catch (AggregateException) { }
+                catch (OperationCanceledException) { }
+                catch (ObjectDisposedException) { }
+            }
+            if (historyRetentionWorker != null)
+            {
+                try { historyRetentionWorker.GetAwaiter().GetResult(); }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
             }

@@ -97,6 +97,75 @@ class ProductionSessionCatalogTest {
     }
 
     @Test
+    fun encryptedAiRoundTripRejectsWrongPeerEpochAndReplayedRequest(): Unit = runBlocking {
+        for (fault in listOf("none", "late", "peer", "epoch", "replay", "capability")) {
+            val capability = "ai_agent_v1"
+            val requestType = MessageType.AI_AGENT_REQUEST
+            val responseType = MessageType.AI_AGENT_RESPONSE
+            val sessionId = UUID.randomUUID()
+            val pcId = UUID.randomUUID()
+            val pcDevice = UUID.randomUUID()
+            val androidId = UUID.randomUUID()
+            val identity = DeviceIdentity.generate()
+            val host = DeviceIdentity.generate()
+            val pairwise = SessionCrypto.derivePairwiseKey(host.exchange.privateKey, identity.exchange.publicKey, pcDevice, androidId, 1)
+            val keyId = "epoch-00000001".encodeToByteArray()
+            val incoming = SessionCrypto.deriveSessionKey(pairwise, pcId, CryptoDirection.ANDROID_TO_PC, keyId)
+            val outgoing = SessionCrypto.deriveSessionKey(pairwise, pcId, CryptoDirection.PC_TO_ANDROID, keyId)
+            pairwise.fill(0)
+            val server = MockWebServer()
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    webSocket.send("""{"type":"welcome","protocol_version":1,"capabilities":[${if (fault == "capability") "" else "\"$capability\""}]}""")
+                }
+                override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
+                    val envelope = Envelope.parseFrom(bytes.toByteArray())
+                    assertEquals(requestType, envelope.messageType)
+                    assertEquals(0L, envelope.ack)
+                    val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, incoming)
+                    val requestId = try {
+                        dev.termlink.protocol.realtime.v1.AiAgentRequestPayload.parseFrom(plaintext).also {
+                            assertEquals("{}", it.json)
+                        }.requestId
+                    } finally { plaintext.fill(0) }
+                    val echoedId = if (fault == "replay") uuid() else requestId
+                    val response = dev.termlink.protocol.realtime.v1.AiAgentResponsePayload.newBuilder().setRequestId(echoedId).setJson("ok").build().toByteArray()
+                    if (fault == "late") {
+                        val old = ProductionRealtimeClient.encryptedEnvelope(
+                            pcId, pcDevice, responseType, CryptoDirection.PC_TO_ANDROID, envelope.seq - 1, 0,
+                            keyId, ByteArray(12) { 2 }, outgoing, response, recipientId = androidId,
+                        )
+                        webSocket.send(okio.ByteString.of(*old.toByteArray()))
+                    }
+                    val reply = ProductionRealtimeClient.encryptedEnvelope(
+                        pcId, if (fault == "peer") UUID.randomUUID() else pcDevice,
+                        responseType, CryptoDirection.PC_TO_ANDROID, envelope.seq, 0,
+                        if (fault == "epoch") "epoch-00000002".encodeToByteArray() else keyId,
+                        ByteArray(12) { 1 }, outgoing, response, recipientId = androidId,
+                    )
+                    webSocket.send(okio.ByteString.of(*reply.toByteArray()))
+                }
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
+            }))
+            server.start()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val mux = ProductionRealtimeMultiplexer(server.url("/").toString(), AccessTokenProvider { "test" },
+                androidId, identity, scope, optionalAdvertisedCapabilities = setOf(capability),
+                allowCleartextForLocalTest = true)
+            try {
+                val result = runCatching {
+                    requestAiAgent(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7, "{}")
+                }
+                if (fault == "none" || fault == "late") assertEquals("ok", result.getOrThrow())
+                else assertTrue("$fault was accepted", result.isFailure)
+            } finally {
+                mux.close(); scope.cancel(); server.shutdown()
+                identity.destroy(); host.destroy(); incoming.fill(0); outgoing.fill(0)
+            }
+        }
+    }
+
+    @Test
     fun completeCatalogRejectsDuplicateIdsAndFalseRunningStatus() {
         val request = uuid()
         val valid = catalog(request)

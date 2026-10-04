@@ -8,6 +8,11 @@ namespace TermLink.Presentation;
 
 public interface IAgentClient
 {
+    bool SupportsZcodeRemoteConfiguration => false;
+    ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException("ZCode remote configuration is unavailable on this platform."));
+    ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(Array.Empty<AiAgentCapability>());
     ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken);
     ValueTask ConfigureServerAsync(string serverUrl, CancellationToken cancellationToken) =>
         ValueTask.FromException(new PlatformNotSupportedException("Server URL configuration is unavailable on this platform."));

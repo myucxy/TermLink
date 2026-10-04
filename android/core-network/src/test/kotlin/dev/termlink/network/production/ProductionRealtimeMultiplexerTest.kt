@@ -56,6 +56,32 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class ProductionRealtimeMultiplexerTest {
     @Test
+    fun aiRepliesCanArriveOutOfOrderWithoutBlockingCommandsOrCatalog(): Unit = runTest {
+        val socket = FakeSocket(); val pc = UUID.randomUUID()
+        val mux = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val read = mux.register(pc, catalogOnly = true, aiOnly = true, aiSequence = 101)
+        val command = mux.register(pc, catalogOnly = true, aiOnly = true, aiSequence = 102)
+        val catalog = mux.register(pc, catalogOnly = true)
+        read.connect(); socket.emitState(RealtimeState.Connected); runCurrent()
+        fun envelope(type: MessageType, seq: Long) = Envelope.newBuilder()
+            .setSessionId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(pc))).setMessageType(type).setSeq(seq).build()
+        assertTrue(read.sendForConnectedGeneration(envelope(MessageType.AI_AGENT_REQUEST, 101), 1))
+        assertTrue(command.sendForConnectedGeneration(envelope(MessageType.AI_AGENT_REQUEST, 102), 1))
+        assertTrue(catalog.sendForConnectedGeneration(envelope(MessageType.SESSION_CATALOG_REQUEST, 103), 1))
+        val a = async { read.receivedEnvelopes.first() }; val b = async { command.receivedEnvelopes.first() }
+        fun deliver(type: MessageType, seq: Long) = socket.deliver(ProductionReceivedEnvelope(envelope(type, seq), 64, 1, releaseReservation = {}))
+        deliver(MessageType.AI_AGENT_RESPONSE, 102); runCurrent()
+        assertTrue(b.isCompleted); assertTrue(!a.isCompleted); b.await().close(); command.close()
+        deliver(MessageType.AI_AGENT_RESPONSE, 102) // Late duplicate cannot reach another request.
+        deliver(MessageType.AI_AGENT_RESPONSE, 101); runCurrent()
+        assertEquals(101L, a.await().envelope.seq); a.await().close()
+        val c = async { catalog.receivedEnvelopes.first() }
+        deliver(MessageType.SESSION_CATALOG_RESPONSE, 103); runCurrent()
+        c.await().close(); assertEquals(0, socket.disconnectCount)
+        mux.close()
+    }
+
+    @Test
     fun optionalResizeRequiresCapabilityOnCurrentServerGeneration(): Unit = runTest {
         val socket = FakeSocket()
         val mux = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)

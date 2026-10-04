@@ -71,6 +71,21 @@ class ProductNavigationPreferencesTest {
     }
 
     @Test
+    fun removedTabAndItsInputPreferenceDoNotReturnAfterRestart() {
+        val ended = UUID.randomUUID()
+        val live = UUID.randomUUID().toString()
+        saveProductSessionTabs(context, listOf(ended.toString(), live), ended.toString())
+        saveTouchMouseEnabled(context, ended, true)
+        saveProductSessionTabs(context, listOf(live), live)
+        val restored = loadProductNavigationState(context)
+        assertEquals(listOf(live), restored.openedSessionIds)
+        assertEquals(live, restored.selectedSessionId)
+        org.junit.Assert.assertFalse(loadTouchMouseEnabled(context, ended))
+        saveProductSessionTabs(context, emptyList(), null)
+        assertNull(loadProductNavigationState(context).selectedSessionId)
+    }
+
+    @Test
     fun ignoresUnknownDestinationsAndMalformedSessionIds() {
         context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
             .edit()

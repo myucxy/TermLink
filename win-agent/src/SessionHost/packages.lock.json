@@ -8,8 +8,16 @@
         "resolved": "1.24.260710001",
         "contentHash": "JR1xAkZbNnAALBjzFpqSwEx7YZfD1LI228jF9j9cgKknBPCiFy9mpphlgH+TpTN8vajTUpcgg9Miy5Y8eUAH9g=="
       },
+      "System.Security.Cryptography.ProtectedData": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "+TUFINV2q2ifyXauQXRwy4CiBhqvDEDZeVJU7qfxya4aRYOKzVBpN+4acx25VcPB9ywUN6C0n8drWl110PhZEg=="
+      },
       "termlink.agentcontrol": {
-        "type": "Project"
+        "type": "Project",
+        "dependencies": {
+          "System.Security.Cryptography.ProtectedData": "[8.0.0, )"
+        }
       },
       "termlink.terminalcore": {
         "type": "Project"

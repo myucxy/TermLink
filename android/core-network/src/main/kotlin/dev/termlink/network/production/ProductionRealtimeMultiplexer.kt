@@ -207,9 +207,10 @@ class ProductionRealtimeMultiplexer private constructor(
     private val scope = CoroutineScope(parentScope.coroutineContext + scopeJob)
     private val closed = AtomicBoolean(false)
     private val endpointLock = Any()
-    private val endpoints = mutableMapOf<Pair<UUID, Boolean>, Endpoint>()
+    private data class RouteKey(val sessionId: UUID, val lane: Int, val sequence: Long = 0)
+    private val endpoints = mutableMapOf<RouteKey, Endpoint>()
     private val directDataGateway = AtomicReference<ProductionRealtimeDirectDataGateway?>(null)
-    private val closedEndpointIncarnations = LinkedHashMap<Pair<UUID, Boolean>, ClosedEndpoint>()
+    private val closedEndpointIncarnations = LinkedHashMap<RouteKey, ClosedEndpoint>()
     /** Socket-global fence; it intentionally survives endpoint replacement. */
     private val rejectedThroughGeneration = AtomicInteger(0)
     /** Highest socket generation observed by any endpoint incarnation. */
@@ -265,7 +266,11 @@ class ProductionRealtimeMultiplexer private constructor(
         peerDeviceId: UUID? = null,
         catalogOnly: Boolean = false,
         cleanupOnly: Boolean = false,
+        aiOnly: Boolean = false,
+        aiSequence: Long = 0,
     ): ProductionRealtimeSessionTransport {
+        require(aiSequence >= 0 && (aiOnly || aiSequence == 0L))
+        require(!aiOnly || catalogOnly && !cleanupOnly)
         require(!cleanupOnly || catalogOnly) { "Cleanup endpoints use the device Relay route" }
         require(!catalogOnly || peerDeviceId == null) { "Catalog endpoints use Relay only" }
         require(peerDeviceId == null || peerDeviceId != UUID(0, 0)) {
@@ -276,10 +281,14 @@ class ProductionRealtimeMultiplexer private constructor(
             // Rechecking under the map lock prevents a register/close race from
             // installing an endpoint after the owner has already drained it.
             check(!closed.get()) { "production realtime multiplexer is closed" }
-            val routeKey = sessionId to cleanupOnly
+            val routeKey = RouteKey(sessionId, if (aiOnly) 2 else if (cleanupOnly) 1 else 0, aiSequence)
+            if (aiOnly) {
+                val siblings = endpoints.keys.filter { it.sessionId == sessionId && it.lane == 2 }
+                check(siblings.size < 4 && siblings.none { it.sequence == 0L || aiSequence == 0L }) { "AI request concurrency limit" }
+            }
             check(routeKey !in endpoints) { "production session is already registered" }
             closedEndpointIncarnations.remove(routeKey)
-            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation(), catalogOnly, cleanupOnly).also { endpoint ->
+            Endpoint(sessionId, peerDeviceId, nextEndpointIncarnation(), catalogOnly, cleanupOnly, aiOnly, aiSequence).also { endpoint ->
                 endpoints[routeKey] = endpoint
                 logEndpointLifecycle("endpoint_register", endpoint)
             }
@@ -309,7 +318,7 @@ class ProductionRealtimeMultiplexer private constructor(
             ?: return false
         val sessionId = ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray())
             ?: return false
-        val endpoint = synchronized(endpointLock) { endpoints[sessionId to false] } ?: return false
+        val endpoint = synchronized(endpointLock) { endpoints[RouteKey(sessionId, 0)] } ?: return false
         if (endpoint.peerDeviceId != peerDeviceId) return false
         return endpoint.sendRelayExact(envelope, exactEnvelopeBytes)
     }
@@ -333,7 +342,7 @@ class ProductionRealtimeMultiplexer private constructor(
             ?: return false
         val sessionId = ProductionRealtimeClient.uuidFromBytes(envelope.sessionId.toByteArray())
             ?: return false
-        val endpoint = synchronized(endpointLock) { endpoints[sessionId to false] } ?: return false
+        val endpoint = synchronized(endpointLock) { endpoints[RouteKey(sessionId, 0)] } ?: return false
         if (endpoint.peerDeviceId != peerDeviceId) return false
 
         val generation = when (carrierOwner) {
@@ -449,8 +458,13 @@ class ProductionRealtimeMultiplexer private constructor(
             }
 
             val sessionId = ProductionRealtimeClient.uuidFromBytes(received.envelope.sessionId.toByteArray())
-            val routeKey = sessionId?.let { it to (received.envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_RESPONSE) }
+            var routeKey = sessionId?.let { RouteKey(it, when (received.envelope.messageType) {
+                dev.termlink.protocol.realtime.v1.MessageType.AI_AGENT_RESPONSE -> 2
+                dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_RESPONSE -> 1
+                else -> 0
+            }, if (received.envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.AI_AGENT_RESPONSE) received.envelope.seq else 0) }
             val target = synchronized(endpointLock) {
+                if (routeKey?.lane == 2 && RouteKey(checkNotNull(sessionId), 2) in endpoints) routeKey = RouteKey(sessionId, 2)
                 RouteTarget(
                     endpoint = routeKey?.let(endpoints::get),
                     closedEndpoint = routeKey?.let(closedEndpointIncarnations::get),
@@ -547,8 +561,10 @@ class ProductionRealtimeMultiplexer private constructor(
         val incarnation: Int,
         private val catalogOnly: Boolean,
         private val cleanupOnly: Boolean,
+        private val aiOnly: Boolean,
+        private val aiSequence: Long,
     ) : ProductionRealtimeSessionTransport {
-        val routeKey = sessionId to cleanupOnly
+        val routeKey = RouteKey(sessionId, if (aiOnly) 2 else if (cleanupOnly) 1 else 0, aiSequence)
         private val endpointClosed = AtomicBoolean(false)
         private val subscribedGeneration = AtomicInteger(0)
         private val admissionLock = Any()
@@ -653,16 +669,19 @@ class ProductionRealtimeMultiplexer private constructor(
             }
             return synchronized(admissionLock) {
                 check(!closed.get() && !endpointClosed.get()) { "production session transport is closed" }
-                require(catalogOnly == (envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST))) {
+                require(catalogOnly == (envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST, dev.termlink.protocol.realtime.v1.MessageType.AI_AGENT_REQUEST))) {
                     "Catalog and terminal endpoints cannot be mixed"
                 }
+                require(aiOnly == (envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.AI_AGENT_REQUEST))
+                require(aiSequence == 0L || envelope.seq == aiSequence) { "AI sequence must match its registered request" }
                 require(cleanupOnly == (envelope.messageType == dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST)) {
                     "Cleanup and catalog endpoints cannot be mixed"
                 }
                 when (envelope.messageType) {
                     dev.termlink.protocol.realtime.v1.MessageType.SUBSCRIBE,
                     dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_REQUEST,
-                    dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST -> {
+                    dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_REQUEST,
+                    dev.termlink.protocol.realtime.v1.MessageType.AI_AGENT_REQUEST -> {
                         val generation = expectedGeneration ?: supervisor.currentConnectedGeneration()
                         if (expectedGeneration == null) {
                             check(generation > 0) { "SUBSCRIBE requires a connected socket generation" }
@@ -786,7 +805,7 @@ class ProductionRealtimeMultiplexer private constructor(
                     if (subscribedGeneration.get() != received.generation) {
                         return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
                     }
-                    if (catalogOnly != (received.envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_RESPONSE, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_RESPONSE))) {
+                    if (catalogOnly != (received.envelope.messageType in setOf(dev.termlink.protocol.realtime.v1.MessageType.SESSION_CATALOG_RESPONSE, dev.termlink.protocol.realtime.v1.MessageType.SESSION_CLEANUP_RESPONSE, dev.termlink.protocol.realtime.v1.MessageType.AI_AGENT_RESPONSE))) {
                         return@synchronized ProductionRealtimeRouteDecision.ENDPOINT_NOT_SUBSCRIBED
                     }
                     val endpointEnvelope = reserveEndpointEnvelopeLocked(received)

@@ -907,6 +907,8 @@ namespace TermLink.Setup
                 cancellationToken.ThrowIfCancellationRequested();
                 Directory.CreateDirectory(staging);
                 ExtractPayload(staging, cancellationToken);
+                if (Directory.Exists(AiWorkspaceStorage.Under(staging)) || File.Exists(AiWorkspaceStorage.Under(staging)))
+                    throw new InvalidDataException("Installer payload cannot contain user AI workspaces.");
 
                 // Re-check immediately before the first mutation. A process may
                 // have started while the payload was being staged.
@@ -936,6 +938,7 @@ namespace TermLink.Setup
                         "Could not activate the new version install folder"),
                     cancellationToken: cancellationToken);
                 newRootActivated = true;
+                AiWorkspaceStorage.MoveBetweenInstallRoots(backup, root);
                 cancellationToken.ThrowIfCancellationRequested();
 
                 marker = new InstallMarker
@@ -1111,6 +1114,8 @@ namespace TermLink.Setup
             RemoveTerminalFragmentIfOwned(marker);
             RemoveStartupIfOwned(marker);
             RemoveShortcuts(marker);
+            var preservedWorkspaces = AiWorkspaceStorage.PreserveBeforeUninstall(root);
+            if (preservedWorkspaces != null) Console.WriteLine(SetupText.Pick("AI 会话文件已保留到: ", "AI workspace files preserved at: ") + preservedWorkspaces);
             Directory.Delete(root, true);
             ForgetInstallDirectory(root);
             if (purgeKnownRuntimeData)
@@ -2754,6 +2759,7 @@ namespace TermLink.Setup
             string failedRoot = null;
             if (Directory.Exists(root))
             {
+                AiWorkspaceStorage.MoveBetweenInstallRoots(root, backup);
                 failedRoot = Path.Combine(parent, ".termlink-failed-" + Guid.NewGuid().ToString("N"));
                 MoveDirectoryWithRetry(
                     root,

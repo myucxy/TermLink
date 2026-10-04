@@ -303,6 +303,7 @@
             <WrapPanel>
               <Button Classes="section-nav" Classes.selected="{Binding IsGeneralSettingsSelected}" Content="{x:Static text:PresentationText.General}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="general" />
               <Button Classes="section-nav" Classes.selected="{Binding IsAccountSettingsSelected}" Content="{x:Static text:PresentationText.Account}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="account" />
+              <Button Classes="section-nav" Classes.selected="{Binding IsAgentsSettingsSelected}" Content="AI Agent" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="agents" />
               <Button Classes="section-nav" Classes.selected="{Binding IsCommandsSettingsSelected}" Content="{x:Static text:PresentationText.Commands}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="commands" />
               <Button Classes="section-nav" Classes.selected="{Binding IsIntegrationSettingsSelected}" Content="{x:Static text:PresentationText.Integration}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="integration" />
               <Button Classes="section-nav" Classes.selected="{Binding IsDiagnosticsSettingsSelected}" Content="{x:Static text:PresentationText.Diagnostics}" Command="{Binding SelectSettingsSectionCommand}" CommandParameter="diagnostics" />
@@ -385,6 +386,38 @@
                 </Border>
               </StackPanel>
 
+              <Grid IsVisible="{Binding IsAgentsSettingsSelected}" RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="8">
+                <Grid ColumnDefinitions="*,Auto">
+                  <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <TextBlock Text="AI Agent" FontWeight="SemiBold" />
+                    <TextBlock Text="检测中…" IsVisible="{Binding DetectAiAgentsCommand.IsRunning}" />
+                  </StackPanel>
+                  <Button Grid.Column="1" Content="重新检测" Command="{Binding DetectAiAgentsCommand}" />
+                </Grid>
+                <TextBlock Grid.Row="1" Text="自动识别本机安装与协议。认证由 Agent 本身处理，首次对话后确认。" TextWrapping="Wrap" />
+                <ItemsControl Grid.Row="2" ItemsSource="{Binding Settings.AiAgents}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="contracts:AiAgentCapability">
+                      <StackPanel Margin="0,4" Spacing="2">
+                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Detail}" />
+                        <TextBlock Text="{Binding Path}" TextWrapping="Wrap" FontSize="12" />
+                      </StackPanel>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <StackPanel Grid.Row="3" Spacing="6" IsVisible="{Binding SupportsZcodeRemoteConfiguration}">
+                  <TextBlock Text="ZCode 桌面远控" FontWeight="SemiBold" />
+                  <TextBlock Text="{Binding Settings.ZcodeRemoteStatus}" FontSize="12" />
+                  <TextBox Text="{Binding Settings.ZcodeRemoteUrl, Mode=TwoWay}" PasswordChar="●" MaxLength="8192"
+                           PlaceholderText="粘贴 https://zcode.z.ai/remote/ 远控地址" />
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Content="保存地址" Command="{Binding SaveZcodeRemoteCommand}" />
+                    <Button Content="清除" Command="{Binding ClearZcodeRemoteCommand}" />
+                  </StackPanel>
+                  <TextBlock Text="配置后，安卓在 AI 中打开桌面远控网页。ZCode 桌面需开启远控；地址失效时重新粘贴保存。" TextWrapping="Wrap" FontSize="12" />
+                </StackPanel>
+              </Grid>
               <Grid x:Name="CommandsSettingsRoot" IsVisible="{Binding IsCommandsSettingsSelected}" RowDefinitions="Auto,Auto,*">
                 <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
                   <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.AvailableCommands}" /><TextBlock Classes="muted" Text="{x:Static text:PresentationText.CommandsDetail}" TextWrapping="Wrap" /></StackPanel>

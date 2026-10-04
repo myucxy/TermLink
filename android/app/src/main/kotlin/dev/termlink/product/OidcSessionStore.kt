@@ -97,6 +97,20 @@ internal object CredentialFreeAuthState {
 }
 
 internal class OidcSessionStore(context: Context) {
+    internal fun sealAiOperation(scope: String, value: String): String {
+        val bytes = ("TermLink AI Operation V1\n$scope\n" + value).encodeToByteArray()
+        return try { AuthStateEnvelope.seal(bytes, cipher) } finally { bytes.fill(0) }
+    }
+
+    internal fun openAiOperation(scope: String, value: String): String {
+        val bytes = AuthStateEnvelope.open(value, cipher)
+        try {
+            val text = bytes.decodeToString()
+            val prefix = "TermLink AI Operation V1\n$scope\n"
+            require(text.startsWith(prefix))
+            return text.removePrefix(prefix)
+        } finally { bytes.fill(0) }
+    }
     private val preferences = context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val cipher = AndroidKeystoreCipher()
 

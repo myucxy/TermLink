@@ -16,7 +16,7 @@
     <string name="app_name">TermLink</string>
     <string name="product_title">TermLink</string>
     <string name="nav_devices">设备</string><string name="nav_activity">活动</string><string name="nav_settings">设置</string>
-    <string name="nav_sessions">会话</string><string name="nav_history">历史</string><string name="nav_membership">会员</string>
+    <string name="nav_sessions">CLI</string><string name="nav_history">历史</string><string name="nav_membership">会员</string>
     <string name="nav_trusted_devices">可信设备</string><string name="nav_account">账号</string>
     <string name="home_greeting_morning">早上好</string><string name="home_greeting_afternoon">下午好</string><string name="home_greeting_evening">晚上好</string><string name="home_title">你的终端</string><string name="home_quota_summary">%1$s · %2$s 台 PC · %3$s 个实时会话</string>
     <string name="connection_error_title">服务器请求不可用</string><string name="connection_error_copy">服务器请求失败，请在公共服务可用时重试。</string><string name="device_type_windows_pc">Windows PC</string><string name="device_type_android">Android 设备</string>
@@ -348,6 +348,7 @@
 <string name="session_direct_policy_failed">获取传输策略失败，正在自动重试。</string><string name="session_direct_unavailable">直连暂不可用。</string><string name="pc_catalog_upgrade_required">请升级 Windows 客户端以读取会话列表。</string><string name="pc_catalog_unavailable">暂时无法读取 Windows 会话列表，正在自动重试。</string>
     <string name="pc_catalog_timeout">暂时无法确认会话状态，正在重试；已连接的会话会保留。</string>
     <string name="session_status_unconfirmed">状态待确认</string>    <string name="session_cleanup_upgrade_required">请升级服务端和 Windows 客户端后再清理会话。</string>
+    <string name="session_cleanup_failed">Windows 未能删除此会话记录，请重试。</string>
     <string name="session_network_timeout">检测超时</string>
     <string name="session_network_no_path">无匹配直连路径</string>
     <string name="session_network_unsupported">需配套升级客户端</string>

@@ -938,9 +938,9 @@ namespace TermLink.Agent
             Guid sessionId,
             CancellationToken token)
         {
-            var workingDirectory = terminals.NormalizeWorkingDirectory(operation.Path);
             var commandId = operation.RequestedTerminalCommandId;
             var managedShellType = terminals.ManagedShellTypeFor(commandId);
+            var workingDirectory = terminals.NormalizeWorkingDirectory(operation.Path);
             if (!sessionVisible(sessionId))
                 terminals.Launch(commandId, workingDirectory, sessionId);
             var deadline = DateTime.UtcNow.Add(registrationWait);

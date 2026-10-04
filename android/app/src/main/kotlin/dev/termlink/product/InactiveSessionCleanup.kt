@@ -13,6 +13,11 @@ import kotlinx.coroutines.withContext
 internal fun isInactiveSession(state: SessionState, online: Boolean): Boolean =
     !online && (state == SessionState.EXITED || state == SessionState.INTERRUPTED)
 
+/** An authenticated host response that the record is absent also completes deletion. */
+internal fun isSessionCleanupComplete(status: String?): Boolean = status == "DELETED" || status == "NOT_FOUND"
+
+internal class SessionCleanupFailedException : IllegalStateException("Windows could not delete the session record")
+
 internal fun ProductSnapshot.inactiveSessionIds(pcId: UUID): List<UUID> {
     if (!signedIn || !isConnected() || pcId in pcSessionCatalogErrors) return emptyList()
     val pc = pcs.firstOrNull { it.id == pcId } ?: return emptyList()
@@ -68,9 +73,9 @@ internal suspend fun ProductRepository.deleteInactiveSessions(
                 return result
             }
             for (id in selected) {
-                when (outcomes[id]) {
-                    "DELETED" -> { onDeleted(id); result = result.copy(deleted = result.deleted + 1) }
-                    "SKIPPED_ACTIVE", "NOT_FOUND" -> result = result.copy(skipped = result.skipped + 1)
+                when {
+                    isSessionCleanupComplete(outcomes[id]) -> { onDeleted(id); result = result.copy(deleted = result.deleted + 1) }
+                    outcomes[id] == "SKIPPED_ACTIVE" -> result = result.copy(skipped = result.skipped + 1)
                     else -> result = result.copy(failed = result.failed + 1)
                 }
             }

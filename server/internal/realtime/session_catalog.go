@@ -18,15 +18,20 @@ type pcCleanupAuthorityStore interface {
 
 func isSessionCatalogMessage(kind realtimewire.MessageType) bool {
 	return kind == realtimewire.SessionCatalogRequest || kind == realtimewire.SessionCatalogResponse ||
-		kind == realtimewire.SessionCleanupRequest || kind == realtimewire.SessionCleanupResponse
+		kind == realtimewire.SessionCleanupRequest || kind == realtimewire.SessionCleanupResponse ||
+		kind == realtimewire.AiAgentRequest || kind == realtimewire.AiAgentResponse
 }
 
 // Catalogs never use terminal subscriptions, terminal ACKs or stored lifecycle.
 func (p *peer) routeSessionCatalog(envelope realtimewire.Envelope, pcID uuid.UUID, frame []byte) error {
+	ai := envelope.MessageType == realtimewire.AiAgentRequest || envelope.MessageType == realtimewire.AiAgentResponse
 	cleanup := envelope.MessageType == realtimewire.SessionCleanupRequest || envelope.MessageType == realtimewire.SessionCleanupResponse
 	capability := "host_session_catalog_v1"
 	if cleanup {
 		capability = "host_session_cleanup_v1"
+	}
+	if ai {
+		capability = "ai_agent_v1"
 	}
 	if !p.hub.isCurrent(p) || envelope.ACK != 0 || !p.capabilities[capability] {
 		return store.ErrDenied
@@ -46,7 +51,7 @@ func (p *peer) routeSessionCatalog(envelope realtimewire.Envelope, pcID uuid.UUI
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var authorizedPC uuid.UUID
-	if cleanup {
+	if cleanup || ai {
 		manager, ok := p.hub.store.(pcCleanupAuthorityStore)
 		if !ok {
 			return store.ErrDenied
