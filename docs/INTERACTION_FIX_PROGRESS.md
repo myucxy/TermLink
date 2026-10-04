@@ -26,13 +26,15 @@
 - [x] Windows Agent 全解决方案、桌面 Windows 目标构建，Control/Update/Adapter/Headless 验证
 - [x] Windows 安装器自动化（隔离临时安装根、既有注册信息恢复），真实更新下载及缓存篡改拒绝
 - [x] 模拟器与 HOME-PC：真实生成文件目录跳转、预览、返回、下载切页、分享与文件哈希一致
-- [ ] 复核、线上版本查询、固定源码及发布计划
+- [x] 复核、线上版本查询、固定源码及发布计划（见 0.3.1/129 计划）
 - [ ] Production 构建、签名连续性验证、精确制品审核
 - [ ] Android 再 Windows AppShip 发布和更新接口验证
 
-版本尚未分配。Docker 已发布 0.3.0，客户端旧候选 0.3.0/128 不覆盖；最终以现场核验为准。
+本轮固定 0.3.1/129，见 [发布计划](RELEASE_0.3.1_129.md)。Docker 已发布 0.3.0，客户端旧候选 0.3.0/128 不覆盖。
 
 ## 2026-10-04 现场复核与剩余门禁
+
+后续进展：用户开启代理后，Docker Hub 全部标签只读查询恢复，最高为 0.3.0；AppShip 与远端 Git 已重新核对。网络占号门禁解除，下一步 Production 构建和精确制品审核。以下保留首次阻塞记录。
 
 AppShip 两端 stable 当前均为 `0.2.71/127`（published、artifact ready，nextBuildNumber=128）；
 远端 `v0.3*` Git tag 查询为空。DEV 一直保持 `0.2.71/127`，独立 Android 包名 `.aivalidation`。
