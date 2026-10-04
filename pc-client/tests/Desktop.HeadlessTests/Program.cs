@@ -364,6 +364,14 @@ public static class Program
         Require(viewModel.NoticeCode == "PRODUCTION_REQUEST_FAILED" &&
                 viewModel.NoticeDetail == PresentationText.ConnectionFailedDetail,
             "An unavailable production identity service was not shown as a connection failure.");
+        await viewModel.ReportFailureAsync(new System.Security.Cryptography.CryptographicException("signature fixture"));
+        Require(viewModel.NoticeCode == "UPDATE_VERIFICATION_FAILED" &&
+                viewModel.NoticeDetail == PresentationText.UpdateVerificationFailedDetail,
+            "A failed update signature check was not shown as an update verification failure.");
+        await viewModel.ReportFailureAsync(new InvalidOperationException("无法启动已验证的 TermLink 安装程序。"));
+        Require(viewModel.NoticeCode == "UPDATE_INSTALLER_LAUNCH_FAILED" &&
+                viewModel.NoticeDetail == PresentationText.UpdateInstallerLaunchFailedDetail,
+            "A failed installer launch was not shown as an installer launch failure.");
         var originalUiCulture = CultureInfo.CurrentUICulture;
         try
         {

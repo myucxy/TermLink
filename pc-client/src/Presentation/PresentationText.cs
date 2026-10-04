@@ -164,6 +164,15 @@ public static class PresentationText
         $"Download and verify {UpdateVersion(status.VersionName, status.BuildNumber)}. Tasks continue during download. Choose whether to install after verification.");
     public static string DownloadingUpdate => Pick("正在下载更新", "Downloading update");
     public static string UpdateDownloadCanceled => Pick("已取消更新下载。", "The update download was cancelled.");
+    public static string UpdateVerificationFailedDetail => Pick(
+        "更新包下载完成，但完整性或发布者签名复核未通过；请重新检查更新。",
+        "The update was downloaded, but its integrity or publisher signature could not be verified. Check for updates again.");
+    public static string UpdateMetadataInvalidDetail => Pick(
+        "更新服务返回的安装包信息无效，请稍后重试。",
+        "The update service returned invalid installer metadata. Try again later.");
+    public static string UpdateInstallerLaunchFailedDetail => Pick(
+        "更新包已验证，但 Windows 未能启动安装程序；请从下载中心重新打开，或直接运行安装包。",
+        "The update was verified, but Windows could not start the installer. Open it from the download center or run the package directly.");
     public static string UpdateDownloadProgress(long received, long total)
     {
         var percent = total <= 0 ? 0 : Math.Clamp(received * 100d / total, 0, 100);

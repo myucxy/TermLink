@@ -59,6 +59,21 @@ Require(appShipUpdate.Status.Decision == DesktopUpdateDecision.Optional &&
         appShipUpdate.Status.BuildNumber == 101 && appShipUpdate.SizeBytes == 123 &&
         appShipUpdate.DownloadUrl == "https://appship.example/artifact/download",
     "The Avalonia Windows adapter did not retain the verified update contract.");
+
+var launchProbe = Path.Combine(Path.GetTempPath(), "TermLink-update-launch-" + Guid.NewGuid().ToString("N") + ".exe");
+File.WriteAllBytes(launchProbe, new byte[] { 0 });
+try
+{
+    var starts = new List<ProcessStartInfo>();
+    WindowsDesktopOperations.StartVerifiedInstaller(launchProbe, info => { starts.Add(info); return null; });
+    Require(starts.Count == 2 && !starts[0].UseShellExecute && starts[1].UseShellExecute &&
+            starts[0].WindowStyle == ProcessWindowStyle.Normal,
+        "The verified installer did not try direct launch before ShellExecute fallback.");
+}
+finally
+{
+    File.Delete(launchProbe);
+}
 RequireThrows<InvalidDataException>(() => WindowsDesktopOperations.ParseAppShipUpdate("""
     {
       "status":"optional","latest":{"versionName":"0.2.46","buildNumber":101},

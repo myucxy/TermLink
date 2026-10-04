@@ -1445,6 +1445,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private static string ErrorCode(Exception error)
     {
         if (error is AgentClientOperationException agentError) return agentError.Code;
+        if (error is System.Security.Cryptography.CryptographicException) return "UPDATE_VERIFICATION_FAILED";
+        if (error is InvalidDataException) return "UPDATE_METADATA_INVALID";
+        if (error is System.ComponentModel.Win32Exception) return "UPDATE_INSTALLER_LAUNCH_FAILED";
+        if (error is InvalidOperationException &&
+            (error.Message.Contains("安装程序", StringComparison.OrdinalIgnoreCase) ||
+             error.Message.Contains("installer", StringComparison.OrdinalIgnoreCase)))
+            return "UPDATE_INSTALLER_LAUNCH_FAILED";
         if (error is FileNotFoundException) return "PC_AGENT_MISSING";
         if (error is UnauthorizedAccessException) return "ACCESS_DENIED";
         if (error is TimeoutException) return "TIMEOUT";
@@ -1500,6 +1507,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "PC-AGENT-IPC-UNAVAILABLE" or "PC-AGENT-IPC-AUTHENTICATION" or
                 "PC-AGENT-CREDENTIAL-ERROR" or "PC-AGENT-ACCESS-DENIED" or
                 "PC-AGENT-TIMEOUT" or "PC-AGENT-UNAVAILABLE" => PresentationText.ConnectionFailedDetail,
+            "UPDATE_VERIFICATION_FAILED" => PresentationText.UpdateVerificationFailedDetail,
+            "UPDATE_METADATA_INVALID" => PresentationText.UpdateMetadataInvalidDetail,
+            "UPDATE_INSTALLER_LAUNCH_FAILED" => PresentationText.UpdateInstallerLaunchFailedDetail,
             _ => PresentationText.UnexpectedFailureDetail,
         };
         return (string.IsNullOrWhiteSpace(code) ? "UNEXPECTED" : code, detail);

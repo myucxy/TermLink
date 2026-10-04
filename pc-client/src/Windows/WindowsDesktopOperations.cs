@@ -59,13 +59,61 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         // Revalidate after the user has spent time reviewing the install impact.
         await VerifyCachedUpdateAsync(setup, update, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = setup,
-            WorkingDirectory = Path.GetDirectoryName(setup)!,
-            UseShellExecute = true,
-        }) ?? throw new InvalidOperationException("无法启动已验证的 TermLink 安装程序。");
+        StartVerifiedInstaller(setup);
         return status with { Message = "已打开已验证的安装程序。" };
+    }
+
+    internal static void StartVerifiedInstaller(
+        string path,
+        Func<ProcessStartInfo, Process?>? startProcess = null)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) ||
+            !File.Exists(path) || !string.Equals(Path.GetExtension(path), ".exe", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("已验证的更新安装程序路径无效。");
+
+        var workingDirectory = Path.GetDirectoryName(path) ?? throw new InvalidDataException("更新安装程序目录无效。");
+        var direct = new ProcessStartInfo
+        {
+            FileName = path,
+            WorkingDirectory = workingDirectory,
+            // The package is already authenticated. Starting the EXE directly
+            // avoids Explorer/ShellExecute policy differences for packages in
+            // LocalAppData while still displaying the WinForms installer.
+            UseShellExecute = false,
+            CreateNoWindow = false,
+            WindowStyle = ProcessWindowStyle.Normal,
+        };
+        try
+        {
+            using var process = (startProcess ?? Process.Start)(direct);
+            if (process != null) return;
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // Fall through to ShellExecute for systems whose application
+            // policy requires the shell to broker an EXE launch.
+        }
+
+        var shell = new ProcessStartInfo
+        {
+            FileName = path,
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = true,
+            Verb = "open",
+            WindowStyle = ProcessWindowStyle.Normal,
+        };
+        try
+        {
+            using var process = (startProcess ?? Process.Start)(shell);
+            if (process != null) return;
+            // ShellExecute may hand the request to an existing broker and
+            // return no process handle; that is still a successful dispatch.
+            return;
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            throw new InvalidOperationException("无法启动已验证的 TermLink 安装程序。", error);
+        }
     }
 
     internal static UpdateCandidate ParseAppShipUpdate(string json, long currentBuild)
