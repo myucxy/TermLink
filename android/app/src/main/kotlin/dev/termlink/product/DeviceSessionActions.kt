@@ -32,7 +32,7 @@ internal fun DeviceSessionActions(workspace: AiWorkspace, pc: PcSummary, opening
     val online = pc.online && pc.remoteRoutingEnabled
     val commands = supportedRemoteTerminalCommands(pc)
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (commands.isNotEmpty() && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(if (opening) "启动中…" else "+CLI", Icons.Default.Terminal, online && !opening, filled = true, onClick = { create = true })
+        if (commands.isNotEmpty() && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(if (opening) "启动中…" else "CLI", Icons.Default.Terminal, online && !opening, filled = true, onClick = { create = true })
         AiAction("AI 聊天", Icons.Default.AutoAwesome, online, filled = true, onClick = {
             if ("ai_agent_v1" in pc.capabilities) {
                 workspace.createPcLocked = true; workspace.createPc = pc.id; onAi()
