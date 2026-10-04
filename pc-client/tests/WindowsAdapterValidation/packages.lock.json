@@ -2,8 +2,16 @@
   "version": 2,
   "dependencies": {
     "net8.0-windows7.0": {
+      "System.Security.Cryptography.ProtectedData": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "+TUFINV2q2ifyXauQXRwy4CiBhqvDEDZeVJU7qfxya4aRYOKzVBpN+4acx25VcPB9ywUN6C0n8drWl110PhZEg=="
+      },
       "termlink.agentcontrol": {
-        "type": "Project"
+        "type": "Project",
+        "dependencies": {
+          "System.Security.Cryptography.ProtectedData": "[8.0.0, )"
+        }
       },
       "termlink.pc.contracts": {
         "type": "Project"

@@ -54,6 +54,11 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
             return status;
 
         var setup = await DownloadAndVerifyUpdateAsync(update, progress, cancellationToken).ConfigureAwait(false);
+        var ready = status with { ReadyToInstall = true, Message = PresentationText.Pick("已下载并验证，可稍后安装。", "Downloaded and verified. Ready to install later.") };
+        if (!await confirm(ready, cancellationToken).ConfigureAwait(false)) return ready;
+        // Revalidate after the user has spent time reviewing the install impact.
+        await VerifyCachedUpdateAsync(setup, update, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
         using var process = Process.Start(new ProcessStartInfo
         {
             FileName = setup,
@@ -86,6 +91,8 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         };
         if (!build.HasValue || build.Value <= currentBuild)
             throw new InvalidDataException("更新服务返回的 build 不是严格升级。");
+        if (version == null || !System.Text.RegularExpressions.Regex.IsMatch(version, @"^\d{1,5}\.\d{1,5}\.\d{1,5}$"))
+            throw new InvalidDataException("更新服务返回的版本号无效。");
         var artifact = Object(root, "artifact") ?? throw new InvalidDataException("更新服务未返回安装包。");
         RequireEqual(artifact, "platform", "windows");
         RequireEqual(artifact, "fileKind", "exe");
@@ -135,6 +142,11 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         var finalPath = Path.Combine(root,
             $"TermLink-Setup-{update.Status.VersionName}-{update.Status.BuildNumber}-x64.exe");
         var temporaryPath = Path.Combine(root, $".download-{Guid.NewGuid():N}.tmp");
+        if (File.Exists(finalPath)) {
+            progress?.Report(new DesktopUpdateProgress(update.SizeBytes, update.SizeBytes, true));
+            try { await VerifyCachedUpdateAsync(finalPath, update, cancellationToken).ConfigureAwait(false); return finalPath; }
+            catch (Exception error) when (error is IOException or CryptographicException or UnauthorizedAccessException) { }
+        }
         try
         {
             progress?.Report(new DesktopUpdateProgress(0, update.SizeBytes));
@@ -166,6 +178,8 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
                 throw new CryptographicException("下载内容与 AppShip SHA-256 不一致。");
             // WinTrust reopens the file; release the exclusive download handle first.
             await destination.DisposeAsync().ConfigureAwait(false);
+            progress?.Report(new DesktopUpdateProgress(received, update.SizeBytes, true));
+            cancellationToken.ThrowIfCancellationRequested();
             var expectedSigner = WindowsUpdateSecurity.ResolveExpectedSignerThumbprint(installationRoot);
             WindowsUpdateSecurity.ValidateAuthenticode(
                 temporaryPath, expectedSigner, update.SignerSha1, installationRoot);
@@ -178,6 +192,17 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }
+    }
+
+    private async Task VerifyCachedUpdateAsync(string path, UpdateCandidate update, CancellationToken token)
+    {
+        await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous)) {
+            if (stream.Length != update.SizeBytes || !CryptographicOperations.FixedTimeEquals(
+                await SHA256.HashDataAsync(stream, token).ConfigureAwait(false), Convert.FromHexString(update.Sha256)))
+                throw new CryptographicException("安装包已变化，请重新下载。");
+        }
+        token.ThrowIfCancellationRequested();
+        WindowsUpdateSecurity.ValidateAuthenticode(path, WindowsUpdateSecurity.ResolveExpectedSignerThumbprint(installationRoot), update.SignerSha1, installationRoot);
     }
 
     private static async Task<HttpResponseMessage> SendWithRedirectsAsync(Uri initial, CancellationToken token)
@@ -269,6 +294,39 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         long SizeBytes = 0,
         string Sha256 = "",
         string SignerSha1 = "");
+
+    public ValueTask<string> OpenSessionDirectoryAsync(string directory, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Path.IsPathFullyQualified(directory) || directory.StartsWith(@"\\") || !Directory.Exists(directory))
+            throw new DirectoryNotFoundException("工作目录不可用。");
+        Process.Start(new ProcessStartInfo { FileName = directory, UseShellExecute = true });
+        return ValueTask.FromResult(PresentationText.Pick("已打开工作目录", "Working directory opened"));
+    }
+
+    public ValueTask<string> OpenAgentHelpAsync(string agentId, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var url = agentId switch {
+            "codex" => "https://developers.openai.com/codex/cli/",
+            "claude" => "https://code.claude.com/docs/en/setup",
+            "gemini" => "https://geminicli.com/docs/get-started/installation/",
+            "opencode" => "https://opencode.ai/docs/",
+            "zcode" => "https://zcode.z.ai/",
+            _ => throw new ArgumentException("Unsupported Agent.")
+        };
+        Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        return ValueTask.FromResult(PresentationText.Pick("已打开官方安装与登录说明", "Official installation and sign-in instructions opened"));
+    }
+
+    public ValueTask<string> OpenZcodeRemoteAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var url = TermLink.Ai.ZcodeRemoteAddressStore.Default.Read();
+        if (string.IsNullOrWhiteSpace(url)) throw new InvalidOperationException("请先保存有效的 ZCode 远控地址。");
+        Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        return ValueTask.FromResult(PresentationText.Pick("已在浏览器打开，请确认远控可用；地址失效时重新保存。", "Opened in the browser. Confirm remote access works; save a new address if it has expired."));
+    }
 
     public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken)
     {

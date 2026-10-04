@@ -11,6 +11,7 @@ namespace TermLink.Presentation;
 /// </summary>
 public static class PresentationText
 {
+    public static string AgentStateUnknown => Pick("暂时无法读取本机 Agent，账户与会话状态待确认。", "Local Agent unavailable. Account and session status are unconfirmed.");
     private static bool IsChinese =>
         CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.Equals("zh", StringComparison.OrdinalIgnoreCase);
 
@@ -29,6 +30,15 @@ public static class PresentationText
     public static string Diagnostics => Pick("诊断", "Diagnostics");
     public static string Refresh => Pick("刷新", "Refresh");
     public static string Refreshing => Pick("正在刷新状态…", "Refreshing status…");
+    public static string ReopenBrowser => Pick("重新打开浏览器", "Reopen browser");
+    public static string SessionSearch => Pick("搜索标题、Agent、工作目录", "Search titles, Agents and directories");
+    public static string OpenDirectory => Pick("目录", "Folder");
+    public static string AgentSetupHelp => Pick("安装 / 登录说明", "Install / sign in");
+    public static string VerifyZcodeRemote => Pick("打开验证", "Open to verify");
+    public static string CancelAuthorization => Pick("取消授权", "Cancel sign-in");
+    public static string AuthorizationCancelled => Pick("已取消网页授权", "Browser sign-in cancelled");
+    public static string AuthorizationNotWaiting => Pick("授权页面尚未就绪或等待已结束，请查看登录状态后重试。", "The page is not ready or sign-in has finished. Check the account status and retry.");
+    public static string AuthorizationCommitting => Pick("授权已返回，正在保存账户，请稍候。", "Authorization received. Saving the account; please wait.");
     public static string RemoteAccess => Pick("允许远程访问", "Allow remote access");
     public static string RemoteAccessDetail => Pick("停止远程访问不会关闭本地终端。", "Stopping remote access does not close local terminals.");
     public static string Enable => Pick("启用", "Enable");
@@ -150,8 +160,8 @@ public static class PresentationText
     public static string StartUpdate => Pick("开始更新", "Start update");
     public static string ConfirmUpdateTitle => Pick("下载 TermLink 更新", "Download TermLink update");
     public static string ConfirmUpdateDetail(DesktopUpdateStatus status) => Pick(
-        $"将下载 {UpdateVersion(status.VersionName, status.BuildNumber)}。下载完成并通过 SHA-256 与发布者签名验证后，将打开安装程序；安装会关闭 TermLink 和受管终端会话。继续吗？",
-        $"TermLink will download {UpdateVersion(status.VersionName, status.BuildNumber)}. After SHA-256 and publisher-signature verification, the installer will open and close TermLink and managed terminal sessions. Continue?");
+        $"将下载并验证 {UpdateVersion(status.VersionName, status.BuildNumber)}。下载期间任务继续运行；完成后可选择立即安装或稍后安装。",
+        $"Download and verify {UpdateVersion(status.VersionName, status.BuildNumber)}. Tasks continue during download. Choose whether to install after verification.");
     public static string DownloadingUpdate => Pick("正在下载更新", "Downloading update");
     public static string UpdateDownloadCanceled => Pick("已取消更新下载。", "The update download was cancelled.");
     public static string UpdateDownloadProgress(long received, long total)
@@ -252,6 +262,7 @@ public static class PresentationText
     {
         ArgumentNullException.ThrowIfNull(status);
         var version = UpdateVersion(status.VersionName, status.BuildNumber);
+        if (status.ReadyToInstall) return Pick($"已验证，等待安装 · {version}", $"Verified, ready to install · {version}");
         return status.Decision switch
         {
             DesktopUpdateDecision.NoUpdate => Pick($"当前已是最新版本 · {version}", $"Up to date · {version}"),

@@ -24,6 +24,92 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class AiWorkspaceTest {
+    @Test fun recoveringQueuedTextPreservesExistingDraftAndRefusesOverflow() {
+        val prefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences("draft-review-" + UUID.randomUUID(), Context.MODE_PRIVATE)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            val workspace = AiWorkspace(UnavailableProductRepository(), scope, prefs)
+            val item = AiQueued(UUID.randomUUID().toString(), "queued", "host", 1)
+            workspace.queued["s"] = listOf(item); workspace.drafts["s"] = "new draft"
+            workspace.cancelQueued("s", item)
+            assertEquals("new draft\n\nqueued", workspace.drafts["s"])
+            assertTrue(workspace.queued["s"].orEmpty().isEmpty())
+            workspace.queued["s"] = listOf(item); workspace.drafts["s"] = "x".repeat(16000)
+            workspace.cancelQueued("s", item)
+            assertEquals(listOf(item), workspace.queued["s"])
+            assertEquals(16000, workspace.drafts["s"]!!.length)
+            assertFalse(workspace.appendDraft("s", "historic user message"))
+            assertEquals(16000, workspace.drafts["s"]!!.length)
+        } finally { scope.cancel(); prefs.edit().clear().commit() }
+    }
+
+    @Test fun missingReceiptOnOneComputerDoesNotBlockAnotherAndAllRequestsSurviveRestart() = runBlocking {
+        val first = UUID.randomUUID(); val second = UUID.randomUUID()
+        val prefs = ApplicationProvider.getApplicationContext<Context>().getSharedPreferences("isolated-review-" + first, Context.MODE_PRIVATE)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val requests = mutableListOf<Pair<UUID, String>>()
+        var fail = true
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun aiRequest(pcId: UUID, body: String): String {
+                requests += pcId to body
+                if (JSONObject(body).getString("action") == "catalog") return """{"hostId":"$pcId","agents":[],"sessions":[]}"""
+                if (fail) throw IOException("lost receipt")
+                return """{"hostId":"$pcId"}"""
+            }
+        }
+        try {
+            val workspace = AiWorkspace(repository, scope, prefs)
+            workspace.refresh(first); workspace.mutate(first, "create")!!.await()
+            assertTrue(workspace.isBlocked(first)); assertFalse(workspace.isBlocked(second))
+            workspace.refresh(second); assertTrue(second in workspace.catalogs)
+            workspace.mutate(second, "create")!!.await()
+            val originals = requests.filter { JSONObject(it.second).getString("action") == "create" }
+            workspace.retire()
+            val restored = AiWorkspace(repository, scope, prefs)
+            assertEquals(setOf(first, second), restored.pendingPcs.toSet())
+            fail = false
+            restored.retryUncertain(first); restored.retryUncertain(second)
+            assertEquals(originals, requests.takeLast(2))
+            assertTrue(restored.pendingPcs.isEmpty()); assertFalse(prefs.contains("pending"))
+            restored.retire()
+        } finally { scope.cancel(); prefs.edit().clear().commit() }
+    }
+
+    @Test fun directoryCreationIntentDoesNotStartSessionOrLeakIntoAnotherEntryPoint() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences("ai-create-directory-" + UUID.randomUUID(), Context.MODE_PRIVATE)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        var requests = 0
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun aiRequest(pcId: UUID, body: String): String {
+                requests++
+                error("Opening a creation form must not create a session")
+            }
+        }
+        try {
+            val workspace = AiWorkspace(repository, scope, prefs)
+            val pc = UUID.randomUUID()
+            val favoritePc = UUID.randomUUID()
+            workspace.beginCreate(pc, "D:\\项目目录\\My App")
+            assertEquals(pc, workspace.createPc)
+            assertEquals("D:\\项目目录\\My App", workspace.createDirectory)
+            assertTrue(workspace.createPcLocked)
+            workspace.createPc = null // Dismiss; a favorite may belong to a different PC.
+            workspace.beginCreate(favoritePc, "E:\\favorite")
+            assertEquals(favoritePc, workspace.createPc)
+            assertEquals("E:\\favorite", workspace.createDirectory)
+            workspace.createPc = null
+            workspace.beginCreate(pc)
+            assertNull(workspace.createDirectory) // Device card keeps managed-directory default.
+            assertTrue(workspace.createPcLocked)
+            workspace.createPc = null
+            workspace.beginCreate(pc, lockPc = false)
+            assertNull(workspace.createDirectory)
+            assertFalse(workspace.createPcLocked)
+            assertEquals(0, requests)
+        } finally { scope.cancel(); prefs.edit().clear().commit() }
+    }
+
     @Test fun catalogSummariesDriveAttentionAndCreationOpensChat(): Unit = runBlocking {
         val pc = UUID.randomUUID()
         val id = UUID.randomUUID().toString()

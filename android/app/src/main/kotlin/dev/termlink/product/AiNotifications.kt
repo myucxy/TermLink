@@ -103,7 +103,7 @@ internal fun AiNotificationNavigation(workspace: AiWorkspace, snapshot: ProductS
             val current = workspace.readNotificationSession(pc, id)
             val decision = body.getString("decision")
             if (decision.isNotEmpty()) {
-                check(aiNotificationCanAnswer(body, workspace.catalogs[pc]?.hostId, current) && !workspace.busy && !workspace.uncertain) {
+                check(aiNotificationCanAnswer(body, workspace.catalogs[pc]?.hostId, current) && !workspace.isBlocked(pc)) {
                     "审批已处理、已过期或控制权已改变，请进入会话重新确认。"
                 }
                 require(decision in setOf("allow", "deny"))

@@ -98,7 +98,7 @@ class ProductionSessionCatalogTest {
 
     @Test
     fun encryptedAiRoundTripRejectsWrongPeerEpochAndReplayedRequest(): Unit = runBlocking {
-        for (fault in listOf("none", "late", "peer", "epoch", "replay", "capability")) {
+        for (fault in listOf("none", "late", "peer", "epoch", "replay", "capability", "disconnect")) {
             val capability = "ai_agent_v1"
             val requestType = MessageType.AI_AGENT_REQUEST
             val responseType = MessageType.AI_AGENT_RESPONSE
@@ -122,6 +122,7 @@ class ProductionSessionCatalogTest {
                     val envelope = Envelope.parseFrom(bytes.toByteArray())
                     assertEquals(requestType, envelope.messageType)
                     assertEquals(0L, envelope.ack)
+                    if (fault == "disconnect") { webSocket.close(1001, "reconnect fixture"); return }
                     val plaintext = ProductionRealtimeClient.decryptEnvelope(envelope, incoming)
                     val requestId = try {
                         dev.termlink.protocol.realtime.v1.AiAgentRequestPayload.parseFrom(plaintext).also {
@@ -154,9 +155,12 @@ class ProductionSessionCatalogTest {
                 allowCleartextForLocalTest = true)
             try {
                 val result = runCatching {
-                    requestAiAgent(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7, "{}")
+                    kotlinx.coroutines.withTimeout(5_000) {
+                        requestAiAgent(mux, pcId, pcDevice, androidId, identity, host.exchange.publicKey, 1, 7, "{}")
+                    }
                 }
                 if (fault == "none" || fault == "late") assertEquals("ok", result.getOrThrow())
+                else if (fault == "disconnect") assertTrue(result.exceptionOrNull().toString(), result.exceptionOrNull() is HostDeviceConnectionChangedException)
                 else assertTrue("$fault was accepted", result.isFailure)
             } finally {
                 mux.close(); scope.cancel(); server.shutdown()

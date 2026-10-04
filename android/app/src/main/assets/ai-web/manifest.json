@@ -5,20 +5,21 @@
     "package-lock.json": "6214429bb9729e9657be730dea116f7ab3589afd76391412ed65ff1902d1cfc2",
     "package.json": "70cf4fdf4eb8f02d6713bfcdbffe62a9e5d7e4957396131bc0417de9802ff01b",
     "scripts/assets.mjs": "447d5203bc011bccc3f9c5320e9fe369ec9df4a6d0a386a398c1217bbec81e6e",
-    "src/CodeBlock.tsx": "092bc60c3aafc843629d6be008d4b65e295b0c26519144b1e81baa0eec7105c9",
-    "src/bridge.ts": "3c21074055d1bd29f3700a1a582f01f5cfb25029a4b0f5d6f968f30d1631adb7",
+    "src/CodeBlock.tsx": "5d2bd0d1b25133ac683ef7505963cba3f1dd5e80eebd816799b6660846240b3f",
+    "src/bridge.ts": "4c2dae15f2ebb98f23bed2d06455222ae8899a48ff6006c5674fc9868be000d9",
     "src/highlight.ts": "d3290f0cc5d19b13d478c02a6ce7ff2c732c4e854c738272c6c5fa3b9679a2e4",
-    "src/main.tsx": "ec74e06f7a98fdbe8622aaff3789cbf5abba1d703640b335ecaf564dfa7f32b6",
-    "src/style.css": "e6a227d0ef48daeca1acdcfdd80c724be3f33a544560e960f3f13985e471175c",
+    "src/i18n.ts": "4d8270a04e1732fa80a81d4f6049bfb2462eca8474bf4d2077198188bd63b4d3",
+    "src/main.tsx": "ba85bc6c0da995adb31b3013fe01875a4d155dac5dd85420b095c1e158140bdf",
+    "src/style.css": "a24aecde499727a37403a2a2a22ca9409fe16ee456baf3f3d533b3e95d40074e",
     "src/timeline.ts": "04457913ced1cc9ee1c0a29046dbcb91ed840a0d06ac6becffd5c2eeefac20ed",
     "tsconfig.json": "a6d8b129c87f7f56a52414f7f498ab207ceea37b0e4d626b1f574a57f42e300d",
     "vite.config.ts": "639cb32ada9eb235607e017db14590e60e86c9f7f10e647d9888c799cb0bc9ae"
   },
   "files": {
-    "assets/highlight-BXFEOrQm.js": "4fc1b4138fbdaa5915842b735a85b9986240c574daa03cff5911d404708f5ee9",
-    "assets/index-BUf7m6Ub.css": "306b229ce6d6ce01a1a8a789d342e39f7978d50094d7d0f35c5a8a553e657306",
-    "assets/index-Wczh_yn8.js": "fb38bdaa29eb5cf535f227f2315eeb2c8ddc46a715bd2eb2caf62166d609b7ac",
-    "index.html": "bfc5e3110df416239c73825ed3441e637bd2c353251f95d909b9866b5dfa058a",
+    "assets/highlight-sUrjtSaz.js": "7260d6956702b36af794e1e5151113873f4dacb86e6ae0a5f87bc2dba47075d0",
+    "assets/index-BSp8ofNJ.js": "3c3f7ee1ac4c3e7e6bcdf74a6f481fadb6423645b73403ebf1300f3a6ab3ac0a",
+    "assets/index-Bz8xxjrj.css": "774ae78e5a447f1cdb12eef9ae545922863d5c6474e8ca144f9f0c54cf2511a5",
+    "index.html": "ea5a90592b078f66e0a7cd3ad6450ab5753a7d308a0b13d02c8f96f1bab3e08d",
     "third-party-notices.txt": "71f508572762ef7b712af2c53a30d23ad4bb65124b46f358ffc38025ce3bfe72"
   }
 }

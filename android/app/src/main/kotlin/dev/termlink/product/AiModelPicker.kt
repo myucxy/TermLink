@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -270,7 +274,7 @@ internal fun AiModelPicker(
                     onSelect(customModel, customProvider); custom = false
                 }) { Text("确定") }
             },
-            dismissButton = { TextButton(onClick = { custom = false }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = { custom = false }) { Text(stringResource(R.string.ai_ui_cancel)) } },
         )
     }
 }

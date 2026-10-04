@@ -16,8 +16,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.selects.select
 
 class HostDeviceUpgradeRequiredException(val capability: String) : IllegalStateException("Host device capability unavailable: $capability")
+class HostDeviceConnectionChangedException : java.io.IOException("Device connection changed during request")
 
 suspend fun fetchHostSessionCatalog(
     multiplexer: ProductionRealtimeMultiplexer,
@@ -100,8 +102,18 @@ internal suspend fun <T : Any> requestHostDevice(
                 )
             } finally { payload.fill(0) }
             requestGeneration.set(endpoint.currentConnectedGeneration())
-            check(endpoint.sendForConnectedGeneration(envelope, requestGeneration.get())) { "Catalog transport unavailable" }
-            pendingResponse.await()
+            if (!endpoint.sendForConnectedGeneration(envelope, requestGeneration.get())) throw HostDeviceConnectionChangedException()
+            // A foreground reconnect can retire the socket immediately after a SAF result.
+            // Fail promptly; the caller decides whether this operation is safe to retry.
+            val connectionChanged = async(start = CoroutineStart.UNDISPATCHED) {
+                endpoint.connectionEvents.first { it.state !is RealtimeState.Connected || it.connectedGeneration != requestGeneration.get() }
+            }
+            try {
+                select<T> {
+                    pendingResponse.onAwait { it }
+                    connectionChanged.onAwait { throw HostDeviceConnectionChangedException() }
+                }
+            } finally { connectionChanged.cancel() }
         } finally {
             transport?.close()
             outbound.fill(0); inbound.fill(0); keyId.fill(0)

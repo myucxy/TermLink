@@ -125,9 +125,11 @@ public sealed record DesktopUpdateStatus(
     string? VersionName,
     long? BuildNumber,
     string? ReleaseNotes,
-    string? Message);
+    string? Message) {
+    public bool ReadyToInstall { get; init; }
+}
 
-public sealed record DesktopUpdateProgress(long BytesReceived, long TotalBytes);
+public sealed record DesktopUpdateProgress(long BytesReceived, long TotalBytes, bool Verifying = false);
 
 public sealed record DesktopTerminalIntegrationSettings(
     bool AddNoLogo,
@@ -141,6 +143,12 @@ public sealed record DesktopTerminalIntegrationSettings(
 /// </summary>
 public interface IDesktopOperations
 {
+    ValueTask<string> OpenSessionDirectoryAsync(string directory, CancellationToken cancellationToken) =>
+        ValueTask.FromException<string>(new PlatformNotSupportedException());
+    ValueTask<string> OpenAgentHelpAsync(string agentId, CancellationToken cancellationToken) =>
+        ValueTask.FromException<string>(new PlatformNotSupportedException());
+    ValueTask<string> OpenZcodeRemoteAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromException<string>(new PlatformNotSupportedException());
     ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
         bool install,
         Func<DesktopUpdateStatus, CancellationToken, ValueTask<bool>>? confirm,

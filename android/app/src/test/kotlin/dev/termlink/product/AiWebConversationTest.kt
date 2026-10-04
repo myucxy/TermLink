@@ -25,6 +25,8 @@ class AiWebConversationTest {
 
     @Test fun bridgeAllowlistAndArtifactScope() {
         assertEquals("search", aiWebRequest("""{"id":"1","action":"search"}""").getString("action"))
+        for (action in listOf("open-directory", "back-state"))
+            assertEquals(action, aiWebRequest("""{"id":"1","action":"$action"}""").getString("action"))
         for (action in listOf("exec", "attachment.chunk", "configure", "openFile", "javascript")) {
             assertThrows(IllegalArgumentException::class.java) { aiWebRequest("""{"id":"2","action":"$action"}""") }
         }
@@ -32,6 +34,18 @@ class AiWebConversationTest {
         for (path in listOf("../secret", "D:\\workspace\\file", "\\\\server\\file", "/etc/passwd", "safe.txt:secret")) {
             assertThrows(IllegalArgumentException::class.java) { aiArtifactRelativePath("D:\\work", path) }
         }
+    }
+
+    @Test fun fileDirectoryUsesSessionComputerAndRejectsPathsOutsideWorkspace() {
+        val value = aiArtifactLocation(session(), "output/site/index.html")
+        assertEquals(pc, value.pcId); assertEquals(id, value.sessionId)
+        assertEquals("D:\\work\\output\\site", value.directory)
+        assertEquals("D:\\work\\output\\site\\index.html", value.filePath)
+        assertEquals(value, aiArtifactLocation(session(), "d:\\WORK\\output\\site\\index.html"))
+        assertEquals("D:\\", aiArtifactLocation(session().copy(directory = "D:\\"), "index.html").directory)
+        for (path in listOf("../secret.txt", "out/../../secret", "out//file", "./file", "D:\\other\\file", "E:\\work\\file", "\\\\host\\share\\file", "safe:stream", "out/*"))
+            assertThrows(IllegalArgumentException::class.java) { aiArtifactLocation(session(), path) }
+        assertThrows(IllegalArgumentException::class.java) { aiArtifactLocation(session().copy(directory = "D:"), "file.txt") }
     }
 
     @Test fun uiStateOnlyRestoresCurrentQuestionsAndCliUsesDistinctWorkspace() {

@@ -80,6 +80,20 @@ public sealed class SessionsPageViewModel : PageViewModel
     public SessionsPageViewModel() : base("sessions", PresentationText.Sessions) { }
     public ObservableCollection<ManagedSessionSnapshot> Sessions { get; } = new();
     public ObservableCollection<SessionListItemViewModel> Items { get; } = new();
+    public ObservableCollection<SessionListItemViewModel> VisibleItems { get; } = new();
+    public ObservableCollection<AiSessionSummary> AiSessions { get; } = new();
+    public ObservableCollection<AiSessionSummary> VisibleAiSessions { get; } = new();
+    private string search = "";
+    public string Search { get => search; set { if (SetProperty(ref search, value)) Filter(); } }
+    private string aiStatus = "";
+    public string AiStatus { get => aiStatus; internal set => SetProperty(ref aiStatus, value); }
+    public bool HasAiSessions => VisibleAiSessions.Count > 0;
+    internal void Filter() {
+        bool Matches(string value) => value.Contains(Search.Trim(), StringComparison.CurrentCultureIgnoreCase);
+        ObservableCollectionDiff.Apply(VisibleItems, Items.Where(item => Matches(item.Title + " " + item.ShellType)).ToArray(), item => item.SessionId);
+        ObservableCollectionDiff.Apply(VisibleAiSessions, AiSessions.Where(item => Matches(item.Title + " " + item.Agent + " " + item.Directory)).ToArray(), item => item.Id);
+        RaisePropertyChanged(nameof(HasAiSessions));
+    }
 }
 
 public sealed record DeviceListItemViewModel(
@@ -379,6 +393,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             parameter is Guid deviceId ? RevokeDeviceAsync(deviceId, cancellationToken) : Task.CompletedTask);
         BeginAccountAuthorizationCommand = new AsyncCommand((_, cancellationToken) =>
             BeginAccountAuthorizationAsync(cancellationToken));
+        CancelAccountAuthorizationCommand = new AsyncCommand((_, token) => ControlBrowserAuthorizationAsync(true, token));
+        ReopenAccountAuthorizationCommand = new AsyncCommand((_, token) => ControlBrowserAuthorizationAsync(false, token));
         ConfigureServerCommand = new AsyncCommand((_, cancellationToken) =>
             ConfigureServerAsync(cancellationToken));
         SignOutCommand = new AsyncCommand((_, cancellationToken) => SignOutAsync(cancellationToken));
@@ -409,6 +425,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
         OpenDiagnosticsDirectoryCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().OpenDiagnosticsDirectoryAsync(token), cancellationToken));
+        OpenSessionDirectoryCommand = new AsyncCommand((path, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenSessionDirectoryAsync(path as string ?? "", t), token));
+        OpenAgentHelpCommand = new AsyncCommand((id, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenAgentHelpAsync(id as string ?? "", t), token));
+        OpenZcodeRemoteCommand = new AsyncCommand((_, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenZcodeRemoteAsync(t), token));
         RepairTerminalIntegrationCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().RepairTerminalIntegrationAsync(token), cancellationToken));
         OpenTerminalIntegrationSettingsCommand = new AsyncCommand((_, cancellationToken) =>
@@ -466,6 +485,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand GrantDeviceCommand { get; }
     public AsyncCommand RevokeDeviceCommand { get; }
     public AsyncCommand BeginAccountAuthorizationCommand { get; }
+    public AsyncCommand CancelAccountAuthorizationCommand { get; }
+    public AsyncCommand ReopenAccountAuthorizationCommand { get; }
+    public bool SupportsBrowserAuthorizationControls => client.SupportsBrowserAuthorizationControls;
     public AsyncCommand ConfigureServerCommand { get; }
     public AsyncCommand SignOutCommand { get; }
     public AsyncCommand OpenTerminalCommandEditorCommand { get; }
@@ -476,6 +498,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand CheckForUpdatesCommand { get; }
     public AsyncCommand UpdateActionCommand { get; }
     public AsyncCommand OpenDiagnosticsDirectoryCommand { get; }
+    public AsyncCommand OpenSessionDirectoryCommand { get; }
+    public AsyncCommand OpenAgentHelpCommand { get; }
+    public AsyncCommand OpenZcodeRemoteCommand { get; }
     public AsyncCommand RepairTerminalIntegrationCommand { get; }
     public AsyncCommand OpenTerminalIntegrationSettingsCommand { get; }
     public AsyncCommand SaveTerminalIntegrationSettingsCommand { get; }
@@ -510,7 +535,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         "about" => PresentationText.About,
         _ => PresentationText.General,
     };
-    public string CurrentPageSubtitle => CurrentPage.Key switch
+    public string CurrentPageSubtitle => AgentUnavailable ? PresentationText.AgentStateUnknown : CurrentPage.Key switch
     {
         "devices" => PresentationText.DeviceHeaderSummary(RemoteAccessStatusText, ActiveSessionCount),
         "sessions" => SessionCountText,
@@ -529,9 +554,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsSuccessNotice => NoticeSeverity == UiNoticeSeverity.Success;
     public bool IsWarningNotice => NoticeSeverity == UiNoticeSeverity.Warning;
     public bool IsErrorNotice => NoticeSeverity == UiNoticeSeverity.Error;
-    public bool ConfirmationVisible { get => confirmationVisible; private set => SetProperty(ref confirmationVisible, value); }
+    public bool ConfirmationVisible { get => confirmationVisible; private set { if (SetProperty(ref confirmationVisible, value)) RaisePropertyChanged(nameof(BlockingOverlayVisible)); } }
+    public bool BlockingOverlayVisible => ConfirmationVisible || UpdateProgressVisible;
     public string ConfirmationTitle { get => confirmationTitle; private set => SetProperty(ref confirmationTitle, value); }
     public string ConfirmationDetail { get => confirmationDetail; private set => SetProperty(ref confirmationDetail, value); }
+    public bool ConfirmationDanger { get; private set; } = true;
+    public string ConfirmationAction { get; private set; } = PresentationText.ConfirmAction;
+    public string ConfirmationCancel { get; private set; } = PresentationText.Cancel;
     public AppearancePreference AppearancePreference { get => appearancePreference; private set => SetProperty(ref appearancePreference, value); }
     public bool IsSystemAppearance => AppearancePreference == AppearancePreference.System;
     public bool IsLightAppearance => AppearancePreference == AppearancePreference.Light;
@@ -550,12 +579,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string SessionCountText => PresentationText.SessionCount(Sessions.Items.Count);
     public int OnlineDeviceCount => Devices.Devices.Count(device => device.Online);
     public bool HasSessions => Sessions.Items.Count > 0;
-    public bool HasNoSessions => !HasSessions;
+    public bool HasNoSessions => !AgentUnavailable && !HasSessions;
     public bool HasDevices => Devices.Items.Count > 0;
     public bool HasNoDevices => !HasDevices;
     public bool RequiresReauthentication => Connection.State == AgentConnectionState.ReauthenticationRequired;
     public bool IsAccountStateKnown => accountStateKnown;
-    public bool IsAccountStateLoading => !IsAccountStateKnown;
+    private bool agentUnavailable;
+    public bool AgentUnavailable => agentUnavailable;
+    public bool IsAccountStateLoading => !IsAccountStateKnown && !AgentUnavailable;
     public bool IsAccountLinked => IsAccountStateKnown && Account.AccountLinked && !RequiresReauthentication;
     public bool IsAccountSignedOut => IsAccountStateKnown && !IsAccountLinked;
     public string AccountStateTitle => RequiresReauthentication
@@ -576,7 +607,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     }
     public string AvailableUpdateText { get => availableUpdateText; private set => SetProperty(ref availableUpdateText, value); }
     public string UpdateActionText => HasAvailableUpdate ? PresentationText.StartUpdate : PresentationText.CheckUpdates;
-    public bool UpdateProgressVisible { get => updateProgressVisible; private set => SetProperty(ref updateProgressVisible, value); }
+    public bool UpdateProgressVisible { get => updateProgressVisible; private set { if (SetProperty(ref updateProgressVisible, value)) RaisePropertyChanged(nameof(BlockingOverlayVisible)); } }
     public double UpdateProgressPercent { get => updateProgressPercent; private set => SetProperty(ref updateProgressPercent, value); }
     public string UpdateProgressText { get => updateProgressText; private set => SetProperty(ref updateProgressText, value); }
 
@@ -640,6 +671,22 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void Apply(AgentStatusSnapshot snapshot)
     {
+        agentUnavailable = !snapshot.StatusKnown;
+        RaisePropertyChanged(nameof(AgentUnavailable));
+        if (agentUnavailable)
+        {
+            Connection.State = AgentConnectionState.Offline;
+            Connection.RemoteAccessEnabled = false;
+            Connection.Detail = LocalizeFailure(snapshot.LastErrorCode, snapshot.LastErrorDetail).Detail;
+            StatusText = PresentationText.Pick("本机 Agent 状态待确认", "Local Agent status unavailable");
+            accountStateKnown = false;
+            ObservableCollectionDiff.Apply(Sessions.Items, Sessions.Items.Select(item => item with {
+                StateText = PresentationText.Pick("待确认", "Unknown"), CanStop = false, IsHealthy = false, IsWarning = true
+            }).ToArray(), item => item.SessionId);
+            Sessions.AiSessions.Clear(); Sessions.AiStatus = PresentationText.AgentStateUnknown; Sessions.Filter();
+            RaiseStatusProperties(); RaiseAccountStateProperties();
+            return;
+        }
         AgentName = snapshot.Identity.Name;
         StatusText = LocalizeConnectionState(snapshot.ConnectionState);
         Connection.State = snapshot.ConnectionState;
@@ -655,11 +702,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(snapshot.ServerOrigin))
             Account.ApplyServerUrl(snapshot.ServerOrigin);
         accountStateKnown = true;
-        if (string.IsNullOrWhiteSpace(Account.PcName)) Account.PcName = snapshot.Identity.Name;
+        Account.PcName = snapshot.Identity.Name;
         ObservableCollectionDiff.Apply(Sessions.Sessions, snapshot.Sessions, item => item.SessionId);
         ObservableCollectionDiff.Apply(Devices.Devices, snapshot.Devices, item => item.DeviceId);
         var sessionItems = snapshot.Sessions.Select(CreateSessionItem).ToArray();
         ObservableCollectionDiff.Apply(Sessions.Items, sessionItems, item => item.SessionId);
+        ObservableCollectionDiff.Apply(Sessions.AiSessions, snapshot.AiSessions, item => item.Id);
+        Sessions.AiStatus = !snapshot.SessionDetailsAvailable ? PresentationText.Pick("升级 Windows Agent 后显示 AI 任务。", "Update the Windows Agent to view AI tasks.") :
+            PresentationText.Pick($"本机已加载 AI 会话 · {snapshot.ObservedAt.LocalDateTime:HH:mm:ss}" + (snapshot.AiSessionsTruncated ? " · 列表已截断" : ""),
+                $"AI sessions loaded on this PC · {snapshot.ObservedAt.LocalDateTime:HH:mm:ss}" + (snapshot.AiSessionsTruncated ? " · list truncated" : ""));
+        Sessions.Filter();
         var deviceItems = snapshot.Devices.Select(CreateDeviceItem).ToArray();
         ObservableCollectionDiff.Apply(Devices.Items, deviceItems, item => item.DeviceId);
         if (!Settings.HasUnsavedCommands && !Settings.CommandEditorOpen)
@@ -723,7 +775,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ShowNotice(UiNoticeSeverity.Info, PresentationText.Refreshing, string.Empty);
             await stateStore.RefreshAsync(true, cancellationToken).ConfigureAwait(false);
             await dispatcher.InvokeAsync(
-                () => ShowNotice(UiNoticeSeverity.Success, PresentationText.OperationCompleted, string.Empty),
+                () => {
+                    var current = stateStore.Current;
+                    if (current?.StatusKnown != true || !string.IsNullOrEmpty(current.LastErrorCode))
+                        ShowNotice(UiNoticeSeverity.Warning, PresentationText.Pick("状态尚未恢复", "Status unavailable"), Connection.Detail);
+                    else ShowNotice(UiNoticeSeverity.Success, PresentationText.Pick("状态已刷新", "Status refreshed"), StatusText);
+                },
                 cancellationToken);
         }
         catch (Exception error) when (error is not OperationCanceledException)
@@ -773,6 +830,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
     }
 
+    private async Task ControlBrowserAuthorizationAsync(bool cancel, CancellationToken token)
+    {
+        try { await client.ControlBrowserAuthorizationAsync(cancel, token).ConfigureAwait(false); }
+        catch (Exception error) when (error is not OperationCanceledException) { await ShowFailureAsync(error); }
+    }
+
     private async Task BeginAccountAuthorizationAsync(CancellationToken cancellationToken)
     {
         try
@@ -789,6 +852,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                     PresentationText.BrowserAuthorizationSucceeded,
                     string.Empty),
                 cancellationToken);
+        }
+        catch (AgentClientOperationException error) when (error.Code == "ACCOUNT_AUTHORIZATION_CANCELLED")
+        {
+            await dispatcher.InvokeAsync(() => ShowNotice(UiNoticeSeverity.Info, PresentationText.AuthorizationCancelled, string.Empty));
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
@@ -985,16 +1052,25 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         DesktopUpdateStatus status,
         CancellationToken cancellationToken)
     {
+        if (status.ReadyToInstall) await stateStore.RefreshAsync(false, cancellationToken).ConfigureAwait(false);
         Task<bool>? confirmation = null;
         await dispatcher.InvokeAsync(() =>
         {
+            UpdateProgressVisible = false;
             ApplyUpdateStatus(status);
+            var current = stateStore.Current;
+            var impact = current?.StatusKnown == true ? PresentationText.Pick(
+                $"当前活动 CLI {ActiveSessionCount} 个，AI 任务 {(current.SessionDetailsAvailable ? current.ActiveAiSessions.ToString() : "待确认")} 个。安装会中断这些任务。",
+                $"Active CLI sessions: {ActiveSessionCount}; AI tasks: {(current.SessionDetailsAvailable ? current.ActiveAiSessions.ToString() : "unknown")}. Installing interrupts these tasks.") : PresentationText.AgentStateUnknown;
             confirmation = RequestConfirmationAsync(
-                PresentationText.ConfirmUpdateTitle,
-                PresentationText.ConfirmUpdateDetail(status),
-                cancellationToken);
+                status.ReadyToInstall ? PresentationText.Pick("安装已验证的更新", "Install verified update") : PresentationText.ConfirmUpdateTitle,
+                status.ReadyToInstall ? impact : PresentationText.ConfirmUpdateDetail(status),
+                cancellationToken, danger: status.ReadyToInstall,
+                action: status.ReadyToInstall ? PresentationText.Pick("安装并重启", "Install and restart") : PresentationText.Pick("下载", "Download"),
+                cancel: status.ReadyToInstall ? PresentationText.Pick("稍后安装", "Install later") : null);
         }, cancellationToken);
         if (!await confirmation!.ConfigureAwait(false)) return false;
+        if (status.ReadyToInstall) return true;
         await dispatcher.InvokeAsync(() =>
         {
             UpdateProgressPercent = 0;
@@ -1010,7 +1086,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         UpdateProgressPercent = progress.TotalBytes <= 0
             ? 0
             : Math.Clamp(progress.BytesReceived * 100d / progress.TotalBytes, 0, 100);
-        UpdateProgressText = PresentationText.UpdateDownloadProgress(progress.BytesReceived, progress.TotalBytes);
+        UpdateProgressText = progress.Verifying ? PresentationText.Pick("正在验证安装包和发布者签名…", "Verifying the installer and publisher signature…") : PresentationText.UpdateDownloadProgress(progress.BytesReceived, progress.TotalBytes);
     }
 
     private async Task PollForUpdatesAsync(CancellationToken cancellationToken)
@@ -1037,7 +1113,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void ApplyUpdateStatus(DesktopUpdateStatus status)
     {
-        Settings.UpdateStatusText = PresentationText.UpdateStatus(status);
+        Settings.UpdateStatusText = status.ReadyToInstall ? status.Message ?? "" : PresentationText.UpdateStatus(status);
         Settings.ReleaseNotes = status.ReleaseNotes?.Trim() ?? string.Empty;
         Settings.ReleaseNotesTitle = PresentationText.UpdateReleaseNotesTitle(
             status.VersionName,
@@ -1174,13 +1250,16 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         return -1;
     }
 
-    public async Task<bool> RequestConfirmationAsync(string title, string detail, CancellationToken cancellationToken)
+    public async Task<bool> RequestConfirmationAsync(string title, string detail, CancellationToken cancellationToken,
+        bool danger = true, string? action = null, string? cancel = null)
     {
         if (pendingConfirmation is not null) return false;
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         pendingConfirmation = completion;
         ConfirmationTitle = title;
         ConfirmationDetail = detail;
+        ConfirmationDanger = danger; ConfirmationAction = action ?? title; ConfirmationCancel = cancel ?? PresentationText.Cancel;
+        RaisePropertyChanged(nameof(ConfirmationDanger)); RaisePropertyChanged(nameof(ConfirmationAction)); RaisePropertyChanged(nameof(ConfirmationCancel));
         ConfirmationVisible = true;
         try
         {
@@ -1218,7 +1297,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         OperationMessage = string.IsNullOrWhiteSpace(detail) ? title : $"{title}: {detail}";
         RaiseNoticeProperties();
         var version = Interlocked.Increment(ref noticeVersion);
-        _ = DismissNoticeAfterDelayAsync(version);
+        if (severity is UiNoticeSeverity.Info or UiNoticeSeverity.Success) _ = DismissNoticeAfterDelayAsync(version);
     }
 
     private void ClearNotice()
@@ -1407,6 +1486,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "PC_AGENT_EXITING" => PresentationText.AgentExitingDetail,
             "PC_AGENT_PROCESSES_STILL_RUNNING" => PresentationText.AgentProcessesStillRunningDetail,
             "ACCOUNT_AUTHORIZATION_IN_PROGRESS" => PresentationText.BrowserAuthorizationInProgressDetail,
+            "ACCOUNT_AUTHORIZATION_NOT_WAITING" => PresentationText.AuthorizationNotWaiting,
+            "ACCOUNT_AUTHORIZATION_COMMITTING" => PresentationText.AuthorizationCommitting,
             "ACCOUNT_CALLBACK_LISTENER_FAILED" => PresentationText.BrowserCallbackListenerFailedDetail,
             "ACCOUNT_BROWSER_OPEN_FAILED" => PresentationText.BrowserOpenFailedDetail,
             "ACCOUNT_AUTHORIZATION_TIMEOUT" => PresentationText.BrowserAuthorizationTimeoutDetail,

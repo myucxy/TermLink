@@ -32,6 +32,10 @@ internal sealed partial class AiAgentSession : IDisposable
     private string threadId = "", turnId = "", state = "starting", error = "", authentication = "unverified", title = "";
     private bool truncated, disposed, discovering;
     internal bool IsAlive { get { lock (sync) return !disposed && state is not ("exited" or "interrupted" or "suspended"); } }
+    internal DesktopAiSessionSummary DesktopSummary() {
+        lock (sync) return new DesktopAiSessionSummary { Id = Id, Title = title.Length > 160 ? title[..160] : title,
+            Agent = agent.Name, Directory = directory, State = state };
+    }
     // Text remains the bounded authoritative detail. The extra presentation fields let the
     // phone render a compact tool row without parsing provider-specific JSON.
     internal sealed record Message(string Id, string Role, string Text, string Kind = "text",

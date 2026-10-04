@@ -17,12 +17,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Description
@@ -35,6 +37,7 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -88,18 +91,31 @@ internal fun RemoteFileBrowserPage(
     onDownloadFavorite: (RemoteDirectoryFavorite) -> Unit,
     onOpenShell: (String, TerminalCommandCapability) -> Unit,
     onOpenFavoriteShell: (RemoteDirectoryFavorite, TerminalCommandCapability) -> Unit,
+    onOpenAiDirectory: (UUID, String) -> String?,
     onToggleFavorite: (RemoteFileEntry) -> Unit,
     onRemoveFavorite: (RemoteDirectoryFavorite) -> Unit,
     modifier: Modifier = Modifier,
+    highlightedFile: String? = null,
+    onReturnToAi: (() -> Unit)? = null,
 ) {
     var selectedTabIndex by rememberSaveable(state.pcId) { mutableIntStateOf(0) }
+    var aiError by rememberSaveable(state.pcId) { mutableStateOf<String?>(null) }
     var searchQuery by rememberSaveable(state.pcId, state.currentPath) { mutableStateOf(state.query) }
     val parentTarget = remoteFileParentTarget(state.currentPath, state.parentPath)
+    val directoryList = rememberLazyListState()
+    val targetIndex = state.entries.indexOfFirst { it.path.equals(highlightedFile, ignoreCase = true) }
+    androidx.compose.runtime.LaunchedEffect(highlightedFile, state.currentPath, targetIndex, selectedTabIndex) {
+        if (highlightedFile != null && targetIndex >= 0 && selectedTabIndex == 0) directoryList.scrollToItem(targetIndex + 1)
+    }
     val currentDirectory = remoteCurrentDirectoryEntry(state.currentPath)
     val currentDirectoryFavorite = currentDirectory != null && state.pcId?.let { pcId ->
         isRemoteDirectoryFavorite(favorites, pcId, currentDirectory.path)
     } == true
     Column(modifier = modifier.fillMaxSize()) {
+        if (onReturnToAi != null) Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(highlightedFile?.substringAfterLast('\\').orEmpty(), Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            TextButton(onClick = onReturnToAi) { Text(stringResource(R.string.ai_directory_return)) }
+        }
         PrimaryTabRow(
             selectedTabIndex = selectedTabIndex,
             modifier = Modifier.height(44.dp),
@@ -128,6 +144,7 @@ internal fun RemoteFileBrowserPage(
             )
         }
         LazyColumn(
+            state = directoryList,
             modifier = Modifier.fillMaxSize(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(
                 start = 16.dp,
@@ -197,6 +214,7 @@ internal fun RemoteFileBrowserPage(
                                 favorite = currentDirectoryFavorite,
                                 onDownload = onDownload,
                                 onOpenShell = onOpenShell,
+                                onOpenAi = { path -> state.pcId?.let { aiError = onOpenAiDirectory(it, path) } },
                                 onToggleFavorite = { directory -> onToggleFavorite(directory) },
                             )
                         }
@@ -228,6 +246,7 @@ internal fun RemoteFileBrowserPage(
                 items(state.entries, key = RemoteFileEntry::path) { entry ->
                     RemoteFileEntryRow(
                         entry = entry,
+                        highlighted = entry.path.equals(highlightedFile, ignoreCase = true),
                         openingCommandId = state.openingCommandId,
                         supportedCommands = supportedCommands,
                         favorite = state.pcId?.let { pcId ->
@@ -236,6 +255,7 @@ internal fun RemoteFileBrowserPage(
                         onOpenDirectory = onOpenDirectory,
                         onDownload = onDownload,
                         onOpenShell = onOpenShell,
+                        onOpenAi = { path -> state.pcId?.let { aiError = onOpenAiDirectory(it, path) } },
                         onToggleFavorite = { onToggleFavorite(entry) },
                     )
                 }
@@ -277,12 +297,25 @@ internal fun RemoteFileBrowserPage(
                         },
                         onDownload = { onDownloadFavorite(favorite) },
                         onOpenShell = { shell -> onOpenFavoriteShell(favorite, shell) },
+                        onOpenAi = { aiError = onOpenAiDirectory(favorite.pcId, favorite.path) },
                         onRemove = { onRemoveFavorite(favorite) },
                     )
                 }
             }
         }
     }
+    aiError?.let { message ->
+        AlertDialog(onDismissRequest = { aiError = null },
+            title = { Text(stringResource(R.string.action_new_ai_chat)) },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { aiError = null }) { Text(stringResource(android.R.string.ok)) } })
+    }
+}
+
+@Composable
+private fun DirectoryAiAction(onClick: () -> Unit) {
+    DropdownMenuItem(text = { Text(stringResource(R.string.action_new_ai_chat)) },
+        leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) }, onClick = onClick)
 }
 
 @Composable
@@ -367,6 +400,7 @@ private fun CurrentDirectoryActions(
     favorite: Boolean,
     onDownload: (RemoteFileEntry) -> Unit,
     onOpenShell: (String, TerminalCommandCapability) -> Unit,
+    onOpenAi: (String) -> Unit,
     onToggleFavorite: (RemoteFileEntry) -> Unit,
 ) {
     var menuExpanded by remember(directory?.path) { mutableStateOf(false) }
@@ -385,6 +419,7 @@ private fun CurrentDirectoryActions(
         }
         DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
             if (directory != null) {
+                DirectoryAiAction { menuExpanded = false; onOpenAi(directory.path) }
                 DropdownMenuItem(
                     text = { Text(stringResource(R.string.action_download_zip)) },
                     leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
@@ -448,6 +483,7 @@ private fun RemoteDirectoryFavoriteRow(
     onOpen: () -> Unit,
     onDownload: () -> Unit,
     onOpenShell: (TerminalCommandCapability) -> Unit,
+    onOpenAi: () -> Unit,
     onRemove: () -> Unit,
 ) {
     var menuExpanded by remember(favorite.pcId, favorite.path) { mutableStateOf(false) }
@@ -481,6 +517,7 @@ private fun RemoteDirectoryFavoriteRow(
                     Icon(Icons.Filled.MoreVert, contentDescription = stringResource(R.string.action_more_options))
                 }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                    DirectoryAiAction { menuExpanded = false; onOpenAi() }
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.action_download_zip)) },
                         leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
@@ -531,19 +568,21 @@ private fun RemoteDirectoryFavoriteRow(
 @Composable
 private fun RemoteFileEntryRow(
     entry: RemoteFileEntry,
+    highlighted: Boolean = false,
     openingCommandId: String?,
     supportedCommands: List<TerminalCommandCapability>,
     favorite: Boolean,
     onOpenDirectory: (String) -> Unit,
     onDownload: (RemoteFileEntry) -> Unit,
     onOpenShell: (String, TerminalCommandCapability) -> Unit,
+    onOpenAi: (String) -> Unit,
     onToggleFavorite: () -> Unit,
 ) {
     var menuExpanded by remember(entry.path) { mutableStateOf(false) }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
-        color = MaterialTheme.colorScheme.surface,
+        color = if (highlighted) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
     ) {
         Column {
@@ -587,6 +626,9 @@ private fun RemoteFileEntryRow(
                         Icon(Icons.Filled.MoreVert, contentDescription = stringResource(R.string.action_more_options))
                     }
                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        if (entry.kind == RemoteFileKind.DIRECTORY) {
+                            DirectoryAiAction { menuExpanded = false; onOpenAi(entry.path) }
+                        }
                         DropdownMenuItem(
                             text = {
                                 Text(stringResource(
@@ -702,6 +744,7 @@ private fun RemoteDownloadRecordRow(
     onRetry: (RemoteDownloadRecord) -> Unit,
     onDelete: (UUID) -> Unit,
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -783,6 +826,10 @@ private fun RemoteDownloadRecordRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                if (record.status == RemoteDownloadStatus.COMPLETED) {
+                    TextButton(onClick = { openDownloadedDocument(context, record, false) }) { Text(stringResource(R.string.action_open_download)) }
+                    TextButton(onClick = { openDownloadedDocument(context, record, true) }) { Text(stringResource(R.string.action_share_download)) }
+                }
                 when {
                     record.status.isActive -> TextButton(
                         onClick = { onCancel(record.id) },

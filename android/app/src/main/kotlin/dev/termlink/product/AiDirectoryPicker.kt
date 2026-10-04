@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -54,7 +58,7 @@ internal fun AiDirectoryPicker(workspace: AiWorkspace, pcId: UUID, initialPath: 
                 if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (error.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(error, Modifier.weight(1f), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    TextButton(enabled = !loading && online, onClick = { attempt++ }) { Text("重试") }
+                    TextButton(enabled = !loading && online, onClick = { attempt++ }) { Text(stringResource(R.string.ai_ui_retry)) }
                 }
                 LazyColumn(Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 320.dp)) {
                     items(page?.entries.orEmpty().distinctBy { it.path }, key = { it.path }) { entry ->
@@ -66,12 +70,12 @@ internal fun AiDirectoryPicker(workspace: AiWorkspace, pcId: UUID, initialPath: 
                     }
                     if (!loading && error.isEmpty() && page?.entries?.isEmpty() == true) item { Text("没有子目录", Modifier.padding(vertical = 12.dp)) }
                     page?.nextOffset?.let { next -> item {
-                        TextButton(enabled = online && !loading, onClick = { loading = true; offset = next }) { Text("加载更多") }
+                        TextButton(enabled = online && !loading, onClick = { loading = true; offset = next }) { Text(stringResource(R.string.ai_ui_more)) }
                     } }
                 }
             }
         }, confirmButton = {
             if (!selectFile) TextButton(enabled = online && !loading && error.isEmpty() && page?.currentPath?.isNotEmpty() == true,
                 onClick = { page?.currentPath?.let(onSelect) }) { Text("使用此目录") }
-        }, dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+        }, dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.ai_ui_cancel)) } })
 }

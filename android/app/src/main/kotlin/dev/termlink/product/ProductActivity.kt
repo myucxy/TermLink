@@ -1187,6 +1187,7 @@ fun ProductApp(
 
     fun navigateTo(next: ProductDestination) {
         if (next.isVisibleInProductShell) {
+            if (next != ProductDestination.FILES) aiWorkspace.fileLocation = null
             if (next != ProductDestination.DEVICES) deviceBackArmedAt = null
             destinationName = next.name
             if (next == next.primaryDestination().destination()) {
@@ -1259,12 +1260,34 @@ fun ProductApp(
     }
 
     val deviceBackExitMessage = stringResource(R.string.devices_back_again_to_exit)
+    fun backFromFiles(): Boolean {
+        val files = snapshot.remoteFileBrowser
+        if (destination != ProductDestination.FILES || files.pcId == null) return false
+        aiWorkspace.fileLocation?.let { origin ->
+            if (origin.pcId == files.pcId && (files.currentPath.equals(origin.directory, true) || files.error != null)) {
+                aiWorkspace.selected = origin.sessionId
+                aiWorkspace.fileLocation = null
+                navigateTo(ProductDestination.AI)
+                return true
+            }
+        }
+        val parent = remoteFileParentTarget(files.currentPath, files.parentPath) ?: return false
+        if (!files.loading) scope.launch {
+            try { repository.browseRemoteDirectory(files.pcId, files.pcName, parent, null, "") }
+            catch (error: CancellationException) { throw error }
+            catch (error: Throwable) { snackbarHostState.showSnackbar(safeOperationMessage(error, unavailableOperationMessage)) }
+        }
+        return true
+    }
     BackHandler(
         enabled = destination == ProductDestination.SESSIONS ||
+            destination == ProductDestination.AI || destination == ProductDestination.SETTINGS ||
             destination == ProductDestination.DEVICES ||
             destination.primaryDestination().destination() != destination,
     ) {
         when {
+            backFromFiles() -> Unit
+            destination == ProductDestination.AI || destination == ProductDestination.SETTINGS -> navigateTo(ProductDestination.DEVICES)
             destination == ProductDestination.SESSIONS -> {
                 deviceBackArmedAt = null
                 navigateTo(ProductDestination.DEVICES)
@@ -1289,6 +1312,8 @@ fun ProductApp(
         scope.launch {
             try {
                 operation()
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Throwable) {
                 snackbarHostState.showSnackbar(
                     safeOperationMessage(error, unavailableOperationMessage, activeSessionDeleteMessage),
@@ -1372,7 +1397,11 @@ fun ProductApp(
                     runOperation({ repository.signIn(username, submittedPassword) }, onComplete)
                 },
                 onConfigureServer = { url, onComplete ->
-                    runOperation({ repository.configureServer(url) }, onComplete)
+                    scope.launch {
+                        try { repository.configureServer(url); onComplete(null) }
+                        catch (error: CancellationException) { throw error }
+                        catch (error: Throwable) { onComplete(safeOperationMessage(error, unavailableOperationMessage)) }
+                    }
                 },
                 onRegister = { onComplete ->
                     runOperation(repository::beginEmbeddedRegistration, onComplete)
@@ -1384,6 +1413,7 @@ fun ProductApp(
             update = snapshot.updateStatus,
             onDismiss = repository::dismissUpdate,
             onDownload = { runOperation(repository::downloadUpdate) },
+            onCancelDownload = repository::cancelUpdateDownload,
             onInstall = onInstallUpdate,
         )
         return
@@ -1405,7 +1435,7 @@ fun ProductApp(
                         onBack = if (destination == ProductDestination.SESSIONS) {
                             null
                         } else {
-                            { navigateTo(destination.primaryDestination().destination()) }
+                            { if (!backFromFiles()) navigateTo(destination.primaryDestination().destination()) }
                         },
                         onRefresh = ::refreshCurrentDestination,
                         refreshEnabled = if (destination != ProductDestination.FILES) {
@@ -1495,6 +1525,23 @@ fun ProductApp(
                     aiWorkspace = aiWorkspace,
                     onOpenAi = { navigateTo(ProductDestination.AI) },
                     onOpenAiDevices = { navigateTo(ProductDestination.DEVICES) },
+                    onOpenAiDirectory = { location ->
+                        val host = aiWorkspace.catalogs[location.pcId]?.hostId
+                        check(destinationName == ProductDestination.AI.name && aiWorkspace.selected == location.sessionId)
+                        val pc = repository.snapshot.value.pcs.singleOrNull { it.id == location.pcId && it.online && it.remoteRoutingEnabled }
+                            ?: error(context.getString(R.string.ai_directory_pc_unavailable))
+                        check(PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) { context.getString(R.string.ai_directory_upgrade) }
+                        repository.browseRemoteDirectory(pc.id, pc.name, location.directory, null, "")
+                        val files = repository.snapshot.value.remoteFileBrowser
+                        check(files.pcId == pc.id && files.currentPath.equals(location.directory, true) && files.error == null) {
+                            context.getString(R.string.ai_directory_unavailable)
+                        }
+                        check(destinationName == ProductDestination.AI.name && aiWorkspace.selected == location.sessionId &&
+                            aiWorkspace.catalogs[location.pcId]?.hostId == host)
+                        aiWorkspace.fileLocation = location
+                        selectedRemotePcId = pc.id.toString(); selectedRemotePcName = pc.name
+                        navigateTo(ProductDestination.FILES)
+                    },
                     modifier = Modifier.weight(1f),
                     destination = destination,
                     sessionContentBottomPixels = if (destination == ProductDestination.SESSIONS) {
@@ -1556,6 +1603,7 @@ fun ProductApp(
                         saveExpandedProductPcs(context, expandedPcIds)
                     },
                     onBrowsePc = { pc ->
+                        aiWorkspace.fileLocation = null
                         selectedRemotePcId = pc.id.toString()
                         selectedRemotePcName = pc.name
                         navigateTo(ProductDestination.FILES)
@@ -1569,6 +1617,7 @@ fun ProductApp(
                         navigateTo(ProductDestination.DOWNLOADS)
                     },
                     onOpenRemoteFavorite = { favorite ->
+                        aiWorkspace.fileLocation = null
                         val currentPcName = snapshot.pcs.firstOrNull { pc -> pc.id == favorite.pcId }
                             ?.name
                             ?: favorite.pcName
@@ -1692,6 +1741,7 @@ fun ProductApp(
         update = snapshot.updateStatus,
         onDismiss = repository::dismissUpdate,
         onDownload = { runOperation(repository::downloadUpdate) },
+        onCancelDownload = repository::cancelUpdateDownload,
         onInstall = onInstallUpdate,
     )
     agentUpdateDialog?.let { state ->
@@ -1764,7 +1814,7 @@ fun ProductApp(
     if (deletableSessionId != null) {
         ConfirmActionDialog(
             title = stringResource(R.string.confirm_delete_session_title),
-            message = stringResource(R.string.confirm_delete_session_copy),
+            message = sessionActionIdentity(snapshot, deletableSessionId) + "\n\n" + stringResource(R.string.confirm_delete_session_copy),
             confirmLabel = stringResource(R.string.confirm_delete_session),
             icon = Icons.Filled.DeleteForever,
             onDismiss = { pendingDeleteSessionId = null },
@@ -1794,7 +1844,7 @@ fun ProductApp(
     if (stoppableSessionId != null) {
         ConfirmActionDialog(
             title = stringResource(R.string.confirm_terminate_session_title),
-            message = stringResource(R.string.confirm_terminate_session_copy),
+            message = sessionActionIdentity(snapshot, stoppableSessionId) + "\n\n" + stringResource(R.string.confirm_terminate_session_copy),
             confirmLabel = stringResource(R.string.confirm_terminate_session),
             icon = Icons.Filled.Stop,
             onDismiss = { pendingStopSessionId = null },
@@ -1834,7 +1884,7 @@ fun ProductApp(
 private fun ProductSignInPage(
     snapshot: ProductSnapshot,
     onSignIn: (String, CharArray, () -> Unit) -> Unit,
-    onConfigureServer: (String, () -> Unit) -> Unit,
+    onConfigureServer: (String, (String?) -> Unit) -> Unit,
     onRegister: (() -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1845,6 +1895,7 @@ private fun ProductSignInPage(
     var serverApplying by remember { mutableStateOf(false) }
     var serverDialogVisible by remember { mutableStateOf(false) }
     var serverDraftUrl by remember { mutableStateOf("") }
+    var serverError by remember { mutableStateOf<String?>(null) }
     var focusedField by remember { mutableStateOf<String?>(null) }
     val scrollState = rememberScrollState()
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
@@ -1960,6 +2011,7 @@ private fun ProductSignInPage(
                 IconButton(
                     onClick = {
                         serverDraftUrl = serverUrl
+                        serverError = null
                         serverDialogVisible = true
                     },
                     enabled = !submitting && !serverApplying,
@@ -2074,11 +2126,13 @@ private fun ProductSignInPage(
             text = {
                 OutlinedTextField(
                     value = serverDraftUrl,
-                    onValueChange = { serverDraftUrl = it },
+                    onValueChange = { serverDraftUrl = it; serverError = null },
                     label = { Text(stringResource(R.string.server_url_label)) },
                     placeholder = { Text(stringResource(R.string.server_url_hint)) },
                     singleLine = true,
                     enabled = !serverApplying,
+                    isError = serverError != null,
+                    supportingText = serverError?.let { message -> { Text(message) } },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -2088,10 +2142,10 @@ private fun ProductSignInPage(
                     onClick = {
                         if (serverApplying || serverDraftUrl.isBlank()) return@TextButton
                         serverApplying = true
-                        onConfigureServer(serverDraftUrl.trim()) {
-                            serverUrl = serverDraftUrl.trim()
+                        onConfigureServer(serverDraftUrl.trim()) { failure ->
                             serverApplying = false
-                            serverDialogVisible = false
+                            serverError = failure
+                            if (failure == null) serverDialogVisible = false
                         }
                     },
                     enabled = !serverApplying && serverDraftUrl.isNotBlank(),
@@ -2119,6 +2173,7 @@ private fun ProductUpdateDialog(
     update: ProductUpdateStatus,
     onDismiss: () -> Unit,
     onDownload: () -> Unit,
+    onCancelDownload: () -> Unit,
     onInstall: (String) -> Unit,
 ) {
     if (!update.dialogVisible || update.decision !in setOf(
@@ -2132,7 +2187,7 @@ private fun ProductUpdateDialog(
     val active = download is ProductUpdateDownloadState.Downloading ||
         download is ProductUpdateDownloadState.Verifying
     AlertDialog(
-        onDismissRequest = { if (!active) onDismiss() },
+        onDismissRequest = onDismiss,
         title = {
             Text(stringResource(R.string.update_dialog_title, update.versionName ?: "-"))
         },
@@ -2219,16 +2274,14 @@ private fun ProductUpdateDialog(
                 }
                 is ProductUpdateDownloadState.Downloading,
                 ProductUpdateDownloadState.Verifying,
-                -> TextButton(onClick = {}, enabled = false) {
-                    Text(stringResource(R.string.update_action_working))
+                -> TextButton(onClick = onCancelDownload) {
+                    Text(stringResource(R.string.action_cancel_download))
                 }
             }
         },
         dismissButton = {
-            if (!active) {
-                TextButton(onClick = onDismiss) {
-                    Text(stringResource(R.string.update_action_later))
-                }
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(if (active) R.string.update_action_hide else R.string.update_action_later))
             }
         },
     )
@@ -3131,6 +3184,7 @@ private fun ProductContent(
     aiWorkspace: AiWorkspace,
     onOpenAi: () -> Unit,
     onOpenAiDevices: () -> Unit,
+    onOpenAiDirectory: suspend (AiFileLocation) -> Unit,
     modifier: Modifier,
     destination: ProductDestination,
     sessionContentBottomPixels: Int,
@@ -3197,7 +3251,7 @@ private fun ProductContent(
         runCatching { java.util.UUID.fromString(value) }.getOrNull()
     }
     if (destination == ProductDestination.AI) {
-        AiPage(aiWorkspace, snapshot, foreground, modifier, onOpenAiDevices)
+        AiPage(aiWorkspace, snapshot, foreground, modifier, onOpenAiDevices, onOpenAiDirectory)
         return
     }
     if (destination == ProductDestination.DEVICES) {
@@ -3245,6 +3299,10 @@ private fun ProductContent(
         }
         RemoteFileBrowserPage(
             state = state,
+            highlightedFile = aiWorkspace.fileLocation?.takeIf { it.pcId == remotePcId }?.filePath,
+            onReturnToAi = aiWorkspace.fileLocation?.takeIf { it.pcId == remotePcId }?.let { location -> {
+                aiWorkspace.selected = location.sessionId; aiWorkspace.fileLocation = null; onOpenAi()
+            } },
             searchSupported = remotePc?.capabilities?.contains(
                 dev.termlink.model.PcCapabilityIds.FILE_OPERATIONS_SEARCH_V1,
             ) == true,
@@ -3284,6 +3342,19 @@ private fun ProductContent(
             onOpenFavoriteShell = { favorite, shell ->
                 onOpenRemoteShell(favorite.pcId, favorite.path, shell)
             },
+            onOpenAiDirectory = { pcId, path ->
+                val pc = snapshot.pcs.firstOrNull { it.id == pcId }
+                when {
+                    pc == null || !pc.online || !pc.remoteRoutingEnabled -> "电脑离线或未启用远程访问，请连接后重试。"
+                    "ai_agent_v1" !in pc.capabilities -> "${pc.name} 尚未提供 AI 聊天能力，请升级 Windows 客户端并检测 AI Agent 后重试。"
+                    path.isBlank() -> "请先选择一个工作目录。"
+                    else -> {
+                        aiWorkspace.beginCreate(pcId, directory = path)
+                        onOpenAi()
+                        null
+                    }
+                }
+            },
             onToggleFavorite = { entry ->
                 onToggleRemoteFavorite(remotePcId, remotePcName, entry)
             },
@@ -3293,13 +3364,25 @@ private fun ProductContent(
         return
     }
     if (destination == ProductDestination.DOWNLOADS) {
+        val context = LocalContext.current
+        var aiRetry by remember { mutableStateOf<java.util.UUID?>(null) }
+        val retryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+            val id = aiRetry; aiRetry = null
+            if (id != null && uri != null) runCatching { aiWorkspace.downloads?.retry(id, uri) }.onFailure {
+                android.widget.Toast.makeText(context, "无法重试，请确认电脑在线。", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+        val aiDownloads = aiWorkspace.downloads
         RemoteDownloadCenterPage(
             pcId = remotePcId,
             pcName = selectedRemotePcName.takeIf(String::isNotBlank),
-            records = snapshot.remoteDownloads,
-            onCancel = onCancelRemoteDownload,
-            onRetry = onRetryRemoteDownload,
-            onDelete = onDeleteRemoteDownloadRecord,
+            records = (snapshot.remoteDownloads + aiDownloads?.records?.values.orEmpty()).sortedByDescending { it.createdAt },
+            onCancel = { id -> if (aiDownloads?.records?.containsKey(id) == true) aiDownloads.cancel(id) else onCancelRemoteDownload(id) },
+            onRetry = { record ->
+                if (aiDownloads?.records?.containsKey(record.id) == true) { aiRetry = record.id; retryLauncher.launch(record.filename) }
+                else onRetryRemoteDownload(record)
+            },
+            onDelete = { id -> if (aiDownloads?.records?.containsKey(id) == true) aiDownloads.remove(id) else onDeleteRemoteDownloadRecord(id) },
             modifier = modifier.fillMaxSize(),
         )
         return
@@ -3449,6 +3532,15 @@ private fun DevicesPage(
 ) {
     PrimaryHomeHeader(onOpenDownloads = onOpenDownloads)
     val pcs = visibleOnlineWindowsPcs(snapshot)
+    val offline = snapshot.pcs.filter { pc -> !pc.online && snapshot.devices.any { it.id == pc.deviceId && it.type.isPcAgent() } }
+    if (offline.isNotEmpty()) {
+        var showOffline by rememberSaveable { mutableStateOf(false) }
+        TextButton(onClick = { showOffline = !showOffline }) { Text(stringResource(R.string.devices_unavailable_count, offline.size)) }
+        if (showOffline) Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+            Text(offline.joinToString("、") { it.name }, style = MaterialTheme.typography.bodySmall)
+            Text(stringResource(R.string.devices_unavailable_detail), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
     if (pcs.isEmpty()) {
         EmptyState(
             icon = Icons.Filled.Devices,
@@ -3741,9 +3833,7 @@ private fun PcRow(
                     .padding(start = 12.dp, top = 8.dp, end = 8.dp, bottom = 8.dp),
             ) {
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(end = 28.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
@@ -3754,12 +3844,14 @@ private fun PcRow(
                         tint = MaterialTheme.colorScheme.primary,
                     )
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                        Text(
-                            pc.name,
-                            style = MaterialTheme.typography.titleMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(pc.name, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            StatusDot(
+                                color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                contentDescription = stringResource(if (pc.online) R.string.pc_online_accessibility else R.string.pc_offline_accessibility),
+                            )
+                        }
                         Text(
                             stringResource(
                                 R.string.pc_routing_status,
@@ -3773,35 +3865,12 @@ private fun PcRow(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                }
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(top = 5.5.dp, end = 5.5.dp),
-                ) {
-                    StatusDot(
-                        color = if (pc.online) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
-                        contentDescription = if (pc.online) {
-                            stringResource(R.string.pc_online_accessibility)
-                        } else {
-                            stringResource(R.string.pc_offline_accessibility)
-                        },
-                    )
-                }
-                if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(bottom = 5.5.dp),
-                    ) {
-                        Icon(
-                            imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                            contentDescription = stringResource(
-                                if (expanded) R.string.action_collapse_sessions else R.string.action_expand_sessions,
-                            ),
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) {
+                        IconButton(onClick = { onToggleExpanded?.invoke() }, enabled = onToggleExpanded != null, modifier = Modifier.size(48.dp)) {
+                            Icon(imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                                contentDescription = stringResource(if (expanded) R.string.action_collapse_sessions else R.string.action_expand_sessions),
+                                modifier = Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
                 DropdownMenu(
@@ -8042,13 +8111,28 @@ private fun safeActivityDetail(value: String): String =
     sensitiveIdPattern.replace(value, "session")
 
 /** Keep transport/auth failures out of transient UI; retain only local validation copy. */
-private fun safeOperationMessage(
+internal fun sessionActionIdentity(snapshot: ProductSnapshot, id: java.util.UUID): String {
+    val session = snapshot.sessions.firstOrNull { it.id == id } ?: return id.toString().take(8)
+    val pc = snapshot.pcs.firstOrNull { it.id == session.pcId }?.name ?: "电脑"
+    return "$pc · ${displaySessionTitle(session, snapshot.sessionTitles[id])}"
+}
+
+internal fun safeOperationMessage(
     error: Throwable,
     fallback: String,
     activeSessionDeleteMessage: String = fallback,
 ): String = when {
     error is TermLinkApiException && error.code == "SESSION_ACTIVE" -> activeSessionDeleteMessage
-    error is IllegalArgumentException -> fallback
+    error is TermLinkApiException && error.status == 401 -> "登录已失效，请重新登录。"
+    error is TermLinkApiException && error.status == 403 -> "当前账号没有此操作权限。"
+    error is TermLinkApiException && error.status >= 500 -> "服务端暂时无法处理请求，请稍后重试。"
+    error is dev.termlink.network.production.HostDeviceUpgradeRequiredException -> "电脑端版本不支持此操作，请升级 Windows 客户端。"
+    error is IllegalArgumentException -> "输入格式或参数不正确，请检查后重试。"
+    error is java.net.UnknownHostException -> "无法解析服务器地址，请检查地址和手机网络。"
+    error is javax.net.ssl.SSLException -> "服务器安全连接验证失败，请检查地址与证书。"
+    error is kotlinx.coroutines.TimeoutCancellationException || error is java.net.SocketTimeoutException -> "请求超时，请检查电脑和服务器连接后重试。"
+    error is SecurityException -> "没有访问所选文件或目录的权限，请重新选择。"
+    error is java.net.ConnectException -> "无法建立连接，请检查服务器与网络。"
     else -> fallback
 }
 

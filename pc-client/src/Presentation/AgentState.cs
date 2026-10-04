@@ -8,6 +8,9 @@ namespace TermLink.Presentation;
 
 public interface IAgentClient
 {
+    bool SupportsBrowserAuthorizationControls => false;
+    ValueTask ControlBrowserAuthorizationAsync(bool cancel, CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException("Browser authorization controls are unavailable."));
     bool SupportsZcodeRemoteConfiguration => false;
     ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken) =>
         ValueTask.FromException(new PlatformNotSupportedException("ZCode remote configuration is unavailable on this platform."));

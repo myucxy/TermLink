@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import dev.termlink.model.PcSummary
 import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.TerminalCommandCapability
@@ -33,14 +37,14 @@ internal fun DeviceSessionActions(workspace: AiWorkspace, pc: PcSummary, opening
     val commands = supportedRemoteTerminalCommands(pc)
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         if (commands.isNotEmpty() && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(if (opening) "启动中…" else "CLI", Icons.Default.Terminal, online && !opening, filled = true, onClick = { create = true })
-        AiAction("AI 聊天", Icons.Default.AutoAwesome, online, filled = true, onClick = {
+        AiAction(stringResource(R.string.ai_ui_chat), Icons.Default.AutoAwesome, online, filled = true, onClick = {
             if ("ai_agent_v1" in pc.capabilities) {
-                workspace.createPcLocked = true; workspace.createPc = pc.id; onAi()
+                workspace.beginCreate(pc.id); onAi()
             } else {
                 aiUpgradeRequired = true
             }
         })
-        if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction("文件", Icons.Default.Folder, online, filled = true, onClick = onFiles)
+        if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(stringResource(R.string.ai_ui_files), Icons.Default.Folder, online, filled = true, onClick = onFiles)
     }
     if (aiUpgradeRequired) {
         AlertDialog(onDismissRequest = { aiUpgradeRequired = false },
@@ -70,13 +74,13 @@ internal fun DeviceSessionActions(workspace: AiWorkspace, pc: PcSummary, opening
                 Row {
                     TextButton(enabled = !loading && catalog?.directoryBrowsing == true && online, onClick = { browse = true }) { Text("选择目录") }
                     if (directory.isNotEmpty()) TextButton(onClick = { directory = "" }) { Text("恢复默认") }
-                    if (!loading && catalog == null) TextButton(onClick = { attempt++ }) { Text("重试") }
+                    if (!loading && catalog == null) TextButton(onClick = { attempt++ }) { Text(stringResource(R.string.ai_ui_retry)) }
                 }
             }
         }, confirmButton = { TextButton(enabled = online && !loading && !opening && command != null && (directory.isNotEmpty() || !catalog?.cliWorkspaceRoot.isNullOrEmpty()), onClick = {
             val path = directory.ifEmpty { cliWorkspacePath(checkNotNull(catalog).cliWorkspaceRoot) }
             create = false; onLaunch(pc.id, path, checkNotNull(command))
-        }) { Text("创建") } }, dismissButton = { TextButton(onClick = { create = false }) { Text("取消") } })
+        }) { Text("创建") } }, dismissButton = { TextButton(onClick = { create = false }) { Text(stringResource(R.string.ai_ui_cancel)) } })
         if (browse) AiDirectoryPicker(workspace, pc.id, directory, online, { browse = false }, { directory = it; browse = false })
     }
 }

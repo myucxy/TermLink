@@ -12,7 +12,7 @@
         MinWidth="820"
         MinHeight="600">
   <Grid ColumnDefinitions="204,*">
-    <Border Grid.Column="0"
+    <Border Grid.Column="0" IsEnabled="{Binding !BlockingOverlayVisible}"
             Background="{DynamicResource TermLinkSurfaceBrush}"
             BorderBrush="{DynamicResource TermLinkOutlineBrush}"
             BorderThickness="0,0,1,0"
@@ -84,6 +84,13 @@
             </Grid>
           </Border>
 
+          <Border Classes="subtle-card" Padding="10" IsVisible="{Binding AgentUnavailable}">
+            <StackPanel Spacing="4">
+              <TextBlock Text="{Binding Account.AccountDisplayName}" TextTrimming="CharacterEllipsis" />
+              <TextBlock Text="{x:Static text:PresentationText.AgentStateUnknown}" TextWrapping="Wrap" Classes="muted" />
+              <Button Content="{x:Static text:PresentationText.RetryNow}" Command="{Binding RefreshCommand}" />
+            </StackPanel>
+          </Border>
           <Button x:Name="SidebarAccountButton"
                   Classes="sidebar-card"
                   IsVisible="{Binding IsAccountLinked}"
@@ -145,7 +152,7 @@
       </Grid>
     </Border>
 
-    <Grid Grid.Column="1" RowDefinitions="72,*">
+    <Grid Grid.Column="1" RowDefinitions="72,*" IsEnabled="{Binding !BlockingOverlayVisible}">
       <Border Grid.Row="0" BorderBrush="{DynamicResource TermLinkOutlineBrush}" BorderThickness="0,0,0,1" Padding="28,14">
         <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
           <StackPanel VerticalAlignment="Center">
@@ -251,7 +258,28 @@
         </ScrollViewer>
 
         <Grid x:Name="SessionsPageRoot" IsVisible="{Binding IsSessionsPageSelected}" MaxWidth="{DynamicResource TermLinkContentMaxWidth}" HorizontalAlignment="Stretch">
-          <Grid>
+          <Grid RowDefinitions="Auto,Auto,Auto,*">
+            <TextBox Text="{Binding Sessions.Search, Mode=TwoWay}" PlaceholderText="{x:Static text:PresentationText.SessionSearch}" Margin="0,0,0,8" />
+            <TextBlock Grid.Row="1" Text="{Binding Sessions.AiStatus}" Classes="muted" Margin="0,0,0,6" />
+            <ScrollViewer Grid.Row="2" MaxHeight="240" IsVisible="{Binding Sessions.HasAiSessions}" Margin="0,0,0,8">
+              <ItemsControl ItemsSource="{Binding Sessions.VisibleAiSessions}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="contracts:AiSessionSummary">
+                    <Border Classes="card compact" Margin="0,0,0,6">
+                      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                        <StackPanel Spacing="2">
+                          <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                          <StackPanel Orientation="Horizontal" Spacing="8"><TextBlock Text="{Binding Agent}" /><TextBlock Text="{Binding State}" Classes="muted" /></StackPanel>
+                          <TextBlock Text="{Binding Directory}" Classes="muted" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Directory}" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="{x:Static text:PresentationText.OpenDirectory}" VerticalAlignment="Center" Command="{Binding $parent[Window].DataContext.OpenSessionDirectoryCommand}" CommandParameter="{Binding Directory}" />
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+            <Grid Grid.Row="3">
             <Border Classes="card" IsVisible="{Binding HasNoSessions}" VerticalAlignment="Top">
               <Grid ColumnDefinitions="Auto,*" ColumnSpacing="14" Margin="4">
                 <PathIcon Data="{DynamicResource TermLinkTerminalIcon}" Width="32" Height="32" Foreground="{DynamicResource TermLinkMutedBrush}" VerticalAlignment="Center" />
@@ -261,7 +289,7 @@
                 </StackPanel>
               </Grid>
             </Border>
-            <ListBox x:Name="SessionList" Classes="clean" ItemsSource="{Binding Sessions.Items}" IsVisible="{Binding HasSessions}" ScrollViewer.AllowAutoHide="False">
+            <ListBox x:Name="SessionList" Classes="clean" ItemsSource="{Binding Sessions.VisibleItems}" IsVisible="{Binding HasSessions}" ScrollViewer.AllowAutoHide="False">
               <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
               <ListBox.ItemTemplate>
                 <DataTemplate x:DataType="vm:SessionListItemViewModel">
@@ -295,6 +323,7 @@
                 </DataTemplate>
               </ListBox.ItemTemplate>
             </ListBox>
+            </Grid>
           </Grid>
         </Grid>
 
@@ -319,7 +348,7 @@
                     <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.ThisDevice}" /><TextBlock Classes="muted" Text="{x:Static text:PresentationText.ThisDeviceDetail}" /></StackPanel>
                     <Grid ColumnDefinitions="150,*" RowDefinitions="Auto,Auto,Auto" RowSpacing="12">
                       <TextBlock Text="{x:Static text:PresentationText.PcName}" VerticalAlignment="Center" />
-                      <TextBox Grid.Column="1" Text="{Binding Account.PcName}" AutomationProperties.Name="PC 名称" />
+                      <TextBox Grid.Column="1" Text="{Binding Account.PcName}" IsReadOnly="True" AutomationProperties.Name="PC 名称（已注册）" />
                       <TextBlock Grid.Row="1" Text="{x:Static text:PresentationText.Platform}" VerticalAlignment="Center" />
                       <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Settings.Platform}" Classes="muted" VerticalAlignment="Center" TextWrapping="Wrap" />
                       <TextBlock Grid.Row="2" Text="{x:Static text:PresentationText.AgentVersion}" VerticalAlignment="Center" />
@@ -374,7 +403,13 @@
                       </Grid>
                     </Border>
                     <Border x:Name="BrowserAuthorizationProgress" Classes="notice" IsVisible="{Binding BeginAccountAuthorizationCommand.IsRunning}">
-                      <TextBlock Text="{x:Static text:PresentationText.BrowserAuthorizationStartedDetail}" TextWrapping="Wrap" />
+                      <StackPanel Spacing="8">
+                        <TextBlock Text="{x:Static text:PresentationText.BrowserAuthorizationStartedDetail}" TextWrapping="Wrap" />
+                        <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding SupportsBrowserAuthorizationControls}">
+                          <Button Content="{x:Static text:PresentationText.ReopenBrowser}" Command="{Binding ReopenAccountAuthorizationCommand}" />
+                          <Button Content="{x:Static text:PresentationText.CancelAuthorization}" Command="{Binding CancelAccountAuthorizationCommand}" />
+                        </StackPanel>
+                      </StackPanel>
                     </Border>
                     <Button x:Name="BrowserAccountAuthorizationButton"
                             Classes="primary"
@@ -402,6 +437,7 @@
                         <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
                         <TextBlock Text="{Binding Detail}" />
                         <TextBlock Text="{Binding Path}" TextWrapping="Wrap" FontSize="12" />
+                        <Button Content="{x:Static text:PresentationText.AgentSetupHelp}" HorizontalAlignment="Left" Command="{Binding $parent[Window].DataContext.OpenAgentHelpCommand}" CommandParameter="{Binding Id}" />
                       </StackPanel>
                     </DataTemplate>
                   </ItemsControl.ItemTemplate>
@@ -414,6 +450,7 @@
                   <StackPanel Orientation="Horizontal" Spacing="8">
                     <Button Content="保存地址" Command="{Binding SaveZcodeRemoteCommand}" />
                     <Button Content="清除" Command="{Binding ClearZcodeRemoteCommand}" />
+                    <Button Content="{x:Static text:PresentationText.VerifyZcodeRemote}" Command="{Binding OpenZcodeRemoteCommand}" />
                   </StackPanel>
                   <TextBlock Text="配置后，安卓在 AI 中打开桌面远控网页。ZCode 桌面需开启远控；地址失效时重新粘贴保存。" TextWrapping="Wrap" FontSize="12" />
                 </StackPanel>
@@ -519,7 +556,7 @@
       </Grid>
     </Grid>
 
-    <Border x:Name="ConfirmationOverlay" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding ConfirmationVisible}" ZIndex="100">
+    <Border x:Name="ConfirmationOverlay" KeyboardNavigation.TabNavigation="Cycle" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding ConfirmationVisible}" ZIndex="100">
       <Border Classes="card" Width="460" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="24">
         <StackPanel Spacing="16">
           <StackPanel Spacing="6">
@@ -527,14 +564,14 @@
             <TextBlock Text="{Binding ConfirmationDetail}" Classes="muted" TextWrapping="Wrap" />
           </StackPanel>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
-            <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelPendingActionCommand}" />
-            <Button Classes="danger" Content="{x:Static text:PresentationText.ConfirmAction}" Command="{Binding ConfirmPendingActionCommand}" />
+            <Button x:Name="CancelConfirmationButton" Classes="subtle" Content="{Binding ConfirmationCancel}" Command="{Binding CancelPendingActionCommand}" />
+            <Button Classes.danger="{Binding ConfirmationDanger}" Classes.primary="{Binding !ConfirmationDanger}" Content="{Binding ConfirmationAction}" Command="{Binding ConfirmPendingActionCommand}" />
           </StackPanel>
         </StackPanel>
       </Border>
     </Border>
 
-    <Border x:Name="UpdateProgressOverlay" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding UpdateProgressVisible}" ZIndex="105">
+    <Border x:Name="UpdateProgressOverlay" KeyboardNavigation.TabNavigation="Cycle" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding UpdateProgressVisible}" ZIndex="105">
       <Border Classes="card" Width="460" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="24">
         <StackPanel Spacing="16">
           <StackPanel Spacing="6">

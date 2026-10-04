@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -36,18 +40,12 @@ internal fun aiVisibleEntries(opened: List<AiOpened>, sessions: Map<String, AiCo
                 .any { it.contains(query.trim(), true) })
     }
 
-internal fun aiAgentIcon(agent: String): ImageVector = when {
-    agent.contains("codex", true) -> Icons.Default.Code
-    agent.contains("claude", true) -> Icons.Default.AutoAwesome
-    agent.contains("zcode", true) -> Icons.Default.Web
-    else -> Icons.Default.ChatBubbleOutline
-}
-
 @Composable
-internal fun AiGroupHeading(name: String, count: Int, icon: ImageVector, collapsed: Boolean, nested: Boolean = false, toggle: () -> Unit) {
+internal fun AiGroupHeading(name: String, count: Int, icon: ImageVector?, collapsed: Boolean, nested: Boolean = false, toggle: () -> Unit) {
     Row(Modifier.fillMaxWidth().clickable(onClick = toggle).heightIn(min = 40.dp).padding(start = if (nested) 10.dp else 0.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Icon(icon, null, Modifier.size(if (nested) 16.dp else 18.dp), tint = MaterialTheme.colorScheme.primary)
+        if (icon == null) AiAgentProductIcon(aiAgentId(name), Modifier.size(22.dp))
+        else Icon(icon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
         Text(name, Modifier.weight(1f), style = if (nested) MaterialTheme.typography.labelLarge else MaterialTheme.typography.titleSmall,
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(count.toString(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -62,7 +60,7 @@ internal fun AiCompactSearch(value: String, change: (String) -> Unit, modifier: 
             Icon(Icons.Default.Search, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             BasicTextField(value, change, Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "搜索 AI 会话" }, singleLine = true,
                 textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface), cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                decorationBox = { inner -> if (value.isEmpty()) Text("搜索会话、设备、Agent", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant); inner() })
+                decorationBox = { inner -> if (value.isEmpty()) Text(stringResource(R.string.ai_ui_search), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant); inner() })
             if (value.isNotEmpty()) IconButton(onClick = { change("") }, Modifier.size(32.dp)) { Icon(Icons.Default.Close, "清空搜索", Modifier.size(16.dp)) }
         }
     }
@@ -113,7 +111,7 @@ internal fun AiComputerHistory(workspace: AiWorkspace, pcs: List<PcSummary>, clo
     ModalBottomSheet(onDismissRequest = close) {
         Column(Modifier.fillMaxWidth().heightIn(max = 600.dp).padding(horizontal = 12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("电脑历史", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.ai_ui_history), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                 IconButton(onClick = close) { Icon(Icons.Default.Close, "关闭电脑历史") }
             }
             Row {
@@ -124,21 +122,21 @@ internal fun AiComputerHistory(workspace: AiWorkspace, pcs: List<PcSummary>, clo
                 Box {
                     TextButton(onClick = { agentMenu = true }, enabled = online) { Text(agent?.name ?: "TermLink 记录"); Icon(Icons.Default.ExpandMore, null, Modifier.size(16.dp)) }
                     DropdownMenu(agentMenu, { agentMenu = false }) {
-                        DropdownMenuItem(text = { Text("TermLink 记录") }, onClick = { agentId = ""; agentMenu = false })
+                        DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_termlink_history)) }, onClick = { agentId = ""; agentMenu = false })
                         native.forEach { option -> DropdownMenuItem(text = { Text("${option.name} 原生历史") }, onClick = { agentId = option.id; agentMenu = false }) }
                     }
                 }
             }
             AiCompactSearch(query, { query = it.take(120) }, Modifier.fillMaxWidth())
-            if (agentId.isNotBlank()) Text("沿用历史授权继续对话；请避免在电脑原窗口同时发送。", Modifier.padding(vertical = 6.dp), style = MaterialTheme.typography.labelSmall)
+            if (agentId.isNotBlank()) Text(stringResource(R.string.ai_ui_history_resume), Modifier.padding(vertical = 6.dp), style = MaterialTheme.typography.labelSmall)
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-            if (!online) Text("电脑离线，已隐藏历史内容。", Modifier.padding(12.dp))
+            if (!online) Text(stringResource(R.string.ai_ui_history_offline), Modifier.padding(12.dp))
             else LazyColumn(Modifier.weight(1f, fill = false)) {
                 if (agentId.isBlank()) {
                     val sessions = catalog?.sessions.orEmpty().filter { (aiConversationTitle(it) + " " + it.agent).contains(query, true) }
-                    if (sessions.isEmpty()) item { Text("暂无匹配记录，可选择 Agent 原生历史。", Modifier.padding(vertical = 20.dp), style = MaterialTheme.typography.bodySmall) }
+                    if (sessions.isEmpty()) item { Text(stringResource(R.string.ai_ui_history_none), Modifier.padding(vertical = 20.dp), style = MaterialTheme.typography.bodySmall) }
                     sessions.groupBy { it.agent }.forEach { (name, values) ->
-                        item(key = "agent:$name") { AiGroupHeading(name, values.size, aiAgentIcon(name), collapsed[name] == true) { collapsed[name] = collapsed[name] != true } }
+                        item(key = "agent:$name") { AiGroupHeading(name, values.size, null, collapsed[name] == true) { collapsed[name] = collapsed[name] != true } }
                         if (collapsed[name] != true) items(values, key = { it.id }) { session ->
                             Row(Modifier.fillMaxWidth().clickable { workspace.open(session); close() }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                                 AiSessionIdentity(session, Modifier.weight(1f)); Text(if (session.capabilities.resume && session.state in setOf("suspended", "exited", "interrupted")) "可恢复" else aiStateLabel(session.state), style = MaterialTheme.typography.labelSmall)
@@ -148,25 +146,25 @@ internal fun AiComputerHistory(workspace: AiWorkspace, pcs: List<PcSummary>, clo
                     }
                 } else {
                     val filtered = entries.filter { (it.title + " " + it.directory).contains(query, true) }
-                    if (filtered.isEmpty() && !loading && error.isEmpty()) item { Text("暂无匹配历史", Modifier.padding(vertical = 20.dp)) }
+                    if (filtered.isEmpty() && !loading && error.isEmpty()) item { Text(stringResource(R.string.ai_ui_no_history), Modifier.padding(vertical = 20.dp)) }
                     items(filtered, key = { it.id }) { entry ->
                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(entry.title.ifBlank { "${agent?.name} 历史对话" }, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
                                 Text(entry.directory, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            TextButton(enabled = !workspace.busy && !workspace.uncertain && !loading, onClick = {
+                            TextButton(enabled = pcId?.let { !workspace.isBlocked(it) } == true && !loading, onClick = {
                                 pcId?.let { workspace.mutate(it, "import-native", extra = JSONObject().put("agentId", agentId).put("requestId", entry.id)) }; close()
-                            }) { Text("继续") }
+                            }) { Text(stringResource(R.string.ai_ui_continue)) }
                         }
                         HorizontalDivider()
                     }
-                    if (cursor.isNotEmpty()) item { TextButton(onClick = { scope.launch { load(true) } }, enabled = !loading) { Text("加载更多") } }
-                    if (truncated) item { Text("仅显示本次扫描范围内的历史。", style = MaterialTheme.typography.labelSmall) }
+                    if (cursor.isNotEmpty()) item { TextButton(onClick = { scope.launch { load(true) } }, enabled = !loading) { Text(stringResource(R.string.ai_ui_more)) } }
+                    if (truncated) item { Text(stringResource(R.string.ai_ui_history_scope), style = MaterialTheme.typography.labelSmall) }
                 }
             }
             if (error.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) { Text(error, Modifier.weight(1f), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                TextButton(onClick = { scope.launch { load(false) } }, enabled = !loading) { Text("重试") } }
+                TextButton(onClick = { scope.launch { load(false) } }, enabled = !loading) { Text(stringResource(R.string.ai_ui_retry)) } }
             Spacer(Modifier.height(12.dp))
         }
     }

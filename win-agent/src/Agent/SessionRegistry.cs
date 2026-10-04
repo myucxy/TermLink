@@ -2340,6 +2340,20 @@ namespace TermLink.Agent
 #else
                     return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
 #endif
+                case RegistryCommand.CancelAccountAuthorization:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    ProductionEnrollment.CancelBrowserAuthorization();
+                    return Response(true, "ACCOUNT_AUTHORIZATION_CANCELLED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
+                case RegistryCommand.ReopenAccountAuthorization:
+#if TERMLINK_PRODUCTION_RUNTIME
+                    ProductionEnrollment.ReopenBrowserAuthorization();
+                    return Response(true, "ACCOUNT_AUTHORIZATION_REOPENED", 0);
+#else
+                    return Response(false, "PRODUCTION_NOT_CONFIGURED", 0);
+#endif
                 case RegistryCommand.BeginAccountAuthorization:
 #if TERMLINK_PRODUCTION_RUNTIME
                     var configuredServerUrl = ProductionEnrollment.ConfiguredServerUrl();

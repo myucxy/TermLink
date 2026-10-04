@@ -104,11 +104,46 @@ namespace TermLink.Agent
         private static readonly object BrowserAuthorizationSync = new object();
         private static BrowserAuthorizationAttempt activeBrowserAuthorization;
 
-        private sealed class BrowserAuthorizationAttempt
+        internal sealed class BrowserAuthorizationAttempt
         {
             public ProductionEnrollmentOptions Options { get; set; }
             public string AuthorizationUrl;
             public Task Completion { get; set; }
+            public CancellationTokenSource Cancellation { get; } = new CancellationTokenSource();
+            public bool Committing { get; private set; }
+            internal void Cancel() {
+                lock (BrowserAuthorizationSync) {
+                    if (Committing) throw new ProductionEnrollmentException("ACCOUNT_AUTHORIZATION_COMMITTING", "Account authorization is being saved.");
+                    Cancellation.Cancel();
+                }
+            }
+            internal void BeginCommit() {
+                lock (BrowserAuthorizationSync) { Cancellation.Token.ThrowIfCancellationRequested(); Committing = true; }
+            }
+        }
+
+        internal static void CancelBrowserAuthorization()
+        {
+            lock (BrowserAuthorizationSync)
+            {
+                var attempt = activeBrowserAuthorization;
+                if (attempt == null || attempt.Completion == null || attempt.Completion.IsCompleted)
+                    throw new ProductionEnrollmentException("ACCOUNT_AUTHORIZATION_NOT_WAITING", "No browser authorization is waiting.");
+                attempt.Cancel();
+            }
+        }
+
+        internal static void ReopenBrowserAuthorization()
+        {
+            lock (BrowserAuthorizationSync)
+            {
+                var attempt = activeBrowserAuthorization;
+                if (attempt == null || attempt.Completion == null || attempt.Completion.IsCompleted ||
+                    attempt.Cancellation.IsCancellationRequested || attempt.Committing ||
+                    string.IsNullOrWhiteSpace(attempt.AuthorizationUrl))
+                    throw new ProductionEnrollmentException("ACCOUNT_AUTHORIZATION_NOT_WAITING", "The authorization page is not ready.");
+                OpenSystemBrowser(attempt.AuthorizationUrl);
+            }
         }
 
         private sealed class ClientConfiguration
@@ -275,7 +310,9 @@ namespace TermLink.Agent
             if (attempt == null || attempt.Completion == null || !attempt.Completion.IsCompleted) return;
             lock (BrowserAuthorizationSync)
             {
-                if (ReferenceEquals(activeBrowserAuthorization, attempt)) activeBrowserAuthorization = null;
+                if (ReferenceEquals(activeBrowserAuthorization, attempt)) {
+                    activeBrowserAuthorization = null; attempt.Cancellation.Dispose();
+                }
             }
         }
 
@@ -542,6 +579,18 @@ namespace TermLink.Agent
             ProductionEnrollmentOptions options,
             BrowserAuthorizationAttempt attempt)
         {
+            try { await RunBrowserAuthorizationAsync(options, attempt).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (attempt.Cancellation.IsCancellationRequested)
+            {
+                throw new ProductionEnrollmentException("ACCOUNT_AUTHORIZATION_CANCELLED", "Browser authorization was cancelled.");
+            }
+        }
+
+        private static async Task RunBrowserAuthorizationAsync(
+            ProductionEnrollmentOptions options,
+            BrowserAuthorizationAttempt attempt)
+        {
+            var cancellation = attempt.Cancellation.Token;
             using var http = ProductionTls.CreateHttpClient(options.ServerUrl);
             http.Timeout = TimeSpan.FromSeconds(20);
             ClientConfiguration client;
@@ -550,9 +599,9 @@ namespace TermLink.Agent
                 client = await GetJsonAsync<ClientConfiguration>(
                     http,
                     options.ServerUrl + "/v1/client-config",
-                    CancellationToken.None).ConfigureAwait(false);
+                    cancellation).ConfigureAwait(false);
             }
-            catch (OperationCanceledException error)
+            catch (OperationCanceledException error) when (!cancellation.IsCancellationRequested)
             {
                 throw new ProductionEnrollmentException(
                     "ACCOUNT_IDENTITY_SERVICE_TIMEOUT",
@@ -566,9 +615,9 @@ namespace TermLink.Agent
                 discovery = await GetJsonAsync<OIDCConfiguration>(
                     http,
                     client.OIDCIssuer.TrimEnd('/') + "/.well-known/openid-configuration",
-                    CancellationToken.None).ConfigureAwait(false);
+                    cancellation).ConfigureAwait(false);
             }
-            catch (OperationCanceledException error)
+            catch (OperationCanceledException error) when (!cancellation.IsCancellationRequested)
             {
                 throw new ProductionEnrollmentException(
                     "ACCOUNT_IDENTITY_SERVICE_TIMEOUT",
@@ -604,12 +653,17 @@ namespace TermLink.Agent
                 ["code_challenge"] = challenge,
                 ["code_challenge_method"] = "S256"
             }).ConfigureAwait(false);
-            Volatile.Write(ref attempt.AuthorizationUrl, authorizationUrl);
-            OpenSystemBrowser(authorizationUrl);
+            lock (BrowserAuthorizationSync)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                Volatile.Write(ref attempt.AuthorizationUrl, authorizationUrl);
+                OpenSystemBrowser(authorizationUrl);
+            }
 
             string code;
-            using (var timeout = new CancellationTokenSource(AuthorizationCallbackTimeout))
+            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
             {
+                timeout.CancelAfter(AuthorizationCallbackTimeout);
                 try
                 {
                     code = await ReceiveAuthorizationCodeAsync(
@@ -618,7 +672,7 @@ namespace TermLink.Agent
                         state,
                         timeout.Token).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException error) when (timeout.IsCancellationRequested)
+                catch (OperationCanceledException error) when (timeout.IsCancellationRequested && !cancellation.IsCancellationRequested)
                 {
                     throw new ProductionEnrollmentException(
                         "ACCOUNT_AUTHORIZATION_TIMEOUT",
@@ -642,9 +696,9 @@ namespace TermLink.Agent
             HttpResponseMessage tokenResponse;
             try
             {
-                tokenResponse = await http.SendAsync(tokenRequest, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+                tokenResponse = await http.SendAsync(tokenRequest, HttpCompletionOption.ResponseHeadersRead, cancellation).ConfigureAwait(false);
             }
-            catch (OperationCanceledException error)
+            catch (OperationCanceledException error) when (!cancellation.IsCancellationRequested)
             {
                 throw new ProductionEnrollmentException(
                     "ACCOUNT_TOKEN_EXCHANGE_TIMEOUT",
@@ -657,12 +711,13 @@ namespace TermLink.Agent
                     throw new ProductionEnrollmentException(
                         "ACCOUNT_TOKEN_EXCHANGE_FAILED",
                         "The OIDC authorization code exchange failed.");
-                var tokens = await ReadJsonAsync<TokenResponse>(tokenResponse, CancellationToken.None).ConfigureAwait(false);
+                var tokens = await ReadJsonAsync<TokenResponse>(tokenResponse, cancellation).ConfigureAwait(false);
                 if (string.IsNullOrWhiteSpace(tokens.AccessToken) || string.IsNullOrWhiteSpace(tokens.RefreshToken) || tokens.ExpiresIn < 30)
                     throw new InvalidDataException("OIDC token response is incomplete.");
 
                 try
                 {
+                    attempt.BeginCommit();
                     await PersistTokensAsync(options.ServerUrl, options.PcName, client, tokens, http).ConfigureAwait(false);
                 }
                 finally

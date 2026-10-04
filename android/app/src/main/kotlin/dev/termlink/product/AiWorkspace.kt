@@ -109,7 +109,7 @@ internal class AiWorkspaceViewModel : ViewModel() {
             current = AiWorkspace(repository, scope, context.getSharedPreferences("ai-views-$accountKey", Context.MODE_PRIVATE),
                 seal = { protectedStore.sealAiOperation(accountKey, it) },
                 unseal = { protectedStore.openAiOperation(accountKey, it) },
-                uploadDirectory = java.io.File(context.cacheDir, "ai/uploads/$accountKey"))
+                uploadDirectory = java.io.File(context.cacheDir, "ai/uploads/$accountKey"), context = context.applicationContext)
         }
         return checkNotNull(current)
     }
@@ -124,12 +124,15 @@ internal class AiWorkspace(
     private val seal: (String) -> String = { it },
     private val unseal: (String) -> String = { it },
     private val uploadDirectory: java.io.File? = null,
+    context: Context? = null,
 ) {
+    val downloads = context?.let { AiDownloads(it, repository, scope, preferences, seal, unseal) }
     val catalogs = mutableStateMapOf<UUID, AiCatalog>()
     val conversations = mutableStateMapOf<String, AiConversation>()
     val drafts = mutableStateMapOf<String, String>()
     val questionDrafts = mutableMapOf<Pair<String, String>, AiQuestionDraft>()
     val reading = mutableMapOf<String, AiReadingState>()
+    var fileLocation by mutableStateOf<AiFileLocation?>(null)
 
     // Account-scoped preferences and the existing Keystore envelope also protect question drafts.
     fun webUiState(session: AiConversation): JSONObject = runCatching {
@@ -172,23 +175,66 @@ internal class AiWorkspace(
     var opened by mutableStateOf(readOpened())
         private set
     var selected by mutableStateOf<String?>(null)
+    var listPc by mutableStateOf<UUID?>(null)
+    var listTarget by mutableStateOf<AiGroupTarget?>(null)
+    fun browseAgentGroup(pcId: UUID, agentId: String) {
+        selected = null
+        createPc = null
+        search = ""
+        attentionOnly = false
+        listPc = pcId
+        listTarget = AiGroupTarget(pcId, aiAgentId(agentId))
+    }
     var createPc by mutableStateOf<UUID?>(null)
     var createPcLocked by mutableStateOf(false)
-    var attentionOnly by mutableStateOf(false)
-    var busy by mutableStateOf(false)
         private set
+    var createDirectory by mutableStateOf<String?>(null)
+        private set
+    fun beginCreate(pcId: UUID, directory: String? = null, lockPc: Boolean = true) {
+        createDirectory = directory?.takeIf(String::isNotBlank)
+        createPcLocked = lockPc
+        createPc = pcId
+    }
+    var attentionOnly by mutableStateOf(false)
+    private val busyPcs = mutableStateMapOf<UUID, Boolean>()
+    private val pending = mutableStateMapOf<UUID, String>().apply {
+        runCatching { preferences.getString("pending", null)?.let { encoded ->
+            val stored = JSONObject(unseal(encoded))
+            val requests = stored.optJSONArray("requests")?.objects() ?: listOf(stored)
+            requests.forEach { put(UUID.fromString(it.getString("pc")), it.getString("body")) }
+        } }
+    }
+    private val displayedPc: UUID? get() = createPc ?: opened.firstOrNull { it.sessionId == selected }?.pcId ?: listPc
+    fun isBusy(pc: UUID) = busyPcs[pc] == true
+    fun isUncertain(pc: UUID) = pc in pending && !isBusy(pc)
+    fun isBlocked(pc: UUID) = isBusy(pc) || pc in pending
+    val busy: Boolean get() = displayedPc?.let(::isBusy) ?: busyPcs.values.any { it }
+    val uncertain: Boolean get() = displayedPc?.let(::isUncertain) ?: pending.keys.any(::isUncertain)
+    val pendingPcs: List<UUID> get() = pending.keys.toList()
+    fun pendingDescription(pc: UUID): String = runCatching {
+        val request = JSONObject(pending.getValue(pc))
+        val session = conversations[request.optString("sessionId")]
+        val action = when (request.optString("action")) {
+            "create" -> "创建对话"; "send", "steer" -> "发送消息"; "answer" -> "审批/回答"
+            "configure" -> "更改设置"; "interrupt" -> "停止生成"; else -> "会话操作"
+        }
+        listOfNotNull(session?.let(::aiConversationTitle), action).joinToString(" · ")
+    }.getOrDefault("会话操作")
     var error by mutableStateOf("")
         private set
-    private var retry: Pair<UUID, String>? = runCatching {
-        preferences.getString("pending", null)?.let { encoded ->
-            val stored = JSONObject(unseal(encoded))
-            UUID.fromString(stored.getString("pc")) to stored.getString("body")
-        }
-    }.getOrNull()
-    var uncertain by mutableStateOf(retry != null)
-        private set
     private val loading = mutableSetOf<UUID>()
-    private var mutationVersion = 0L
+    private val mutationVersions = mutableMapOf<UUID, Long>()
+    private fun version(pc: UUID) = mutationVersions[pc] ?: 0L
+    private fun advance(pc: UUID): Long = (version(pc) + 1).also { mutationVersions[pc] = it }
+    private fun savePending(values: Map<UUID, String>) {
+        val editor = preferences.edit()
+        if (values.isEmpty()) editor.remove("pending") else {
+            val requests = values.map { (pc, body) -> JSONObject().put("pc", pc).put("body", body) }
+            // Keep the legacy first request fields readable during upgrade; never mint replacement operation IDs.
+            editor.putString("pending", seal(JSONObject(requests.first().toString()).put("requests", JSONArray(requests)).toString()))
+        }
+        check(editor.commit())
+    }
     private var retired = false
     private var draftJob: kotlinx.coroutines.Job? = null
     init {
@@ -265,18 +311,27 @@ internal class AiWorkspace(
                 if (!confirmedMode.isNullOrBlank()) put("confirmedPermissionMode", confirmedMode)
             })
 
-    fun quote(id: String, text: String) { drafts[id] = (drafts[id].orEmpty() + "\n> " + text.take(8000).replace("\n", "\n> ") + "\n\n").take(16000) }
+    fun appendDraft(id: String, text: String): Boolean {
+        val next = listOf(drafts[id].orEmpty(), text).filter { it.isNotEmpty() }.joinToString("\n\n")
+        if (next.length > 16000) { error = "输入超过 16000 字符，原草稿和待发消息已保留，请先整理草稿。"; return false }
+        drafts[id] = next
+        return true
+    }
+    fun quote(id: String, text: String) = appendDraft(id, "> " + text.replace("\n", "\n> ") + "\n")
     fun enqueue(session: AiConversation) {
         val text = drafts[session.id].orEmpty()
         if (text.isBlank() || !session.canControl || attachments[session.id].orEmpty().isNotEmpty() || fileReferences[session.id].orEmpty().isNotEmpty() || queued[session.id].orEmpty().size >= 8) return
         queued[session.id] = queued[session.id].orEmpty() + AiQueued(UUID.randomUUID().toString(), text, catalogs[session.pcId]?.hostId.orEmpty(), session.controlVersion)
         drafts.remove(session.id)
     }
-    fun cancelQueued(id: String, item: AiQueued) { queued[id] = queued[id].orEmpty().filterNot { it.id == item.id }; if (drafts[id].isNullOrEmpty()) drafts[id] = item.text }
+    fun cancelQueued(id: String, item: AiQueued) {
+        if (queued[id].orEmpty().none { it.id == item.id }) return
+        if (appendDraft(id, item.text)) queued[id] = queued[id].orEmpty().filterNot { it.id == item.id }
+    }
     private fun drainQueue(session: AiConversation) {
         val item = queued[session.id]?.firstOrNull() ?: return
         if (item.failed || item.restored) return
-        if (busy || uncertain || !session.canControl || session.state != "idle" || session.pendingCount > 0 || session.error.isNotEmpty()) return
+        if (isBlocked(session.pcId) || !session.canControl || session.state != "idle" || session.pendingCount > 0 || session.error.isNotEmpty()) return
         if (catalogs[session.pcId]?.hostId != item.host || session.controlVersion != item.controlVersion) return
         mutate(session.pcId, "send", session, JSONObject().put("text", item.text).put("queueId", item.id))
     }
@@ -468,7 +523,7 @@ internal class AiWorkspace(
     }
 
     fun openRemote(pcId: UUID, agentId: String) {
-        if (retired || busy || uncertain || catalogs[pcId]?.agents?.none { it.id == agentId && it.strategy == "desktop_remote" && it.supported } != false) return
+        if (retired || isBlocked(pcId) || catalogs[pcId]?.agents?.none { it.id == agentId && it.strategy == "desktop_remote" && it.supported } != false) return
         val entry = AiOpened(pcId, "remote:$pcId:$agentId", "desktop_remote", agentId)
         if (entry !in opened) { opened = (opened + entry).takeLast(64); saveOpened() }
         selected = entry.sessionId; createPc = null
@@ -495,11 +550,13 @@ internal class AiWorkspace(
     }
 
     fun retire(clearPending: Boolean = false) {
+        fileLocation = null
+        downloads?.retire(clearPending)
         if (clearPending) opened.forEach { clearAttention?.invoke(it.sessionId) }
         if (!clearPending) saveDrafts()
         draftJob?.cancel(); draftJob = null
         stopBackgroundWatch()
-        retired = true; catalogs.clear(); conversations.clear(); drafts.clear(); unavailable.clear(); retry = null; uncertain = false
+        retired = true; catalogs.clear(); conversations.clear(); drafts.clear(); unavailable.clear(); pending.clear(); busyPcs.clear()
         questionDrafts.clear()
         queued.clear(); fileReferences.clear(); attachments.values.flatten().forEach { it.job?.cancel(); if (clearPending) it.file?.delete() }; attachments.clear()
         if (clearPending) preferences.edit().apply { remove("pending"); remove("drafts"); preferences.all.keys.filter { it.startsWith("web:") }.forEach(::remove) }.commit()
@@ -527,8 +584,8 @@ internal class AiWorkspace(
     }
 
     suspend fun refresh(pcId: UUID, sessionId: String? = null) {
-        if (retired || busy || uncertain || !loading.add(pcId)) return
-        val version = mutationVersion
+        if (retired || isBlocked(pcId) || !loading.add(pcId)) return
+        val version = version(pcId)
         try {
             val host = catalogs[pcId]?.hostId
             val current = sessionId?.let(conversations::get)
@@ -537,14 +594,14 @@ internal class AiWorkspace(
                     .put("streamId", current?.streamId.orEmpty()).put("cursor", current?.cursor ?: "0")
                 else JSONObject().put("action", "catalog")
             val result = JSONObject(repository.aiRequest(pcId, body.toString()))
-            if (retired || busy || uncertain || version != mutationVersion) return
+            if (retired || isBlocked(pcId) || version != version(pcId)) return
             if (result.optString("error") == "SESSION_NOT_FOUND" && sessionId != null) conversations.remove(sessionId)
             accept(pcId, result)
             unavailable.remove(pcId)
             conversations.values.filter { it.pcId == pcId }.forEach(::drainQueue)
         } catch (failure: Exception) {
             if (failure is CancellationException && failure !is TimeoutCancellationException) throw failure
-            if (!retired && !busy && !uncertain && version == mutationVersion) {
+            if (!retired && !isBlocked(pcId) && version == version(pcId)) {
                 unavailable[pcId] = true
                 error = "暂时无法连接电脑，正在重新确认状态。"
             }
@@ -554,15 +611,15 @@ internal class AiWorkspace(
 
     /** A notification must not use a cached snapshot or wait for the active long poll. */
     suspend fun readNotificationSession(pcId: UUID, id: String): AiConversation {
-        check(!retired && !busy && !uncertain) { "请先确认当前未完成的操作。" }
-        val version = ++mutationVersion
+        check(!retired && !isBlocked(pcId)) { "请先确认这台电脑尚未完成的操作。" }
+        val version = advance(pcId)
         val catalog = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", "catalog").toString()))
-        check(!retired && !busy && !uncertain && version == mutationVersion)
+        check(!retired && !isBlocked(pcId) && version == version(pcId))
         check(catalog.optString("error").isEmpty()) { aiErrorLabel(catalog.optString("error")) }
         accept(pcId, catalog)
         val host = catalog.getString("hostId")
         val result = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", "poll").put("hostId", host).put("sessionId", id).toString()))
-        check(!retired && !busy && !uncertain && version == mutationVersion && result.getString("hostId") == host)
+        check(!retired && !isBlocked(pcId) && version == version(pcId) && result.getString("hostId") == host)
         check(result.optString("error").isEmpty()) { aiErrorLabel(result.optString("error")) }
         check(result.getJSONObject("session").getString("id") == id)
         accept(pcId, result); unavailable.remove(pcId)
@@ -570,32 +627,33 @@ internal class AiWorkspace(
     }
 
     fun mutate(pcId: UUID, action: String, session: AiConversation? = null, extra: JSONObject = JSONObject()): Deferred<Boolean>? {
-        if (busy || uncertain || retired) return null
+        if (isBlocked(pcId) || retired) return null
         val host = catalogs[pcId]?.hostId ?: return null
         val body = extra.put("action", action).put("hostId", host).put("operationId", UUID.randomUUID().toString())
         if (session != null) body.put("sessionId", session.id).put("controlVersion", session.controlVersion)
         val encoded = body.toString()
         try {
-            check(preferences.edit().putString("pending", seal(JSONObject().put("pc", pcId).put("body", encoded).toString())).commit())
+            savePending(pending.toMap() + (pcId to encoded))
         } catch (_: Exception) { error = "无法安全保存发送状态，未发送。"; return null }
-        retry = pcId to encoded
-        return submit()
+        pending[pcId] = encoded
+        return submit(pcId)
     }
 
-    fun retryUncertain() { if (!busy && uncertain && !retired) submit() }
+    fun retryUncertain() { (displayedPc ?: pending.keys.firstOrNull(::isUncertain))?.let(::retryUncertain) }
+    fun retryUncertain(pcId: UUID) { if (isUncertain(pcId) && !retired) submit(pcId) }
 
-    private fun submit(): Deferred<Boolean>? {
-        val (pcId, body) = retry ?: return null
-        mutationVersion++
-        busy = true; error = ""
+    private fun submit(pcId: UUID): Deferred<Boolean>? {
+        val body = pending[pcId] ?: return null
+        advance(pcId)
+        busyPcs[pcId] = true; error = ""
         return scope.async {
             try {
                 val result = JSONObject(repository.aiRequest(pcId, body))
                 if (retired) return@async false
                 accept(pcId, result)
                 unavailable.remove(pcId)
-                check(preferences.edit().remove("pending").commit())
-                uncertain = false; retry = null
+                savePending(pending.toMap() - pcId)
+                pending.remove(pcId)
                 val request = JSONObject(body)
                 if (result.optString("error").isNotEmpty() && request.has("queueId")) {
                     val id = request.optString("sessionId")
@@ -611,18 +669,18 @@ internal class AiWorkspace(
                     if (request.optString("action") in setOf("create", "fork", "import-native")) {
                         result.optJSONObject("session")?.let {
                             val created = parseConversation(pcId, it)
-                            open(created)
+                            if (displayedPc == null || displayedPc == pcId) open(created)
                             if (request.optString("directoryMode") != "managed") preferences.edit().putString("directory:$pcId", created.directory).apply()
                         }
-                        createPc = null
+                        if (createPc == pcId) createPc = null
                     }
                 }
                 result.optString("error").isEmpty()
             } catch (failure: Exception) {
                 if (failure is CancellationException && failure !is TimeoutCancellationException) throw failure
-                if (!retired) { unavailable[pcId] = true; uncertain = true; error = "尚未收到电脑回执。重试将查询同一请求，不会重复执行。" }
+                if (!retired) { unavailable[pcId] = true; error = "尚未收到电脑回执。请查询原请求结果，不会重复执行。" }
                 false
-            } finally { busy = false }
+            } finally { busyPcs.remove(pcId) }
         }
     }
 

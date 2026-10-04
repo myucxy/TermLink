@@ -1059,6 +1059,7 @@ internal class ProductionProductRepository(
     private val sessionLifecycleLanes = SessionLifecycleLanes<UUID>()
     private val updateCheckLock = Mutex()
     private val updateDownloadLock = Mutex()
+    private var updateDownloadJob: kotlinx.coroutines.Job? = null
     private val keyMetadataRefreshLock = Mutex()
     private val authenticationAccountScopeLock = Mutex()
     /** Serializes auth transitions with local publication of an authenticated refresh. */
@@ -1456,7 +1457,14 @@ internal class ProductionProductRepository(
         }
     }
 
-    override suspend fun downloadUpdate() = updateDownloadLock.withLock {
+    override suspend fun downloadUpdate() {
+        if (updateDownloadJob?.isActive == true) return
+        updateDownloadJob = scope.launch { performUpdateDownload() }
+    }
+
+    override fun cancelUpdateDownload() { updateDownloadJob?.cancel(); updateDownloader.cancel() }
+
+    private suspend fun performUpdateDownload() = updateDownloadLock.withLock {
         val update = mutableSnapshot.value.updateStatus
         val build = update.buildNumber
             ?: return@withLock publishUpdateDownloadState(
@@ -1487,6 +1495,7 @@ internal class ProductionProductRepository(
             )
             publishUpdateDownloadState(build, ProductUpdateDownloadState.Ready(file.absolutePath))
         } catch (error: CancellationException) {
+            publishUpdateDownloadState(build, ProductUpdateDownloadState.Idle)
             throw error
         } catch (error: Throwable) {
             publishUpdateDownloadState(
@@ -3962,7 +3971,15 @@ internal class ProductionProductRepository(
         val slots = aiRequestSlots.getOrPut(pcId) { AiRequestSlots() }
         val action = org.json.JSONObject(body).optString("action")
         val read = action in setOf("catalog", "models", "directories", "files", "remote", "message", "history", "poll", "changes", "watch", "search", "artifacts", "artifact.read", "diff.read", "native-history") || action.startsWith("attachment.")
-        return (if (read) slots.reads else slots.commands).withPermit { requestAiWithCurrentIdentity(pcId, body) }
+        return (if (read) slots.reads else slots.commands).withPermit {
+            try { requestAiWithCurrentIdentity(pcId, body) }
+            catch (error: dev.termlink.network.production.HostDeviceConnectionChangedException) {
+                // Only read-only AI queries may get a fresh envelope after reconnect.
+                // Writes retain the existing operationId/uncertain-result workflow.
+                if (!read || action.startsWith("attachment.")) throw error
+                requestAiWithCurrentIdentity(pcId, body)
+            }
+        }
     }
     private suspend fun requestAiWithCurrentIdentity(pcId: UUID, body: String): String {
         val generation = captureAuthenticationState().authenticationGeneration
@@ -4710,7 +4727,7 @@ internal class ProductionProductRepository(
             if (expectedBuild != null && update.buildNumber != expectedBuild) return@update snapshot
             snapshot.copy(
                 updateStatus = update.copy(
-                    dialogVisible = true,
+                    dialogVisible = update.dialogVisible,
                     downloadState = state,
                 ),
             )
@@ -5928,6 +5945,7 @@ internal class ProductionProductRepository(
     override fun close() {
         if (closed) return
         closed = true
+        cancelUpdateDownload()
         aiRequestSlots.clear()
         directProductE2EBridgeRegistration?.close()
         directProductE2EBridgeRegistration = null

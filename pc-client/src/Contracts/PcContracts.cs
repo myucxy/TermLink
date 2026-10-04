@@ -201,6 +201,8 @@ public sealed record ManagedSessionSnapshot(
     ulong LastSequence,
     SessionDataPlaneCarrier Carrier = SessionDataPlaneCarrier.Relay);
 
+public sealed record AiSessionSummary(string Id, string Title, string Agent, string Directory, string State);
+
 public sealed record AccountDeviceSnapshot(
     Guid DeviceId,
     string Name,
@@ -225,6 +227,11 @@ public sealed record AgentStatusSnapshot(
     IReadOnlyList<ManagedSessionSnapshot> Sessions,
     IReadOnlyList<AccountDeviceSnapshot> Devices)
 {
+    public bool StatusKnown { get; init; } = true;
+    public IReadOnlyList<AiSessionSummary> AiSessions { get; init; } = Array.Empty<AiSessionSummary>();
+    public int ActiveAiSessions { get; init; }
+    public bool SessionDetailsAvailable { get; init; }
+    public bool AiSessionsTruncated { get; init; }
     public static AgentStatusSnapshot Disconnected(PcAgentIdentity identity, string code, string detail) =>
         new(
             0,
@@ -241,7 +248,7 @@ public sealed record AgentStatusSnapshot(
             ReadOnlySet<string>.Empty,
             Array.Empty<TerminalCommandCapability>(),
             Array.Empty<ManagedSessionSnapshot>(),
-            Array.Empty<AccountDeviceSnapshot>());
+            Array.Empty<AccountDeviceSnapshot>()) { StatusKnown = false };
 }
 
 public static class PcContractValidator

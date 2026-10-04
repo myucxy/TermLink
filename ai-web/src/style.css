@@ -5,3 +5,6 @@ summary{cursor:pointer;min-height:36px;padding:6px 0;color:var(--muted)}.tool,.r
 
 .file-row{display:flex;align-items:center;min-width:0}.file-row .file{flex:1;min-width:0}.usage progress{width:100%;accent-color:var(--accent)}.usage dl{display:grid;grid-template-columns:1fr 1fr;gap:6px}.usage dd{margin:0;text-align:right}.usage small{display:block}.hljs-keyword,.hljs-selector-tag,.hljs-literal{color:#9863db}.hljs-string,.hljs-attr{color:#21865d}.hljs-comment{color:var(--muted)}.hljs-number,.hljs-built_in,.hljs-title{color:#c57931}.code-head{padding:0 8px}
 .tool-group{margin:5px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.tool-group>summary{padding:7px 9px;font-size:.86rem}.tool-group>summary small{margin-left:6px}.tool-group .message{padding:4px 8px}
+
+/* Keep compact visuals while ensuring finger-sized controls. */
+.tools button,.message-head button,.code-head button,.actions button,.panel-title button,summary{min-height:44px;min-width:44px}

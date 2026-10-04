@@ -1,59 +1,33 @@
 package dev.termlink.product
 
-import android.provider.DocumentsContract
-import android.util.Base64
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
 
 internal data class AiArtifactDownload(val id: String, val version: String, val name: String)
+private data class PendingArtifactDownload(val file: AiArtifactDownload, val session: AiConversation, val host: String)
 
-/** SAF decides the destination. Bytes are streamed natively; no JS or arbitrary phone paths. */
+/** SAF chooses a destination; the account workspace owns the download, not this page. */
 @Composable
 internal fun rememberAiArtifactDownload(workspace: AiWorkspace, session: AiConversation): (AiArtifactDownload) -> Unit {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var pending by remember { mutableStateOf<AiArtifactDownload?>(null) }
-    var saving by remember { mutableStateOf(false) }
+    var pending by remember { mutableStateOf<PendingArtifactDownload?>(null) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         val file = pending; pending = null
-        if (uri != null && file != null) scope.launch {
-            saving = true
-            try {
-                val stream = withContext(Dispatchers.IO) { checkNotNull(context.contentResolver.openOutputStream(uri, "w")) }
-                stream.use { output ->
-                    var offset = 0L; var expectedSize: Long? = null
-                    do {
-                        val page = workspace.readFeature(session, "artifact.read", JSONObject().put("requestId", file.id)
-                            .put("cursor", file.version).put("offset", offset))
-                        val size = page.getLong("size"); val next = page.getLong("nextOffset")
-                        val bytes = Base64.decode(page.getString("data"), Base64.NO_WRAP)
-                        require(page.getString("version") == file.version && page.getString("id") == file.id &&
-                            page.getLong("offset") == offset && size in 0..50L * 1024 * 1024 &&
-                            (expectedSize == null || expectedSize == size) && bytes.size <= 65536 &&
-                            next == offset + bytes.size && next <= size && (next > offset || next == size))
-                        expectedSize = size
-                        withContext(Dispatchers.IO) { output.write(bytes) }
-                        offset = next
-                    } while (offset < size)
-                }
-                Toast.makeText(context, "文件已保存", Toast.LENGTH_SHORT).show()
-            } catch (error: Exception) {
-                runCatching { DocumentsContract.deleteDocument(context.contentResolver, uri) }
-                if (error is CancellationException) throw error
-                Toast.makeText(context, "保存失败，文件可能已变化，请重新读取。", Toast.LENGTH_LONG).show()
-            } finally { saving = false }
+        if (uri != null && file != null) {
+            runCatching {
+                check(workspace.catalogs[file.session.pcId]?.hostId == file.host)
+                checkNotNull(workspace.downloads).start(file.session, file.host, file.session.pcId.toString().take(8), file.file, uri)
+            }.onSuccess {
+                Toast.makeText(context, "已加入下载中心，可离开当前页面。", Toast.LENGTH_SHORT).show()
+            }.onFailure { Toast.makeText(context, "无法开始下载，请重新读取文件后重试。", Toast.LENGTH_LONG).show() }
         }
     }
     return { file ->
-        check(!saving && pending == null) { "请先完成当前文件保存" }
-        pending = file; launcher.launch(file.name.take(160))
+        check(pending == null) { "请先选择保存位置" }
+        pending = PendingArtifactDownload(file, session, checkNotNull(workspace.catalogs[session.pcId]).hostId)
+        launcher.launch(file.name.take(160))
     }
 }

@@ -3,6 +3,7 @@ using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
+using Avalonia.Input;
 using Avalonia.LogicalTree;
 using Avalonia.Threading;
 using TermLink.Desktop;
@@ -294,6 +295,20 @@ public static class Program
         await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
         Require(desktopOperations.InstallCanceled && !viewModel.UpdateProgressVisible,
             "Cancelling the main-window update progress did not cancel and close the download.");
+        desktopOperations.CompleteDownload = true;
+        viewModel.CheckForUpdatesCommand.Execute(null);
+        await WaitForAsync(() => viewModel.ConfirmationVisible, "Download confirmation missing.");
+        viewModel.ConfirmPendingActionCommand.Execute(null);
+        await DrainCommandAsync(viewModel.ConfirmPendingActionCommand);
+        await WaitForAsync(() => viewModel.ConfirmationVisible && desktopOperations.VerifiedConfirmationRequested,
+            "A verified download did not request separate installation confirmation.");
+        Require(!viewModel.UpdateProgressVisible && viewModel.ConfirmationDetail.Contains("AI", StringComparison.Ordinal),
+            "Install confirmation overlapped download progress or omitted active tasks.");
+        viewModel.CancelPendingActionCommand.Execute(null);
+        await DrainCommandAsync(viewModel.CancelPendingActionCommand);
+        await DrainCommandAsync(viewModel.CheckForUpdatesCommand);
+        Require(!desktopOperations.InstallerStarted && viewModel.Settings.UpdateStatusText.Contains("verified", StringComparison.OrdinalIgnoreCase),
+            "Install later launched the installer or lost verified status.");
         viewModel.Navigate("devices");
         viewModel.OpenAboutUpdatesCommand.Execute(null);
         await DrainCommandAsync(viewModel.OpenAboutUpdatesCommand);
@@ -325,7 +340,11 @@ public static class Program
         viewModel.StopSessionCommand.Execute(firstSessionId);
         await WaitForAsync(() => viewModel.ConfirmationVisible, "A destructive session action did not request confirmation.");
         Require(!client.StopSessionCalled, "The session was stopped before confirmation.");
-        viewModel.CancelPendingActionCommand.Execute(null);
+        Dispatcher.UIThread.RunJobs();
+        Require(RequireControl<Button>(window, "CancelConfirmationButton").IsFocused,
+            "Confirmation did not focus Cancel.");
+        window.KeyPress(Key.Escape, RawInputModifiers.None, PhysicalKey.Escape, null);
+        window.KeyRelease(Key.Escape, RawInputModifiers.None, PhysicalKey.Escape, null);
         await DrainCommandAsync(viewModel.CancelPendingActionCommand);
         await DrainCommandAsync(viewModel.StopSessionCommand);
         Require(!client.StopSessionCalled, "Cancelling the confirmation still stopped the session.");
@@ -389,8 +408,20 @@ public static class Program
         Dispatcher.UIThread.RunJobs();
         Require(viewModel.HasNotice && viewModel.NoticeCode == "TIMEOUT",
             "A newer notice did not reset the five-second auto-dismiss countdown.");
-        await WaitForAsync(() => !viewModel.HasNotice,
-            "A notice did not close automatically after its configured display duration.");
+        Thread.Sleep(350); Dispatcher.UIThread.RunJobs();
+        Require(viewModel.HasNotice && viewModel.NoticeCode == "TIMEOUT", "An actionable failure disappeared automatically.");
+
+        client.CurrentSnapshot = AgentStatusSnapshot.Disconnected(identity, "PC-AGENT-TIMEOUT", "fixture") with { Revision = 100 };
+        await stateStore.RefreshAsync(); Dispatcher.UIThread.RunJobs();
+        Require(viewModel.AgentUnavailable && !viewModel.IsAccountSignedOut && !viewModel.HasNoSessions &&
+            viewModel.Account.CurrentUsername == snapshot.AccountUsername && viewModel.Sessions.Items.All(s => !s.CanStop),
+            "Unavailable IPC was misrepresented as sign-out/empty sessions or left destructive controls enabled.");
+        client.CurrentSnapshot = snapshot with { Revision = 101 };
+        await stateStore.RefreshAsync(); Dispatcher.UIThread.RunJobs();
+        Require(!viewModel.AgentUnavailable && viewModel.Account.PcName == identity.Name, "Recovery did not restore the real registered identity.");
+        viewModel.Sessions.Search = "session-099";
+        Require(viewModel.Sessions.VisibleItems.Count == 1, "Session search did not filter real titles.");
+        viewModel.Sessions.Search = "";
 
         var reauthenticationSnapshot = snapshot with
         {
@@ -576,6 +607,7 @@ public static class Program
 
     private sealed class StaticAgentClient(AgentStatusSnapshot snapshot) : IAgentClient
     {
+        public AgentStatusSnapshot CurrentSnapshot { get; set; } = snapshot;
         public bool StopSessionCalled { get; private set; }
         public bool BeginAccountAuthorizationCalled { get; private set; }
         public string AuthorizedPcName { get; private set; } = string.Empty;
@@ -589,7 +621,7 @@ public static class Program
         public ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken) =>
             ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(new[] { new AiAgentCapability("zcode", "ZCode", "D:\\ZCode\\zcode.exe", "1", "available", RemoteConfigured ? "desktop_remote" : "native") });
         public ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken) =>
-            ValueTask.FromResult(snapshot);
+            ValueTask.FromResult(CurrentSnapshot);
 
         public ValueTask SetRemoteAccessAsync(bool enabled, CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
@@ -629,6 +661,9 @@ public static class Program
         public bool FailUpdateChecks { get; set; }
         public bool InstallRequested { get; private set; }
         public bool InstallCanceled { get; private set; }
+        public bool CompleteDownload { get; set; }
+        public bool VerifiedConfirmationRequested { get; private set; }
+        public bool InstallerStarted { get; private set; }
         private int checkCount;
         public int CheckCount => Volatile.Read(ref checkCount);
         public (bool AddNoLogo, bool AddNoProfile)? ConfiguredTerminalSettings { get; private set; }
@@ -652,6 +687,13 @@ public static class Program
             if (confirm is null || !await confirm(Status, cancellationToken)) return Status;
             InstallRequested = true;
             progress?.Report(new DesktopUpdateProgress(5 * 1024 * 1024, 10 * 1024 * 1024));
+            if (CompleteDownload) {
+                progress?.Report(new DesktopUpdateProgress(10 * 1024 * 1024, 10 * 1024 * 1024, true));
+                var ready = Status with { ReadyToInstall = true, Message = "Downloaded and verified" };
+                VerifiedConfirmationRequested = true;
+                InstallerStarted = await confirm(ready, cancellationToken);
+                return ready;
+            }
             try
             {
                 await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);

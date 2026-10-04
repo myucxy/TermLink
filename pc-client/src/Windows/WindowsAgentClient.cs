@@ -68,10 +68,14 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                     throw new InvalidOperationException(refresh.Code ?? "PRODUCTION_REFRESH_FAILED");
                 }
             }
-            var response = await SendAsync(
-                new RegistryRequest { Command = RegistryCommand.List },
-                15_000,
-                cancellationToken).ConfigureAwait(false);
+            RegistryResponse response;
+            try {
+                response = await SendAsync(new RegistryRequest { Command = RegistryCommand.List, ProtocolVersion = 14 }, 15_000, cancellationToken).ConfigureAwait(false);
+                if (!response.Success) throw new IOException("Session detail protocol unavailable.");
+            } catch (Exception error) when (error is IOException or InvalidDataException) {
+                // A new UI can still read the V12 Agent while its update is pending.
+                response = await SendAsync(new RegistryRequest { Command = RegistryCommand.List }, 15_000, cancellationToken).ConfigureAwait(false);
+            }
             if (!response.Success) throw new InvalidOperationException(response.Code ?? "AGENT_STATUS_FAILED");
             return WithRevision(Map(response));
         }
@@ -144,6 +148,16 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             Command = RegistryCommand.RevokeDevice,
             DeviceId = deviceId
         }, 30_000, cancellationToken).ConfigureAwait(false);
+    }
+
+    public bool SupportsBrowserAuthorizationControls => true;
+
+    public async ValueTask ControlBrowserAuthorizationAsync(bool cancel, CancellationToken cancellationToken)
+    {
+        await SendRequiredAsync(new RegistryRequest
+        {
+            Command = cancel ? RegistryCommand.CancelAccountAuthorization : RegistryCommand.ReopenAccountAuthorization
+        }, 10_000, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask BeginAccountAuthorizationAsync(
@@ -697,7 +711,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                 productionSessions.TryGetValue(session.SessionId, out var remote);
                 return new ManagedSessionSnapshot(
                     session.SessionId,
-                    $"{session.ShellType} · {session.SessionId.ToString("N")[..8]}",
+                    string.IsNullOrWhiteSpace(remote?.Title) ? $"{session.ShellType} · {session.SessionId.ToString("N")[..8]}" : remote.Title,
                     session.ShellType.ToString(),
                     MapSessionState(session.Lifecycle),
                     remote?.ViewerCount ?? 0,
@@ -752,7 +766,13 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             capabilities,
             commands,
             sessions,
-            devices);
+            devices) {
+                SessionDetailsAvailable = response.ProtocolVersion >= 14,
+                ActiveAiSessions = production.ActiveAiSessions,
+                AiSessionsTruncated = production.AiSessionsTruncated,
+                AiSessions = (production.AiSessions ?? Array.Empty<DesktopAiSessionSummary>()).Select(item =>
+                    new AiSessionSummary(item.Id, item.Title, item.Agent, item.Directory, item.State)).ToArray()
+            };
     }
 
     private PcAgentIdentity CreateIdentity(ProductionStatus? production)
@@ -803,6 +823,8 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
             .Append(snapshot.ServerOrigin).Append('|').Append(snapshot.RemoteAccessEnabled).Append('|')
             .Append(snapshot.LastErrorCode).Append('|').Append(snapshot.LastErrorDetail);
         foreach (var session in snapshot.Sessions) builder.Append('|').Append(session);
+        builder.Append('|').Append(snapshot.StatusKnown).Append('|').Append(snapshot.SessionDetailsAvailable).Append('|').Append(snapshot.ActiveAiSessions);
+        foreach (var session in snapshot.AiSessions) builder.Append('|').Append(session);
         foreach (var device in snapshot.Devices) builder.Append('|').Append(device);
         foreach (var command in snapshot.TerminalCommands) builder.Append('|').Append(command);
         return builder.ToString();

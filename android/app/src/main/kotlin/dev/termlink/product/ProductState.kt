@@ -1010,6 +1010,7 @@ interface ProductRepository : Closeable {
     suspend fun checkForUpdate(force: Boolean = true): ProductUpdateStatus = ProductUpdateStatus()
     /** Downloads and verifies the APK selected by [checkForUpdate]. */
     suspend fun downloadUpdate() = Unit
+    fun cancelUpdateDownload() = Unit
     /** Hides the current update prompt without discarding its verified download state. */
     fun dismissUpdate() = Unit
     /** Opens the policy-driven hosted registration page inside the app-owned OIDC surface. */

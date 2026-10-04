@@ -35,6 +35,15 @@ try {
     if (@(Get-ChildItem -LiteralPath (Split-Path $path) -Force -Filter '.download-*.tmp').Count) {
         throw 'Partial download was left behind.'
     }
+    $cachedTask = $download.Invoke($operations, [object[]]@($candidate, $null, [Threading.CancellationToken]::None))
+    if ($cachedTask.GetAwaiter().GetResult() -ne $path) { throw 'Verified cache path changed.' }
+    # Only the isolated temporary copy is modified. The installer is never launched.
+    [IO.File]::AppendAllText($path, 'changed-after-review')
+    $verify = $type.GetMethod('VerifyCachedUpdateAsync', [Reflection.BindingFlags]'NonPublic,Instance')
+    $rejected = $false
+    try { $verify.Invoke($operations, [object[]]@($path, $candidate, [Threading.CancellationToken]::None)).GetAwaiter().GetResult() }
+    catch { if ($_.Exception.ToString() -notmatch 'CryptographicException') { throw }; $rejected = $true }
+    if (-not $rejected) { throw 'Installer changed after review was accepted.' }
     "Windows update download, integrity, Authenticode and file promotion passed: $($candidate.Status.VersionName).$($candidate.Status.BuildNumber)"
 }
 finally {

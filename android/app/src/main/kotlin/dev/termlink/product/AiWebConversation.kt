@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -33,7 +37,7 @@ internal fun aiWebRequest(raw: String): JSONObject {
     val request = JSONObject(raw)
     require(request.optString("id").matches(Regex("[0-9]{1,16}")))
     require(request.optString("action") in setOf("ready", "history", "interrupt", "answer", "copy", "quote", "edit",
-        "search", "artifacts", "artifact.read", "diff.read", "message", "open-link", "open-file", "download", "ui-state"))
+        "search", "artifacts", "artifact.read", "diff.read", "message", "open-link", "open-file", "open-directory", "download", "ui-state", "back-state"))
     return request
 }
 
@@ -44,6 +48,17 @@ internal fun aiArtifactRelativePath(directory: String, value: String): String {
     val relative = if (path.startsWith(root, ignoreCase = true)) path.substring(root.length) else path
     require(!relative.startsWith('/') && ':' !in relative && relative.split('/').none { it == ".." })
     return relative
+}
+
+internal data class AiFileLocation(val pcId: java.util.UUID, val sessionId: String, val directory: String, val filePath: String)
+internal fun aiArtifactLocation(session: AiConversation, value: String): AiFileLocation {
+    val relative = aiArtifactRelativePath(session.directory, value)
+    require(relative.split('/').all { it.isNotBlank() && it != "." && it.none { c -> c in "<>\"|?*" } })
+    val absolute = session.directory.replace('\\', '/')
+    require(absolute.matches(Regex("[A-Za-z]:/.*")) && absolute.none(Char::isISOControl))
+    val root = absolute.trimEnd('/')
+    val path = "$root/$relative".replace('/', '\\')
+    return AiFileLocation(session.pcId, session.id, path.substringBeforeLast('\\').let { if (it.endsWith(':')) "$it\\" else it }, path)
 }
 
 /** Sends changed messages only; host revisions and native state remain authoritative. */
@@ -61,7 +76,7 @@ internal class AiWebUpdates {
                 .put("diff", session.diff).put("usage", session.usage).put("error", session.error)
                 .put("diffLength", session.diffLength).put("diffTruncated", session.diffTruncated).put("diffRead", session.capabilities.diffRead)
                 .put("artifacts", session.capabilities.artifacts).put("search", session.capabilities.search)
-                .put("dark", dark).put("fontScale", scale)
+                .put("dark", dark).put("fontScale", scale).put("language", java.util.Locale.getDefault().language)
                 .put("plan", runCatching { JSONArray(session.plan) }.getOrElse { JSONArray() })
                 .put("pending", JSONArray().apply { session.pending.forEach { pending -> put(JSONObject()
                     .put("id", pending.id).put("kind", pending.kind).put("title", pending.title).put("summary", pending.summary)
@@ -78,7 +93,8 @@ internal class AiWebUpdates {
 }
 
 @Composable
-internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, modifier: Modifier) {
+internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, modifier: Modifier,
+    onOpenDirectory: suspend (AiFileLocation) -> Unit = {}) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val current by rememberUpdatedState(session)
@@ -89,6 +105,8 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
     var view by remember { mutableStateOf<WebView?>(null) }
     var ready by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf("") }
+    var webCanGoBack by remember { mutableStateOf(false) }
+    androidx.activity.compose.BackHandler(enabled = ready && webCanGoBack) { view?.evaluateJavascript("window.termlinkBack?.()", null) }
     var external by remember { mutableStateOf<String?>(null) }
     var generation by remember { mutableIntStateOf(0) }
     var updates by remember { mutableStateOf(AiWebUpdates()) }
@@ -113,7 +131,7 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
     Column(modifier.fillMaxWidth()) {
         if (failure.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
             Text(failure, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = { failure = ""; ready = false; generation++ }) { Text("重新加载") }
+            TextButton(onClick = { failure = ""; ready = false; generation++ }) { Text(stringResource(R.string.ai_ui_reload)) }
         }
         key(generation) {
             AndroidView(modifier = Modifier.weight(1f).fillMaxWidth(), factory = { ctx ->
@@ -160,10 +178,11 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
                                 val text = request.optString("text")
                                 val value: Any = when (action) {
                                     "ready" -> { updates = AiWebUpdates(); ready = true; true }
+                                    "back-state" -> { webCanGoBack = request.optBoolean("canGoBack"); true }
                                     "ui-state" -> { workspace.saveWebUiState(active, request.getJSONObject("state")); true }
                                     "copy" -> { require(text.length <= 1048577); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("AI", text)); true }
-                                    "quote" -> { require(text.length <= 65536); workspace.quote(active.id, text); true }
-                                    "edit" -> { require(text.length <= 65536); workspace.drafts[active.id] = text.take(16000); true }
+                                    "quote" -> { require(text.length <= 65536); check(workspace.quote(active.id, text)) { workspace.error }; true }
+                                    "edit" -> { require(text.length <= 65536); check(workspace.appendDraft(active.id, text)) { workspace.error }; true }
                                     "history" -> { workspace.loadHistory(active); true }
                                     "message" -> workspace.fullMessage(active, AiMessage(request.getString("messageId").also { require(it.length in 1..256) }, "", ""))
                                     "diff.read" -> {
@@ -187,6 +206,11 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
                                         val file = aiArtifactRelativePath(active.directory, request.getString("fileId"))
                                         val version = request.getString("version"); require(version.length in 1..100)
                                         download(AiArtifactDownload(file, version, file.substringAfterLast('/'))); true }
+                                    "open-directory" -> {
+                                        check(active.capabilities.artifacts)
+                                        val location = aiArtifactLocation(active, request.getString("fileId"))
+                                        onOpenDirectory(location); true
+                                    }
                                     "open-link" -> { val url = request.getString("url"); val uri = Uri.parse(url)
                                         require(url.length <= 4096 && uri.scheme in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.userInfo == null)
                                         external = url; true }
@@ -217,8 +241,8 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
             }, onRelease = { web -> WebViewCompat.removeWebMessageListener(web, "TermLink"); web.stopLoading(); web.destroy(); if (view === web) view = null })
         }
     }
-    external?.let { url -> AlertDialog(onDismissRequest = { external = null }, title = { Text("在浏览器打开链接？") },
+    external?.let { url -> AlertDialog(onDismissRequest = { external = null }, title = { Text(stringResource(R.string.ai_ui_external_link)) },
         text = { Text(url, maxLines = 5) }, confirmButton = { TextButton(onClick = { external = null
             runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }.onFailure { failure = "没有可用浏览器。" }
-        }) { Text("打开") } }, dismissButton = { TextButton(onClick = { external = null }) { Text("取消") } }) }
+        }) { Text(stringResource(R.string.ai_ui_open)) } }, dismissButton = { TextButton(onClick = { external = null }) { Text(stringResource(R.string.ai_ui_cancel)) } }) }
 }

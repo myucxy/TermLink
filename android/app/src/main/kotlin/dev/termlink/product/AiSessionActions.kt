@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -36,6 +40,8 @@ import org.json.JSONObject
 internal fun AiListTools(workspace: AiWorkspace, onlineIds: Set<UUID>) {
     var menu by remember { mutableStateOf(false) }
     var closing by remember { mutableStateOf(false) }
+    var reminderSettings by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     val checked = remember { mutableStateMapOf<String, Boolean>() }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { workspace.setNotifications(it) }
     Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -43,25 +49,52 @@ internal fun AiListTools(workspace: AiWorkspace, onlineIds: Set<UUID>) {
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "AI 列表操作") }
             DropdownMenu(menu, { menu = false }) {
-                DropdownMenuItem(text = { Text("批量关闭手机视图") }, onClick = { menu = false; checked.clear(); closing = true })
-                DropdownMenuItem(text = { Text(if (workspace.notificationsEnabled) "关闭后台提醒" else "开启后台提醒") }, onClick = {
-                    menu = false
-                    if (workspace.notificationsEnabled) workspace.setNotifications(false)
-                    else if (Build.VERSION.SDK_INT >= 33) permission.launch(Manifest.permission.POST_NOTIFICATIONS) else workspace.setNotifications(true)
-                })
+                DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_close_bulk)) }, onClick = { menu = false; checked.clear(); closing = true })
+                DropdownMenuItem(text = { Text(androidx.compose.ui.res.stringResource(dev.termlink.harness.R.string.ai_reminder_settings)) }, onClick = { menu = false; reminderSettings = true })
             }
         }
+    }
+    if (reminderSettings) {
+        var allowed by remember { mutableStateOf(false) }
+        val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+        DisposableEffect(lifecycle) {
+            fun refresh() {
+                val manager = context.getSystemService(NotificationManager::class.java)
+                allowed = NotificationManagerCompat.from(context).areNotificationsEnabled() &&
+                    manager.getNotificationChannel("ai_attention")?.importance != NotificationManager.IMPORTANCE_NONE
+            }
+            refresh()
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event -> if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) refresh() }
+            lifecycle.addObserver(observer)
+            onDispose { lifecycle.removeObserver(observer) }
+        }
+        AlertDialog(onDismissRequest = { reminderSettings = false }, title = { Text(androidx.compose.ui.res.stringResource(dev.termlink.harness.R.string.ai_reminder_settings)) }, text = {
+            Column {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(androidx.compose.ui.res.stringResource(dev.termlink.harness.R.string.ai_reminder_running), Modifier.weight(1f))
+                    Switch(workspace.notificationsEnabled, { enabled ->
+                        if (enabled && Build.VERSION.SDK_INT >= 33 && !allowed) permission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        else workspace.setNotifications(enabled)
+                    })
+                }
+                Text(androidx.compose.ui.res.stringResource(if (allowed) dev.termlink.harness.R.string.ai_notifications_allowed else dev.termlink.harness.R.string.ai_notifications_blocked), style = MaterialTheme.typography.bodySmall)
+                Text(androidx.compose.ui.res.stringResource(dev.termlink.harness.R.string.ai_reminder_limit), Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall)
+            }
+        }, confirmButton = { TextButton(onClick = { reminderSettings = false }) { Text(androidx.compose.ui.res.stringResource(dev.termlink.harness.R.string.action_close)) } },
+            dismissButton = { TextButton(onClick = {
+                runCatching { context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)) }
+            }) { Text(androidx.compose.ui.res.stringResource(dev.termlink.harness.R.string.ai_notification_system_settings)) } })
     }
     if (closing) AlertDialog(onDismissRequest = { closing = false }, title = { Text("关闭手机视图") }, text = {
         Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
             Text("电脑任务继续运行。未发送草稿和手机待发队列将被清除。", style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = { workspace.opened.forEach { checked[it.sessionId] = true } }) { Text("全选") }
+            TextButton(onClick = { workspace.opened.forEach { checked[it.sessionId] = true } }) { Text(stringResource(R.string.ai_ui_select_all)) }
             workspace.opened.forEach { entry -> Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked[entry.sessionId] == true, { checked[entry.sessionId] = it })
                 AiSessionIdentity(workspace.conversations[entry.sessionId]?.takeIf { entry.pcId in onlineIds }, Modifier.weight(1f), aiEntryAgent(entry, null) + " · " + entry.sessionId.take(8))
             } }
         }
-    }, confirmButton = { TextButton(onClick = { checked.filterValues { it }.keys.toList().forEach(workspace::closeView); checked.clear(); closing = false }) { Text("关闭所选") } }, dismissButton = { TextButton(onClick = { closing = false }) { Text("取消") } })
+    }, confirmButton = { TextButton(onClick = { checked.filterValues { it }.keys.toList().forEach(workspace::closeView); checked.clear(); closing = false }) { Text(stringResource(R.string.ai_ui_close_selected)) } }, dismissButton = { TextButton(onClick = { closing = false }) { Text(stringResource(R.string.ai_ui_cancel)) } })
 }
 
 internal fun aiUsageLabel(raw: String): String = runCatching {
@@ -86,16 +119,16 @@ internal fun AiFullMessageDialog(workspace: AiWorkspace, session: AiConversation
         catch (error: Exception) { if (error is kotlinx.coroutines.CancellationException) throw error; failure = true }
     }
     val pages = remember(content) { content.chunked(16000) }
-    AlertDialog(onDismissRequest = close, title = { Text("完整内容") }, text = { Column {
-        if (failure) Text("读取失败，请关闭后重试。") else if (pages.isEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
+    AlertDialog(onDismissRequest = close, title = { Text(stringResource(R.string.ai_ui_full)) }, text = { Column {
+        if (failure) Text(stringResource(R.string.ai_ui_read_failed)) else if (pages.isEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
         else { SelectionContainer { Text(pages[page], Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState()), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
             Row(verticalAlignment = Alignment.CenterVertically) {
-                TextButton(enabled = page > 0, onClick = { page-- }) { Text("上一页") }
+                TextButton(enabled = page > 0, onClick = { page-- }) { Text(stringResource(R.string.ai_ui_previous_page)) }
                 Text("${page + 1}/${pages.size}", style = MaterialTheme.typography.labelSmall)
-                TextButton(enabled = page < pages.lastIndex, onClick = { page++ }) { Text("下一页") }
+                TextButton(enabled = page < pages.lastIndex, onClick = { page++ }) { Text(stringResource(R.string.ai_ui_next_page)) }
             }
         }
-    } }, confirmButton = { TextButton(onClick = close) { Text("关闭") } }, dismissButton = { if (content.isNotEmpty()) AiCopyAction(content, "复制全文") })
+    } }, confirmButton = { TextButton(onClick = close) { Text(stringResource(R.string.ai_ui_close)) } }, dismissButton = { if (content.isNotEmpty()) AiCopyAction(content, "复制全文") })
 }
 
 @Composable
@@ -115,22 +148,22 @@ internal fun AiSessionActions(workspace: AiWorkspace, session: AiConversation, c
             finally { exporting = false }
         }
     }
-    AlertDialog(onDismissRequest = close, title = { Text("会话管理") }, text = {
+    AlertDialog(onDismissRequest = close, title = { Text(stringResource(R.string.ai_ui_manage)) }, text = {
         Column(Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            OutlinedTextField(title, { title = it.filterNot(Char::isISOControl).take(80) }, label = { Text("名称") }, singleLine = true)
+            OutlinedTextField(title, { title = it.filterNot(Char::isISOControl).take(80) }, label = { Text(stringResource(R.string.ai_ui_name)) }, singleLine = true)
             Row {
-                TextButton(onClick = { workspace.mutate(session.pcId, "rename", session, JSONObject().put("text", title)); close() }, enabled = session.canControl && title.isNotBlank() && !workspace.busy) { Text("重命名") }
+                TextButton(onClick = { workspace.mutate(session.pcId, "rename", session, JSONObject().put("text", title)); close() }, enabled = session.canControl && title.isNotBlank() && !workspace.busy) { Text(stringResource(R.string.ai_ui_rename)) }
                 TextButton(onClick = { workspace.togglePin(session.id) }) { Text(if (workspace.isPinned(session.id)) "取消置顶" else "置顶") }
             }
             Text(aiUsageLabel(session.usage), style = MaterialTheme.typography.bodySmall)
-            if (session.archiveError.isNotEmpty()) Text("电脑历史保存失败，请检查磁盘空间。", color = MaterialTheme.colorScheme.error)
-            if (session.capabilities.history && session.state in setOf("exited", "interrupted", "suspended")) TextButton(onClick = { confirmDelete = true }, enabled = !workspace.busy && !workspace.uncertain) { Text("删除电脑上的会话记录", color = MaterialTheme.colorScheme.error) }
-            if (session.compacting) Text("Agent 正在整理上下文…", style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = { detail = session.diff.ifBlank { session.messages.filter { it.role == "tool" && it.title == "修改文件" }.joinToString("\n\n") { it.text }.ifBlank { "Agent 尚未报告文件变更。" } } }) { Text("查看文件变更 / Diff") }
-            if (session.capabilities.fork) TextButton(onClick = { workspace.mutate(session.pcId, "fork", session); close() }, enabled = session.canControl && session.state == "idle" && session.pendingCount == 0 && !workspace.busy && !workspace.uncertain) { Text("从当前上下文创建分支") }
-            if (session.capabilities.fork) Text("分支继承当前上下文，共用电脑工作目录。", style = MaterialTheme.typography.labelSmall)
+            if (session.archiveError.isNotEmpty()) Text(stringResource(R.string.ai_ui_archive_failed), color = MaterialTheme.colorScheme.error)
+            if (session.capabilities.history && session.state in setOf("exited", "interrupted", "suspended")) TextButton(onClick = { confirmDelete = true }, enabled = !workspace.busy && !workspace.uncertain) { Text(stringResource(R.string.ai_ui_delete_history), color = MaterialTheme.colorScheme.error) }
+            if (session.compacting) Text(stringResource(R.string.ai_ui_compacting), style = MaterialTheme.typography.bodySmall)
+            TextButton(onClick = { detail = session.diff.ifBlank { session.messages.filter { it.role == "tool" && it.title == "修改文件" }.joinToString("\n\n") { it.text }.ifBlank { "Agent 尚未报告文件变更。" } } }) { Text(stringResource(R.string.ai_ui_diff)) }
+            if (session.capabilities.fork) TextButton(onClick = { workspace.mutate(session.pcId, "fork", session); close() }, enabled = session.canControl && session.state == "idle" && session.pendingCount == 0 && !workspace.busy && !workspace.uncertain) { Text(stringResource(R.string.ai_ui_fork)) }
+            if (session.capabilities.fork) Text(stringResource(R.string.ai_ui_fork_hint), style = MaterialTheme.typography.labelSmall)
             if (session.capabilities.history) {
-                TextButton(onClick = { save.launch("termlink-${session.id.take(8)}.md") }, enabled = !exporting) { Text("导出 Markdown") }
+                TextButton(onClick = { save.launch("termlink-${session.id.take(8)}.md") }, enabled = !exporting) { Text(stringResource(R.string.ai_ui_export)) }
                 TextButton(enabled = !exporting, onClick = { scope.launch {
                     exporting = true
                     try {
@@ -145,12 +178,12 @@ internal fun AiSessionActions(workspace: AiWorkspace, session: AiConversation, c
             if (exporting) LinearProgressIndicator(Modifier.fillMaxWidth())
             if (status.isNotEmpty()) Text(status, style = MaterialTheme.typography.bodySmall)
         }
-    }, confirmButton = { TextButton(onClick = close) { Text("关闭") } })
+    }, confirmButton = { TextButton(onClick = close) { Text(stringResource(R.string.ai_ui_close)) } })
     if (confirmDelete) AlertDialog(onDismissRequest = { confirmDelete = false }, title = { Text("删除会话记录？") }, text = { Column { AiSessionIdentity(session); Text("删除 Windows 中的这条 TermLink 历史记录。工作目录、文件和 Agent 自己的原生历史保留。") } },
-        confirmButton = { TextButton(onClick = { confirmDelete = false; workspace.mutate(session.pcId, "forget", session); close() }) { Text("删除记录") } }, dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("取消") } })
+        confirmButton = { TextButton(onClick = { confirmDelete = false; workspace.mutate(session.pcId, "forget", session); close() }) { Text("删除记录") } }, dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text(stringResource(R.string.ai_ui_cancel)) } })
     detail?.let { text -> AlertDialog(onDismissRequest = { detail = null }, title = { Text("文件变更") }, text = {
         SelectionContainer { Text(text, Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
-    }, confirmButton = { TextButton(onClick = { detail = null }) { Text("关闭") } }, dismissButton = { Row { AiCopyAction(text); TextButton(onClick = { workspace.quote(session.id, text); detail = null; close() }) { Text("引用") } } }) }
+    }, confirmButton = { TextButton(onClick = { detail = null }) { Text(stringResource(R.string.ai_ui_close)) } }, dismissButton = { Row { AiCopyAction(text); TextButton(onClick = { workspace.quote(session.id, text); detail = null; close() }) { Text(stringResource(R.string.ai_ui_quote)) } } }) }
 }
 
 /** Best-effort reminders while this application process and its authenticated connection live.

@@ -1,5 +1,9 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -130,7 +134,7 @@ internal fun AiEnhancedComposer(workspace: AiWorkspace, session: AiConversation)
             workspace.queued[session.id].orEmpty().forEach { item ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("${if (item.restored) "已恢复 · 请取回后发送" else if (item.failed) "发送失败 · 请取回" else "手机待发"} · ${item.text}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall)
-                    TextButton(onClick = { workspace.cancelQueued(session.id, item) }) { Text("取回", style = MaterialTheme.typography.labelSmall) }
+                    TextButton(onClick = { workspace.cancelQueued(session.id, item) }) { Text(stringResource(R.string.ai_ui_recover), style = MaterialTheme.typography.labelSmall) }
                 }
             }
             if (files.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -157,17 +161,17 @@ internal fun AiEnhancedComposer(workspace: AiWorkspace, session: AiConversation)
                             IconButton(onClick = { menu = true }, enabled = enabled) { Icon(Icons.Default.Add, "添加附件或引用", Modifier.size(20.dp)) }
                             DropdownMenu(menu, { menu = false }) {
                                 if (session.capabilities.attachments) {
-                                    DropdownMenuItem(text = { Text("图片") }, onClick = { menu = false; picker.launch(arrayOf("image/*")) })
-                                    DropdownMenuItem(text = { Text("手机文件") }, onClick = { menu = false; picker.launch(arrayOf("*/*")) })
-                                    DropdownMenuItem(text = { Text("拍照") }, onClick = {
+                                    DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_image)) }, onClick = { menu = false; picker.launch(arrayOf("image/*")) })
+                                    DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_phone_file)) }, onClick = { menu = false; picker.launch(arrayOf("*/*")) })
+                                    DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_camera)) }, onClick = {
                                         menu = false
                                         val file = File(context.cacheDir, "ai/camera/${UUID.randomUUID()}.jpg").also { it.parentFile?.mkdirs() }
                                         cameraUri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
                                         runCatching { camera.launch(cameraUri!!) }.onFailure { cameraUri = null; file.delete() }
                                     })
                                 }
-                                if (session.capabilities.attachments) DropdownMenuItem(text = { Text("引用电脑文件 @") }, enabled = references.size < 5, onClick = { menu = false; browseFile = true })
-                                if (session.capabilities.steer && session.state == "running") DropdownMenuItem(text = { Text("立即补充当前任务") }, enabled = draft.isNotBlank() && files.isEmpty(), onClick = {
+                                if (session.capabilities.attachments) DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_pc_file)) }, enabled = references.size < 5, onClick = { menu = false; browseFile = true })
+                                if (session.capabilities.steer && session.state == "running") DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_steer)) }, enabled = draft.isNotBlank() && files.isEmpty(), onClick = {
                                     menu = false; workspace.mutate(session.pcId, "steer", session, JSONObject().put("text", draft))
                                 })
                             }
@@ -223,13 +227,13 @@ internal fun AiEnhancedComposer(workspace: AiWorkspace, session: AiConversation)
     confirmMode?.let { mode -> AlertDialog(onDismissRequest = { confirmMode = null }, title = { Text(aiPermissionLabel(mode)) }, text = {
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(aiPermissionDetail(mode))
-            if (mode.requiresConfirmation) Text("该授权模式可能扩大 Agent 的操作范围，请确认后继续。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            if (mode.requiresConfirmation) Text(stringResource(R.string.ai_ui_permission_warning), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
         }
-    }, confirmButton = { TextButton(enabled = configurable, onClick = { confirmMode = null; workspace.configure(session, mode = mode.id, confirmedMode = mode.id) }) { Text("确认并应用") } },
-        dismissButton = { TextButton(onClick = { confirmMode = null }) { Text("取消") } }) }
+    }, confirmButton = { TextButton(enabled = configurable, onClick = { confirmMode = null; workspace.configure(session, mode = mode.id, confirmedMode = mode.id) }) { Text(stringResource(R.string.ai_ui_apply)) } },
+        dismissButton = { TextButton(onClick = { confirmMode = null }) { Text(stringResource(R.string.ai_ui_cancel)) } }) }
     if (session.settingsNotice.isNotBlank()) Text(session.settingsNotice, Modifier.padding(horizontal = 12.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     inspect?.let { file -> AlertDialog(onDismissRequest = { inspect = null }, title = { Text(file.name) }, text = { Text(if (file.error.isNotEmpty()) file.error else "${file.size} 字节 · ${file.status}\n" + if (session.capabilities.nativeImages) "图片使用原生输入，识图取决于所选模型。其他附件作为电脑文件引用。" else "附件作为电脑文件引用。") },
-        confirmButton = { if (file.status == "failed") TextButton(onClick = { inspect = null; workspace.retryUpload(context, session, file) }) { Text("重试上传") } else TextButton(onClick = {
+        confirmButton = { if (file.status == "failed") TextButton(onClick = { inspect = null; workspace.retryUpload(context, session, file) }) { Text(stringResource(R.string.ai_ui_retry_upload)) } else TextButton(onClick = {
             file.file?.let { staged -> runCatching { context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(FileProvider.getUriForFile(context, context.packageName + ".fileprovider", staged), file.mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) } }
-        }) { Text("预览") } }, dismissButton = { TextButton(onClick = { inspect = null; workspace.removeUpload(session, file) }) { Text("移除") } }) }
+        }) { Text(stringResource(R.string.ai_ui_preview)) } }, dismissButton = { TextButton(onClick = { inspect = null; workspace.removeUpload(session, file) }) { Text(stringResource(R.string.ai_ui_remove)) } }) }
 }

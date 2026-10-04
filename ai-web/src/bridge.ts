@@ -1,3 +1,4 @@
+import {t} from './i18n';
 export interface Message { id: string; role: string; kind: string; text: string; title: string; summary: string; status: string; fullLength: number }
 export interface Question { id: string; text: string; options: string[]; multiSelect: boolean }
 export interface Pending { id: string; kind: string; title: string; summary: string; detail: string; canApprove: boolean; questions: Question[] }
@@ -6,7 +7,7 @@ export interface Session {
   canControl: boolean; busy: boolean; uncertain: boolean; historyBefore: number; truncated: boolean;
   pending: Pending[]; plan: {step: string; status: string}[]; usage: string; diff: string; error: string;
   artifacts: boolean; search: boolean; dark: boolean; fontScale: number;
-  diffLength?: number; diffTruncated?: boolean; diffRead?: boolean;
+  diffLength?: number; diffTruncated?: boolean; diffRead?: boolean; language?: string;
 }
 export type QuestionDraft = {schema:string;answers:Record<string,string[]>;extra:Record<string,string>};
 export type UiState = {tail?:boolean;anchor?:{id:string;offset:number};expanded?:string[];questions?:Record<string,QuestionDraft>};
@@ -14,6 +15,7 @@ export interface Update { session: Session; messages: Message[]; order?: string[
 declare global { interface Window {
   TermLink?: { postMessage: (value: string) => void };
   termlinkUpdate?: (update: Update) => void;
+  termlinkBack?: () => void;
   termlinkReply?: (reply: {id: string; value?: unknown; error?: string}) => void;
 } }
 let nextId = 0;
@@ -25,10 +27,10 @@ window.termlinkReply = reply => {
 };
 export function request<T = any>(action: string, args: Record<string, unknown> = {}): Promise<T> {
   return new Promise((resolve, reject) => {
-    if (!window.TermLink) { reject(new Error('手机连接尚未就绪')); return; }
-    if (pending.size >= 16) { reject(new Error('请等待当前操作完成')); return; }
+    if (!window.TermLink) { reject(new Error(t('手机连接尚未就绪'))); return; }
+    if (pending.size >= 16) { reject(new Error(t('请等待当前操作完成'))); return; }
     const id = String(++nextId);
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error('请求结果尚未确认，请检查连接')); }, 45_000);
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(t('请求结果尚未确认，请检查连接'))); }, 45_000);
     pending.set(id, {resolve, reject, timer});
     window.TermLink.postMessage(JSON.stringify({id, action, ...args}));
   });

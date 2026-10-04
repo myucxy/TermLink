@@ -335,7 +335,9 @@ namespace TermLink.Agent
         SaveTerminalCommands = 16,
         BeginAccountAuthorization = 17,
         ConfigureServer = 18,
-        DetectAiAgents = 19
+        DetectAiAgents = 19,
+        CancelAccountAuthorization = 20,
+        ReopenAccountAuthorization = 21
     }
 
     public sealed class RegistryRequest
@@ -434,11 +436,21 @@ namespace TermLink.Agent
 
     public sealed class ProductionSessionSummary
     {
+        public string Title { get; set; }
         public Guid SessionId { get; set; }
         public int ViewerCount { get; set; }
         public Guid? ControllerDeviceId { get; set; }
         public DateTime? LeaseExpiresAtUtc { get; set; }
         public string Carrier { get; set; } = ProductionSessionCarrier.Relay;
+    }
+
+    public sealed class DesktopAiSessionSummary
+    {
+        public string Id { get; set; }
+        public string Title { get; set; }
+        public string Agent { get; set; }
+        public string Directory { get; set; }
+        public string State { get; set; }
     }
 
     public sealed class ProductionTerminalCommandSummary
@@ -474,6 +486,9 @@ namespace TermLink.Agent
     {
         public Guid PcId { get; set; }
         public string AiAgentsJson { get; set; }
+        public IList<DesktopAiSessionSummary> AiSessions { get; set; }
+        public int ActiveAiSessions { get; set; }
+        public bool AiSessionsTruncated { get; set; }
         public string AgentVersion { get; set; }
         public bool Configured { get; set; }
         public bool AccountLinked { get; set; }
@@ -509,7 +524,7 @@ namespace TermLink.Agent
 
     public static class RegistryControlCodec
     {
-        public const byte CurrentVersion = 13;
+        public const byte CurrentVersion = 14;
         private const byte MinimumSupportedVersion = 5;
         private const int MaximumBytes = 64 * 1024;
 
@@ -523,6 +538,8 @@ namespace TermLink.Agent
             if (stream == null) throw new ArgumentNullException("stream");
             if (request == null) throw new ArgumentNullException("request");
             ValidateVersion(version, "control");
+            if (version < 14 && request.Command >= RegistryCommand.CancelAccountAuthorization)
+                throw new InvalidDataException("Authorization controls require control V14.");
             if (version < 8 && request.Command >= RegistryCommand.LoginAccount)
                 throw new InvalidDataException("Registry account and command settings require control V8.");
             if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
@@ -697,6 +714,8 @@ namespace TermLink.Agent
             if (!Enum.IsDefined(typeof(RegistryCommand), commandValue))
                 throw new InvalidDataException("Unknown Registry command.");
             var request = new RegistryRequest { Command = (RegistryCommand)commandValue };
+            if (version < 14 && request.Command >= RegistryCommand.CancelAccountAuthorization)
+                throw new InvalidDataException("Authorization controls require control V14.");
             if (version < 11 && request.Command == RegistryCommand.BeginAccountAuthorization)
                 throw new InvalidDataException("Browser account authorization requires control V11.");
             if (version < 13 && request.Command == RegistryCommand.DetectAiAgents)
@@ -1005,6 +1024,18 @@ namespace TermLink.Agent
             }
             if (version >= 10) WriteString(writer, status.AccountNickname ?? string.Empty);
             if (version >= 13) WriteString(writer, status.AiAgentsJson ?? "[]");
+            if (version >= 14)
+            {
+                var ai = status.AiSessions ?? new List<DesktopAiSessionSummary>();
+                if (ai.Count > 64) throw new InvalidDataException("Too many AI summaries.");
+                writer.Write(status.ActiveAiSessions); writer.Write(status.AiSessionsTruncated); writer.Write(ai.Count);
+                foreach (var item in ai) {
+                    WriteString(writer, item.Id); WriteString(writer, item.Title); WriteString(writer, item.Agent);
+                    WriteString(writer, item.Directory); WriteString(writer, item.State);
+                }
+                writer.Write(sessions.Count);
+                foreach (var item in sessions) { WriteGuid(writer, item.SessionId); WriteString(writer, item.Title); }
+            }
         }
 
         private static ProductionStatus ReadProductionStatus(BinaryReader reader, byte version)
@@ -1109,6 +1140,22 @@ namespace TermLink.Agent
             }
             status.AccountNickname = version >= 10 ? ReadString(reader) : string.Empty;
             status.AiAgentsJson = version >= 13 ? ReadString(reader) : "[]";
+            if (version >= 14)
+            {
+                status.ActiveAiSessions = reader.ReadInt32(); status.AiSessionsTruncated = reader.ReadBoolean();
+                var count = reader.ReadInt32();
+                if (count < 0 || count > 64 || status.ActiveAiSessions < 0) throw new InvalidDataException("Invalid AI summary count.");
+                status.AiSessions = new List<DesktopAiSessionSummary>();
+                for (var index = 0; index < count; index++) status.AiSessions.Add(new DesktopAiSessionSummary {
+                    Id = ReadString(reader), Title = ReadString(reader), Agent = ReadString(reader), Directory = ReadString(reader), State = ReadString(reader)
+                });
+                var titles = reader.ReadInt32();
+                if (titles != sessions.Count) throw new InvalidDataException("Invalid session title count.");
+                for (var index = 0; index < titles; index++) {
+                    if (ReadGuid(reader) != sessions[index].SessionId) throw new InvalidDataException("Session title identity mismatch.");
+                    sessions[index].Title = ReadString(reader);
+                }
+            }
             return status;
         }
 
@@ -1264,7 +1311,8 @@ namespace TermLink.Agent
                 {
                     // Existing commands remain usable while a new UI is paired with a V12 Agent during upgrade.
                     var version = request.ProtocolVersion != 0 ? request.ProtocolVersion :
-                        request.Command == RegistryCommand.DetectAiAgents ? RegistryControlCodec.CurrentVersion : (byte)12;
+                        request.Command >= RegistryCommand.CancelAccountAuthorization ? RegistryControlCodec.CurrentVersion :
+                        request.Command == RegistryCommand.DetectAiAgents ? (byte)13 : (byte)12;
                     RegistryControlAuthentication.Prepare(request, secret, DateTime.UtcNow, version);
                     RegistryControlCodec.WriteRequest(pipe, request, version);
                     var response = RegistryControlCodec.ReadResponse(pipe);

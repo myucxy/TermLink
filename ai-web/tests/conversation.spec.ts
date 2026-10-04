@@ -14,11 +14,13 @@ async function open(page:Page,messages:any[],value:any=session){
       if(r.action==='ready')setTimeout(()=>(window as any).termlinkUpdate({session,messages,reset:true,uiState:JSON.parse(sessionStorage.getItem('fixture-ui')||'{}')}),0);
       if(r.action==='ui-state')sessionStorage.setItem('fixture-ui',JSON.stringify(r.state));
       const hits=messages.filter((m:any)=>m.text.includes(r.query||''));
-      const result=r.action==='search'?{items:hits.slice(r.offset||0,(r.offset||0)+50),nextOffset:hits.length>(r.offset||0)+50?(r.offset||0)+50:-1}:true;
+      const files=(session as any).fixtureArtifacts||[];
+      const file=files.find((f:any)=>f.id===r.fileId);
+      const result=r.action==='search'?{items:hits.slice(r.offset||0,(r.offset||0)+50),nextOffset:hits.length>(r.offset||0)+50?(r.offset||0)+50:-1}:r.action==='artifacts'?{files,truncated:false}:r.action==='artifact.read'&&file?{...file,offset:0,nextOffset:file.size,data:btoa(file.text)}:true;
       setTimeout(()=>(window as any).termlinkReply({id:r.id,value:result}),r.query==='delayed'?700:0);
     }};
   },{messages,session:value});
-  await page.goto('/');await expect(page.getByRole('navigation',{name:'会话工具'})).toBeVisible();
+  await page.goto('/');await expect(page.getByRole('navigation',{name:value.language==='en'?'Conversation tools':'会话工具'})).toBeVisible();
 }
 test('10,000 messages stay virtualized; updates preserve the reading position',async({page})=>{
   await open(page,Array.from({length:10000},(_,i)=>msg(`m${i}`,`Message ${i}\n\n${'body '.repeat(15)}`)));
@@ -54,6 +56,27 @@ test('static HTML has no scripts, navigation, remote resources or native bridge'
   expect(await frame.locator('body').evaluate(()=>typeof (window as any).TermLink)).toBe('undefined');
   expect(await page.evaluate(()=>(window as any).hacked)).toBeUndefined();expect(requests).toEqual([]);
   await expect(page.locator('iframe')).toHaveAttribute('sandbox','');
+  await expect(page.getByRole('button',{name:'打开所在目录',exact:true})).toHaveCount(0);
+});
+
+test('workspace file and preview open the exact parent through the native bridge',async({page})=>{
+  const file={id:'output/site/index.html',name:'index.html',mime:'text/html',text:'<h1>Generated file</h1>',size:23,version:'23:123'};
+  file.size=file.text.length;
+  await open(page,[msg('m1','Created output/site/index.html')],{...session,fixtureArtifacts:[file]});
+  await page.getByRole('button',{name:'▱ 文件'}).click();
+  await page.getByRole('button',{name:'打开所在目录 · index.html'}).click();
+  expect(await page.evaluate(()=>(window as any).calls.filter((c:any)=>c.action==='open-directory').map((c:any)=>c.fileId))).toEqual([file.id]);
+  await page.locator('.file-row .file').click();
+  await expect(page.frameLocator('iframe').locator('h1')).toHaveText('Generated file');
+  await page.getByRole('button',{name:'打开所在目录',exact:true}).click();
+  expect(await page.evaluate(()=>(window as any).calls.filter((c:any)=>c.action==='open-directory').map((c:any)=>c.fileId))).toEqual([file.id,file.id]);
+});
+
+test('English locale translates conversation actions and file directory control',async({page})=>{
+  await open(page,[msg('m1','Hello')],{...session,language:'en',fixtureArtifacts:[{id:'note.txt',name:'note.txt',size:0,mime:'text/plain',version:'0:1'}]});
+  await page.getByRole('button',{name:'▱ Files'}).click();
+  await expect(page.getByRole('button',{name:'Open containing folder · note.txt'})).toBeVisible();
+  await expect(page.getByRole('button',{name:'Save note.txt'})).toBeVisible();
 });
 test('compact transcript exposes plan, thought, usage and per-file diff',async({page})=>{
   await open(page,[msg('m1','检查公开事件并执行测试','assistant','reasoning'),msg('m2','## 已完成\n\n| 功能 | 状态 |\n|---|---|\n| 预览 | 通过 |')]);
@@ -90,4 +113,24 @@ test('search paginates and rejects stale query results; grouped tool detail stay
   await expect(page.locator('.panel .file')).toHaveCount(11);await page.waitForTimeout(750);await expect(page.locator('.panel .file')).toHaveCount(11);
   await page.locator('.panel .file').filter({hasText:'tool needle 4'}).first().click();
   await expect(page.locator('[data-message-id="t4"] pre')).toBeVisible();
+});
+
+test('file filters do not change search results; native Back closes preview before the panel',async({page})=>{
+  await open(page,[msg('m1','needle'),msg('m2','```html\n<h1>Example</h1>\n```')]);
+  await page.getByRole('button',{name:'⌕ 搜索'}).click();
+  await page.getByPlaceholder('输入要查找的内容').fill('needle');
+  await page.getByRole('button',{name:'查找',exact:true}).click();
+  await expect(page.locator('.panel .file')).toHaveCount(1);
+  await page.getByRole('button',{name:'▱ 文件'}).click();
+  await page.getByPlaceholder('筛选文件名称').fill('html');
+  await page.getByRole('button',{name:'⌕ 搜索'}).click();
+  await expect(page.getByPlaceholder('输入要查找的内容')).toHaveValue('needle');
+  await expect(page.locator('.panel .file')).toHaveCount(1);
+  await page.getByRole('button',{name:'预览',exact:true}).click();
+  await expect(page.locator('iframe')).toBeVisible();
+  await page.evaluate(()=>(window as any).termlinkBack());
+  await expect(page.locator('iframe')).toHaveCount(0);
+  await expect(page.locator('.panel')).toBeVisible();
+  await page.evaluate(()=>(window as any).termlinkBack());
+  await expect(page.locator('.panel')).toHaveCount(0);
 });

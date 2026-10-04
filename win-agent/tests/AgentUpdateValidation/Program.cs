@@ -282,6 +282,14 @@ namespace TermLink.AgentUpdate.Validation
 
         private static void ValidateBrowserAuthorizationLaunch()
         {
+            var cancelled = new ProductionEnrollment.BrowserAuthorizationAttempt();
+            cancelled.Cancel();
+            try { cancelled.BeginCommit(); throw new InvalidOperationException("Cancelled authorization accepted a late callback."); }
+            catch (OperationCanceledException) { }
+            var committing = new ProductionEnrollment.BrowserAuthorizationAttempt();
+            committing.BeginCommit();
+            try { committing.Cancel(); throw new InvalidOperationException("Saving authorization was falsely cancelled."); }
+            catch (ProductionEnrollmentException error) when (error.Code == "ACCOUNT_AUTHORIZATION_COMMITTING") { }
             const string authorizationUrl = "https://identity.example.test/authorize?client_id=termlink-windows";
             var start = ProductionEnrollment.CreateBrowserStartInfo(authorizationUrl);
             Assert(start.FileName == authorizationUrl && start.ArgumentList.Count == 0,

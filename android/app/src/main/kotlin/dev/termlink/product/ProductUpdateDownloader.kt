@@ -30,12 +30,14 @@ internal class ProductUpdateDownloader(
         .followSslRedirects(false)
         .build()
     private val verifier = ProductApkVerifier(appContext)
+    @Volatile private var activeCall: okhttp3.Call? = null
+    fun cancel() { activeCall?.cancel() }
 
     suspend fun download(
         update: ProductUpdateStatus,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit,
         onVerifying: () -> Unit,
-    ): File = withContext(Dispatchers.IO) {
+    ): File = withContext(Dispatchers.IO) { try {
         val downloadUrl = update.downloadUrl
             ?: throw ProductUpdateDownloadException("This update has no APK / 当前更新没有可下载的 APK")
         val expectedSize = update.artifactSizeBytes
@@ -177,6 +179,10 @@ internal class ProductUpdateDownloader(
             throw ProductUpdateDownloadException("APK verification failed / APK 校验失败", error)
         }
         finalFile
+    } catch (error: Exception) {
+        currentCoroutineContext().ensureActive()
+        throw error
+    } finally { activeCall = null }
     }
 
     private fun validateDownloadedApk(
@@ -189,13 +195,13 @@ internal class ProductUpdateDownloader(
         verifier.verify(file, expectedBuild)
     }
 
-    private fun openDownload(url: String, completed: Long): Response = openWithRedirects(
+    private suspend fun openDownload(url: String, completed: Long): Response = openWithRedirects(
         initialUrl = url,
         method = "GET",
         headers = if (completed > 0L) mapOf("Range" to "bytes=$completed-") else emptyMap(),
     )
 
-    private fun openWithRedirects(
+    private suspend fun openWithRedirects(
         initialUrl: String,
         method: String,
         headers: Map<String, String> = emptyMap(),
@@ -209,7 +215,10 @@ internal class ProductUpdateDownloader(
                 .header("Accept-Encoding", "identity")
                 .apply { headers.forEach { (name, value) -> header(name, value) } }
                 .build()
-            val response = downloadClient.newCall(request).execute()
+            val call = downloadClient.newCall(request)
+            activeCall = call
+            currentCoroutineContext().ensureActive()
+            val response = call.execute()
             if (response.code !in REDIRECT_CODES) return response
             val location = response.header("Location")
             response.close()

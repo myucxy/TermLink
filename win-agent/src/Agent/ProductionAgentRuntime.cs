@@ -3185,16 +3185,25 @@ namespace TermLink.Agent
         private ProductionStatus SnapshotStatus()
         {
             PruneSubscribers();
+            var aiSummary = aiSessions.DesktopSummaries();
+            Dictionary<Guid, string> titles;
+            lock (catalogSync) titles = catalogEntries.ToDictionary(item => item.Key, item => item.Value.Entry.Title);
             var sessions = new List<ProductionSessionSummary>();
+            var titleBytes = 0;
             var registrySessions = registry == null ? new List<SessionSummary>() : new List<SessionSummary>(registry.GetSummaries());
             foreach (var session in registrySessions)
             {
+                var title = titles.TryGetValue(session.SessionId, out var observedTitle) ? observedTitle[..Math.Min(observedTitle.Length, 160)] : string.Empty;
+                var bytes = Encoding.UTF8.GetByteCount(title);
+                if (titleBytes + bytes > 12000) title = string.Empty;
+                else titleBytes += bytes;
                 subscribers.TryGetValue(session.SessionId, out var viewers);
                 leaseStatuses.TryGetValue(session.SessionId, out var lease);
                 var activeLease = lease != null && lease.ExpiresAtUtc > DateTime.UtcNow ? lease : null;
                 sessions.Add(new ProductionSessionSummary
                 {
                     SessionId = session.SessionId,
+                    Title = title,
                     ViewerCount = viewers == null ? 0 : viewers.Count,
                     ControllerDeviceId = activeLease == null ? (Guid?)null : activeLease.HolderDeviceId,
                     LeaseExpiresAtUtc = activeLease == null ? (DateTime?)null : activeLease.ExpiresAtUtc,
@@ -3229,6 +3238,7 @@ namespace TermLink.Agent
                 {
                     PcId = config.PcId,
                     AgentVersion = config.AgentVersion,
+                    AiSessions = aiSummary.Items, ActiveAiSessions = aiSummary.Active, AiSessionsTruncated = aiSummary.Truncated,
                     Configured = true,
                     AccountLinked = true,
                     AccountUsername = accountUsername,

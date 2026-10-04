@@ -1,3 +1,4 @@
+import {t} from './i18n';
 import {useEffect,useState} from 'react';
 
 export function CodeBlock({value,language,onCopy,onPreview}:{value:string;language:string;onCopy:()=>void;onPreview:()=>void}) {
@@ -9,6 +10,6 @@ export function CodeBlock({value,language,onCopy,onPreview}:{value:string;langua
     }).catch(()=>{});},250);
     return()=>{active=false;clearTimeout(timer);};
   },[value,language]);
-  return <div className="code"><div className="code-head"><span>{language||'代码'}</span><button onClick={onCopy}>复制</button>{language==='html'&&<button onClick={onPreview}>预览</button>}</div>
+  return <div className="code"><div className="code-head"><span>{language||t('代码')}</span><button onClick={onCopy}>{t('复制')}</button>{language==='html'&&<button onClick={onPreview}>{t('预览')}</button>}</div>
     <pre>{markup?<code dangerouslySetInnerHTML={{__html:markup}}/>:<code>{value}</code>}</pre></div>;
 }

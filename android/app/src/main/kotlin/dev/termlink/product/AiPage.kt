@@ -1,7 +1,12 @@
 package dev.termlink.product
 
+import dev.termlink.harness.R
+
+import androidx.compose.ui.res.stringResource
+
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -10,6 +15,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -71,16 +77,23 @@ internal fun aiTimelineEntries(messages: List<AiMessage>): List<AiTimelineEntry>
     }
     flush(); return result
 }
-private fun aiSessionLabel(session: AiConversation?): String = when {
-    session == null -> "状态待确认"
-    session.pendingCount > 0 || session.pending.isNotEmpty() -> "待处理"
-    session.error.isNotEmpty() -> "需关注"
-    else -> aiStateLabel(session.state)
-}
+@Composable
+private fun aiSessionLabel(session: AiConversation?): String = stringResource(when {
+    session == null -> R.string.ai_status_unknown
+    session.pendingCount > 0 || session.pending.isNotEmpty() -> R.string.ai_status_pending
+    session.error.isNotEmpty() -> R.string.ai_status_error
+    session.state == "running" -> R.string.ai_status_running
+    session.state == "idle" -> R.string.ai_status_idle
+    session.state == "starting" -> R.string.ai_status_starting
+    session.state == "exited" -> R.string.ai_status_ended
+    session.state == "interrupted" -> R.string.ai_status_interrupted
+    session.state == "suspended" -> R.string.ai_status_resumable
+    else -> R.string.ai_status_unknown
+})
 
 @Composable
 internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foreground: Boolean,
-    modifier: Modifier = Modifier, onOpenDevices: () -> Unit = {}) {
+    modifier: Modifier = Modifier, onOpenDevices: () -> Unit = {}, onOpenDirectory: suspend (AiFileLocation) -> Unit = {}) {
     val pcs = snapshot.pcs.filter { "ai_agent_v1" in it.capabilities }
     val selected = workspace.selected
     val session = selected?.let(workspace.conversations::get)
@@ -135,7 +148,7 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
             } else {
                 if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.WEB_MESSAGE_LISTENER)) {
                     key(session.pcId, session.id, workspace.catalogs[session.pcId]?.hostId) {
-                        AiWebConversation(workspace, session, Modifier.weight(1f))
+                        AiWebConversation(workspace, session, Modifier.weight(1f), onOpenDirectory)
                     }
                 } else {
                     AiConversationStatus(workspace, session)
@@ -145,17 +158,23 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
                     color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 when {
                     session.state in setOf("exited", "interrupted", "suspended") -> Row(verticalAlignment = Alignment.CenterVertically) { Text(
-                        if (session.capabilities.resume) "可恢复对话，沿用历史授权。" else "会话已结束，内容由电脑提供。",
+                        stringResource(if (session.capabilities.resume) R.string.ai_resume_saved else R.string.ai_ended_pc),
                         Modifier.weight(1f).padding(12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                        if (session.capabilities.resume) AiAction("恢复会话", enabled = !workspace.busy && !workspace.uncertain, onClick = { workspace.mutate(session.pcId, "resume", session) }) }
+                        if (session.capabilities.resume) AiAction(stringResource(R.string.ai_ui_resume), enabled = !workspace.busy && !workspace.uncertain, onClick = { workspace.mutate(session.pcId, "resume", session) }) }
                     session.pending.none { it.kind == "question" } -> AiEnhancedComposer(workspace, session)
                 }
             }
         }
         if (workspace.busy) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
+        workspace.pendingPcs.filter { workspace.isUncertain(it) }.forEach { pendingPc ->
+            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("${snapshot.pcs.firstOrNull { it.id == pendingPc }?.name ?: "电脑"} · ${workspace.pendingDescription(pendingPc)} · 结果待确认",
+                    Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                AiAction(stringResource(R.string.ai_ui_query_result), onClick = { workspace.retryUncertain(pendingPc) })
+            }
+        }
         if (workspace.error.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(workspace.error, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-            if (workspace.uncertain) AiAction("重试", enabled = !workspace.busy, onClick = workspace::retryUncertain)
         }
     }
     workspace.createPc?.let { AiCreateSheet(workspace, pcs, it) }
@@ -164,54 +183,84 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
 @Composable
 private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot, pcs: List<PcSummary>, onOpenDevices: () -> Unit, modifier: Modifier) {
     val available = pcs.filter { it.online && it.remoteRoutingEnabled }
-    val attention = workspace.opened.count { workspace.conversations[it.sessionId]?.let(::aiNeedsAttention) == true }
     var history by remember { mutableStateOf(false) }
     val collapsed = remember { mutableStateMapOf<String, Boolean>() }
+    val list = rememberLazyListState()
+    var highlighted by remember { mutableStateOf<String?>(null) }
+    val onlineIds = available.filter { snapshot.signedIn && workspace.unavailable[it.id] != true }.mapTo(hashSetOf()) { it.id }
+    val sourceEntries = aiListEntries(workspace.opened, workspace.listPc, workspace.catalogs[workspace.listPc], workspace.listPc in onlineIds)
+    val attention = sourceEntries.count { it.pcId in onlineIds && workspace.conversations[it.sessionId]?.let(::aiNeedsAttention) == true }
+    val entries = aiVisibleEntries(sourceEntries, workspace.conversations.filterValues { it.pcId in onlineIds }, snapshot.pcs.associate { it.id to it.name },
+        workspace.search, workspace.attentionOnly).sortedByDescending { workspace.isPinned(it.sessionId) }
+    val rows = aiListRows(entries, workspace.conversations, collapsed)
+    val target = workspace.listTarget
+    val targetCollapsed = target?.let { collapsed["device:${it.pcId}"] == true || collapsed[it.key] == true } == true
+    LaunchedEffect(target, rows.map { it.key }, targetCollapsed) {
+        if (target != null) {
+            if (targetCollapsed) {
+                collapsed["device:${target.pcId}"] = false
+                collapsed[target.key] = false
+                return@LaunchedEffect // Locate only after recomposition has expanded the actual list rows.
+            }
+            val index = rows.indexOfFirst { it.key == target.key }
+            if (index >= 0) {
+                list.scrollToItem(index)
+                highlighted = target.key
+                workspace.listTarget = null
+            }
+        }
+    }
+    LaunchedEffect(highlighted) { if (highlighted != null) { delay(2_000); highlighted = null } }
     if (history) AiComputerHistory(workspace, available) { history = false }
     Column(modifier) {
         Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("AI 对话", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            IconButton(onClick = { history = true }, enabled = available.isNotEmpty()) { Icon(Icons.Default.History, "电脑历史", Modifier.size(20.dp)) }
-            AiAction("新建", Icons.Default.Add, enabled = available.isNotEmpty(), filled = true, description = "新建 AI 对话",
-                onClick = { workspace.createPcLocked = false; workspace.createPc = available.first().id })
+            Text(stringResource(R.string.ai_chats_title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            IconButton(onClick = { history = true }, enabled = available.isNotEmpty()) { Icon(Icons.Default.History, stringResource(R.string.ai_ui_history), Modifier.size(20.dp)) }
+            AiAction(stringResource(R.string.ai_ui_create), Icons.Default.Add, enabled = available.isNotEmpty(), filled = true, description = stringResource(R.string.ai_ui_new_chat),
+                onClick = { workspace.beginCreate(available.first().id, lockPc = false) })
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            AiAction("全部 ${workspace.opened.size}", filled = !workspace.attentionOnly, onClick = { workspace.attentionOnly = false })
-            AiAction("待处理 $attention", filled = workspace.attentionOnly, onClick = { workspace.attentionOnly = true })
-            Spacer(Modifier.weight(1f))
-            Text("手机已打开", Modifier.padding(end = 4.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+            AiAction(stringResource(R.string.ai_all_count, sourceEntries.size), filled = !workspace.attentionOnly, onClick = { workspace.attentionOnly = false })
+            AiAction(stringResource(R.string.ai_attention_count, attention), filled = workspace.attentionOnly, onClick = { workspace.attentionOnly = true })
+            Text(if (workspace.listPc == null) stringResource(R.string.ai_phone_opened) else stringResource(R.string.ai_including_pc, snapshot.pcs.firstOrNull { it.id == workspace.listPc }?.name.orEmpty()),
+                Modifier.weight(1f).padding(start = 4.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+            if (workspace.listPc != null) IconButton(onClick = { workspace.listPc = null; workspace.listTarget = null }, Modifier.size(40.dp)) {
+                Icon(Icons.Default.Close, stringResource(R.string.ai_phone_only), Modifier.size(18.dp))
+            }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        val onlineIds = available.filter { snapshot.signedIn && workspace.unavailable[it.id] != true }.mapTo(hashSetOf()) { it.id }
         AiListTools(workspace, onlineIds)
-        val entries = aiVisibleEntries(workspace.opened, workspace.conversations.filterValues { it.pcId in onlineIds }, snapshot.pcs.associate { it.id to it.name },
-            workspace.search, workspace.attentionOnly).sortedByDescending { workspace.isPinned(it.sessionId) }
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp)) {
+        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, contentPadding = PaddingValues(horizontal = 12.dp)) {
             if (entries.isEmpty()) item {
                 AiEmptyState(Icons.Default.AutoAwesome, if (workspace.attentionOnly) "暂无待处理请求" else "开始一段 AI 对话",
                     if (pcs.isEmpty()) "电脑与服务端需支持 AI 对话，原命令行会话仍在 CLI。"
                     else if (workspace.attentionOnly) "需要审批、回答或关注的对话会显示在这里。"
                     else "点击右上角新建，或从设备打开已有对话。", Modifier.fillMaxWidth().padding(vertical = 40.dp))
             }
-            entries.groupBy { it.pcId }.forEach { (pcId, deviceEntries) ->
-                item(key = "device:$pcId") { AiGroupHeading(snapshot.pcs.firstOrNull { it.id == pcId }?.name ?: "电脑", deviceEntries.size,
-                    Icons.Default.Computer, collapsed[pcId.toString()] == true) { collapsed[pcId.toString()] = collapsed[pcId.toString()] != true } }
-                if (collapsed[pcId.toString()] != true) deviceEntries.groupBy { aiEntryAgent(it, workspace.conversations[it.sessionId]) }.forEach { (agent, agentEntries) ->
-                    val key = "$pcId:$agent"
-                    item(key = "agent:$key") { AiGroupHeading(agent, agentEntries.size, aiAgentIcon(agent), collapsed[key] == true, true) { collapsed[key] = collapsed[key] != true } }
-                    if (collapsed[key] != true) items(agentEntries, key = { it.sessionId }) { opened ->
+            items(rows, key = { it.key }) { row -> when (row) {
+                is AiListRow.Device -> AiGroupHeading(snapshot.pcs.firstOrNull { it.id == row.pcId }?.name ?: "电脑", row.count,
+                    Icons.Default.Computer, collapsed[row.key] == true) { collapsed[row.key] = collapsed[row.key] != true }
+                is AiListRow.Agent -> Box(Modifier.background(if (highlighted == row.key) MaterialTheme.colorScheme.primary.copy(alpha = .12f) else Color.Transparent, RoundedCornerShape(8.dp))) {
+                    AiGroupHeading(aiAgentName(row.agentId), row.count, null, collapsed[row.key] == true, true) { collapsed[row.key] = collapsed[row.key] != true }
+                }
+                is AiListRow.Session -> {
+                val opened = row.entry
                 val value = workspace.conversations[opened.sessionId]
+                val phoneOpened = workspace.opened.any { it.sessionId == opened.sessionId }
                 val host = snapshot.pcs.firstOrNull { it.id == opened.pcId }
                 val online = snapshot.signedIn && host?.online == true && host.remoteRoutingEnabled && workspace.unavailable[host.id] != true
                 if (opened.strategy == "desktop_remote") {
                     var menu by remember { mutableStateOf(false) }
-                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable { workspace.selected = opened.sessionId }, verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(enabled = online) {
+                        if (phoneOpened) workspace.selected = opened.sessionId else workspace.openRemote(opened.pcId, opened.agentId)
+                    }, verticalAlignment = Alignment.CenterVertically) {
                         AiAgentBadge("ZCode")
                         Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                             Text("ZCode", style = MaterialTheme.typography.titleSmall)
-                            Text("${host?.name ?: "电脑"} · 桌面远控", style = MaterialTheme.typography.bodySmall)
+                            Text("${host?.name.orEmpty()} · ${stringResource(R.string.ai_remote_strategy)}", style = MaterialTheme.typography.bodySmall)
                         }
-                        Box {
+                        if (phoneOpened) Box {
                             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "远控视图操作") }
                             DropdownMenu(menu, { menu = false }) {
                                 DropdownMenuItem(text = { Text("关闭手机视图") }, onClick = { menu = false; workspace.closeView(opened.sessionId) })
@@ -219,13 +268,13 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
                         }
                     }
                 } else AiConversationRow(value, host?.name ?: "电脑", online, opened.pcId in workspace.catalogs,
-                    { workspace.selected = opened.sessionId }, { workspace.closeView(opened.sessionId) })
+                    { if (phoneOpened) workspace.selected = opened.sessionId else if (online && value != null) workspace.open(value) },
+                    if (phoneOpened) ({ workspace.closeView(opened.sessionId) }) else null)
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .65f))
-            }
                 }
-            }
+            } }
             item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                AiAction("从设备打开其他会话", Icons.Default.ChevronRight, onClick = onOpenDevices)
+                AiAction(stringResource(R.string.ai_ui_view_pc), Icons.Default.ChevronRight, onClick = onOpenDevices)
             } }
         }
     }
@@ -233,11 +282,11 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun AiConversationRow(session: AiConversation?, pcName: String, online: Boolean, catalogKnown: Boolean, onOpen: () -> Unit, onClose: () -> Unit) {
+private fun AiConversationRow(session: AiConversation?, pcName: String, online: Boolean, catalogKnown: Boolean, onOpen: () -> Unit, onClose: (() -> Unit)?) {
     var menu by remember { mutableStateOf(false) }
     var confirmClose by remember { mutableStateOf(false) }
     Box {
-        Column(Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = { menu = true }, onLongClickLabel = "对话操作")
+        Column(Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = onClose?.let { { menu = true } }, onLongClickLabel = "对话操作")
             .padding(start = 12.dp, top = 8.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(if (online && session != null) aiConversationTitle(session) else "${session?.agent ?: "AI"} 对话",
@@ -254,11 +303,11 @@ private fun AiConversationRow(session: AiConversation?, pcName: String, online: 
             DropdownMenuItem(text = { Text("关闭手机视图") }, onClick = { menu = false; confirmClose = true })
         }
     }
-    if (confirmClose) AlertDialog(onDismissRequest = { confirmClose = false }, title = { Text("关闭手机视图？") },
+    if (confirmClose) AlertDialog(onDismissRequest = { confirmClose = false }, title = { Text(stringResource(R.string.ai_ui_close_view_question)) },
         text = { Column { AiSessionIdentity(session?.takeIf { online }, fallback = "${session?.agent ?: "AI"} · $pcName")
-            Text("电脑任务继续运行，手机草稿和待发队列将清除。", style = MaterialTheme.typography.bodySmall) } },
-        confirmButton = { TextButton(onClick = { confirmClose = false; onClose() }) { Text("关闭视图") } },
-        dismissButton = { TextButton(onClick = { confirmClose = false }) { Text("取消") } })
+            Text(stringResource(R.string.ai_ui_close_view_hint), style = MaterialTheme.typography.bodySmall) } },
+        confirmButton = { TextButton(onClick = { confirmClose = false; onClose?.invoke() }) { Text(stringResource(R.string.ai_ui_close_view)) } },
+        dismissButton = { TextButton(onClick = { confirmClose = false }) { Text(stringResource(R.string.ai_ui_cancel)) } })
 }
 
 @Composable
@@ -270,14 +319,14 @@ private fun AiConversationHeader(workspace: AiWorkspace, session: AiConversation
     var showActions by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(onClick = { workspace.selected = null }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回 AI 列表", Modifier.size(20.dp)) }
+        IconButton(onClick = { workspace.selected = null }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.ai_back_list), Modifier.size(20.dp)) }
         Column(Modifier.weight(1f).clickable(enabled = session != null && online) { showDetails = true }) {
-            Text(if (online && session != null) aiConversationTitle(session) else "AI 对话", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+            Text(if (online && session != null) aiConversationTitle(session) else stringResource(R.string.ai_chats_title), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
             Text(listOfNotNull(session?.agent, pc?.name, session?.takeIf { online }?.directory?.let(::aiDirectoryName)).joinToString(" · "),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
         }
         Box {
-            IconButton(onClick = { menu = true }) { Icon(if (online) Icons.Default.Cloud else Icons.Default.CloudOff, "AI 对话菜单", Modifier.size(20.dp)) }
+            IconButton(onClick = { menu = true }) { Icon(if (online) Icons.Default.Cloud else Icons.Default.CloudOff, stringResource(R.string.ai_chat_menu), Modifier.size(20.dp)) }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 AiMenuLabel("连接 · ${if (online) "服务端中转" else "状态待确认"}")
                 DropdownMenuItem(text = { Text("重新确认连接", style = MaterialTheme.typography.bodyMedium) }, enabled = pc != null && !workspace.busy && !workspace.uncertain,
@@ -285,35 +334,35 @@ private fun AiConversationHeader(workspace: AiWorkspace, session: AiConversation
                         session?.id?.let(workspace.conversations::get)?.takeIf { s -> !s.canControl && s.state !in setOf("exited", "interrupted", "suspended") }?.let { s -> workspace.mutate(s.pcId, "control", s) }
                     } } })
                 HorizontalDivider()
-                AiMenuLabel("当前会话")
-                DropdownMenuItem(text = { Text("会话管理与导出") }, enabled = session != null && online, onClick = { menu = false; showActions = true })
-                DropdownMenuItem(text = { Text("中断生成", style = MaterialTheme.typography.bodyMedium) },
+                AiMenuLabel(stringResource(R.string.ai_current_chat))
+                DropdownMenuItem(text = { Text(stringResource(R.string.ai_manage_export)) }, enabled = session != null && online, onClick = { menu = false; showActions = true })
+                DropdownMenuItem(text = { Text(stringResource(R.string.ai_interrupt), style = MaterialTheme.typography.bodyMedium) },
                     enabled = online && session?.canControl == true && session.state == "running" && !workspace.busy && !workspace.uncertain,
                     onClick = { menu = false; session?.let { workspace.mutate(it.pcId, "interrupt", it) } })
-                DropdownMenuItem(text = { Text("关闭手机视图", style = MaterialTheme.typography.bodyMedium) },
+                DropdownMenuItem(text = { Text(stringResource(R.string.ai_ui_close_view), style = MaterialTheme.typography.bodyMedium) },
                     onClick = { menu = false; confirmClose = true })
-                DropdownMenuItem(text = { Text("结束会话", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) },
+                DropdownMenuItem(text = { Text(stringResource(R.string.ai_end_chat), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) },
                     enabled = online && session?.canControl == true && !workspace.busy && !workspace.uncertain,
                     onClick = { menu = false; confirmEnd = true })
             }
         }
     }
     if (showActions && session != null && online) AiSessionActions(workspace, session) { showActions = false }
-    if (confirmClose) AlertDialog(onDismissRequest = { confirmClose = false }, title = { Text("关闭手机视图？") },
-        text = { Column { AiSessionIdentity(session?.takeIf { online }); Text("电脑任务继续运行，手机草稿和待发队列将清除。", style = MaterialTheme.typography.bodySmall) } },
-        confirmButton = { TextButton(onClick = { confirmClose = false; workspace.selected?.let(workspace::closeView) }) { Text("关闭视图") } },
-        dismissButton = { TextButton(onClick = { confirmClose = false }) { Text("取消") } })
-    if (showDetails && session != null && online) AlertDialog(onDismissRequest = { showDetails = false }, title = { Text("会话信息") },
+    if (confirmClose) AlertDialog(onDismissRequest = { confirmClose = false }, title = { Text(stringResource(R.string.ai_ui_close_view_question)) },
+        text = { Column { AiSessionIdentity(session?.takeIf { online }); Text(stringResource(R.string.ai_ui_close_view_hint), style = MaterialTheme.typography.bodySmall) } },
+        confirmButton = { TextButton(onClick = { confirmClose = false; workspace.selected?.let(workspace::closeView) }) { Text(stringResource(R.string.ai_ui_close_view)) } },
+        dismissButton = { TextButton(onClick = { confirmClose = false }) { Text(stringResource(R.string.ai_ui_cancel)) } })
+    if (showDetails && session != null && online) AlertDialog(onDismissRequest = { showDetails = false }, title = { Text(stringResource(R.string.ai_ui_session_info)) },
         text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("${session.agent} · ${pc?.name.orEmpty()}")
-            Text("工作目录", style = MaterialTheme.typography.labelSmall)
+            Text(stringResource(R.string.ai_ui_workdir), style = MaterialTheme.typography.labelSmall)
             SelectionContainer { Text(session.directory, style = MaterialTheme.typography.bodySmall) }
             AiCopyAction(session.directory, "复制目录")
-        } }, confirmButton = { TextButton(onClick = { showDetails = false }) { Text("关闭") } })
-    if (confirmEnd && session != null) AlertDialog(onDismissRequest = { confirmEnd = false }, title = { Text("结束 AI 会话？") },
-        text = { Column { AiSessionIdentity(session); Text("停止此对话的电脑端 Agent 进程。仅关闭手机视图不会结束任务。") } },
-        confirmButton = { TextButton(onClick = { confirmEnd = false; workspace.mutate(session.pcId, "end", session) }) { Text("结束") } },
-        dismissButton = { TextButton(onClick = { confirmEnd = false }) { Text("取消") } })
+        } }, confirmButton = { TextButton(onClick = { showDetails = false }) { Text(stringResource(R.string.ai_ui_close)) } })
+    if (confirmEnd && session != null) AlertDialog(onDismissRequest = { confirmEnd = false }, title = { Text(stringResource(R.string.ai_ui_end_question)) },
+        text = { Column { AiSessionIdentity(session); Text(stringResource(R.string.ai_ui_end_hint)) } },
+        confirmButton = { TextButton(onClick = { confirmEnd = false; workspace.mutate(session.pcId, "end", session) }) { Text(stringResource(R.string.ai_ui_end)) } },
+        dismissButton = { TextButton(onClick = { confirmEnd = false }) { Text(stringResource(R.string.ai_ui_cancel)) } })
 }
 
 @Composable
@@ -376,8 +425,8 @@ private fun AiMessages(workspace: AiWorkspace, session: AiConversation, modifier
             "描述要完成的任务，操作需要批准时会在这里提示。", Modifier.fillMaxSize())
         LazyColumn(Modifier.fillMaxSize(), state = list, verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(12.dp)) {
             if (session.truncated || session.historyBefore > 0) item(key = "history-notice") {
-                if (session.historyBefore > 0) TextButton(onClick = { reading.followsTail = false; scope.launch { workspace.loadHistory(session) } }) { Text("加载更早的消息") }
-                else Text("已到达 TermLink 历史保留边界。", style = MaterialTheme.typography.labelSmall)
+                if (session.historyBefore > 0) TextButton(onClick = { reading.followsTail = false; scope.launch { workspace.loadHistory(session) } }) { Text(stringResource(R.string.ai_ui_earlier)) }
+                else Text(stringResource(R.string.ai_ui_history_end), style = MaterialTheme.typography.labelSmall)
             }
             items(entries, key = { it.key }) { entry ->
                 if (entry is AiTimelineEntry.Tools) {
@@ -394,14 +443,14 @@ private fun AiMessages(workspace: AiWorkspace, session: AiConversation, modifier
                             AiAgentBadge(session.agent)
                             Text(session.agent, Modifier.weight(1f), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
                             AiCopyAction(message.text)
-                            TextButton(onClick = { workspace.quote(session.id, message.text) }, contentPadding = PaddingValues(4.dp)) { Text("引用", style = MaterialTheme.typography.labelSmall) }
+                            TextButton(onClick = { workspace.quote(session.id, message.text) }, contentPadding = PaddingValues(4.dp)) { Text(stringResource(R.string.ai_ui_quote), style = MaterialTheme.typography.labelSmall) }
                         }
                         AiReplyContent(message.text)
                     }
                     if (message.fullLength > message.text.length) TextButton(onClick = { fullMessage = message; reading.followsTail = false }) { Text("查看完整内容 · ${message.fullLength} 字符") }
                     if (message.role == "user") Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                         Text(when (message.status) { "accepted" -> "已接收"; "completed" -> "已完成"; "failed" -> "失败"; "uncertain" -> "结果待确认"; else -> "" }, style = MaterialTheme.typography.labelSmall)
-                        TextButton(onClick = { workspace.drafts[session.id] = message.text.take(16000) }) { Text("编辑重发", style = MaterialTheme.typography.labelSmall) }
+                        TextButton(onClick = { workspace.appendDraft(session.id, message.text) }) { Text(stringResource(R.string.ai_ui_append), style = MaterialTheme.typography.labelSmall) }
                     }
                 }
             }
@@ -454,9 +503,9 @@ private fun AiToolGroup(values: List<AiMessage>, onInspect: () -> Unit, onQuote:
             text = { Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(aiToolStatusLabel(tool.status), style = MaterialTheme.typography.labelSmall)
                 SelectionContainer { Text(tool.text, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }
-                if (tool.fullLength > tool.text.length) TextButton(onClick = { detailId = null; onFull(tool) }) { Text("查看完整工具记录") }
-            } }, confirmButton = { TextButton(onClick = { detailId = null }) { Text("关闭") } },
-            dismissButton = { Row { AiCopyAction(tool.text, "复制详情"); TextButton(onClick = { onQuote(tool.text); detailId = null }) { Text("引用") } } })
+                if (tool.fullLength > tool.text.length) TextButton(onClick = { detailId = null; onFull(tool) }) { Text(stringResource(R.string.ai_ui_full_tool)) }
+            } }, confirmButton = { TextButton(onClick = { detailId = null }) { Text(stringResource(R.string.ai_ui_close)) } },
+            dismissButton = { Row { AiCopyAction(tool.text, "复制详情"); TextButton(onClick = { onQuote(tool.text); detailId = null }) { Text(stringResource(R.string.ai_ui_quote)) } } })
     }
 }
 
@@ -511,13 +560,13 @@ private fun AiInteraction(workspace: AiWorkspace, session: AiConversation, pendi
                     }
                 }
                 OutlinedTextField(value = answers[question.id].orEmpty(), onValueChange = { if (it.length <= 4000) answers[question.id] = it },
-                    modifier = Modifier.fillMaxWidth(), label = { Text("补充回答") }, maxLines = 3, enabled = enabled, textStyle = MaterialTheme.typography.bodyMedium)
+                    modifier = Modifier.fillMaxWidth(), label = { Text(stringResource(R.string.ai_ui_answer)) }, maxLines = 3, enabled = enabled, textStyle = MaterialTheme.typography.bodyMedium)
             }
             Text("仅本次请求 · ${aiDirectoryName(session.directory)}", maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (!pending.canApprove) Text("操作内容超过显示范围，请在电脑端处理。", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            if (!pending.canApprove) Text(stringResource(R.string.ai_ui_oversize_request), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                AiAction("拒绝", enabled = enabled, onClick = { workspace.mutate(session.pcId, "answer", session, JSONObject().put("requestId", pending.id).put("decision", "deny")) })
+                AiAction(stringResource(R.string.ai_ui_deny), enabled = enabled, onClick = { workspace.mutate(session.pcId, "answer", session, JSONObject().put("requestId", pending.id).put("decision", "deny")) })
                 AiAction(if (pending.kind == "question") "提交回答" else "允许本次", filled = true,
                     enabled = enabled && pending.canApprove && (pending.kind != "question" || pending.questions.isNotEmpty() && pending.questions.all { answers[it.id].orEmpty().isNotBlank() || choices[it.id].orEmpty().isNotEmpty() }),
                     onClick = {
@@ -541,9 +590,10 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
     val options = catalog?.agents.orEmpty().filter { it.supported }
     var agentId by rememberSaveable(pcKey) { mutableStateOf("") }
     val agent = options.firstOrNull { it.id == agentId } ?: options.firstOrNull()
-    var directoryOverride by rememberSaveable(pcKey) { mutableStateOf<String?>(null) }
+    val initialDirectory = workspace.createDirectory.takeIf { pcId == initialPc }
+    var directoryOverride by rememberSaveable(pcKey, initialDirectory) { mutableStateOf(initialDirectory) }
     val perSession = catalog?.directoryMode == "per_session"
-    var customDirectory by rememberSaveable(pcKey) { mutableStateOf(false) }
+    var customDirectory by rememberSaveable(pcKey, initialDirectory) { mutableStateOf(initialDirectory != null) }
     val managed = perSession && !customDirectory
     val directory = if (managed) "" else directoryOverride ?: workspace.preferredDirectory(pcId)
     var browseDirectory by rememberSaveable(pcKey) { mutableStateOf(false) }
@@ -556,7 +606,7 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
     var proposedMode by remember { mutableStateOf<String?>(null) }
     val remote = agent?.strategy == "desktop_remote"
     val ready = pcs.any { it.id == pcId && it.online && it.remoteRoutingEnabled } && workspace.unavailable[pcId] != true
-    val editable = !workspace.busy && !workspace.uncertain
+    val editable = !workspace.isBlocked(pcId)
     val scope = rememberCoroutineScope()
     LaunchedEffect(pcId) { workspace.refresh(pcId) }
     ModalBottomSheet(onDismissRequest = { if (!workspace.busy) workspace.createPc = null },
@@ -572,24 +622,26 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
         }
         Column(Modifier.fillMaxWidth().heightIn(max = 620.dp).imePadding()) {
             Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("新建 AI 对话", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.ai_ui_new_chat), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                 IconButton(enabled = !workspace.busy, onClick = { workspace.createPc = null }) { Icon(Icons.Default.Close, "关闭新建对话", Modifier.size(20.dp)) }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (!workspace.createPcLocked && pcs.count { it.online && it.remoteRoutingEnabled } > 1)
-                    AiChoice("电脑", pcs.filter { it.online && it.remoteRoutingEnabled }.map { it.id.toString() to it.name }, pcKey, editable) { pcKey = it }
+                    AiChoice("电脑", pcs.filter { it.online && it.remoteRoutingEnabled }.map { it.id.toString() to it.name }, pcKey, true) {
+                        pcKey = it; workspace.beginCreate(UUID.fromString(it), lockPc = false)
+                    }
                 else Text(pcs.firstOrNull { it.id == pcId }?.name ?: "电脑", Modifier.padding(vertical = 10.dp), style = MaterialTheme.typography.bodySmall)
                 when {
-                    workspace.unavailable[pcId] == true -> Text("读取电脑能力失败，请重试。", style = MaterialTheme.typography.bodySmall)
-                    catalog == null -> Text("正在读取电脑能力…", style = MaterialTheme.typography.bodySmall)
-                    options.isEmpty() -> Text("当前电脑暂无可用 Agent，请在 Windows 设置中检测或配置。", style = MaterialTheme.typography.bodySmall)
+                    workspace.unavailable[pcId] == true -> Text(stringResource(R.string.ai_ui_cap_failed), style = MaterialTheme.typography.bodySmall)
+                    catalog == null -> Text(stringResource(R.string.ai_ui_cap_loading), style = MaterialTheme.typography.bodySmall)
+                    options.isEmpty() -> Text(stringResource(R.string.ai_ui_no_agents), style = MaterialTheme.typography.bodySmall)
                     else -> FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         options.forEach { option -> AiAction(option.name, filled = option.id == agent?.id,
                             enabled = ready && editable, onClick = { agentId = option.id }) }
                     }
                 }
-                if (remote) Text("使用已配置的 ZCode 桌面远控，连接由 ZCode 服务提供。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (remote) Text(if (initialDirectory != null) "ZCode 桌面远控不接收所选目录，工作目录需在 ZCode 中设置。" else "使用已配置的 ZCode 桌面远控，连接由 ZCode 服务提供。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 else if (agent != null) {
                     val agentConfiguration = agent.configuration
                     val permissionModes = agentConfiguration.permissionModes.ifEmpty {
@@ -614,9 +666,9 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                     }
                     if (!managed) {
                         OutlinedTextField(directory, { if (it.length <= 4096) directoryOverride = it },
-                            label = { Text("电脑工作目录") }, modifier = Modifier.fillMaxWidth(), maxLines = 3, enabled = editable, textStyle = MaterialTheme.typography.bodyMedium)
-                        if (catalog?.directoryBrowsing == true) AiAction("浏览选择", Icons.Default.FolderOpen, enabled = editable && ready, onClick = { browseDirectory = true })
-                        else Text("升级 Windows 客户端后可浏览选择目录。", style = MaterialTheme.typography.labelSmall)
+                            label = { Text(stringResource(R.string.ai_ui_pc_workdir)) }, modifier = Modifier.fillMaxWidth(), maxLines = 3, enabled = editable, textStyle = MaterialTheme.typography.bodyMedium)
+                        if (catalog?.directoryBrowsing == true) AiAction(stringResource(R.string.ai_ui_browse), Icons.Default.FolderOpen, enabled = editable && ready, onClick = { browseDirectory = true })
+                        else Text(stringResource(R.string.ai_ui_upgrade_browse), style = MaterialTheme.typography.labelSmall)
                     }
                     key(pcKey, catalog?.hostId, agent.id, agent.strategy) {
                         AiModelPicker(workspace, pcId, agent.id, agentConfiguration.modelListing, ready, editable,
@@ -644,9 +696,9 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                         }
                 }
                 if (workspace.error.isNotEmpty()) Text(workspace.error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                if (workspace.uncertain) AiAction("查询创建结果", enabled = !workspace.busy, onClick = workspace::retryUncertain)
+                if (workspace.uncertain) AiAction(stringResource(R.string.ai_ui_query_create), enabled = !workspace.busy, onClick = workspace::retryUncertain)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    AiAction("刷新", Icons.Default.Refresh, enabled = editable, onClick = { scope.launch { workspace.refresh(pcId) } })
+                    AiAction(stringResource(R.string.ai_ui_refresh), Icons.Default.Refresh, enabled = editable, onClick = { scope.launch { workspace.refresh(pcId) } })
                     Spacer(Modifier.weight(1f))
                     AiAction(if (workspace.busy) "正在创建…" else if (remote) "打开远控" else "创建对话", Icons.AutoMirrored.Filled.ArrowForward, filled = true,
                         enabled = ready && editable && agent != null && (remote || (managed || directory.isNotBlank()) &&
@@ -666,7 +718,7 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
             if (workspace.busy) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
         }
     }
-    if (browseDirectory && !remote) AiDirectoryPicker(workspace, pcId, "", ready,
+    if (browseDirectory && !remote) AiDirectoryPicker(workspace, pcId, directory, ready,
         onDismiss = { browseDirectory = false }, onSelect = { directoryOverride = it; customDirectory = true; browseDirectory = false })
     proposedMode?.let { candidate ->
         val selected = agent?.configuration?.permissionModes?.firstOrNull { it.id == candidate }
@@ -674,10 +726,10 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
         AlertDialog(onDismissRequest = { proposedMode = null }, title = { Text(selected?.let(::aiPermissionLabel) ?: candidate) }, text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(selected?.let(::aiPermissionDetail) ?: "由 Agent 原生处理。")
-                if (selected?.requiresConfirmation == true) Text("该授权模式可能扩大 Agent 的操作范围，请确认后继续。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                if (selected?.requiresConfirmation == true) Text(stringResource(R.string.ai_ui_permission_warning), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
-        }, confirmButton = { TextButton(onClick = { mode = candidate; confirmedMode = candidate; proposedMode = null }) { Text("确认用于新会话") } },
-            dismissButton = { TextButton(onClick = { proposedMode = null }) { Text("取消") } })
+        }, confirmButton = { TextButton(onClick = { mode = candidate; confirmedMode = candidate; proposedMode = null }) { Text(stringResource(R.string.ai_ui_confirm_new)) } },
+            dismissButton = { TextButton(onClick = { proposedMode = null }) { Text(stringResource(R.string.ai_ui_cancel)) } })
     }
 }
 
@@ -714,10 +766,7 @@ internal fun AiAction(text: String, icon: ImageVector? = null, enabled: Boolean 
 
 @Composable
 private fun AiAgentBadge(name: String) {
-    Surface(shape = RoundedCornerShape(6.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .12f)) {
-        Text(when { name.contains("Claude", true) -> "C"; name.contains("Codex", true) -> ">_"; name.contains("ZCode", true) -> "Z"; else -> "AI" },
-            Modifier.padding(horizontal = 6.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-    }
+    AiAgentProductIcon(aiAgentId(name))
 }
 
 @Composable
@@ -749,21 +798,25 @@ internal fun AiDeviceSessions(workspace: AiWorkspace, pc: PcSummary, expanded: B
     LaunchedEffect(pc.id, expanded, pc.online, pc.remoteRoutingEnabled, foreground) {
         if (expanded && pc.online && pc.remoteRoutingEnabled && foreground) while (true) { workspace.refresh(pc.id); delay(6_000) }
     }
-    val sessions = workspace.catalogs[pc.id]?.sessions.orEmpty()
-    Column(Modifier.padding(horizontal = 12.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            if (expanded) Text("${sessions.size} 个对话", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
-        }
-        if (expanded) sessions.forEach { entry ->
-            val session = workspace.conversations[entry.id] ?: entry
-            val online = pc.online && pc.remoteRoutingEnabled && workspace.unavailable[pc.id] != true
-            Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable { workspace.open(session); onOpen() }, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Icon(Icons.Default.AutoAwesome, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
-                Column(Modifier.weight(1f)) {
-                    Text(if (online) aiConversationTitle(session) else "${session.agent} 对话", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                    Text(session.agent + if (online) " · ${aiDirectoryName(session.directory)}" else "", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
+    if (!expanded) return
+    val catalog = workspace.catalogs[pc.id]
+    val online = pc.online && pc.remoteRoutingEnabled && workspace.unavailable[pc.id] != true
+    val groups = aiCatalogEntries(pc.id, catalog).groupBy { aiEntryAgentId(it, workspace.conversations[it.sessionId]) }
+    Column(Modifier.padding(horizontal = 12.dp, vertical = 2.dp)) {
+        when {
+            !online -> Text(stringResource(R.string.ai_ui_ai_wait), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            catalog == null -> Text(stringResource(R.string.ai_ui_ai_loading), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            groups.isEmpty() -> Text(stringResource(R.string.ai_ui_ai_empty), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else -> groups.forEach { (agentId, entries) ->
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(role = Role.Button) {
+                    workspace.browseAgentGroup(pc.id, agentId); onOpen()
+                }, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AiAgentProductIcon(agentId)
+                    Text(aiAgentName(agentId), Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                    val count = entries.count { it.strategy != "desktop_remote" }
+                    Text(if (count == 0) stringResource(R.string.ai_remote_strategy) else stringResource(R.string.ai_group_count, count), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Icon(Icons.Default.ChevronRight, stringResource(R.string.ai_group_open, pc.name, aiAgentName(agentId)), Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                AiStatusTag(if (online) aiSessionLabel(session) else "待确认", online && aiNeedsAttention(session))
             }
         }
     }

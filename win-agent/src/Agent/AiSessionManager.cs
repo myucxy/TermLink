@@ -26,6 +26,18 @@ internal sealed class AiSessionManager : IDisposable
     private readonly SemaphoreSlim modelQueries = new(2, 2);
     private readonly AiSessionArchive archive;
     private bool archiveLoaded;
+    internal (DesktopAiSessionSummary[] Items, int Active, bool Truncated) DesktopSummaries() {
+        lock (sync) {
+            var all = sessions.Values.Select(s => s.DesktopSummary()).ToArray();
+            var items = new List<DesktopAiSessionSummary>(); var bytes = 0;
+            foreach (var item in all) {
+                var length = System.Text.Encoding.UTF8.GetByteCount(item.Id + item.Title + item.Agent + item.Directory + item.State) + 32;
+                if (bytes + length > 12000 || items.Count == 64) continue;
+                bytes += length; items.Add(item);
+            }
+            return (items.ToArray(), all.Count(s => s.State is "starting" or "running" or "awaiting_input"), items.Count != all.Length);
+        }
+    }
     private readonly Dictionary<(Guid Caller, string Agent, string NativeId), (AiNativeHistoryEntry Entry, DateTime At)> nativeHistory = new();
     internal AiSessionManager(ZcodeRemoteAddressStore remoteStore = null, string installRoot = null, string archiveRoot = null) {
         this.remoteStore = remoteStore ?? ZcodeRemoteAddressStore.Default;

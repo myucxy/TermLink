@@ -269,6 +269,19 @@ var response = new RegistryResponse
 response.Production.AiAgentsJson = "[{\"Id\":\"zcode\",\"Status\":\"available\"}]";
 Require(RoundTripRequest(new RegistryRequest { Command = RegistryCommand.DetectAiAgents }).Command == RegistryCommand.DetectAiAgents, "V13 discovery command changed.");
 var decoded = RoundTripResponse(response);
+response.Production.Sessions[0].Title = "真实终端标题";
+response.Production.AiSessions = new List<DesktopAiSessionSummary> {
+    new() { Id = sessionId.ToString(), Title = "AI task", Agent = "Codex", Directory = @"D:\Work", State = "running" }
+};
+response.Production.ActiveAiSessions = 1;
+var detailed = RoundTripResponse(response);
+Require(detailed.Production.Sessions[0].Title == "真实终端标题" && detailed.Production.AiSessions[0].Directory == @"D:\Work" && detailed.Production.ActiveAiSessions == 1,
+    "V14 session metadata or active count changed.");
+foreach (var command in new[] { RegistryCommand.CancelAccountAuthorization, RegistryCommand.ReopenAccountAuthorization }) {
+    Require(RoundTripRequest(new RegistryRequest { Command = command }).Command == command, "V14 authorization control changed.");
+    try { using var old = new MemoryStream(); RegistryControlCodec.WriteRequest(old, new RegistryRequest { Command = command }, 13); throw new Exception("V13 accepted new authorization controls."); }
+    catch (InvalidDataException) { }
+}
 Require(decoded.Production.AiAgentsJson == response.Production.AiAgentsJson, "V13 AI catalog changed.");
 Require(decoded.Success && decoded.Code == "OK" && decoded.RemoteAccessEnabled, "Response header changed.");
 Require(decoded.AffectedSessions == 2 && decoded.TimedOutSessions == 1, "Response counts changed.");

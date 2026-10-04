@@ -40,6 +40,9 @@ internal fun AiRemotePage(workspace: AiWorkspace, entry: AiOpened, pcName: Strin
     var failure by remember(entry.sessionId) { mutableStateOf("") }
     var progress by remember(entry.sessionId) { mutableIntStateOf(0) }
     var menu by remember { mutableStateOf(false) }
+    var remoteView by remember { mutableStateOf<WebView?>(null) }
+    var canGoBack by remember { mutableStateOf(false) }
+    androidx.activity.compose.BackHandler(enabled = canGoBack && online) { remoteView?.goBack() }
     val context = LocalContext.current
     var fileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     var fileLimit by remember { mutableIntStateOf(1) }
@@ -89,6 +92,7 @@ internal fun AiRemotePage(workspace: AiWorkspace, entry: AiOpened, pcName: Strin
             key(target, generation) {
                 AndroidView(modifier = Modifier.weight(1f).fillMaxWidth(), factory = { context ->
                     WebView(context).apply {
+                        remoteView = this
                         // A wrap-content WebView gives percentage-height pages a zero-height root.
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         settings.javaScriptEnabled = true
@@ -114,6 +118,7 @@ internal fun AiRemotePage(workspace: AiWorkspace, entry: AiOpened, pcName: Strin
                             }
                         }
                         webViewClient = object : WebViewClient() {
+                            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) { canGoBack = view.canGoBack() }
                             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                                 val blocked = !isAllowedZcodeRemoteUrl(request.url.toString())
                                 if (blocked && request.isForMainFrame) failure = "页面跳转受限，可从菜单使用浏览器打开。"
@@ -136,6 +141,7 @@ internal fun AiRemotePage(workspace: AiWorkspace, entry: AiOpened, pcName: Strin
                         doOnLayout { loadUrl(target) }
                     }
                 }, update = { if (foreground) it.onResume() else it.onPause() }, onRelease = {
+                    remoteView = null; canGoBack = false
                     fileCallback?.onReceiveValue(null); fileCallback = null
                     it.stopLoading(); it.webChromeClient = null; it.webViewClient = WebViewClient()
                     it.clearHistory(); it.removeAllViews(); it.destroy()
