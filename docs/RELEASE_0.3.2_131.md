@@ -18,7 +18,8 @@ origin/main 与此源码一致。此后发布记录提交不改变构建来源�
 
 Windows adapter 验证与 Avalonia headless 验证通过，桌面构建 0 warning / 0 error。
 已发布 130 的真实下载、哈希、签名、缓存复核和篡改拒绝此前通过。
-安装生命周期对本轮源码单独验证，DEV 构建沿用当前已发布 0.3.2/130。
+安装生命周期对本轮源码单独验证通过：隔离安装、原地升级、工作目录脱离、跨路径升级拒绝与卸载；
+该验收 DEV 构建沿用验证当时已发布的 0.3.2/130，与 build131 生产签名校验分别记录。
 
 HT-LPC-1326 的准确原始异常尚未取得；独立下载的安装包可安装不能证明其自动更新失败的唯一根因。
 本轮交付启动兼容改进，不宣称该电脑已实测修复，也没有改变自签名信任策略。
@@ -42,10 +43,27 @@ HT-LPC-1326 的准确原始异常尚未取得；独立下载的安装包可安�
 
 ## 发布状态与回滚
 
-当前为本地生产制品，上传前记录。用户已明确授权发布当前 Windows 修复并沿用版本名；
+已通过 AppShip 发布到 Windows stable，状态为 **published/ready**。用户已明确授权发布当前 Windows 修复并沿用版本名；
 使用既有批准的发布者签名，机器验证与用户发布授权分别记录，不把机器校验冒充用户逐项核对哈希。
 上传沿用仓库包装器与 appship-publish 技能，失败保留幂等状态，重试不重新加号。
-Windows DEV 基线仅在 published/ready 与公开更新接口核验成功后改为 0.3.2/131。
+2026-10-04 15:12:01 UTC 管理 API 与公开更新接口核验通过，Windows DEV 基线更新为 **0.3.2/131**；
+Android DEV 基线仍为 0.3.2/130。
+
+| 项目 | 结果 |
+| --- | --- |
+| application ID | `0ae760b3-294e-48e8-a793-95d162f685e2` |
+| release ID | `ce2e69a0-d9ae-4a74-b69f-6535e61e15f8` |
+| artifact ID | `c0f0abe1-bf33-4e5f-8403-9ae6a16713a1` |
+| 发布时间（UTC） | 2026-10-04 15:11:13 |
+| 签名审核状态 | manual_approved |
+| Windows build129、130 更新查询 | optional → 0.3.2/build131 |
+| Windows build131 更新查询 | no_update |
+| Android build130 更新查询 | no_update，仍为 0.3.2/130 |
+
+旧 build130 的 published 状态与 SHA-256 保持不变。线上新制品版本、哈希、字节数和 signer 均匹配本地审核记录。
+使用本机旧版 0.3.1/129 更新组件重新下载 build131，完整性、Authenticode、缓存、文件释放及篡改拒绝测试通过。
+线上核验：`artifacts/validation/release-131-appship-final.json`；下载回归：`artifacts/validation/release-131-download-validation.log`。
+幂等状态：`.appship/termlink-win64-stable-0.3.2-build131-signature-approved.json`。
 
 保留 Windows 0.3.2/130 的原制品与历史发布；不删除数据降级，不覆盖已发布哈希。
 若需回退，通过受控安装或更高 build 发布已知良好源码。AppShip 发布完成不等于客户端已安装。
