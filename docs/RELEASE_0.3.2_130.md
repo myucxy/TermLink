@@ -5,13 +5,28 @@
 用户要求先完成测试并发布 Android、Windows，然后适配其他 Agent；后续适配不要求登录，
 本机已安装时可测试。本轮不修改 Server，不构建或推送 Docker。只验收服务器转发，LAN/NAT 不适用。
 
-现场 AppShip 两端 stable 为 0.3.1/129，发布状态为 published/ready，nextBuildNumber=130；
+构建前现场 AppShip 两端 stable 为 0.3.1/129，发布状态为 published/ready，nextBuildNumber=130；
 Docker Hub 最高版本为 0.3.0，远端 v0.3* tag 为空。本轮固定 **0.3.2/130**，重试不重新加号。
 Production 源码 revision 为 `b697751c4634108fa4c9b9d442f84b21a6787724`，已推送 origin/main，
 构建时工作树干净；Windows ProductVersion 绑定此完整 revision。后续记录提交不改变制品来源。
 
-当前状态：功能及影响范围测试、Production 双端构建与独立校验完成，等待精确制品的人工签名审核，尚未上传 AppShip。
+当前状态：用户对精确制品审核请求回复“开始上传”，已记录人工签名审核；Android → Windows
+依次发布 AppShip stable 成功，两端均为 **0.3.2/130、published/ready**。
 构建、签名审核、AppShip 上传与客户端部署分别记录，不能把候选构建当成已发布。
+
+## AppShip 发布结果
+
+| 平台 | 发布 ID | 制品 ID | 发布时间（UTC） |
+| --- | --- | --- | --- |
+| Android | `9dffe996-f374-42d8-a574-ecf1ea09414a` | `902ee2a3-9597-40e2-b817-51ca9e52fb5e` | 2026-10-04 14:27:51 |
+| Windows x64 | `a8734922-00d6-45b6-a6ad-c95e0c22b92b` | `6a3728a0-7b27-4769-8f72-f73d44312916` | 2026-10-04 14:28:51 |
+
+2026-10-04 14:30:25 UTC 重新读取管理 API 与公开更新 API：两端发布/制品为 published/ready，
+版本、build、字节数、SHA-256、签名指纹均与下列候选一致；签名审核状态为 manual_approved。
+Android arm64-v8a 与 Windows x64 的 build 129 均返回 optional，build 130 均返回 no_update。
+核验记录：`artifacts/validation/release-130-appship-final.json`；幂等状态保留在
+`.appship/termlink-{android,win64}-stable-0.3.2-build130-signature-approved.json`。
+**两端后续 DEV 基线均更新为 0.3.2/130**，下一轮开发构建不加号。
 
 ## 发布内容
 
@@ -38,7 +53,7 @@ Production 源码 revision 为 `b697751c4634108fa4c9b9d442f84b21a6787724`，已�
 - 上游 Grok 曾间歇性 HTTP 429，取消后有限复测成功；保留失败记录，不宣称账号不会再次限流。
 
 日志/截图均在 ignored 的 artifacts/validation/：ai-grok-*、ai-claude-relay-*。
-本轮 DEV 沿用 0.3.1/129；待每端正式发布并验证后才更新 DEV 基线。
+本轮发布前 DEV 测试沿用 0.3.1/129；上述正式发布核验后，后续 DEV 基线为 0.3.2/130。
 
 ## 签名、回滚与边界
 
@@ -55,11 +70,12 @@ AppShip 精确制品签名审核见 artifacts/release/0.3.2-130/REVIEW.md。
 APK v2 唯一 signer、Windows AuthentiCode Valid、17 个载荷二进制、RFC 3161 时间戳及哈希/版本均通过。
 首轮 Microsoft 时间戳服务重试失败，保留日志；同源码/同版本使用 Sectigo 重试成功，未跳过门禁。
 模拟器正式包从 0.3.0/128 无损覆盖至本候选 0.3.2/130，成功启动并保留登录，DEV 仍独立保留。
-签名校验是机器验证，尚不代表人工审核通过；两端上传计划已只读验证。
+签名校验与人工审核分别留存；用户批准后使用同一审核说明及既有指纹顺序发布双端。
 
 回滚使用保留的 0.3.1/129 制品及既有签名；Android 不卸载清数据，版本降级限制需要走兼容的
 更高 build 修复发布或受控测试流程。Windows 保留用户数据及安装器回滚证据；Server 不变。
 联测临时 Windows Agent 结束后恢复 D:/Dev/Tool/TermLink 运行时，原安装文件没有替换。
+本轮上传未触发本机 Windows 安装；其安装版本仍为 0.3.1.129，可通过正常更新获取新版本。
 
 Grok 外部原生历史导入、会话中途切换权限、原生识图、问答/usage 扩展未宣称支持；
 后台真机与全部弱网组合未全覆盖。Gemini/OpenCode/Qwen/Kimi/Copilot/Cursor/Pi 等适配在本轮
