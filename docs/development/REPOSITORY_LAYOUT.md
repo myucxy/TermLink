@@ -35,6 +35,8 @@ TermLink/                  工作区容器，无 .git
 
 ## 构建和版本
 
+实际编译、无核心源码检出打包及 DLL/SO 入包验证见[二进制边界验证记录](BINARY_CORE_VALIDATION.md)。
+
 应用构建只读取本仓库的 `native/terminal-core/` 二进制，不访问同级核心源码。维护者可以继续使用同级目录；普通应用开发者只需检出应用仓库。
 
 ```text
