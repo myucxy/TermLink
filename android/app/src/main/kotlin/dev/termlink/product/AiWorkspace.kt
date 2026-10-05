@@ -174,6 +174,8 @@ internal class AiWorkspace(
     val unavailable = mutableStateMapOf<UUID, Boolean>()
     var opened by mutableStateOf(readOpened())
         private set
+    var closedSessionIds by mutableStateOf(preferences.getStringSet("closed_sessions", emptySet()).orEmpty().toSet())
+        private set
     var selected by mutableStateOf<String?>(null)
     var listPc by mutableStateOf<UUID?>(null)
     var listTarget by mutableStateOf<AiGroupTarget?>(null)
@@ -204,7 +206,7 @@ internal class AiWorkspace(
             requests.forEach { put(UUID.fromString(it.getString("pc")), it.getString("body")) }
         } }
     }
-    private val displayedPc: UUID? get() = createPc ?: opened.firstOrNull { it.sessionId == selected }?.pcId ?: listPc
+    private val displayedPc: UUID? get() = createPc ?: conversations[selected]?.pcId ?: opened.firstOrNull { it.sessionId == selected }?.pcId ?: listPc
     fun isBusy(pc: UUID) = busyPcs[pc] == true
     fun isUncertain(pc: UUID) = pc in pending && !isBusy(pc)
     fun isBlocked(pc: UUID) = isBusy(pc) || pc in pending
@@ -450,14 +452,21 @@ internal class AiWorkspace(
     }.getOrDefault(emptyList())
 
     private fun saveOpened() {
-        preferences.edit().putString("opened", JSONArray().apply { opened.forEach {
+        preferences.edit().putStringSet("closed_sessions", closedSessionIds).putString("opened", JSONArray().apply { opened.forEach {
             put(JSONObject().put("pc", it.pcId).put("session", it.sessionId).put("strategy", it.strategy).put("agentId", it.agentId))
         } }.toString()).apply()
     }
 
     fun open(session: AiConversation) {
         conversations.putIfAbsent(session.id, session)
-        if (opened.none { it.sessionId == session.id }) { opened = (opened + AiOpened(session.pcId, session.id, agentId = session.agentId)).takeLast(64); saveOpened() }
+        if (aiIsHistorical(session)) {
+            opened = opened.filterNot { it.sessionId == session.id }
+            closedSessionIds = closedSessionIds + session.id
+        } else {
+            closedSessionIds = closedSessionIds - session.id
+            if (opened.none { it.sessionId == session.id }) opened = (opened + AiOpened(session.pcId, session.id, agentId = session.agentId)).takeLast(64)
+        }
+        saveOpened()
         selected = session.id
     }
 
@@ -525,7 +534,9 @@ internal class AiWorkspace(
     fun openRemote(pcId: UUID, agentId: String) {
         if (retired || isBlocked(pcId) || catalogs[pcId]?.agents?.none { it.id == agentId && it.strategy == "desktop_remote" && it.supported } != false) return
         val entry = AiOpened(pcId, "remote:$pcId:$agentId", "desktop_remote", agentId)
-        if (entry !in opened) { opened = (opened + entry).takeLast(64); saveOpened() }
+        closedSessionIds = closedSessionIds - entry.sessionId
+        if (entry !in opened) opened = (opened + entry).takeLast(64)
+        saveOpened()
         selected = entry.sessionId; createPc = null
     }
 
@@ -541,12 +552,28 @@ internal class AiWorkspace(
     }
 
     fun closeView(id: String) {
+        // Catalog-only rows can also be dismissed. Persist the choice so a
+        // catalog refresh or process restart cannot reopen the phone view.
+        closedSessionIds = closedSessionIds + id
         opened = opened.filterNot { it.sessionId == id }; saveOpened()
         conversations.remove(id); reading.remove(id); drafts.remove(id)
+        clearAttention?.invoke(id)
         preferences.edit().remove("web:$id").apply()
         questionDrafts.keys.removeAll { it.first == id }
         queued.remove(id); fileReferences.remove(id); attachments.remove(id)?.forEach { it.job?.cancel(); it.file?.delete() }
         if (selected == id) selected = null
+        saveDrafts()
+    }
+
+    fun endSession(session: AiConversation): Deferred<Boolean> = scope.async {
+        var current = conversations[session.id]?.takeIf { it.pcId == session.pcId }
+            ?: catalogs[session.pcId]?.sessions?.firstOrNull { it.id == session.id } ?: return@async false
+        if (aiIsHistorical(current)) return@async false
+        if (!current.canControl) {
+            if (mutate(current.pcId, "control", current)?.await() != true) return@async false
+            current = conversations[session.id]?.takeIf { it.pcId == session.pcId && it.canControl } ?: return@async false
+        }
+        mutate(current.pcId, "end", current)?.await() == true
     }
 
     fun retire(clearPending: Boolean = false) {
@@ -650,11 +677,19 @@ internal class AiWorkspace(
             try {
                 val result = JSONObject(repository.aiRequest(pcId, body))
                 if (retired) return@async false
+                val request = JSONObject(body)
+                if (result.optString("error").isEmpty() && request.optString("action") in setOf("end", "forget")) {
+                    check(result.getString("hostId") == request.getString("hostId"))
+                    if (request.getString("action") == "forget") check(result.getString("deletedSessionId") == request.getString("sessionId"))
+                    else {
+                        val ended = parseConversation(pcId, result.getJSONObject("session"))
+                        check(ended.id == request.getString("sessionId") && aiIsHistorical(ended))
+                    }
+                }
                 accept(pcId, result)
                 unavailable.remove(pcId)
                 savePending(pending.toMap() - pcId)
                 pending.remove(pcId)
-                val request = JSONObject(body)
                 if (result.optString("error").isNotEmpty() && request.has("queueId")) {
                     val id = request.optString("sessionId")
                     queued[id] = queued[id].orEmpty().map { if (it.id == request.optString("queueId")) it.copy(failed = true) else it }
@@ -673,6 +708,14 @@ internal class AiWorkspace(
                             if (request.optString("directoryMode") != "managed") preferences.edit().putString("directory:$pcId", created.directory).apply()
                         }
                         if (createPc == pcId) createPc = null
+                    }
+                    // Only a confirmed end removes the phone view. Lost replies
+                    // retain the exact operation ID for receipt recovery.
+                    if (request.optString("action") == "end") {
+                        request.optString("sessionId").takeIf { it.isNotBlank() }?.let(::closeView)
+                    }
+                    if (request.optString("action") == "resume") {
+                        result.optJSONObject("session")?.let { open(parseConversation(pcId, it)) }
                     }
                 }
                 result.optString("error").isEmpty()
@@ -712,6 +755,8 @@ internal class AiWorkspace(
                 } }
             }
             catalogs[pcId] = next
+            val historical = sessions.filter(::aiIsHistorical).map { it.id }
+            if (historical.any { it !in closedSessionIds }) { closedSessionIds = closedSessionIds + historical; saveOpened() }
             val updatedOpened = opened.map { entry ->
                 if (entry.pcId == pcId && entry.agentId.isEmpty()) sessions.firstOrNull { it.id == entry.sessionId }?.let { entry.copy(agentId = it.agentId) } ?: entry else entry
             }
@@ -726,6 +771,7 @@ internal class AiWorkspace(
         }
         result.optJSONObject("session")?.let {
             val next = parseConversation(pcId, it)
+            if (aiIsHistorical(next) && next.id !in closedSessionIds) { closedSessionIds = closedSessionIds + next.id; saveOpened() }
             val old = conversations[next.id]
             if (old?.state != next.state) aiReminderTrace("transition ${old?.state} -> ${next.state}; foreground=$foreground enabled=$notificationsEnabled callback=${notifyAttention != null}")
             if (notificationsEnabled && !foreground && old != null && (old.pendingCount == 0 && next.pendingCount > 0 || old.state == "running" && next.state != "running" || old.error.isEmpty() && next.error.isNotEmpty()))
@@ -735,9 +781,18 @@ internal class AiWorkspace(
                 val latest = next.messages.associateBy { message -> message.id }
                 next.copy(messages = (old.messages.map { message -> latest[message.id] ?: message } + next.messages).distinctBy { message -> message.id }, historyBefore = minOf(old.historyBefore, next.historyBefore))
             } else next
+            // Keep history metadata current even before the next catalog poll.
+            catalogs[pcId]?.let { catalog ->
+                val metadata = next.copy(messages = emptyList(), pending = emptyList())
+                catalogs[pcId] = catalog.copy(sessions = catalog.sessions.filterNot { s -> s.id == next.id } + metadata)
+            }
         }
         result.optString("deletedSessionId").takeIf { it.isNotEmpty() }?.let { id ->
-            if (conversations[id]?.pcId == pcId) { closeView(id); catalogs[pcId]?.let { catalogs[pcId] = it.copy(sessions = it.sessions.filterNot { s -> s.id == id }) } }
+            if (conversations[id]?.pcId == pcId || catalogs[pcId]?.sessions?.any { it.id == id } == true || opened.any { it.pcId == pcId && it.sessionId == id }) {
+                closeView(id)
+                catalogs[pcId]?.let { catalogs[pcId] = it.copy(sessions = it.sessions.filterNot { s -> s.id == id }) }
+                pinned.remove(id); preferences.edit().remove("pin:$id").apply()
+            }
         }
         questionDrafts.keys.removeAll { (id, request) -> conversations[id]?.pending?.none { it.id == request } != false }
     }

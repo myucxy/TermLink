@@ -6,6 +6,14 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 
 > 项目级许可证暂未确定。现有组件声明和第三方授权继续有效，详见 [许可证状态](LICENSE-STATUS.md)。
 
+## 界面演示
+
+[![TermLink 中文功能演示：CLI、AI 对话与文件](docs/media/termlink-demo-zh.png)](docs/media/termlink-demo-zh.mp4)
+
+[观看或下载视频（1 分 54 秒，MP4，约 5.3 MiB）](docs/media/termlink-demo-zh.mp4) · 简体中文界面、中文旁白、同步字幕与轻电子配乐。
+
+模拟器与 Windows 通过服务器中转实录：从设备新建 CLI、输入命令、调整窗口，到选择 AI Agent／模型／推理强度／授权、查看真实回复、预览文件及从目录继续 AI 对话，最后切换深色主题。等待片段经剪辑压缩。[章节与制作说明](docs/media/README.md) · [中文字幕](docs/media/termlink-demo-zh.srt)
+
 ## 下载与开始使用
 
 - Android / Windows：[AppShip](https://appship.kget.cc:8910)，安装包版本及签名说明见[发布记录索引](docs/releases/README.md)。

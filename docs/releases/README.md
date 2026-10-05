@@ -14,6 +14,7 @@
 
 ## 产品版本与 build 记录
 
+- [0.3.3 / build 132](../RELEASE_0.3.3_132.md)
 - [0.3.2 / build 131](../RELEASE_0.3.2_131.md)
 - [0.3.2 / build 130](../RELEASE_0.3.2_130.md)
 - [0.3.1 / build 129](../RELEASE_0.3.1_129.md)

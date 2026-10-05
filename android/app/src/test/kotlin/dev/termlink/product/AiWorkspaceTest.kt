@@ -262,6 +262,43 @@ class AiWorkspaceTest {
         } finally { scope.cancel(); prefs.edit().clear().commit() }
     }
 
+    @Test fun endingSessionRemovesPhoneViewAndLeavesCatalogHistory() = runBlocking {
+        val pc = UUID.randomUUID()
+        val id = UUID.randomUUID().toString()
+        val requests = mutableListOf<String>()
+        fun session(state: String) = """{"kind":"ai","id":"$id","agentName":"fixture","agentId":"codex","directory":"D:\\work","state":"$state","error":"","controlVersion":1,"canControl":true,"capabilities":{"history":true,"resume":true}}"""
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun aiRequest(pcId: UUID, body: String): String {
+                val action = JSONObject(body).getString("action")
+                requests += action
+                return when (action) {
+                    "catalog" -> """{"hostId":"host","agents":[],"sessions":[${session("idle")}] }"""
+                    "end" -> """{"hostId":"host","session":${session("exited")}}"""
+                    else -> error("unexpected action: $action")
+                }
+            }
+        }
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences("ai-end-close-" + UUID.randomUUID(), Context.MODE_PRIVATE)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            val workspace = AiWorkspace(repository, scope, prefs)
+            workspace.refresh(pc)
+            val value = workspace.conversations.getValue(id)
+            workspace.open(value)
+            assertEquals(listOf(id), workspace.opened.map { it.sessionId })
+            workspace.mutate(pc, "end", value)!!.await()
+            assertTrue(workspace.opened.isEmpty())
+            assertNull(workspace.conversations[id])
+            assertEquals(id, workspace.catalogs.getValue(pc).sessions.single().id)
+            assertEquals("exited", workspace.catalogs.getValue(pc).sessions.single().state)
+            assertEquals(listOf("catalog", "end"), requests)
+        } finally {
+            scope.cancel()
+            prefs.edit().clear().commit()
+        }
+    }
+
     @Test fun cliRouteAndAiRouteStayIndependent() {
         assertEquals(ProductPrimaryDestination.SESSIONS, ProductDestination.SESSIONS.primaryDestination())
         assertEquals(ProductDestination.SESSIONS, ProductPrimaryDestination.SESSIONS.destination())

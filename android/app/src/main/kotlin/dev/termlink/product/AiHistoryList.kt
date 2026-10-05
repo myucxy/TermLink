@@ -87,6 +87,7 @@ internal fun AiComputerHistory(workspace: AiWorkspace, pcs: List<PcSummary>, clo
     var error by remember(pcId, agentId) { mutableStateOf("") }
     var truncated by remember(pcId, agentId) { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    var lifecycle by remember { mutableStateOf<AiConversation?>(null) }
     val collapsed = remember(pcId) { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
     val catalog = workspace.catalogs[pcId]
@@ -138,8 +139,19 @@ internal fun AiComputerHistory(workspace: AiWorkspace, pcs: List<PcSummary>, clo
                     sessions.groupBy { it.agent }.forEach { (name, values) ->
                         item(key = "agent:$name") { AiGroupHeading(name, values.size, null, collapsed[name] == true) { collapsed[name] = collapsed[name] != true } }
                         if (collapsed[name] != true) items(values, key = { it.id }) { session ->
-                            Row(Modifier.fillMaxWidth().clickable { workspace.open(session); close() }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                AiSessionIdentity(session, Modifier.weight(1f)); Text(if (session.capabilities.resume && session.state in setOf("suspended", "exited", "interrupted")) "可恢复" else aiStateLabel(session.state), style = MaterialTheme.typography.labelSmall)
+                            Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Row(Modifier.weight(1f).clickable { workspace.open(session); close() }, verticalAlignment = Alignment.CenterVertically) {
+                                    AiSessionIdentity(session, Modifier.weight(1f))
+                                    Text(if (session.capabilities.resume && aiIsHistorical(session)) "可恢复" else aiStateLabel(session.state), style = MaterialTheme.typography.labelSmall)
+                                }
+                                var menu by remember(session.id) { mutableStateOf(false) }
+                                Box {
+                                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, stringResource(R.string.ai_ui_history_actions), Modifier.size(20.dp)) }
+                                    DropdownMenu(menu, { menu = false }) {
+                                        DropdownMenuItem(text = { Text(stringResource(if (aiIsHistorical(session)) R.string.ai_ui_delete_history else R.string.ai_end_chat), color = MaterialTheme.colorScheme.error) },
+                                            enabled = !workspace.isBlocked(session.pcId), onClick = { menu = false; lifecycle = session })
+                                    }
+                                }
                             }
                             HorizontalDivider()
                         }
@@ -168,4 +180,5 @@ internal fun AiComputerHistory(workspace: AiWorkspace, pcs: List<PcSummary>, clo
             Spacer(Modifier.height(12.dp))
         }
     }
+    lifecycle?.let { session -> AiLifecycleDialog(workspace, session, delete = aiIsHistorical(session)) { lifecycle = null } }
 }

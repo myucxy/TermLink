@@ -673,6 +673,11 @@
     <string name="ai_ui_remove">Remove</string>
     <string name="ai_ui_close_bulk">Close multiple phone views</string>
     <string name="ai_ui_select_all">Select all</string>
+    <string name="ai_ui_deselect_all">Deselect all</string>
+    <string name="ai_ui_close_empty">No chats in this list to close. Closed chats are available in PC history.</string>
+    <string name="ai_ui_delete_question">Delete chat record?</string>
+    <string name="ai_ui_delete_hint">Delete this TermLink record from Windows. The working directory, files and Agent’s own history are kept.</string>
+    <string name="ai_ui_history_actions">History record actions</string>
     <string name="ai_ui_close_selected">Close selected</string>
     <string name="ai_ui_full">Full content</string>
     <string name="ai_ui_read_failed">Could not read content. Close and retry.</string>

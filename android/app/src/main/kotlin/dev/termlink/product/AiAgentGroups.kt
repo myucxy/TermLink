@@ -33,16 +33,21 @@ internal fun aiAgentName(id: String): String = when (id) {
 internal fun aiEntryAgentId(entry: AiOpened, session: AiConversation?): String =
     aiAgentId(entry.agentId.ifBlank { session?.agentId.orEmpty() }, session?.agent.orEmpty())
 
+internal fun aiIsHistorical(session: AiConversation): Boolean = session.state in setOf("exited", "interrupted", "suspended")
+
 /** Catalog references are temporary list rows; browsing them must not open/persist phone views. */
 internal fun aiCatalogEntries(pcId: UUID, catalog: AiCatalog?): List<AiOpened> = buildList {
-    catalog?.sessions?.filter { it.pcId == pcId }?.forEach { add(AiOpened(pcId, it.id, agentId = aiAgentId(it.agentId, it.agent))) }
+    catalog?.sessions?.filter { it.pcId == pcId && !aiIsHistorical(it) }?.forEach { add(AiOpened(pcId, it.id, agentId = aiAgentId(it.agentId, it.agent))) }
     catalog?.agents?.filter { it.supported && it.strategy == "desktop_remote" }?.forEach {
         add(AiOpened(pcId, "remote:$pcId:${it.id}", "desktop_remote", it.id))
     }
 }.distinctBy { it.sessionId }
 
-internal fun aiListEntries(opened: List<AiOpened>, pcId: UUID?, catalog: AiCatalog?, online: Boolean): List<AiOpened> =
+internal fun aiListEntries(opened: List<AiOpened>, pcId: UUID?, catalog: AiCatalog?, online: Boolean,
+    closedSessionIds: Set<String> = emptySet(), sessions: Map<String, AiConversation> = emptyMap()): List<AiOpened> =
     (opened + if (pcId != null && online) aiCatalogEntries(pcId, catalog) else emptyList()).distinctBy { it.sessionId }
+        .filter { it.sessionId !in closedSessionIds && sessions[it.sessionId]?.let(::aiIsHistorical) != true &&
+            catalog?.sessions?.firstOrNull { session -> session.id == it.sessionId }?.let(::aiIsHistorical) != true }
 
 internal data class AiGroupTarget(val pcId: UUID, val agentId: String) {
     val key get() = "agent:$pcId:$agentId"
