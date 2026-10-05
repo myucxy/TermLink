@@ -67,6 +67,44 @@ function Invoke-NativeCapture {
     return @($output | ForEach-Object { [string]$_ })
 }
 
+function Export-TermLinkServerBinary {
+    param(
+        [Parameter(Mandatory)][object[]]$Layers,
+        [Parameter(Mandatory)][string]$BlobRoot,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    # Later COPY instructions may add notices after the executable layer.
+    # Search the effective root file from newest to oldest, respecting deletion.
+    for ($index = $Layers.Count - 1; $index -ge 0; $index--) {
+        $digest = [string]$Layers[$index].digest
+        Assert-Release ($digest -cmatch '^sha256:[0-9a-f]{64}$') 'Invalid OCI layer digest.'
+        $layerPath = Join-Path $BlobRoot $digest.Substring(7)
+        Assert-Release ((Get-Sha256Hex $layerPath) -ceq $digest.Substring(7)) 'OCI layer digest mismatch.'
+        $entries = @(Invoke-NativeCapture -FilePath 'tar' -Arguments @('-tf', $layerPath) `
+            -Description 'OCI layer listing')
+        $binaryEntries = @($entries | Where-Object { $_ -cmatch '^(?:\./)*termlink-server/?$' })
+        if ($binaryEntries.Count -gt 0) {
+            Assert-Release ($binaryEntries.Count -eq 1) 'OCI layer has ambiguous server entries.'
+            $details = @(Invoke-NativeCapture -FilePath 'tar' `
+                -Arguments @('-tvf', $layerPath, '--', $binaryEntries[0]) -Description 'OCI server entry inspection')
+            Assert-Release ($details.Count -eq 1 -and $details[0].StartsWith('-')) `
+                'OCI server entry must be a regular file.'
+            [IO.Directory]::CreateDirectory($Destination) | Out-Null
+            $null = Invoke-NativeCapture -FilePath 'tar' `
+                -Arguments @('-xf', $layerPath, '-C', $Destination, '--', $binaryEntries[0]) `
+                -Description 'OCI server binary extraction'
+            $binaryPath = Join-Path $Destination 'termlink-server'
+            Assert-Release (Test-Path -LiteralPath $binaryPath -PathType Leaf) 'Server binary extraction failed.'
+            return $binaryPath
+        }
+        $rootEntries = @($entries | ForEach-Object { $_ -creplace '^(?:\./)+', '' })
+        Assert-Release (-not ($rootEntries -ccontains '.wh.termlink-server' -or
+            $rootEntries -ccontains '.wh..wh..opq')) 'Server binary removed by a later OCI layer.'
+    }
+    throw 'Server binary missing from OCI image.'
+}
+
 function Read-BoundedBundleString {
     param(
         [Parameter(Mandatory)][IO.BinaryReader]$Reader,
@@ -740,16 +778,9 @@ if ($ociRecords.Count -eq 1) {
                 Assert-Release ($labels.'org.opencontainers.image.revision' -match '^[0-9a-f]{40}(?:-dirty)?$') `
                     "OCI revision label is invalid for linux/$architecture."
 
-                $lastLayer = @($imageManifest.layers)[-1]
-                $layerDigest = ([string]$lastLayer.digest).Split(':')[1]
                 $platformRoot = Join-Path $temporaryDirectory $architecture
-                [IO.Directory]::CreateDirectory($platformRoot) | Out-Null
-                $null = Invoke-NativeCapture -FilePath 'tar' `
-                    -Arguments @('-xf', (Join-Path $temporaryDirectory "blobs\sha256\$layerDigest"), '-C', $platformRoot) `
-                    -Description "linux/$architecture application layer extraction"
-                $binaryPath = Join-Path $platformRoot 'termlink-server'
-                Assert-Release (Test-Path -LiteralPath $binaryPath -PathType Leaf) `
-                    "Server binary missing from linux/$architecture image."
+                $binaryPath = Export-TermLinkServerBinary -Layers @($imageManifest.layers) `
+                    -BlobRoot (Join-Path $temporaryDirectory 'blobs\sha256') -Destination $platformRoot
                 $stream = [IO.File]::OpenRead($binaryPath)
                 try {
                     $header = New-Object byte[] 20

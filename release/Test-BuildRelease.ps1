@@ -272,6 +272,9 @@ foreach ($status in @('Valid', 'UnknownError', 'NotTrusted')) {
 
 $payloadHelperNames = @(
     'Assert-Release',
+    'Get-Sha256Hex',
+    'Invoke-NativeCapture',
+    'Export-TermLinkServerBinary',
     'Resolve-SafeArchiveTarget',
     'Assert-NoReparsePoint',
     'Expand-SafePayloadArchive'
@@ -338,6 +341,46 @@ try {
     Expand-SafePayloadArchive -ArchivePath $validArchivePath -Destination $validOutput
     Assert-True ((Get-Content -LiteralPath (Join-Path $validOutput 'TermLink.TerminalCore.dll') -Raw) -ceq
         'managed terminal core') 'Setup payload extraction rejected or changed a safe regular file.'
+
+    $blobRoot = Join-Path $archiveSafetyRoot 'blobs'
+    [IO.Directory]::CreateDirectory($blobRoot) | Out-Null
+    $layers = @{}
+    foreach ($fixture in @(
+        @{ name = 'original'; file = 'termlink-server'; content = 'old server' },
+        @{ name = 'notices'; file = 'THIRD_PARTY_NOTICES.md'; content = 'notices' },
+        @{ name = 'replacement'; file = 'termlink-server'; content = 'new server' },
+        @{ name = 'deleted'; file = '.wh.termlink-server'; content = '' },
+        @{ name = 'opaque'; file = '.wh..wh..opq'; content = '' }
+    )) {
+        $layerInput = Join-Path $archiveSafetyRoot $fixture.name
+        [IO.Directory]::CreateDirectory($layerInput) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $layerInput $fixture.file), $fixture.content)
+        $layerArchive = Join-Path $archiveSafetyRoot "$($fixture.name).tar.gz"
+        $null = Invoke-NativeCapture -FilePath 'tar' -Arguments @('-czf', $layerArchive, '-C', $layerInput, '.') `
+            -Description 'OCI layer fixture creation'
+        $hash = Get-Sha256Hex $layerArchive
+        Copy-Item -LiteralPath $layerArchive -Destination (Join-Path $blobRoot $hash)
+        $layers[$fixture.name] = [pscustomobject]@{ digest = "sha256:$hash" }
+    }
+    $extracted = Export-TermLinkServerBinary -Layers @($layers.original, $layers.notices) `
+        -BlobRoot $blobRoot -Destination (Join-Path $archiveSafetyRoot 'oci-notices-output')
+    Assert-True ((Get-Content -LiteralPath $extracted -Raw) -ceq 'old server') `
+        'OCI verification lost the server when notices were added in a later layer.'
+    $extracted = Export-TermLinkServerBinary -Layers @($layers.original, $layers.replacement, $layers.notices) `
+        -BlobRoot $blobRoot -Destination (Join-Path $archiveSafetyRoot 'oci-replacement-output')
+    Assert-True ((Get-Content -LiteralPath $extracted -Raw) -ceq 'new server') `
+        'OCI verification selected an outdated server layer.'
+    foreach ($rejectedLayer in @('deleted', 'opaque', 'notices')) {
+        $candidates = if ($rejectedLayer -eq 'notices') { @($layers.notices) }
+            else { @($layers.original, $layers[$rejectedLayer]) }
+        $rejected = $false
+        try {
+            $null = Export-TermLinkServerBinary -Layers $candidates -BlobRoot $blobRoot `
+                -Destination (Join-Path $archiveSafetyRoot "oci-rejected-$rejectedLayer")
+        }
+        catch { $rejected = $_.Exception.Message -match 'Server binary (removed|missing)' }
+        Assert-True $rejected "OCI verification accepted a missing/deleted server: $rejectedLayer"
+    }
 }
 finally {
     $releaseArtifactsRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts\release'))

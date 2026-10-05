@@ -131,6 +131,15 @@ Server 使用 `docker buildx build --output type=oci,dest=...` 生成本地多�
 没有 `--push`。`-Publish` 是为未来审核后的发布实现预留的显式闸门；当前传入它会立即报错，
 即使同时使用 `-Plan` 也不会调用 registry、AppShip 或其他上传入口。
 
+构建前运行 `docker buildx ls`，选择支持多架构 OCI 导出的构建器。经典 image store 下的
+`docker` driver 不支持 OCI exporter，会报 `OCI exporter is not supported for the docker driver`。
+已有 `docker-container` 构建器时，用进程环境变量 `$env:BUILDX_BUILDER = '<builder-name>'`
+选择它，再调用构建脚本；不要为此修改 Docker Desktop 全局 image store 或默认构建器。
+本机 2026-10-05 验证使用已有的 `termlink-release-117`，其他机器须按现场清单选择。
+
+本地验证器按镜像层的覆盖/删除顺序查找 `/termlink-server`，不能假定程序在最后一层，
+因为许可证等后续 `COPY` 会生成新层。双仓库拆分后的实际入包核验见[打包验证记录](development/PACKAGING_SPLIT_VALIDATION.md)。
+
 以下为历史 Server registry 工作流说明，当前按页首规则本机直推；`.github/workflows/release.yml` 已取消 tag 自动触发。
 历史工作流曾在严格的 `vX.Y.Z` tag 上执行，
 目标固定为 `docker.io/myucxy/termlink`。工作流使用受保护的 `DOCKERHUB_USERNAME` 与
