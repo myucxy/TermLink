@@ -35,24 +35,36 @@ TermLink/                  工作区容器，无 .git
 
 ## 构建和版本
 
-从应用仓库运行[开发说明](BUILDING.md)中的命令。Windows 原生构建、.NET 项目的 DLL 引用以及 Android JNI 构建都指向同级 `../terminal-core`。
+应用构建只读取本仓库的 `native/terminal-core/` 二进制，不访问同级核心源码。维护者可以继续使用同级目录；普通应用开发者只需检出应用仓库。
 
-核心测试在核心仓库运行，固定 Rust 1.97.1；静态 CRT 配置和十份 Golden Stream 输入已随核心保留，不依赖应用目录内的测试数据。
-
-应用与核心独立提交。客户端正式发布必须同时记录两个 revision、确认各自工作区干净，并保存 native 产物哈希；应用 Git revision 不再独自代表全部源码。Server 构建不依赖终端核心。
-
-`terminal-core.lock.json` 固定本次兼容的核心 commit。核心代码修改并提交后，再在应用仓库更新该锁定值；不按浮动 main 自动升级核心。
-
-```powershell
-# 从应用仓库执行，只读核对两个 checkout
-.\scripts\Verify-TerminalCoreCheckout.ps1
-# 正式客户端构建前还要求两个仓库都干净
-.\scripts\Verify-TerminalCoreCheckout.ps1 -RequireClean
+```text
+terminal-core/                   私有实现与构建
+├── crates/、include/             Rust、C ABI 与头文件
+├── android/jni/                  JNI C++ 与 CMake
+└── scripts/Build-ToTermLink.ps1   编译并导出 DLL/SO
+termlink/
+├── native/terminal-core/
+│   ├── windows-x64/termlink_terminal_ffi.dll
+│   └── android/<abi>/libtermlink_terminal_jni.so
+└── terminal-core.lock.json       revision、dirty 标记、大小及 SHA-256
 ```
 
-统一发布脚本及 Windows Setup/MSIX 入口已接入该检查；普通核心构建允许未提交开发修改，但会核对核心 HEAD 与锁定值。绕过统一入口直接调用 Gradle 时仍需先运行该检查。锁定文件不代表核心 commit 已上传到远端；上传状态须单独核对。
+core 维护者从核心仓库运行 `./scripts/Build-ToTermLink.ps1`，默认向同级 `../termlink` 导出一个 DLL 和四种 ABI 的 SO。可用 `-TermLinkDirectory` 指定另一份应用源码目录。必须先完成全部编译，再复制二进制并更新锁文件；应用中的核心目录只存 DLL/SO，核心构建缓存保留在 core 的 `target/` 和 `dist/`。
 
-这次拆分仍是有权限维护者的源码构建方案。面向无核心源码权限的贡献者，预编译 DLL/SO/AAR、下载校验和二进制许可仍需后续实现，不能声称已经支持。
+core 的 JNI 注册名称、C ABI、Windows 静态 CRT 保持兼容；应用保留 C#/Kotlin 调用绑定、严格帧解码与 View，不包含原生核心实现或编译脚本。network-core 是应用自有的独立网络模块，不属于这次终端核心迁移。
+
+应用维护者将五个库与锁文件一起提交。构建校验仅核对这些文件，无需安装 core 仓库或取得其源码权限：
+
+```powershell
+.\scripts\Verify-NativeArtifacts.ps1
+.\scripts\Verify-NativeArtifacts.ps1 -Platform Windows
+# 正式客户端打包还要求应用干净，且核心产物来自干净提交
+.\scripts\Verify-NativeArtifacts.ps1 -RequireClean
+```
+
+Windows Setup/MSIX 与统一构建入口调用上述校验；Android Gradle 在 preBuild 验证四种 ABI 的大小和 SHA-256。校验失败即停止，不自动下载、重新编译或悄悄使用旧缓存。客户端发布记录应用 revision、锁文件中的 core revision 和二进制哈希；Server-only 不依赖终端核心。
+
+core 默认拒绝未提交源码导出；明确使用 `-Development` 才允许，锁文件记录 `source_dirty=true`，正式打包拒绝此类产物。此流程只实现已有授权边界内的二进制交付，不授予新的公开分发许可。
 
 ## 历史、可见性与许可
 

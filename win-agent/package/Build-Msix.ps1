@@ -114,7 +114,7 @@ Assert-True ($versionParts.Count -eq 4 -and @($versionParts | Where-Object { $_ 
 Assert-True (-not [string]::IsNullOrWhiteSpace($Publisher)) 'Publisher is required.'
 Assert-True (-not [string]::IsNullOrWhiteSpace($PublisherDisplayName)) 'Publisher display name is required.'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$null = & (Join-Path $projectRoot '..\scripts\Verify-TerminalCoreCheckout.ps1') -RequireClean:(-not $Development)
+$null = & (Join-Path $projectRoot '..\scripts\Verify-NativeArtifacts.ps1') -Platform Windows -RequireClean:(-not $Development)
 $dotNetPathWasExplicit = $PSBoundParameters.ContainsKey('DotNetPath')
 . (Join-Path $projectRoot 'scripts\Resolve-DotNetSdk.ps1')
 $candidate = Resolve-TermLinkDotNetSdk -ProjectRoot $projectRoot `
@@ -166,9 +166,7 @@ try {
     $temporaryPackage = Join-Path $workRoot 'TermLink.msix'
     [IO.Directory]::CreateDirectory($layout) | Out-Null
     try {
-        $null = & (Join-Path $projectRoot 'scripts\Build-TerminalCoreNative.ps1') `
-            -CargoPath $CargoPath `
-            -OutputDirectory $layout
+        Copy-Item -LiteralPath (Join-Path $projectRoot '../native/terminal-core/windows-x64/termlink_terminal_ffi.dll') -Destination $layout -Force
         $directNativeBuildOutput = @(& (Join-Path $projectRoot 'scripts\Build-DirectCoreNative.ps1') `
             -CargoPath $CargoPath `
             -OutputDirectory $layout)

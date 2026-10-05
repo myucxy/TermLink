@@ -3,9 +3,10 @@
 ## Repository layout
 
 - 应用仓库与私有 `../terminal-core` 仓库同级，工作区父目录不属于任何 Git 仓库。不得将核心源码复制回应用仓库。
-- Windows/Android 源码构建使用同级核心 checkout。发布必须记录并核对两个仓库的 revision 和工作区状态；主仓库干净不能代替核心仓库干净。
+- Windows/Android 只消费 `native/terminal-core/` 下的预编译 DLL/SO，不得读取同级 core 源码或在本仓库编译核心。核心 Rust、JNI C++、头文件、CMake 和编译脚本均放在 core 仓库；本仓库只保留应用调用绑定、UI 和二进制依赖校验。
+- `terminal-core.lock.json` 记录核心 revision、构建时脏状态和各库 SHA-256；二进制与锁文件一起提交。发布执行 `scripts/Verify-NativeArtifacts.ps1 -RequireClean`，拒绝缺失、哈希不符或 dirty core 产物，不要求构建机器持有 core 仓库。
 - 本轮按用户要求保留旧 Git 历史，旧历史仍包含核心源码；不重写旧提交/标签或主动推送远端。
-- 核心远端需单独核验为 private 后再上传。当前只是源码与 Git 边界拆分，不代表预编译 SDK 分发或非商业许可证已经完成。
+- 核心远端需单独核验为 private 后再上传。预编译产物边界不代表已授予公开二进制再分发权或完成非商业许可证。
 
 ## Android terminal implementation policy
 

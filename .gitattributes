@@ -4,6 +4,8 @@
 
 *.sh text eol=lf
 *.rs text eol=lf
+/native/terminal-core/**/*.dll binary
+/native/terminal-core/**/*.so binary
 Cargo.toml text eol=lf
 Cargo.lock text eol=lf
 rust-toolchain.toml text eol=lf

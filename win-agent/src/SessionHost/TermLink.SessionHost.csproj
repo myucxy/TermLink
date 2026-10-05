@@ -14,8 +14,8 @@
     <InternalsVisibleTo Include="TermLink.SessionHost.Validation" />
     <PackageReference Include="Microsoft.Windows.Console.ConPTY" Version="[1.24.260710001]" GeneratePathProperty="true" />
   </ItemGroup>
-  <ItemGroup Condition="Exists('..\..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll')">
-    <None Include="..\..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
+  <ItemGroup>
+    <None Include="..\..\..\native\terminal-core\windows-x64\termlink_terminal_ffi.dll"
           Link="termlink_terminal_ffi.dll"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />

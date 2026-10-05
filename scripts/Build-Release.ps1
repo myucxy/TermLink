@@ -562,7 +562,9 @@ if ($AndroidApk -or $AndroidAab) {
 }
 
 if ($WindowsSetup -or $WindowsMsix -or $AndroidApk -or $AndroidAab) {
-    $null = & (Join-Path $repositoryRoot 'scripts\Verify-TerminalCoreCheckout.ps1') -RequireClean:$isProduction
+    $nativePlatform = if (($WindowsSetup -or $WindowsMsix) -and ($AndroidApk -or $AndroidAab)) { 'All' }
+        elseif ($WindowsSetup -or $WindowsMsix) { 'Windows' } else { 'Android' }
+    $null = & (Join-Path $repositoryRoot 'scripts\Verify-NativeArtifacts.ps1') -Platform $nativePlatform -RequireClean:$isProduction
 }
 
 $allArtifactTargets = @($manifestPath, $pendingManifestPath)

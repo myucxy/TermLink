@@ -6,7 +6,7 @@
 
 | 范围 | 当前记录 |
 | --- | --- |
-| terminal-core（同级私有仓库） | Cargo workspace 声明 `Proprietary`，见[仓库边界](docs/development/REPOSITORY_LAYOUT.md) |
+| terminal-core（私有源码及本仓库 DLL/SO） | Cargo workspace 声明 `Proprietary`，见[仓库边界](docs/development/REPOSITORY_LAYOUT.md) |
 | [network-core](network-core/Cargo.toml) | Cargo workspace 声明 `Apache-2.0`；仍需核对完整许可文本与覆盖范围 |
 | [Termux 来源归档](terminal-forks/termux-terminal/UPSTREAM_LICENSE.txt) | 上游 GPLv3-only 及组件例外，保留来源和原始署名 |
 | [xterm 参考资源](terminal-reference/xterm-harness/THIRD_PARTY_NOTICES.md) | 按该目录的第三方声明 |

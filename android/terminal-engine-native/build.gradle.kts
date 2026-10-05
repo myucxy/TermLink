@@ -1,91 +1,38 @@
-import java.io.File
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
 
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
 }
 
-val terminalCoreRoot = rootProject.projectDir.resolve("../../terminal-core").canonicalFile
-val generatedNativeRoot = layout.buildDirectory.dir("generated/termlink-native")
-val nativeBuildRoot = layout.buildDirectory.dir("intermediates/termlink-native")
+val applicationRoot = rootProject.projectDir.parentFile
+val nativeRoot = applicationRoot.resolve("native/terminal-core/android")
+val nativeLock = applicationRoot.resolve("terminal-core.lock.json")
 val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
 
-fun executableFromEnvironment(name: String, fallback: File): File =
-    providers.environmentVariable(name).orNull?.let(::File) ?: fallback
-
-val cmakeExecutable = executableFromEnvironment(
-    "TERMLINK_CMAKE",
-    File("D:/Dev/Env/msys64/mingw64/bin/cmake.exe"),
-)
-val ninjaExecutable = executableFromEnvironment(
-    "TERMLINK_NINJA",
-    File("D:/Dev/Env/msys64/mingw64/bin/ninja.exe"),
-)
-val androidSdkRoot = executableFromEnvironment(
-    "ANDROID_SDK_ROOT",
-    File("D:/Dev/Env/Android/Sdk"),
-)
-val androidNdkRoot = androidSdkRoot.resolve("ndk/27.0.12077973")
-val cargoExecutable = executableFromEnvironment(
-    "TERMLINK_CARGO",
-    File("D:/Dev/Env/Rust/rustup/toolchains/1.97.1-x86_64-pc-windows-msvc/bin/cargo.exe"),
-)
-
-val buildTermlinkNative by tasks.registering {
-    group = "build"
-    description = "Builds the Rust terminal core and JNI wrapper for all Android ABIs."
-    inputs.files(
-        fileTree(terminalCoreRoot) {
-            include(
-                "Cargo.lock",
-                "Cargo.toml",
-                "rust-toolchain.toml",
-                "crates/**/*.rs",
-                "crates/**/Cargo.toml",
-                "include/**/*.h",
-            )
-        },
-        fileTree("src/main/cpp"),
-    )
-    outputs.dir(generatedNativeRoot)
-
+val verifyTerminalNativeArtifacts by tasks.registering {
+    group = "verification"
+    description = "Verifies the pinned prebuilt terminal JNI libraries; no core source checkout is needed."
+    inputs.file(nativeLock)
+    inputs.dir(nativeRoot)
     doLast {
-        check(terminalCoreRoot.resolve("Cargo.toml").isFile) {
-            "Clone the private terminal-core repository next to the TermLink application repository: $terminalCoreRoot"
+        val lock = JsonSlurper().parse(nativeLock) as Map<*, *>
+        check(lock["schema_version"] == 2 && lock["revision"].toString().matches(Regex("[0-9a-f]{40}"))) {
+            "Invalid terminal-core binary lock"
         }
+        val artifacts = lock["artifacts"] as List<*>
         for (abi in supportedAbis) {
-            val buildDir = nativeBuildRoot.get().dir(abi).asFile
-            val outputDir = generatedNativeRoot.get().dir(abi).asFile
-            buildDir.mkdirs()
-            outputDir.mkdirs()
-            val configure = providers.exec {
-                isIgnoreExitValue = true
-                commandLine(
-                    cmakeExecutable.absolutePath,
-                    "-S", file("src/main/cpp").absolutePath,
-                    "-B", buildDir.absolutePath,
-                    "-G", "Ninja",
-                    "-DCMAKE_MAKE_PROGRAM=${ninjaExecutable.absolutePath}",
-                    "-DCMAKE_TOOLCHAIN_FILE=${androidNdkRoot.resolve("build/cmake/android.toolchain.cmake").absolutePath}",
-                    "-DANDROID_ABI=$abi",
-                    "-DANDROID_PLATFORM=android-26",
-                    "-DANDROID_NDK=${androidNdkRoot.absolutePath}",
-                    "-DTERMLINK_TERMINAL_CORE_ROOT=${terminalCoreRoot.absolutePath}",
-                    "-DTERMLINK_CARGO=${cargoExecutable.absolutePath}",
-                    "-DTERMLINK_JNI_OUTPUT_DIR=${outputDir.absolutePath}",
-                    "-DCMAKE_BUILD_TYPE=Release",
-                )
-            }.result.get()
-            check(configure.exitValue == 0) { "CMake configure failed for $abi" }
-            val build = providers.exec {
-                isIgnoreExitValue = true
-                commandLine(
-                    cmakeExecutable.absolutePath,
-                    "--build", buildDir.absolutePath,
-                    "--target", "termlink_terminal_jni",
-                )
-            }.result.get()
-            check(build.exitValue == 0) { "Native build failed for $abi" }
+            val relative = "native/terminal-core/android/$abi/libtermlink_terminal_jni.so"
+            val records = artifacts.map { it as Map<*, *> }.filter { it["path"] == relative }
+            check(records.size == 1) { "Missing or duplicate native lock entry: $relative" }
+            val binary = applicationRoot.resolve(relative)
+            check(binary.isFile) { "Missing prebuilt library: $relative. Obtain the pinned DLL/SO package from the core maintainer." }
+            val digest = MessageDigest.getInstance("SHA-256").digest(binary.readBytes())
+                .joinToString("") { "%02x".format(it) }
+            check(binary.length() == (records.single()["size"] as Number).toLong() && digest == records.single()["sha256"]) {
+                "Native binary SHA-256/size mismatch: $relative"
+            }
         }
     }
 }
@@ -103,7 +50,7 @@ android {
         }
     }
 
-    sourceSets.getByName("main").jniLibs.srcDir(generatedNativeRoot)
+    sourceSets.getByName("main").jniLibs.srcDir(nativeRoot)
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -131,5 +78,5 @@ dependencies {
 }
 
 tasks.named("preBuild").configure {
-    dependsOn(buildTermlinkNative)
+    dependsOn(verifyTerminalNativeArtifacts)
 }

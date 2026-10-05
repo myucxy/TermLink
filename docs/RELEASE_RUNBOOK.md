@@ -14,11 +14,12 @@
 
 ## 当前传输验收范围（2026-10-04）
 
-2026-10-05 双仓库补充：应用与私有 `../terminal-core` 独立维护。客户端正式构建前执行
-`scripts/Verify-TerminalCoreCheckout.ps1 -RequireClean`，核对 `terminal-core.lock.json` 固定的核心
-commit；同时记录两库 revision、干净状态和 native 产物哈希。仅主仓库 revision 不再足以复现客户端。
-统一构建及 Windows Setup/MSIX 入口已接入校验，Server-only 不需要核心。目录和旧历史边界见
-[双仓库说明](development/REPOSITORY_LAYOUT.md)。
+2026-10-05 二进制边界补充：应用只消费 `native/terminal-core/` 下的 DLL/SO。客户端正式构建前执行
+`scripts/Verify-NativeArtifacts.ps1 -RequireClean`，核对 `terminal-core.lock.json` 的核心 commit、
+干净源码标记、大小和 SHA-256；记录应用 revision 与核心二进制来源。应用构建不检查或编译 core checkout。
+更新核心时在私有 core 仓库运行 `scripts/Build-ToTermLink.ps1`，应用的五个库和锁文件一起提交。
+统一构建及 Windows Setup/MSIX 已接入校验，Android Gradle 也检查入包前的 SO；Server-only 不依赖核心。
+目录和旧历史边界见[双仓库说明](development/REPOSITORY_LAYOUT.md)。
 
 用户明确指定当前仅使用服务器转发（Relay Only），CLI 与 AI 均适用。LAN/NAT 直连、打洞及直连/中转切换不再测试，不作为当前发布阻塞项；本文及历史记录中相关矩阵在本范围内记为“不适用（用户指定 Relay Only）”，不能记为通过。后续只有用户明确恢复直连范围时才执行相关测试。
 

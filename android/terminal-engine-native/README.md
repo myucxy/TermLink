@@ -5,11 +5,15 @@ Kotlin DTOs, stable status mapping, an idempotent native-handle wrapper, and the
 `JniNativeBridge` object. Local JVM tests keep using the pure Kotlin fake and therefore never try to
 load an Android shared library.
 
-The Gradle build uses the pinned NDK 27.0.12077973 and Rust 1.97.1 inventory under `D:\Dev`. It
-builds the Rust static library and links it into one `libtermlink_terminal_jni.so` for arm64-v8a,
-armeabi-v7a, x86, and x86_64. `TERMLINK_CMAKE`, `TERMLINK_NINJA`, `TERMLINK_CARGO`, and
-`ANDROID_SDK_ROOT` may override the inventory probe paths for CI without changing machine PATH.
-Every final ELF is stripped and linked with a 16 KiB maximum page size.
+This module consumes the four prebuilt `libtermlink_terminal_jni.so` files in
+`native/terminal-core/android/` at the application root. Gradle checks each file's size and SHA-256
+against `terminal-core.lock.json` before building. No core checkout, Rust terminal compiler, JNI
+C++ source or terminal CMake project is loaded by the application build.
+
+The private core repository owns `android/jni/` and `scripts/Build-ToTermLink.ps1`, using Rust
+1.97.1 and NDK 27.0.12077973 to compile/export all four ABIs. The libraries remain stripped with
+16 KiB ELF alignment. This application module owns only the Kotlin calling contracts, validated
+frame decoders, view and tests; JNI registration names are unchanged.
 
 Production callers use the stable bridge object directly:
 

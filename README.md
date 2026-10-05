@@ -43,13 +43,13 @@ flowchart LR
 
 | 目录 | 用途 |
 | --- | --- |
-| [android/](android/README.md) | Android 产品 UI、网络、加密、terminal-core JNI 与 View |
+| [android/](android/README.md) | Android 产品 UI、网络、加密、预编译 JNI 调用与 View |
 | [pc-client/](pc-client/README.md) | Avalonia 桌面 UI、本机 Agent 控制接口及平台适配 |
 | [win-agent/](win-agent/README.md) | Windows Agent、AI 适配器、ConPTY SessionHost、Setup、Updater |
 | [ai-web/](ai-web/README.md) | APK 内嵌的 AI 对话 Web 界面 |
 | [server/](server/README.md) | Go 服务端、数据库迁移、Web 管理和部署 |
 | [protocol/](protocol/README.md) | 实时消息、加密信封与协议契约 |
-| terminal-core（同级私有仓库） | Rust 终端状态核心与 FFI，见[双仓库说明](docs/development/REPOSITORY_LAYOUT.md) |
+| native/terminal-core/ | 预编译 DLL/SO；实现与编译在私有 core 仓库，见[双仓库说明](docs/development/REPOSITORY_LAYOUT.md) |
 | [network-core/](network-core/README.md) | 可选直连核心；当前运行及验收使用 Relay |
 | scripts/、release/ | 构建、制品验证和发布脚本 |
 | testdata/、technical-validation/ | 测试向量、协议和跨端验收工具 |

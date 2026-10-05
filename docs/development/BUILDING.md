@@ -4,13 +4,13 @@
 
 ## 工具与环境
 
-应用仓库与私有核心仓库需同级检出，见[双仓库说明](REPOSITORY_LAYOUT.md)。下文“仓库根目录”均指应用仓库 `termlink/`；核心源码位于 `../terminal-core/`。没有核心访问权限时，当前源码构建尚无预编译 SDK 替代流程。
+应用只需检出 `termlink/`，终端核心以 `native/terminal-core/` 下的 DLL/SO 提供，SHA-256 固定在 `terminal-core.lock.json`；不需要同级 core 源码。核心维护者的编译/导出入口见[双仓库说明](REPOSITORY_LAYOUT.md)。
 
 | 工具 | 仓库要求/依据 |
 | --- | --- |
 | .NET SDK | `8.0.303`，以 `pc-client/global.json`、`win-agent/global.json` 和各自 rollForward 策略为准 |
 | Go | `server/go.mod` 声明 Go 1.26 |
-| Rust | `../terminal-core/`、`network-core/` 固定 `1.97.1` |
+| Rust | 应用的 `network-core/` 固定 `1.97.1`；终端 DLL/SO 已预编译 |
 | Node.js/npm | Vite 锁定依赖要求 Node.js `^20.19.0 \|\| >=22.12.0`，选择满足条件的现有 LTS |
 | JDK | 本指南使用 JDK 21；Android Java/Kotlin 字节码目标为 17 |
 | Android SDK | compile/target SDK 36、min SDK 26，NDK `27.0.12077973` |
@@ -93,13 +93,12 @@ Pop-Location
 Windows 原生脚本采用 `--locked --offline`。新机器依赖缓存为空时，需要先获取锁文件指定依赖，再执行构建：
 
 ```powershell
-& $cargo '+1.97.1' fetch --locked --manifest-path ../terminal-core/Cargo.toml
 & $cargo '+1.97.1' fetch --locked --manifest-path network-core/Cargo.toml
-& .\win-agent\scripts\Build-TerminalCoreNative.ps1 -CargoPath $cargo
+& .\scripts\Verify-NativeArtifacts.ps1 -Platform Windows
 & .\win-agent\scripts\Build-DirectCoreNative.ps1 -CargoPath $cargo
 ```
 
-这里的 Cargo 入口必须支持 `+1.97.1`；不要将仅接受普通 Cargo 参数的底层程序误用于终端核心脚本。原生 DLL 默认生成到各 Rust workspace 的 target 目录，.NET 项目从这些路径复制。Relay Only 不等于可以省略客户端构建依赖。
+这里的 Cargo 入口必须支持 `+1.97.1`，仅用于应用内 network-core。终端 DLL 直接从 `native/terminal-core/windows-x64/` 复制到 .NET 输出和安装载荷，应用不编译终端核心。Relay Only 不等于可以省略网络模块的构建依赖。
 
 按需要构建 Windows 运行时与桌面 UI：
 
@@ -119,7 +118,7 @@ Pop-Location
 
 ## Android 原生工具与构建
 
-当前原生脚本仍包含 Windows 默认路径和 NDK 的 Windows 编译器名，尚不能声称 Linux runner 可直接完成同样构建。不要只更换盘符就宣称跨平台适配完成。
+终端 SO 已预编译，Gradle 只验证并打包；下列 CMake/Rust 工具仍用于应用的 network-core，其 Windows 默认路径尚未验证为可在 Linux runner 原样使用。
 
 使用现有工具设置当前进程环境：
 
@@ -134,7 +133,7 @@ $env:TERMLINK_LLVM_READELF = Join-Path $env:ANDROID_SDK_ROOT 'ndk/27.0.12077973/
 
 Android 的 Cargo 配置应指向实际 1.97.1 工具链；CMake 会从同目录定位 `rustc.exe`，与上面 Windows 脚本需要的 rustup 入口有所区别。SDK 平台、Build Tools、NDK 需已安装且许可证已接受；不要提交 `local.properties` 或机器凭据。
 
-终端库默认编译四个 ABI。Rust 工具链需要具备以下目标：`aarch64-linux-android`、`armv7-linux-androideabi`、`i686-linux-android`、`x86_64-linux-android`。缺少目标会导致 JNI 构建失败；仅准备模拟器 x86_64 并不足以完成默认全 ABI 构建。
+预编译终端库覆盖四个 ABI；应用内 network-core 的 Rust 构建仍需要以下目标：`aarch64-linux-android`、`armv7-linux-androideabi`、`i686-linux-android`、`x86_64-linux-android`。缺少目标会导致网络 JNI 构建失败；仅准备模拟器 x86_64 并不足以完成默认全 ABI 构建。
 
 AI Web 资源准备好后，在仓库根目录执行：
 

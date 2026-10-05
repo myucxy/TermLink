@@ -4,7 +4,7 @@ Windows 运行时负责受管 CLI、AI Agent 协议、电脑文件和远程加�
 
 ## 构建与测试入口
 
-先阅读[开发与构建](../docs/development/BUILDING.md)。使用固定 .NET SDK，先生成 `terminal-core` 和 `network-core` 原生 DLL，再编译需要的 .NET 项目；DEV 版本沿用 Windows 最后一次成功正式发布的版本/build。
+先阅读[开发与构建](../docs/development/BUILDING.md)。使用固定 .NET SDK，先验证预编译 terminal-core DLL，再生成应用内 `network-core` 原生 DLL，再编译需要的 .NET 项目；DEV 版本沿用 Windows 最后一次成功正式发布的版本/build。
 
 源码编译输出不等于完整的签名安装包。Setup、原生 DLL、Agent、SessionHost、桌面程序和 Updater 的组合、签名与验证由[发布构建规则](../docs/RELEASE.md)约束；发布执行顺序见[运行手册](../docs/RELEASE_RUNBOOK.md)。
 

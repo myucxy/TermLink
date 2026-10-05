@@ -7,8 +7,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\TerminalCore\TermLink.TerminalCore.csproj" />
-    <None Include="..\..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
+    <None Include="..\..\..\native\terminal-core\windows-x64\termlink_terminal_ffi.dll"
           Link="termlink_terminal_ffi.dll"
-          CopyToOutputDirectory="PreserveNewest" />
+          CopyToOutputDirectory="Always" />
   </ItemGroup>
 </Project>

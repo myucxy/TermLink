@@ -21,9 +21,9 @@ Windows 命令配置、Server 能力同步和 Android 受控启动的兼容契�
 
 ## 版本与目标
 
-客户端源码现由应用仓库和同级私有 `terminal-core` 仓库组成，版本/build 规则不变。
-正式构建必须通过 `scripts/Verify-TerminalCoreCheckout.ps1 -RequireClean`，并记录两库 revision；
-核心版本由 `terminal-core.lock.json` 固定，不能只检查应用仓库。参见[双仓库说明](development/REPOSITORY_LAYOUT.md)。
+客户端消费预编译 terminal-core DLL/SO，版本/build 规则不变。
+正式构建通过 `scripts/Verify-NativeArtifacts.ps1 -RequireClean`，记录应用 revision 和锁文件中的 core revision；
+核心文件大小、SHA-256 与 dirty 状态由 `terminal-core.lock.json` 固定，构建机器不需要 core checkout。参见[双仓库说明](development/REPOSITORY_LAYOUT.md)。
 
 版本分配必须遵循 [DEV 与正式发布版本规则](RELEASE_RUNBOOK.md#dev-与正式发布版本规则)：
 

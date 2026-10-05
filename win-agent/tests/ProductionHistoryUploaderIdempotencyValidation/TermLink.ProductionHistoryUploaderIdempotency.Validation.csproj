@@ -20,7 +20,7 @@
     <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />
     <ProjectReference Include="..\..\src\Protocol\TermLink.Protocol.csproj" />
     <ProjectReference Include="..\..\src\TerminalCore\TermLink.TerminalCore.csproj" />
-    <None Include="..\..\..\..\terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll"
+    <None Include="..\..\..\native\terminal-core\windows-x64\termlink_terminal_ffi.dll"
           Link="termlink_terminal_ffi.dll"
           CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="Google.Protobuf" Version="3.31.1" />
