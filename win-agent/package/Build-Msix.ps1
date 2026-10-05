@@ -114,6 +114,7 @@ Assert-True ($versionParts.Count -eq 4 -and @($versionParts | Where-Object { $_ 
 Assert-True (-not [string]::IsNullOrWhiteSpace($Publisher)) 'Publisher is required.'
 Assert-True (-not [string]::IsNullOrWhiteSpace($PublisherDisplayName)) 'Publisher display name is required.'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$null = & (Join-Path $projectRoot '..\scripts\Verify-TerminalCoreCheckout.ps1') -RequireClean:(-not $Development)
 $dotNetPathWasExplicit = $PSBoundParameters.ContainsKey('DotNetPath')
 . (Join-Path $projectRoot 'scripts\Resolve-DotNetSdk.ps1')
 $candidate = Resolve-TermLinkDotNetSdk -ProjectRoot $projectRoot `

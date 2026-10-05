@@ -561,6 +561,10 @@ if ($AndroidApk -or $AndroidAab) {
     }
 }
 
+if ($WindowsSetup -or $WindowsMsix -or $AndroidApk -or $AndroidAab) {
+    $null = & (Join-Path $repositoryRoot 'scripts\Verify-TerminalCoreCheckout.ps1') -RequireClean:$isProduction
+}
+
 $allArtifactTargets = @($manifestPath, $pendingManifestPath)
 if ($ServerImage) {
     $allArtifactTargets += $serverArtifactPath

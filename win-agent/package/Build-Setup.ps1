@@ -114,6 +114,7 @@ function Confirm-EmbeddedSignature {
 }
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$null = & (Join-Path $projectRoot '..\scripts\Verify-TerminalCoreCheckout.ps1') -RequireClean:(-not $Development)
 $dotNetPathWasExplicit = $PSBoundParameters.ContainsKey('DotNetPath')
 . (Join-Path $projectRoot 'scripts\Resolve-DotNetSdk.ps1')
 $candidate = Resolve-TermLinkDotNetSdk -ProjectRoot $projectRoot `

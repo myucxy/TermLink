@@ -1,5 +1,11 @@
 # TermLink direct network core
 
+> Current usage and acceptance scope (2026-10-04): CLI and AI use **Relay Only**.
+> Direct-path code and the staged implementation notes below are retained, but
+> LAN/NAT discovery, punching, and switching are outside current acceptance.
+> Do not interpret a compiled library as proof that direct routing is enabled.
+> See [current architecture](../docs/architecture/CURRENT.md).
+
 This workspace is the transport-only, stability-first boundary for TermLink's
 optional direct path. It does not own the realtime WebSocket, terminal sessions,
 renderer state, durable acknowledgements, or application command outboxes.

@@ -1,9 +1,13 @@
 # TermLink 完整产品与系统设计
 
+> **文档状态：历史设计基线。** 当前运行拓扑、传输范围、构建命令和发布门禁以
+> [文档索引](README.md)、各组件 README 和 [发布运行手册](RELEASE_RUNBOOK.md) 为准。
+> 本文保留早期需求与架构推导，不是当前部署清单。
+
 > **⚠️ 状态警告（2026-09-20，审计 #29）**：本文档 §6（部署架构）描述的 Redis+Caddy+ghcr.io 多容器架构已废弃。当前生产拓扑为"反向代理 → 单 Server 容器 → PostgreSQL"（内置身份/OIDC/协调/直连信令全部内置于 Server 进程），详见 `server/README-runtime.md`、`server/compose.yml` 与 `docs/EDGE_GATEWAY.md`。其余章节仍作设计背景参考，但部署相关内容以运行文档为准。
 
 文档版本：1.0
-状态：开发基线
+状态：历史开发基线
 更新日期：2026-09-05
 适用范围：Windows Agent、Docker 服务端、Android 客户端、终端引擎与 UI/UX
 

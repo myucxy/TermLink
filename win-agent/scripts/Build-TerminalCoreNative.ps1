@@ -30,25 +30,33 @@ function Resolve-TermLinkCargo {
 
 $agentRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $agentRoot '..'))
-$manifest = Join-Path $repositoryRoot 'terminal-core\Cargo.toml'
+$null = & (Join-Path $repositoryRoot 'scripts\Verify-TerminalCoreCheckout.ps1')
+$coreRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '..\terminal-core'))
+$manifest = Join-Path $coreRoot 'Cargo.toml'
 if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-    throw "terminal-core manifest was not found: $manifest"
+    throw "Clone the private terminal-core repository next to the TermLink application repository: $manifest"
 }
 
 $cargo = Resolve-TermLinkCargo -ExplicitPath $CargoPath
-& $cargo '+1.97.1' build `
-    --manifest-path $manifest `
-    -p termlink-terminal-ffi `
-    --release `
-    --locked `
-    --offline `
-    --target x86_64-pc-windows-msvc
-if ($LASTEXITCODE -ne 0) {
-    throw "terminal-core native build failed with exit code $LASTEXITCODE."
+Push-Location $coreRoot
+try {
+    & $cargo '+1.97.1' build `
+        --manifest-path $manifest `
+        -p termlink-terminal-ffi `
+        --release `
+        --locked `
+        --offline `
+        --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) {
+        throw "terminal-core native build failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    Pop-Location
 }
 
-$nativePath = Join-Path $repositoryRoot `
-    'terminal-core\target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll'
+$nativePath = Join-Path $coreRoot `
+    'target\x86_64-pc-windows-msvc\release\termlink_terminal_ffi.dll'
 if (-not (Test-Path -LiteralPath $nativePath -PathType Leaf)) {
     throw "terminal-core native output was not produced: $nativePath"
 }

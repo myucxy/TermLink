@@ -1,5 +1,7 @@
 # Local repository handoff
 git地址.txt
+# Private terminal engine lives in the sibling terminal-core repository.
+/terminal-core/
 
 # Environment and secrets
 .env

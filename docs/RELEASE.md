@@ -21,6 +21,10 @@ Windows 命令配置、Server 能力同步和 Android 受控启动的兼容契�
 
 ## 版本与目标
 
+客户端源码现由应用仓库和同级私有 `terminal-core` 仓库组成，版本/build 规则不变。
+正式构建必须通过 `scripts/Verify-TerminalCoreCheckout.ps1 -RequireClean`，并记录两库 revision；
+核心版本由 `terminal-core.lock.json` 固定，不能只检查应用仓库。参见[双仓库说明](development/REPOSITORY_LAYOUT.md)。
+
 版本分配必须遵循 [DEV 与正式发布版本规则](RELEASE_RUNBOOK.md#dev-与正式发布版本规则)：
 
 - 下一轮新正式版本从 `0.3.0` 开始，之后默认自动递增 patch；已有更高发布版本时从现场值继续递增。

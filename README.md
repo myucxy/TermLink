@@ -1,79 +1,68 @@
 # TermLink
 
-TermLink 是一个由 Windows Agent、Android 客户端和 TermLink Server 组成的远程终端系统。
-Android 与 Windows Agent 使用同一个账号登录后，可以查看和控制该账号下的 Windows
-终端会话。
+TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、AI Agent 对话和文件**。任务在电脑上执行，手机负责交互；你可以部署自己的服务端连接两端。
 
-## 生产运行时
+当前主要交付 Android 客户端、Windows x64 客户端和 Docker 服务端。Linux/macOS 桌面代码仍有待验收的能力，不等同于已正式支持的完整产品。
 
-生产服务端只保留两个容器：
+> 项目级许可证暂未确定。现有组件声明和第三方授权继续有效，详见 [许可证状态](LICENSE-STATUS.md)。
 
-```text
-外部 HTTPS 反向代理 → TermLink Server → PostgreSQL
+## 下载与开始使用
+
+- Android / Windows：[AppShip](https://appship.kget.cc:8910)，安装包版本及签名说明见[发布记录索引](docs/releases/README.md)。
+- 服务端：[Docker Hub](https://hub.docker.com/r/myucxy/termlink)，部署方式见 [Server README](server/README.md)。
+- 首次使用：[快速开始](docs/guides/QUICK_START.md)。
+- 修改代码：[开发与构建](docs/development/BUILDING.md)及[贡献指南](CONTRIBUTING.md)。
+
+下载包有独立的签名要求。当前 Windows 发布记录仍使用自签名开发证书，不能把“GitHub 构建”或“签名校验通过”理解为已经获得公开 CA 的信任。
+
+## 可以做什么
+
+- **CLI**：打开和操作电脑上的受管终端，支持输入、快捷键、鼠标报告、窗口尺寸调整和历史浏览。
+- **AI**：从电脑实际上报的 Agent 能力创建或恢复对话；按协议能力提供模型、推理强度、附件、工具详情、审批和中断。
+- **文件**：浏览和传输电脑文件，从目录创建 AI 会话，以及从 AI 文件结果跳到对应目录。
+- **多设备与恢复**：同账号设备发现、加密 Relay 转发、断线恢复；Windows 提供会话真实状态与主机历史。
+- **自部署**：服务端内置身份服务、设备管理和 Web 管理页面，使用 PostgreSQL 持久化元数据。
+
+各 Agent 支持的模型和操作不同。程序已安装不等于已登录或具备可用额度；ZCode 桌面远控采用独立网页入口，具体边界见[当前架构](docs/architecture/CURRENT.md)。
+
+## 系统组成
+
+```mermaid
+flowchart LR
+    A[Android：CLI / AI / 文件] <-->|HTTPS / WebSocket| P[外部 HTTPS 反向代理]
+    P <--> S[TermLink Server：认证 / 元数据 / Relay]
+    W[Windows：桌面 UI / Agent / 本地任务] <-->|HTTPS / WebSocket| P
+    S --> D[(PostgreSQL)]
 ```
 
-TermLink Server 内置身份服务、账号管理、设备发现、会话控制、Relay、Direct/NAT 信令、
-文件任务、Agent 升级任务和 Web 管理页面。
+正常 CLI 和 TermLink 结构化 AI 的内容通过客户端间的 E2EE 通道传输。Server 管理身份、设备、会话元数据和任务协调，不执行电脑命令，不保存完整终端历史或持久文件对象。第三方 Agent 自身的模型服务访问及 ZCode 官方网页远控有各自的网络边界。
 
-生产服务端不执行 Windows 命令、不创建 ConPTY、不保存完整终端历史、不保存文件对象。
-这些能力分别由 Windows Agent 或客户端负责。
+**当前使用与发布验收范围为 Relay Only。** 仓库保留直连代码与历史实验，但不把 LAN/NAT 记为本轮已验证能力；配置与构建能力开关不等于线上策略已经核验。
 
-生产部署入口：
+## 仓库导航
 
-- [Server 部署说明](server/README.md)
-- [单节点运行时](server/README-runtime.md)
-- [单节点安装、升级、备份和恢复](server/deploy/single-node-production/README.md)
+| 目录 | 用途 |
+| --- | --- |
+| [android/](android/README.md) | Android 产品 UI、网络、加密、terminal-core JNI 与 View |
+| [pc-client/](pc-client/README.md) | Avalonia 桌面 UI、本机 Agent 控制接口及平台适配 |
+| [win-agent/](win-agent/README.md) | Windows Agent、AI 适配器、ConPTY SessionHost、Setup、Updater |
+| [ai-web/](ai-web/README.md) | APK 内嵌的 AI 对话 Web 界面 |
+| [server/](server/README.md) | Go 服务端、数据库迁移、Web 管理和部署 |
+| [protocol/](protocol/README.md) | 实时消息、加密信封与协议契约 |
+| terminal-core（同级私有仓库） | Rust 终端状态核心与 FFI，见[双仓库说明](docs/development/REPOSITORY_LAYOUT.md) |
+| [network-core/](network-core/README.md) | 可选直连核心；当前运行及验收使用 Relay |
+| scripts/、release/ | 构建、制品验证和发布脚本 |
+| testdata/、technical-validation/ | 测试向量、协议和跨端验收工具 |
+| [docs/](docs/README.md) | 使用、开发、架构、发布及历史文档导航 |
+| terminal-forks/、terminal-reference/、prototypes/、ui-prototypes/ | 来源归档、参考实现和原型，详见[归档索引](docs/archive/README.md) |
 
-## 客户端
+## 开发、贡献与发布
 
-| 客户端 | 目录 | 作用 |
-|---|---|---|
-| Android | [`android`](android) | 查看会话、输入命令、管理设备和传输文件 |
-| Windows Agent | [`win-agent`](win-agent) | 管理 Windows 会话、启动 Shell、保存历史和执行升级 |
-| Terminal Core | [`terminal-core`](terminal-core) | 终端解析、状态重建和渲染核心 |
-| 协议 | [`protocol`](protocol) | 实时协议、加密信封和测试向量 |
+请先阅读[开发与构建](docs/development/BUILDING.md)。它说明固定工具链、AI Web 资源生成、Android 原生依赖及 DEV 版本参数，不要求贡献者复用维护者电脑的盘符路径。
 
-## 主要能力
+正式构建、签名及上传遵循[发布运行手册](docs/RELEASE_RUNBOOK.md)和[发布构建说明](docs/RELEASE.md)。客户端分发使用 AppShip；Docker 按当前规则由本机构建并推送 Docker Hub。Windows/Android 的 GitHub Actions 构建尚未接入。
 
-- 内置 OIDC 登录、注册、邀请码、邮箱验证和可选人机校验；
-- Android 与 Windows Agent 的设备和 PC 管理；
-- Relay 实时连接、ACK、断线恢复、控制租约和多端协同；
-- Direct/NAT 信令，失败时自动回到 Relay；
-- 客户端之间的文件传输和断点续传；
-- Windows Agent 远程升级；
-- Windows 主机拥有的终端历史和分页恢复；
-- Web 个人中心和管理后台。
-
-## 服务端边界
-
-| 能力 | 负责方 |
-|---|---|
-| 账号、Token、设备和会话元数据 | TermLink Server + PostgreSQL |
-| 实时消息路由 | TermLink Server Relay |
-| 命令执行和 ConPTY | Windows Agent |
-| 终端历史 | Windows Agent 本地存储 |
-| 文件内容 | Android 与 Windows Agent |
-| 文件任务和权限 | TermLink Server + PostgreSQL |
-| HTTPS 和证书 | 外部反向代理 |
-
-## 开发检查
-
-```powershell
-cd server
-D:\Dev\Env\Go\bin\go.exe test ./...
-D:\Dev\Env\Go\bin\go.exe vet ./...
-```
-
-Android、Windows、协议和 Terminal Core 的构建说明分别位于对应目录的 README。
-LAN Replay、Phase 1、验收 Compose 和外部监控栈属于测试或运维扩展，不属于生产运行时。
-
-## 其他文档
-
-- [完整系统设计](docs/COMPLETE_SYSTEM_DESIGN.md)
-- [终端核心设计](docs/TERMLINK_TERMINAL_CORE_V2.md)
-- [实时协议](protocol/protobuf/PRODUCTION_REALTIME_V1.md)
-- [文件操作 E2E](docs/REMOTE_FILE_OPERATIONS_E2E.md)
-- [Windows Agent](win-agent/README.md)
-- [Android 客户端](android/README.md)
-
-商业套餐、支付、公告、MinIO 对象存储和服务端终端历史存储已从当前产品运行时移除。
+- 改动与问题反馈：[CONTRIBUTING.md](CONTRIBUTING.md)
+- 漏洞报告：[SECURITY.md](SECURITY.md)
+- 项目及第三方授权：[LICENSE-STATUS.md](LICENSE-STATUS.md)
+- 开源准备进度与未完成项：[整理清单](docs/development/OPEN_SOURCE_READINESS.md)

@@ -1,5 +1,12 @@
 # TermLink Project Guidance
 
+## Repository layout
+
+- 应用仓库与私有 `../terminal-core` 仓库同级，工作区父目录不属于任何 Git 仓库。不得将核心源码复制回应用仓库。
+- Windows/Android 源码构建使用同级核心 checkout。发布必须记录并核对两个仓库的 revision 和工作区状态；主仓库干净不能代替核心仓库干净。
+- 本轮按用户要求保留旧 Git 历史，旧历史仍包含核心源码；不重写旧提交/标签或主动推送远端。
+- 核心远端需单独核验为 private 后再上传。当前只是源码与 Git 边界拆分，不代表预编译 SDK 分发或非商业许可证已经完成。
+
 ## Android terminal implementation policy
 
 - Android 产品、Harness 和自动化测试统一使用 TermLink 自有 terminal-core、JNI 与 View，不直接依赖或加载 Termux 模块。

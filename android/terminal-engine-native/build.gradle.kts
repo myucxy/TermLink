@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val terminalCoreRoot = rootProject.projectDir.resolve("../terminal-core").canonicalFile
+val terminalCoreRoot = rootProject.projectDir.resolve("../../terminal-core").canonicalFile
 val generatedNativeRoot = layout.buildDirectory.dir("generated/termlink-native")
 val nativeBuildRoot = layout.buildDirectory.dir("intermediates/termlink-native")
 val supportedAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
@@ -50,6 +50,9 @@ val buildTermlinkNative by tasks.registering {
     outputs.dir(generatedNativeRoot)
 
     doLast {
+        check(terminalCoreRoot.resolve("Cargo.toml").isFile) {
+            "Clone the private terminal-core repository next to the TermLink application repository: $terminalCoreRoot"
+        }
         for (abi in supportedAbis) {
             val buildDir = nativeBuildRoot.get().dir(abi).asFile
             val outputDir = generatedNativeRoot.get().dir(abi).asFile

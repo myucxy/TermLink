@@ -1,5 +1,11 @@
 # Pinned Termux terminal source
 
+> Historical source archive: this tree and `android/terminal-engine-termux` are
+> outside the current Android build graph. Product, Harness, and tests use
+> TermLink's own terminal-core/JNI/View. The adapter statement below records the
+> former integration, not a current dependency. Preserve upstream licensing and
+> attribution; see [archive scope](../../docs/archive/README.md).
+
 - Repository: <https://github.com/termux/termux-app>
 - Commit: `3df69d1da197dd9bd71a3bafd902dffd720576b4`
 - Imported modules: selected Java core from `terminal-emulator`; Java/resources from

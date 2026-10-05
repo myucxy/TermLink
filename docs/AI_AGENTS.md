@@ -1,5 +1,7 @@
 # 独立 AI 会话（开发中，未发布）
 
+> 历史阶段记录（2026-10-03）。“未发布”、功能缺口和 Agent 支持范围描述当时状态，不能代表当前版本。当前入口见[架构说明](architecture/CURRENT.md)，实际交付见[发布记录](releases/README.md)。以下原始记录保留。
+
 设计基线：`faca661`，本地标签 `design/android-ai-agent-v3`。本轮代码未提交或发布到 AppShip、Docker Hub。2026-10-03 已升级本机 Docker 开发服务端，使用独立 Android 测试包与暂存 Windows 客户端完成真实加密桥联合测试，未覆盖正式客户端安装文件。部署、回滚和现场限制见 [联合测试记录](AI_AGENTS_JOINT_TEST_20261003.md)。
 
 ## 实现范围

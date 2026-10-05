@@ -14,6 +14,12 @@
 
 ## 当前传输验收范围（2026-10-04）
 
+2026-10-05 双仓库补充：应用与私有 `../terminal-core` 独立维护。客户端正式构建前执行
+`scripts/Verify-TerminalCoreCheckout.ps1 -RequireClean`，核对 `terminal-core.lock.json` 固定的核心
+commit；同时记录两库 revision、干净状态和 native 产物哈希。仅主仓库 revision 不再足以复现客户端。
+统一构建及 Windows Setup/MSIX 入口已接入校验，Server-only 不需要核心。目录和旧历史边界见
+[双仓库说明](development/REPOSITORY_LAYOUT.md)。
+
 用户明确指定当前仅使用服务器转发（Relay Only），CLI 与 AI 均适用。LAN/NAT 直连、打洞及直连/中转切换不再测试，不作为当前发布阻塞项；本文及历史记录中相关矩阵在本范围内记为“不适用（用户指定 Relay Only）”，不能记为通过。后续只有用户明确恢复直连范围时才执行相关测试。
 
 发布和部署现场核对策略保持 Relay Only，不因代码或部署模板的直连默认值自动开启直连。继续验证实际服务器转发下的功能、弱网重连、网络切换后的 Relay 恢复、升级及回滚。此范围记录不代表已修改或核验在线配置。
