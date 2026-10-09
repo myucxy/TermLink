@@ -1,5 +1,10 @@
 # Android production Termux dependency replacement
 
+> Historical implementation and validation record (2026-09-24). Product, Harness and tests now
+> use TermLink's native engine. The later cleanup removed the retired adapter, fork and comparison
+> tooling from this checkout; see [the 2026-10-08 cleanup record](archive/TERMUX_CLEANUP_20261008.md).
+> Paths and test counts below describe the earlier stage, not current build instructions.
+
 The production live terminal already uses `NativeTerminalEngine` and Rust `terminal-core`.
 This change replaces the remaining detached history renderer with `NativeTranscriptViewport`
 and removes parser-backed placeholders. The legacy replay activity and Termux dependency are

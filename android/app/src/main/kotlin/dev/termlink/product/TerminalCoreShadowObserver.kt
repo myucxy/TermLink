@@ -32,7 +32,7 @@ internal fun createJniTerminalCoreShadowObserver(
  * Legacy diagnostic terminal-core comparator. The native terminal-core engine is production
  * renderer/input authority; this observer is isolated, optional, and must never advance ACKs.
  *
- * A non-empty Termux bootstrap cannot seed terminal-core, so the observer stays dormant until a
+ * An existing renderer bootstrap cannot seed this isolated core, so it stays dormant until a
  * verified renderer reset announces a complete replay beginning at sequence 1.
  */
 internal class TerminalCoreShadowObserver(

@@ -172,9 +172,9 @@ internal class RealtimeAccessTokenSource {
 /**
  * Invalidates any asynchronous token result captured by an older auth lifecycle.
  *
- * The pinned Termux sources intentionally exclude OIDC, WebSocket authentication,
- * and remote-session ownership.  TermLink therefore owns this boundary; Termux's
- * generation checks are only a lifecycle-behaviour reference, not reusable code.
+ * TermLink owns OIDC, WebSocket authentication and remote-session ownership.
+ * Historical Termux generation checks were only a lifecycle-behaviour reference;
+ * no upstream authentication or process code is used here.
  */
 internal class AuthenticationLifecycleFence(
     initialGeneration: Long = 0L,

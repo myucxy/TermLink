@@ -25,7 +25,7 @@ DEV 构建显式传入 Android 最后一次成功正式发布的版本/build，�
 
 ## 当前边界
 
-- 产品、Harness 和测试使用自有 terminal-core、JNI 与 View。`terminal-engine-termux/` 仅为来源归档，不在构建图中。
+- 产品、Harness 和测试使用自有 terminal-core、JNI 与 View。旧 Termux 模块和源码已迁出仓库，来源记录见[清理说明](../docs/archive/TERMUX_CLEANUP_20261008.md)。
 - CLI 与结构化 AI 当前使用及验收范围为 Relay Only，不安排 LAN/NAT 测试。
 - AI Web 资源目前内嵌 APK；ZCode 桌面远控使用其官方网页。详情见[当前架构](../docs/architecture/CURRENT.md)。
 - 手机不是 Windows 进程或历史的权威来源，离线、过期登录及失效会话应按主机状态处理。

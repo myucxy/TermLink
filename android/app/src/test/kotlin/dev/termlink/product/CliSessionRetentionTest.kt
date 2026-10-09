@@ -46,12 +46,56 @@ class CliSessionRetentionTest {
             confirmed.copy(pcs = emptyList(), sessions = emptyList()),
         )
         uncertain.forEach { assertEquals(opened, retainedCliSessionTabs(it, opened)) }
-        uncertain.forEach { snapshot ->
-            val devicePc = snapshot.pcs.firstOrNull() ?: pc
-            assertEquals(snapshot.sessions, visibleDeviceCliSessions(snapshot, devicePc))
-        }
         val reconnecting = confirmed.copy(sessions = listOf(live), sessionStates = mapOf(live.id to RemoteSessionState.Reconnecting(1, "network unavailable")))
         assertEquals(listOf(live.id.toString()), retainedCliSessionTabs(reconnecting, listOf(live.id.toString())))
+    }
+
+    @Test fun endedDeviceRowsStayHiddenThroughoutRefreshFailureAndRecovery() {
+        val refreshing = confirmed.copy(connectionState = ProductConnectionState.CONNECTING)
+        val timedOut = confirmed.copy(pcSessionCatalogErrors = mapOf(pcId to "TIMEOUT"))
+        val failed = timedOut.copy(connectionState = ProductConnectionState.ERROR, connectionError = "network unavailable")
+        val recovered = confirmed.copy(pcSessionCatalogObservations = mapOf(pcId to
+            confirmed.pcSessionCatalogObservations.getValue(pcId).copy(observedAtMillis = 2)))
+
+        listOf(confirmed, refreshing, timedOut, failed, recovered).forEach { snapshot ->
+            assertEquals(listOf(live), visibleDeviceCliSessions(snapshot, pc))
+            assertEquals(listOf(live, ended, interrupted), snapshot.sessions)
+        }
+        listOf(refreshing, timedOut, failed).forEach { snapshot ->
+            assertFalse(snapshot.hasConfirmedSessionCatalog(pc))
+            assertEquals(opened, retainedCliSessionTabs(snapshot, opened))
+        }
+        assertEquals(listOf(live.id.toString()), retainedCliSessionTabs(recovered, opened))
+        assertTrue(visibleDeviceCliSessions(refreshing.copy(sessions = listOf(ended, interrupted)), pc).isEmpty())
+    }
+
+    @Test fun deviceRowsRequireAHostObservationForTheCurrentTrustedIdentity() {
+        val unverified = listOf(
+            confirmed.copy(signedIn = false),
+            confirmed.copy(pcSessionCatalogObservations = emptyMap()),
+            confirmed.copy(pcs = listOf(pc.copy(deviceId = UUID.randomUUID()))),
+            confirmed.copy(pcs = listOf(pc.copy(keyEpoch = pc.keyEpoch + 1))),
+            confirmed.copy(pcs = listOf(pc.copy(online = false))),
+            confirmed.copy(pcs = listOf(pc.copy(remoteRoutingEnabled = false))),
+            confirmed.copy(devices = listOf(device.copy(trustState = DeviceTrustState.REVOKED))),
+            confirmed.copy(devices = emptyList()),
+        )
+        unverified.forEach { snapshot ->
+            assertTrue(visibleDeviceCliSessions(snapshot, snapshot.pcs.single()).isEmpty())
+            assertEquals(opened, retainedCliSessionTabs(snapshot, opened))
+        }
+    }
+
+    @Test fun refreshKeepsUncertainLiveRowsAndFreshRunningObservationCanRestoreARow() {
+        val uncertainLive = live.copy(online = false)
+        val aliveInterrupted = interrupted.copy(online = true)
+        val refreshing = confirmed.copy(connectionState = ProductConnectionState.CONNECTING,
+            sessions = listOf(uncertainLive, aliveInterrupted, ended),
+            sessionStates = mapOf(live.id to RemoteSessionState.Reconnecting(1, "network unavailable")))
+        assertEquals(listOf(uncertainLive, aliveInterrupted), visibleDeviceCliSessions(refreshing, pc))
+        val resumed = interrupted.copy(state = SessionState.RUNNING, online = true)
+        assertEquals(listOf(live, resumed), visibleDeviceCliSessions(confirmed.copy(sessions = listOf(live, resumed, ended)), pc))
+        assertEquals(listOf(live), visibleDeviceCliSessions(confirmed.copy(sessions = listOf(live)), pc))
     }
 
     @Test fun oneOfflinePcDoesNotBlockConfirmedEndedTabsButUnknownOwnersWait() {
@@ -60,6 +104,6 @@ class CliSessionRetentionTest {
         val partial = confirmed.copy(pcs = listOf(pc, offlinePc), sessions = confirmed.sessions + offlineSession)
         assertEquals(listOf(live.id.toString(), missing), retainedCliSessionTabs(partial, opened))
         assertEquals(listOf(live), visibleDeviceCliSessions(partial, pc))
-        assertEquals(listOf(offlineSession), visibleDeviceCliSessions(partial, offlinePc))
+        assertTrue(visibleDeviceCliSessions(partial, offlinePc).isEmpty())
     }
 }

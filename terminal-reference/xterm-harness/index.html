@@ -29,7 +29,6 @@
       </div>
       <div class="actions">
         <button id="download-grid" type="button" disabled>Export xterm grid</button>
-        <button id="download-report" type="button" disabled>Export diff</button>
       </div>
     </section>
 
@@ -37,17 +36,6 @@
       <div id="terminal"></div>
     </section>
 
-    <section class="comparison" aria-labelledby="comparison-title">
-      <div class="comparison-heading">
-        <div>
-          <p class="eyebrow">Termux ↔ xterm.js</p>
-          <h2 id="comparison-title">Comparable grid fields</h2>
-        </div>
-        <span id="compare-status" class="status" data-tone="neutral">Not compared</span>
-      </div>
-      <p id="compare-summary">Replay a validated bundle to compare the engines.</p>
-      <ol id="differences" class="differences"></ol>
-    </section>
   </main>
 
   <script type="module" src="src/app.mjs"></script>

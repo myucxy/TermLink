@@ -2,8 +2,8 @@
   "bridgeVersion": 1,
   "sources": {
     "index.html": "e570c263f990ac8d2ecae9296e8a57e5321731288428b1922b2e1b20f66f115a",
-    "package-lock.json": "6214429bb9729e9657be730dea116f7ab3589afd76391412ed65ff1902d1cfc2",
-    "package.json": "70cf4fdf4eb8f02d6713bfcdbffe62a9e5d7e4957396131bc0417de9802ff01b",
+    "package-lock.json": "1474d0894fafa9715b98b9dc77cc9d9fcd645bc8b2a71060b18c1b3ef49b525e",
+    "package.json": "533e0e9750162fdb656b532738867507dbef4b56f14d462acd4ebe2bb3ecca3c",
     "scripts/assets.mjs": "447d5203bc011bccc3f9c5320e9fe369ec9df4a6d0a386a398c1217bbec81e6e",
     "src/CodeBlock.tsx": "2f640cb3242900b222c31d36abba754c7fb1a28db244bdb143f4c6af6384378b",
     "src/bridge.ts": "c944c6d2ea045f9dd88ec0758279c0e7b03d7342b64d10bffd75abeecf6df294",

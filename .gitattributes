@@ -14,4 +14,3 @@ android/gradlew text eol=lf
 testdata/terminal-golden-streams/**/events.jsonl text eol=crlf
 testdata/terminal-golden-streams/**/expectations.json text eol=crlf
 testdata/terminal-golden-streams/**/output.bin binary
-terminal-forks/termux-patches/*.patch whitespace=-trailing-space,-space-before-tab

@@ -441,7 +441,7 @@ TermLink/
 - [LAN Replay V1](protocol/test-vectors/LAN_REPLAY_V1.md)；
 - [Phase 1 临时双向测试协议](protocol/test-vectors/PHASE1_TEST_SESSION_V1.md)；
 - [Android Harness 与真机测试](android/README.md)；
-- [固定 Termux Fork 与补丁队列](terminal-forks/termux-terminal/UPSTREAM.md)；
+- [固定 Termux 来源与归档记录](docs/archive/TERMUX_CLEANUP_20261008.md)（原 Fork 与补丁已迁出工作树）；
 - [LAN Docker 测试服务](server/README.md)；
 - [可交互 UI 原型](ui-prototypes/index.html)。
 

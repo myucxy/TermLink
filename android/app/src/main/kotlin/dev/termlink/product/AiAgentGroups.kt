@@ -9,6 +9,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import dev.termlink.harness.R
@@ -77,7 +78,8 @@ internal fun aiListRows(entries: List<AiOpened>, sessions: Map<String, AiConvers
 @Composable
 internal fun AiAgentProductIcon(agentId: String, modifier: Modifier = Modifier.size(22.dp)) {
     when (aiAgentId(agentId)) {
-        "codex" -> Icon(painterResource(R.drawable.ai_agent_codex), null, modifier, tint = MaterialTheme.colorScheme.onSurface)
+        "codex" -> Icon(painterResource(R.drawable.ai_agent_openai), null, modifier,
+            tint = if (MaterialTheme.colorScheme.surface.luminance() < .5f) Color.White else Color.Black)
         "claude" -> Icon(painterResource(R.drawable.ai_agent_claude), null, modifier, tint = Color.Unspecified)
         "zcode" -> Image(painterResource(R.drawable.ai_agent_zcode), null, modifier)
         else -> Icon(Icons.Default.ChatBubbleOutline, null, modifier, tint = MaterialTheme.colorScheme.primary)

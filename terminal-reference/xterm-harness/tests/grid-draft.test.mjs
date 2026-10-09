@@ -26,7 +26,7 @@ test('reports text, cursor and mode differences without comparing engine metadat
   ]);
 });
 
-test('makes a missing Termux export explicit', () => {
+test('makes a missing reference grid explicit', () => {
   assert.equal(compareGridDrafts(null, fixtureGrid()).status, 'missing-reference');
 });
 
@@ -107,7 +107,7 @@ function fixtureGrid() {
   return {
     format: GRID_FORMAT,
     format_version: GRID_FORMAT_VERSION,
-    engine: { name: 'termux', version: 'test', unicode_version: null },
+    engine: { name: 'reference-fixture', version: 'test', unicode_version: null },
     source: {
       case_name: 'case',
       capture_id: '00000000-0000-4000-8000-000000000001',

@@ -5,6 +5,7 @@ import dev.termlink.harness.R
 import androidx.compose.ui.res.stringResource
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -17,11 +18,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.termlink.model.PcSummary
 import java.util.UUID
@@ -42,11 +46,16 @@ internal fun aiVisibleEntries(opened: List<AiOpened>, sessions: Map<String, AiCo
 
 @Composable
 internal fun AiGroupHeading(name: String, count: Int, icon: ImageVector?, collapsed: Boolean, nested: Boolean = false, toggle: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = toggle).heightIn(min = 40.dp).padding(start = if (nested) 10.dp else 0.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (icon == null) AiAgentProductIcon(aiAgentId(name), Modifier.size(22.dp))
+    Row(Modifier.fillMaxWidth()
+        .background(if (nested) Color.Transparent else MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(8.dp))
+        .clickable(role = Role.Button, onClick = toggle).heightIn(min = 40.dp)
+        .padding(start = if (nested) 10.dp else 8.dp, end = 6.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (icon == null) AiAgentProductIcon(aiAgentId(name), Modifier.size(20.dp))
         else Icon(icon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
-        Text(name, Modifier.weight(1f), style = if (nested) MaterialTheme.typography.labelLarge else MaterialTheme.typography.titleSmall,
+        Text(name, Modifier.weight(1f), style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (nested) FontWeight.Medium else FontWeight.SemiBold,
+            color = if (nested) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(count.toString(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Icon(if (collapsed) Icons.Default.ChevronRight else Icons.Default.ExpandMore, if (collapsed) "展开 $name" else "折叠 $name", Modifier.size(20.dp))
@@ -55,7 +64,7 @@ internal fun AiGroupHeading(name: String, count: Int, icon: ImageVector?, collap
 
 @Composable
 internal fun AiCompactSearch(value: String, change: (String) -> Unit, modifier: Modifier = Modifier) {
-    Surface(modifier.height(40.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+    Surface(modifier.heightIn(min = 36.dp), shape = RoundedCornerShape(8.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
         Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.Search, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             BasicTextField(value, change, Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "搜索 AI 会话" }, singleLine = true,

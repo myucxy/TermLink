@@ -1273,7 +1273,10 @@ namespace TermLink.Agent
             return null;
         }
 
+        // Legacy V1 compatibility only; native snapshot authority returns above this path.
         // Exact Unicode 15 tables from the pinned Termux WcWidth implementation.
+        // Range values match jquast/wcwidth@1b9b6585 (15.0.0); see WcWidth-NOTICE.txt.
+        // Original provenance and remaining V1 review: docs/archive/TERMUX_CLEANUP_20261008.md.
         private static readonly (int Start, int End)[] TermuxZeroWidthRanges =
         {
             (0x00300, 0x0036f), (0x00483, 0x00489), (0x00591, 0x005bd), (0x005bf, 0x005bf),

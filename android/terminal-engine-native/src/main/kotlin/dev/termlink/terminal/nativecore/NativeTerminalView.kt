@@ -1563,7 +1563,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** History preserves the pinned Termux renderer's metrics and synthetic styles. */
+    /** Own history renderer; metrics/styles retain the behavior documented in ANDROID_TERMUX_REMOVAL.md. */
     private fun drawTranscript(canvas: Canvas, frame: TerminalRenderFrameV3, theme: TerminalThemeV1) {
         canvas.drawColor(theme.background.value)
         val first = floor(viewportY / cellHeight).toInt().coerceAtLeast(0)

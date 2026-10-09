@@ -1,0 +1,49 @@
+TermLink legacy V1 snapshot compatibility width data
+
+ProductionTerminalHistoryProducer.cs retains Unicode 15.0.0 zero-width and
+wide-character ranges originally taken through Termux's WcWidth.java at:
+https://github.com/termux/termux-app/tree/3df69d1da197dd9bd71a3bafd902dffd720576b4
+
+The upstream WcWidth.java identifies jquast/wcwidth as its source. The 343
+zero-width and 121 wide-character ranges were checked on 2026-10-08 against
+the corresponding Unicode 15.0.0 tables at the following pinned revision;
+all range values and their order match. No rendering or protocol behavior
+was changed as part of this attribution update.
+
+https://github.com/jquast/wcwidth/blob/1b9b6585b0080ea5cb88dc9815796505724793fe/wcwidth/table_zero.py
+https://github.com/jquast/wcwidth/blob/1b9b6585b0080ea5cb88dc9815796505724793fe/wcwidth/table_wide.py
+
+The license below is reproduced from that same wcwidth revision's LICENSE.
+It covers that upstream material, not all TermLink code or all historic
+Termux-derived material. Original Termux provenance and the remaining
+compatibility review are recorded in docs/archive/TERMUX_CLEANUP_20261008.md.
+
+----- wcwidth LICENSE -----
+
+The MIT License (MIT)
+
+Copyright (c) 2014 Jeff Quast <contact@jeffquast.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Markus Kuhn -- 2007-05-26 (Unicode 5.0)
+
+Permission to use, copy, modify, and distribute this software
+for any purpose and without fee is hereby granted. The author
+disclaims all warranties with regard to this software.

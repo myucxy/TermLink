@@ -146,7 +146,7 @@ Pop-Location
 
 APK 位于 `android/app/build/outputs/apk/debug/`。Debug 使用调试签名，不需要正式发布 keystore；正式 APK 必须沿用既有发布签名。需要独立测试服务端时，通过 Debug 属性 `termlinkServerUrl` 显式指定测试地址，不把账号或密码写入构建参数和源码。
 
-`terminal-engine-termux/` 不参与构建，也不是测试前置条件。
+旧 Termux 模块、源码和导出工具已迁出仓库；无需获取或生成其任何文件，详见[清理记录](../archive/TERMUX_CLEANUP_20261008.md)。
 
 ## 按影响范围验证
 
@@ -174,7 +174,7 @@ go vet ./...
 Pop-Location
 ```
 
-Rust 核心在同级私有仓库中独立测试，参见[双仓库说明](REPOSITORY_LAYOUT.md)；协议向量和真实跨端链路分别参见[测试向量](../../testdata/terminal-golden-streams/README.md)、[跨端验证](../../technical-validation/e2e/README.md)。真实 AI 生成可能需要已安装 Agent、登录和可用额度；模拟协议结果与真实生成分开记录。
+Rust 核心在同级独立仓库中测试，采用 GPLv3、计划后续公开，参见[双仓库说明](REPOSITORY_LAYOUT.md)；协议向量和真实跨端链路分别参见[测试向量](../../testdata/terminal-golden-streams/README.md)、[跨端验证](../../technical-validation/e2e/README.md)。真实 AI 生成可能需要已安装 Agent、登录和可用额度；模拟协议结果与真实生成分开记录。
 
 当前 CLI 与 AI 联测仅使用 Relay Only：按修改范围验证登录、会话、输入、附件、审批、断线恢复和升级等。不安排 LAN/NAT 探测或打洞，不把历史直连项记录为通过。
 
@@ -182,4 +182,4 @@ Rust 核心在同级私有仓库中独立测试，参见[双仓库说明](REPOSI
 
 当前尚未在新的干净环境中验证本文全部步骤。已知可移植性问题、许可审计和 CI 缺口见[开源准备清单](OPEN_SOURCE_READINESS.md)。
 
-普通贡献不需要上传 AppShip、Docker Hub 或接触正式签名私钥。完整发布须另行固定源码 revision、版本/build、签名者、测试及回滚证据；所有平台的运行手册门禁仍适用。
+普通贡献不需要上传 AppShip、Docker Hub 或接触正式签名私钥。完整发布须另行固定源码 revision、版本/build、签名者、测试及回滚证据，并提供 GPLv3 要求的对应源码和构建资料；所有平台的运行手册门禁仍适用。应用可以不检出 core 而构建，不代表对外分发时可以省略 core 的对应源码。

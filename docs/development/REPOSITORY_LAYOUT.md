@@ -40,7 +40,7 @@ TermLink/                  工作区容器，无 .git
 应用构建只读取本仓库的 `native/terminal-core/` 二进制，不访问同级核心源码。维护者可以继续使用同级目录；普通应用开发者只需检出应用仓库。
 
 ```text
-terminal-core/                   私有实现与构建
+terminal-core/                   独立实现与构建（GPLv3，后续公开）
 ├── crates/、include/             Rust、C ABI 与头文件
 ├── android/jni/                  JNI C++ 与 CMake
 └── scripts/Build-ToTermLink.ps1   编译并导出 DLL/SO
@@ -66,7 +66,7 @@ core 的 JNI 注册名称、C ABI、Windows 静态 CRT 保持兼容；应用保�
 
 Windows Setup/MSIX 与统一构建入口调用上述校验；Android Gradle 在 preBuild 验证四种 ABI 的大小和 SHA-256。校验失败即停止，不自动下载、重新编译或悄悄使用旧缓存。客户端发布记录应用 revision、锁文件中的 core revision 和二进制哈希；Server-only 不依赖终端核心。
 
-core 默认拒绝未提交源码导出；明确使用 `-Development` 才允许，锁文件记录 `source_dirty=true`，正式打包拒绝此类产物。此流程只实现已有授权边界内的二进制交付，不授予新的公开分发许可。
+core 默认拒绝未提交源码导出；明确使用 `-Development` 才允许，锁文件记录 `source_dirty=true`，正式打包拒绝此类产物。二进制交付必须同时满足 GPLv3 的许可和对应源码要求；核心导出路径仍只复制 DLL/SO，许可由应用随包携带，源码作为独立发布材料提供。
 
 ## 历史、可见性与许可
 
@@ -74,7 +74,7 @@ core 默认拒绝未提交源码导出；明确使用 `-Development` 才允许�
 
 2026-10-05 上传前核验：核心仓库通过已授权 SSH 可读取；匿名访问 GitHub 仓库页与 API 均为 404，同网络下公开仓库 API 为 200，符合私有仓库访问行为。未取得认证 API 的 `private` 字段，不将此记录写成 GitHub 配置审计。后续上传仍须核对可见性。若决定清理主仓库历史，需要独立规划迁移与远端推送，不能对现有分支/标签直接强制覆盖。
 
-核心维持 Proprietary；其他组件许可证不因目录迁移而改变。此前“禁止商用”的意向尚未转换成新的许可文本。参见[许可证状态](../../LICENSE-STATUS.md)。
+2026-10-09，维护者决定将应用与 core 自有代码统一改为 `GPL-3.0-only`，替代拆分时 core 的 Proprietary 声明和此前的非商业意向。GPLv3 允许商用；第三方原有许可不变。core 计划后续公开，当前未调整远端可见性。主仓库保留 core 历史不再与“core 永久闭源”的目标绑定，但完整历史的秘密和第三方审核仍须完成。分发新版二进制前必须提供匹配的完整对应源码，参见[授权说明](../../LICENSE-STATUS.md)。
 
 ## 初次拆分验证（2026-10-05）
 

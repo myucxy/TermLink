@@ -1,11 +1,10 @@
 import { Terminal } from '../vendor/xterm.mjs';
 import { Unicode11Addon } from '../vendor/addon-unicode11.mjs';
 import { loadGoldenBundle, replayGoldenBundle } from './golden-stream.mjs';
-import { compareGridDrafts, exportXtermGrid } from './grid-draft.mjs';
+import { exportXtermGrid } from './grid-draft.mjs';
 
 const DEFAULT_CASE = 'smoke-powershell-v1';
 const TESTDATA_ROOT = '../../testdata/terminal-golden-streams';
-const TERMUX_REFERENCE_ROOT = '../../android/terminal-engine-termux/build/termlink-reference';
 
 const elements = {
   caseName: document.querySelector('#case-name'),
@@ -13,11 +12,7 @@ const elements = {
   status: document.querySelector('#run-status'),
   facts: document.querySelector('#run-facts'),
   terminal: document.querySelector('#terminal'),
-  compareStatus: document.querySelector('#compare-status'),
-  compareSummary: document.querySelector('#compare-summary'),
-  differences: document.querySelector('#differences'),
   downloadGrid: document.querySelector('#download-grid'),
-  downloadReport: document.querySelector('#download-report'),
 };
 
 const terminal = new Terminal({
@@ -62,12 +57,10 @@ terminal.unicode.activeVersion = '11';
 terminal.open(elements.terminal);
 
 let currentGrid = null;
-let currentReport = null;
 
 elements.caseName.value = new URL(location.href).searchParams.get('case') ?? DEFAULT_CASE;
 elements.replay.addEventListener('click', run);
 elements.downloadGrid.addEventListener('click', () => downloadJson(currentGrid, `${elements.caseName.value}.xterm-grid.json`));
-elements.downloadReport.addEventListener('click', () => downloadJson(currentReport, `${elements.caseName.value}.grid-diff.json`));
 
 await run();
 
@@ -93,9 +86,7 @@ async function run() {
       capture_id: bundle.manifest.capture_id,
       final_sequence: bundle.report.finalSequence,
     });
-    const termuxGrid = await loadTermuxReference(caseName);
-    currentReport = compareGridDrafts(termuxGrid, currentGrid);
-    renderSuccess(bundle.report, currentReport);
+    renderSuccess(bundle.report);
   } catch (error) {
     console.error(error);
     showFailure(error instanceof Error ? error.message : String(error));
@@ -104,69 +95,28 @@ async function run() {
   }
 }
 
-async function loadTermuxReference(caseName) {
-  const response = await fetch(`${TERMUX_REFERENCE_ROOT}/${caseName}.termux-grid.json`, {
-    cache: 'no-store',
-    credentials: 'same-origin',
-  });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`Unable to load Termux reference: HTTP ${response.status}`);
-  return response.json();
-}
-
-function renderSuccess(report, comparison) {
+function renderSuccess(report) {
   elements.status.dataset.tone = 'success';
   elements.status.textContent = 'Verified';
   elements.facts.textContent = `${report.eventCount} events · ${report.outputBytes} bytes · ` +
     `${report.finalSize.columns}×${report.finalSize.rows} · exit ${report.exitCode}`;
-  elements.compareStatus.dataset.tone = comparison.status === 'match'
-    ? 'success'
-    : comparison.status === 'different' ? 'danger' : 'warning';
-  elements.compareStatus.textContent = comparison.status === 'match'
-    ? 'Grid match'
-    : comparison.status === 'different' ? 'Differences found' : 'Reference pending';
-  elements.compareSummary.textContent = comparison.summary;
-  elements.differences.replaceChildren();
-
-  if (comparison.differences.length === 0) {
-    const row = document.createElement('li');
-    row.textContent = comparison.status === 'match'
-      ? 'No comparable differences.'
-      : 'Generate the Termux grid with the documented Gradle task, then replay.';
-    elements.differences.append(row);
-  } else {
-    for (const difference of comparison.differences.slice(0, 20)) {
-      const row = document.createElement('li');
-      const path = document.createElement('code');
-      path.textContent = difference.path;
-      const values = document.createElement('span');
-      values.textContent = `${displayValue(difference.expected)} → ${displayValue(difference.actual)}`;
-      row.append(path, values);
-      elements.differences.append(row);
-    }
-  }
   elements.downloadGrid.disabled = false;
-  elements.downloadReport.disabled = false;
 }
 
 function showFailure(message) {
   elements.status.dataset.tone = 'danger';
   elements.status.textContent = 'Validation failed';
   elements.facts.textContent = message;
-  elements.compareStatus.dataset.tone = 'neutral';
-  elements.compareStatus.textContent = 'Not compared';
-  elements.compareSummary.textContent = 'The bundle must pass strict validation before rendering.';
-  elements.differences.replaceChildren();
   currentGrid = null;
-  currentReport = null;
   elements.downloadGrid.disabled = true;
-  elements.downloadReport.disabled = true;
 }
 
 function setBusy(busy) {
   elements.replay.disabled = busy;
   elements.caseName.disabled = busy;
   if (busy) {
+    currentGrid = null;
+    elements.downloadGrid.disabled = true;
     elements.status.dataset.tone = 'neutral';
     elements.status.textContent = 'Validating';
     elements.facts.textContent = 'Checking hashes, ordering, output ranges and expectations…';
@@ -181,9 +131,4 @@ function downloadJson(value, filename) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
-}
-
-function displayValue(value) {
-  const serialized = JSON.stringify(value);
-  return serialized.length > 140 ? `${serialized.slice(0, 137)}…` : serialized;
 }

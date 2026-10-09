@@ -44,7 +44,7 @@ export function compareGridDrafts(reference, candidate, differenceLimit = 200) {
   if (!reference) {
     return {
       status: 'missing-reference',
-      summary: 'Termux reference grid is not available. Run the Android unit-test export first.',
+      summary: 'No reference grid was supplied for comparison.',
       difference_count: 0,
       differences: [],
     };
@@ -100,7 +100,7 @@ export function compareGridDrafts(reference, candidate, differenceLimit = 200) {
   return {
     status: differenceCount === 0 ? 'match' : 'different',
     summary: differenceCount === 0
-      ? 'Termux and xterm.js draft grids match on comparable fields.'
+      ? 'Reference and candidate grids match on comparable fields.'
       : `${differenceCount} comparable grid difference${differenceCount === 1 ? '' : 's'} detected.`,
     difference_count: differenceCount,
     truncated: differenceCount > differences.length,

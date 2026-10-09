@@ -17,13 +17,26 @@
 2026-10-05 二进制边界补充：应用只消费 `native/terminal-core/` 下的 DLL/SO。客户端正式构建前执行
 `scripts/Verify-NativeArtifacts.ps1 -RequireClean`，核对 `terminal-core.lock.json` 的核心 commit、
 干净源码标记、大小和 SHA-256；记录应用 revision 与核心二进制来源。应用构建不检查或编译 core checkout。
-更新核心时在私有 core 仓库运行 `scripts/Build-ToTermLink.ps1`，应用的五个库和锁文件一起提交。
+更新核心时在独立 core 仓库运行 `scripts/Build-ToTermLink.ps1`，应用的五个库和锁文件一起提交。
 统一构建及 Windows Setup/MSIX 已接入校验，Android Gradle 也检查入包前的 SO；Server-only 不依赖核心。
 目录和旧历史边界见[双仓库说明](development/REPOSITORY_LAYOUT.md)。
 
 用户明确指定当前仅使用服务器转发（Relay Only），CLI 与 AI 均适用。LAN/NAT 直连、打洞及直连/中转切换不再测试，不作为当前发布阻塞项；本文及历史记录中相关矩阵在本范围内记为“不适用（用户指定 Relay Only）”，不能记为通过。后续只有用户明确恢复直连范围时才执行相关测试。
 
 发布和部署现场核对策略保持 Relay Only，不因代码或部署模板的直连默认值自动开启直连。继续验证实际服务器转发下的功能、弱网重连、网络切换后的 Relay 恢复、升级及回滚。此范围记录不代表已修改或核验在线配置。
+
+## 许可证与对应源码交付（2026-10-09）
+
+应用与 core 自有代码采用 `GPL-3.0-only`，允许商用，第三方材料保留各自许可与署名。
+本节为后续分发的人工核验要求，不代表既有自动脚本已验证源码交付合规：
+
+1. 核对两仓库 LICENSE、NOTICE、Cargo/npm/.NET 元数据和 Docker OCI license 标签一致；不覆盖第三方声明。
+2. 确认 APK 的 `assets/licenses/termlink/`、Windows 发布载荷根目录及 Server 镜像根目录包含完整 LICENSE 和 NOTICE；同时保留各平台第三方许可。独立分发组件时也须携带适用许可。
+3. 为每个制品准备可下载的完整对应源码及其构建脚本、依赖版本和适用的安装信息；客户端记录应用 commit 和 `terminal-core.lock.json` 的实际 core commit。Server-only 不需要未链接的终端 core。
+4. 在下载页/发布说明提供对应源码入口，按 GPLv3 第 6 条的适用方式核验接收者可取得，记录下载地址和源码归档 SHA-256。仅有私有仓库地址、锁文件哈希或“稍后开源”不能通过本项。
+5. 本次授权不改写旧二进制来源：若 core 产物早于 GPLv3 许可提交，应交付真实构建 revision 的源码及本次许可授权说明；不得仅改锁文件 revision 冒充重编译。历史制品和旧版已授予的许可另按当时内容核对。
+
+core 仓库后续公开与本次许可变更分开执行。匹配的源码交付未落实时，保留本地构建验证结果并停止新的对外二进制分发。现有签名、版本与发布授权门禁仍适用，详见[授权说明](../LICENSE-STATUS.md)。
 
 ## DEV 与正式发布版本规则
 

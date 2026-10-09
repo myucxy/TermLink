@@ -4,18 +4,34 @@ These small product marks identify the connected third-party Agent in TermLink. 
 TermLink branding and do not indicate endorsement. Product names and marks remain the property
 of their respective owners. No Agent runtime, account data or application code is included.
 
-## Codex and Claude Code
+## Codex
+
+The Codex integration uses OpenAI's black/white Blossom mark, as requested by the user.
+Official brand page: https://openai.com/brand/ (checked 2026-10-09).
+Source artwork:
+https://images.ctfassets.net/kftzwdyauwt9/3hUGLn3ypllZ0oa01qOYVq/28e8188e6f11b84c3e876569d492734f/Blossom_Light.svg
+
+Source SHA-256: `01485e70cea6df8422f5abc643fbbd3c153442cc41da0e7d8e7451801ebf26e2`.
+
+Destination: `res/drawable/ai_agent_openai.xml` (Android VectorDrawable).
+The first solid black Blossom path is preserved verbatim from the source artwork;
+the surrounding construction guides and duplicate example are not part of the mark.
+The viewport centers the unmodified geometry with clear space. Rendered black on light
+surfaces and white on dark surfaces, without stretching or decorative effects.
+
+Copyright and trademarks belong to OpenAI. This asset is used only to identify the Codex
+integration, not as TermLink branding or an endorsement. It is not covered by TermLink's GPL
+or the LobeHub MIT license. Usage is subject to OpenAI's brand guidelines and Marks usage terms:
+https://openai.com/brand/ (checked 2026-10-09; usage terms retained in `openai-marks-usage.txt`).
+
+## Claude Code
 
 Source: https://github.com/lobehub/lobe-icons/tree/82e641b4fece9d1028a127149af9ded00df5ac0c
 
-- `packages/static-png/light/codex.png` → `res/drawable-nodpi/ai_agent_codex.png`
 - `packages/static-svg/icons/claudecode-color.svg` → `res/drawable/ai_agent_claude.xml`
 
 Copyright (c) 2023 LobeHub. MIT license reproduced in `lobe-icons-LICENSE.txt`.
-Codex's original PNG is copied byte-for-byte (SHA-256:
-`87b2480a8fbb1ee1c3454e40ef2cd3c3a8d98e7203ecee25fdfb50b813f0aafa`)
-and tinted to the app's foreground color at rendering time. This avoids Android VectorDrawable's
-incompatibility with the SVG's compact arc flags. Claude Code's SVG path is converted to
+Claude Code's SVG path is converted to
 Android VectorDrawable, preserving geometry, even-odd fill and product color.
 No icon library dependency or network icon loading is used.
 

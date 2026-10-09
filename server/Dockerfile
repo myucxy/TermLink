@@ -41,10 +41,11 @@ LABEL org.opencontainers.image.title="TermLink Server" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
       org.opencontainers.image.source="${SOURCE}" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="GPL-3.0-only"
 
 COPY --from=build /out/termlink-server /termlink-server
 COPY server/THIRD_PARTY_NOTICES.md /THIRD_PARTY_NOTICES.md
+COPY LICENSE NOTICE /
 
 USER 65532:65532
 EXPOSE 8080 9090

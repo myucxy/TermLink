@@ -29,6 +29,8 @@
     <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\Presentation\TermLink.Presentation.csproj" />
+    <None Include="..\..\..\LICENSE;..\..\..\NOTICE" Link="%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="RemoveIncompatibleAvaloniaAnalyzers" BeforeTargets="CoreCompile">
     <ItemGroup>

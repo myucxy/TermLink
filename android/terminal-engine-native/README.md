@@ -10,7 +10,7 @@ This module consumes the four prebuilt `libtermlink_terminal_jni.so` files in
 against `terminal-core.lock.json` before building. No core checkout, Rust terminal compiler, JNI
 C++ source or terminal CMake project is loaded by the application build.
 
-The private core repository owns `android/jni/` and `scripts/Build-ToTermLink.ps1`, using Rust
+The separate GPLv3 core repository (public release planned) owns `android/jni/` and `scripts/Build-ToTermLink.ps1`, using Rust
 1.97.1 and NDK 27.0.12077973 to compile/export all four ABIs. The libraries remain stripped with
 16 KiB ELF alignment. This application module owns only the Kotlin calling contracts, validated
 frame decoders, view and tests; JNI registration names are unchanged.

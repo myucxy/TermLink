@@ -1,5 +1,7 @@
 # 01 · 项目总览
 
+> 本文保留原阶段技术盘点。2026-10-09 起，应用、network-core 与独立 terminal-core 的自有代码均采用 `GPL-3.0-only`；下文 Proprietary/Apache-2.0 描述为历史声明，当前以[授权说明](../../LICENSE-STATUS.md)为准。Termux 退役材料已迁出，见[清理记录](../archive/TERMUX_CLEANUP_20261008.md)。
+
 ## 定位
 
 TermLink 是一个远程终端产品：Android 手机端安全、低延迟地查看和控制自己账号下多台 Windows PC 上的受管终端会话，支持断线恢复、可选加密历史、设备撤销、审计和会员套餐。

@@ -2,10 +2,10 @@
   "name": "@termlink/xterm-reference-harness",
   "version": "0.1.0",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
   "description": "Offline xterm.js Golden Stream compatibility reference for TermLink",
   "scripts": {
-    "compare:phase0": "node scripts/compare-phase0.mjs --output ../../docs/validation/phase0-grid-report.json",
     "sync-vendor": "node scripts/sync-vendor.mjs",
     "test": "node --test tests/*.test.mjs"
   },

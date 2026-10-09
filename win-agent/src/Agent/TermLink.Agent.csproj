@@ -64,6 +64,9 @@
     <InternalsVisibleTo Include="TermLink" />
   </ItemGroup>
   <ItemGroup>
+    <None Update="WcWidth-NOTICE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\..\LICENSE;..\..\..\NOTICE" Link="%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Include="..\..\..\native\terminal-core\windows-x64\termlink_terminal_ffi.dll"
           Link="termlink_terminal_ffi.dll"
           CopyToOutputDirectory="PreserveNewest"

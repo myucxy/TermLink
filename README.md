@@ -4,7 +4,7 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 
 当前主要交付 Android 客户端、Windows x64 客户端和 Docker 服务端。Linux/macOS 桌面代码仍有待验收的能力，不等同于已正式支持的完整产品。
 
-> 项目级许可证暂未确定。现有组件声明和第三方授权继续有效，详见 [许可证状态](LICENSE-STATUS.md)。
+> 自有代码采用 [GNU GPLv3，仅第 3 版](LICENSE)（`GPL-3.0-only`），允许商用。terminal-core 同样采用 GPLv3，仓库计划后续公开；第三方材料保留各自条款。详见[授权范围与源码交付说明](LICENSE-STATUS.md)。
 
 ## 界面演示
 
@@ -57,12 +57,12 @@ flowchart LR
 | [ai-web/](ai-web/README.md) | APK 内嵌的 AI 对话 Web 界面 |
 | [server/](server/README.md) | Go 服务端、数据库迁移、Web 管理和部署 |
 | [protocol/](protocol/README.md) | 实时消息、加密信封与协议契约 |
-| native/terminal-core/ | 预编译 DLL/SO；实现与编译在私有 core 仓库，见[双仓库说明](docs/development/REPOSITORY_LAYOUT.md) |
+| native/terminal-core/ | 预编译 DLL/SO；实现与编译在独立 core 仓库，采用 GPLv3、计划后续公开，见[双仓库说明](docs/development/REPOSITORY_LAYOUT.md) |
 | [network-core/](network-core/README.md) | 可选直连核心；当前运行及验收使用 Relay |
 | scripts/、release/ | 构建、制品验证和发布脚本 |
 | testdata/、technical-validation/ | 测试向量、协议和跨端验收工具 |
 | [docs/](docs/README.md) | 使用、开发、架构、发布及历史文档导航 |
-| terminal-forks/、terminal-reference/、prototypes/、ui-prototypes/ | 来源归档、参考实现和原型，详见[归档索引](docs/archive/README.md) |
+| terminal-reference/、prototypes/、ui-prototypes/ | 独立参考工具和原型；已退役的 Termux 源码迁出应用仓库，详见[归档索引](docs/archive/README.md) |
 
 ## 开发、贡献与发布
 

@@ -1,0 +1,30 @@
+TermLink
+SPDX-License-Identifier: GPL-3.0-only
+
+TermLink is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, version 3 only.
+
+TermLink is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+more details.
+
+You should have received a copy of the GNU General Public License along
+with TermLink in LICENSE. If not, see <https://www.gnu.org/licenses/>.
+
+This license applies to TermLink-owned code, including the clients, server,
+AI Web UI, network-core, and the separately maintained terminal-core.
+Third-party code, dependencies, fonts, icons and other resources retain
+their own licenses, copyright notices and trademark rights. Keep their
+notices; this file does not replace or relicense them.
+
+Application source: https://github.com/myucxy/TermLink
+Terminal core source repository: https://github.com/myucxy/terminal-core
+
+As of the 2026-10-09 licensing decision, public access to the core repository
+is planned, not established by this notice. Binary distributors must provide
+the complete Corresponding Source required by GPLv3, including matching
+core source and build materials; a private or unavailable URL is not enough.
+Release records must identify the exact application revision, core revision
+and the actual source download location for each distributed artifact.

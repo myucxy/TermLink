@@ -11,6 +11,8 @@
 [发布与部署运行手册](RELEASE_RUNBOOK.md)。该手册记录已经现场验证过的命令约束；遇到相同错误时
 不要跳过门禁或重复使用已知无效的调用方式。
 
+2026-10-09 起，自有代码采用 GPLv3（`GPL-3.0-only`）。对外分发须携带 LICENSE、NOTICE 及第三方许可，并落实[对应源码交付检查](RELEASE_RUNBOOK.md#许可证与对应源码交付2026-10-09)；制品哈希和签名校验不替代该人工检查，core 计划后续公开也不豁免源码交付。
+
 Android 独占触发的 Windows Agent 自动升级协议、事务、取消与回滚边界见
 [Windows Agent 远程自动升级](REMOTE_AGENT_UPDATE.md)。
 

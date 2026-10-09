@@ -216,7 +216,7 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
     if (history) AiComputerHistory(workspace, available) { history = false }
     ending?.let { AiLifecycleDialog(workspace, it, delete = false) { ending = null } }
     Column(modifier) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(stringResource(R.string.ai_chats_title), Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             IconButton(onClick = { history = true }, enabled = available.isNotEmpty()) { Icon(Icons.Default.History, stringResource(R.string.ai_ui_history), Modifier.size(20.dp)) }
             AiAction(stringResource(R.string.ai_ui_create), Icons.Default.Add, enabled = available.isNotEmpty(), filled = true, description = stringResource(R.string.ai_ui_new_chat),
@@ -232,9 +232,8 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
                 Icon(Icons.Default.Close, stringResource(R.string.ai_phone_only), Modifier.size(18.dp))
             }
         }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         AiListTools(workspace, onlineIds, entries)
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, contentPadding = PaddingValues(horizontal = 12.dp)) {
+        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
             if (entries.isEmpty()) item {
                 AiEmptyState(Icons.Default.AutoAwesome, if (workspace.attentionOnly) "暂无待处理请求" else "开始一段 AI 对话",
                     if (pcs.isEmpty()) "电脑与服务端需支持 AI 对话，原命令行会话仍在 CLI。"
@@ -253,18 +252,18 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
                 val phoneOpened = workspace.opened.any { it.sessionId == opened.sessionId }
                 val host = snapshot.pcs.firstOrNull { it.id == opened.pcId }
                 val online = snapshot.signedIn && host?.online == true && host.remoteRoutingEnabled && workspace.unavailable[host.id] != true
+                Box(Modifier.padding(start = 28.dp).background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(8.dp))) {
                 if (opened.strategy == "desktop_remote") {
                     var menu by remember { mutableStateOf(false) }
-                    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).clickable(enabled = online) {
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = online, role = Role.Button) {
                         if (phoneOpened) workspace.selected = opened.sessionId else workspace.openRemote(opened.pcId, opened.agentId)
-                    }, verticalAlignment = Alignment.CenterVertically) {
-                        AiAgentBadge("ZCode")
-                        Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                            Text("ZCode", style = MaterialTheme.typography.titleSmall)
-                            Text("${host?.name.orEmpty()} · ${stringResource(R.string.ai_remote_strategy)}", style = MaterialTheme.typography.bodySmall)
-                        }
+                    }.padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(stringResource(R.string.ai_remote_strategy), Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (!online) AiStatusTag("待确认") else Icon(Icons.AutoMirrored.Filled.ArrowForward, null,
+                            Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         Box {
-                            IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "远控视图操作") }
+                            IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "ZCode 远控视图操作", Modifier.size(18.dp)) }
                             DropdownMenu(menu, { menu = false }) {
                                 DropdownMenuItem(text = { Text("关闭手机视图") }, onClick = { menu = false; workspace.closeView(opened.sessionId) })
                             }
@@ -274,7 +273,8 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
                     { if (phoneOpened) workspace.selected = opened.sessionId else if (online && value != null) workspace.open(value) },
                     { workspace.closeView(opened.sessionId) },
                     if (online && value != null && !aiIsHistorical(value)) ({ ending = value }) else null)
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .65f))
+                }
+                Spacer(Modifier.height(4.dp))
                 }
             } }
             item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
@@ -291,17 +291,19 @@ private fun AiConversationRow(session: AiConversation?, pcName: String, online: 
     var confirmClose by remember { mutableStateOf(false) }
     Box {
         Column(Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = { menu = true }, onLongClickLabel = "对话操作")
-            .padding(start = 12.dp, top = 8.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            .heightIn(min = 48.dp).padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(if (online && session != null) aiConversationTitle(session) else "${session?.agent ?: "AI"} 对话",
-                    Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
                 AiStatusTag(if (!online) "待确认" else if (session == null && catalogKnown) "已失效" else aiSessionLabel(session), online && session?.let(::aiNeedsAttention) == true)
             }
             val preview = session?.preview?.ifBlank { session.messages.lastOrNull { it.role != "tool" }?.text.orEmpty() }.orEmpty()
             Text(if (!online) "连接不可用，已隐藏对话摘要" else preview.ifBlank {
                 if (session == null && catalogKnown) "电脑端已无此会话，可长按关闭视图"
                 else if (session == null) "正在确认电脑上的会话状态…" else "打开对话继续查看" },
-                maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             DropdownMenuItem(text = { Text("关闭手机视图") }, onClick = { menu = false; confirmClose = true })

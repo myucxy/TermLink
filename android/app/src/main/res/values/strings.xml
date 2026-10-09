@@ -17,6 +17,7 @@
     <string name="download_open_failed">The file is unavailable or no installed app can open it.</string>
     <string name="update_action_hide">Hide progress</string>
     <string name="session_input_title">Terminal input</string>
+    <string name="remote_files_back_to_devices">Back to devices</string>
     <string name="session_touch_mouse">Touch as mouse</string>
     <string name="session_input_read_only">Acquire control to use terminal input</string>
     <string name="session_mouse_unavailable">Mouse reporting is not enabled by this terminal</string>

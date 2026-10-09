@@ -2,17 +2,18 @@
 
 ## Repository layout
 
-- 应用仓库与私有 `../terminal-core` 仓库同级，工作区父目录不属于任何 Git 仓库。不得将核心源码复制回应用仓库。
+- 应用仓库与独立 `../terminal-core` 仓库同级，工作区父目录不属于任何 Git 仓库。core 计划后续公开，仍不得将核心源码复制回应用仓库。
 - Windows/Android 只消费 `native/terminal-core/` 下的预编译 DLL/SO，不得读取同级 core 源码或在本仓库编译核心。核心 Rust、JNI C++、头文件、CMake 和编译脚本均放在 core 仓库；本仓库只保留应用调用绑定、UI 和二进制依赖校验。
 - `terminal-core.lock.json` 记录核心 revision、构建时脏状态和各库 SHA-256；二进制与锁文件一起提交。发布执行 `scripts/Verify-NativeArtifacts.ps1 -RequireClean`，拒绝缺失、哈希不符或 dirty core 产物，不要求构建机器持有 core 仓库。
 - 本轮按用户要求保留旧 Git 历史，旧历史仍包含核心源码；不重写旧提交/标签或主动推送远端。
-- 核心远端需单独核验为 private 后再上传。预编译产物边界不代表已授予公开二进制再分发权或完成非商业许可证。
+- 2026-10-09 起，应用与 core 自有代码统一采用 `GPL-3.0-only`，允许商用；保留第三方许可和署名，不附加非商业限制。根 LICENSE、NOTICE、组件元数据与分发声明须一致。core 后续公开不等于本轮获准改变可见性或推送。
+- 分发 GPLv3 二进制前提供匹配应用/core revision 的完整对应源码及构建资料，按 `docs/RELEASE_RUNBOOK.md` 核验接收者可取得；私有仓库地址或“后续开源”不代替源码交付。
 
 ## Android terminal implementation policy
 
 - Android 产品、Harness 和自动化测试统一使用 TermLink 自有 terminal-core、JNI 与 View，不直接依赖或加载 Termux 模块。
 - 不再将查询 Termux、上游 Issue/PR 或运行 Termux 差分测试作为开发、测试、发布门禁。有具体需要时可以参考源码行为，再结合本项目边界自行实现。
-- `terminal-forks/termux-terminal/`、补丁、同步脚本和 `android/terminal-engine-termux/` 仅为历史来源归档，不属于 Android 构建图。保留已有许可证和署名，不把归档自动重新接入构建。
+- 已停用的 Termux 模块、上游源码、补丁与同步工具已迁出应用仓库，保存在工作区私有备份中；不得自动恢复或重新接入构建。来源与许可记录见 `docs/archive/TERMUX_CLEANUP_20261008.md`，保留现有代码仍需的署名及旧协议兼容边界。
 - 不要直接照搬 Termux 的本地 PTY、Shell、Bootstrap、APT、插件签名或本地进程架构。必须结合 TermLink 的 Windows ConPTY、远程传输、E2EE、控制租约、ACK、History Gap、Snapshot 和 native `terminal-core` 权威边界综合设计。
 - 引入或复制代码、资源、字体、主题、测试向量前必须核对许可证、署名、签名连续性和分发要求。许可证或架构边界不清楚时，只参考行为并自行实现。
 - 修复完成后以 TermLink 自有协议、输入、渲染和设备回归测试验证行为；参考外部实现时记录来源及适配边界。

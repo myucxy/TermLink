@@ -10,7 +10,7 @@ import java.net.InetAddress
  * may not finish `onDestroy()`, issues #377/#2366 document Doze/background limits, and PR #5094
  * demonstrates stale activity teardown racing a newer owner. TermLink therefore fences optional
  * network work by the exact epoch/attempt/network owner and treats lifecycle cleanup as best effort.
- * The pinned terminal fork and patch queue exclude remote transport/authentication; no Termux PTY,
+ * The historical reference excludes remote transport/authentication; no Termux PTY,
  * process, local socket, or GPL network implementation is reused here.
  */
 internal data class DirectTransportFeature(

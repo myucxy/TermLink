@@ -368,6 +368,7 @@ android {
     sourceSets {
         named("main") {
             assets.srcDir(rootProject.file("../testdata"))
+            assets.srcDir(layout.buildDirectory.dir("generated/termlink-license-assets"))
         }
         named("test") {
             resources.srcDir(rootProject.file("../protocol/test-vectors"))
@@ -442,7 +443,11 @@ val verifyAiWebAssets = tasks.register("verifyAiWebAssets") {
         }
     }
 }
-tasks.named("preBuild").configure { dependsOn(verifyAiWebAssets) }
+val syncTermLinkLicenseAssets = tasks.register<Sync>("syncTermLinkLicenseAssets") {
+    from(rootProject.file("../LICENSE"), rootProject.file("../NOTICE"))
+    into(layout.buildDirectory.dir("generated/termlink-license-assets/licenses/termlink"))
+}
+tasks.named("preBuild").configure { dependsOn(verifyAiWebAssets, syncTermLinkLicenseAssets) }
 
 dependencies {
     implementation(project(":terminal-engine-api"))

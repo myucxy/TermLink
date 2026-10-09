@@ -1,4 +1,6 @@
 **
+!LICENSE
+!NOTICE
 !server/
 !server/go.mod
 !server/go.sum

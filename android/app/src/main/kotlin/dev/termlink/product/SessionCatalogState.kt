@@ -80,15 +80,18 @@ internal fun retainedCliSessionTabs(snapshot: ProductSnapshot, opened: List<Stri
     }
 }
 
-internal fun ProductSnapshot.hasConfirmedSessionCatalog(pc: PcSummary): Boolean {
+private fun ProductSnapshot.hasObservedSessionCatalog(pc: PcSummary): Boolean {
     val observation = pcSessionCatalogObservations[pc.id]
-    return signedIn && isConnected() && pc.online && pc.remoteRoutingEnabled && pc.id !in pcSessionCatalogErrors &&
+    return signedIn && pc.online && pc.remoteRoutingEnabled &&
         observation?.deviceId == pc.deviceId && observation.keyEpoch == pc.keyEpoch &&
         devices.any { it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED }
 }
 
-/** Hide confirmed inactive rows on mobile without deleting Windows' retained history. */
+internal fun ProductSnapshot.hasConfirmedSessionCatalog(pc: PcSummary): Boolean =
+    isConnected() && pc.id !in pcSessionCatalogErrors && hasObservedSessionCatalog(pc)
+
+/** Refresh or timeout must not undo known Windows lifecycle facts for the same trusted host. */
 internal fun visibleDeviceCliSessions(snapshot: ProductSnapshot, pc: PcSummary): List<SessionSummary> {
-    val confirmed = snapshot.hasConfirmedSessionCatalog(pc)
-    return snapshot.sessions.filter { it.pcId == pc.id && (!confirmed || !isInactiveSession(it.state, it.online)) }
+    if (!snapshot.hasObservedSessionCatalog(pc)) return emptyList()
+    return snapshot.sessions.filter { it.pcId == pc.id && !isInactiveSession(it.state, it.online) }
 }

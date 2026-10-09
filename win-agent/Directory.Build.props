@@ -5,6 +5,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <PlatformTarget>x64</PlatformTarget>
     <Deterministic>true</Deterministic>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 </Project>

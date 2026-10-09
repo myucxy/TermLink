@@ -1435,7 +1435,7 @@ fun ProductApp(
                         onBack = if (destination == ProductDestination.SESSIONS) {
                             null
                         } else {
-                            { if (!backFromFiles()) navigateTo(destination.primaryDestination().destination()) }
+                            { navigateTo(destination.primaryDestination().destination()) }
                         },
                         onRefresh = ::refreshCurrentDestination,
                         refreshEnabled = if (destination != ProductDestination.FILES) {
@@ -3067,7 +3067,10 @@ private fun ProductTopBar(
         navigationIcon = {
             if (onBack != null) {
                 IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.action_back))
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(
+                        if (destination == ProductDestination.FILES) R.string.remote_files_back_to_devices
+                        else R.string.action_back,
+                    ))
                 }
             }
         },

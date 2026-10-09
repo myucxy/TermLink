@@ -2,22 +2,27 @@ package dev.termlink.product
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -30,7 +35,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.core.content.edit
 import dev.termlink.harness.R
@@ -89,37 +98,51 @@ internal fun SessionInputMenuItems(
     var showHelp by remember { mutableStateOf(false) }
     val mouseToggleEnabled = touchMouseEnabled || controlling && mouseReporting
     HorizontalDivider()
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        DropdownMenuItem(
-            modifier = Modifier.weight(1f),
-            text = { Text(stringResource(R.string.session_touch_mouse)) },
-            trailingIcon = { Switch(checked = touchMouseEnabled, onCheckedChange = null, enabled = mouseToggleEnabled) },
-            enabled = mouseToggleEnabled,
-            onClick = { onTouchMouseChanged(!touchMouseEnabled) },
-        )
-        IconButton(onClick = { showHelp = true }) {
-            Icon(Icons.AutoMirrored.Filled.HelpOutline,
-                contentDescription = stringResource(R.string.session_input_title))
+    Row(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            .toggleable(value = touchMouseEnabled, enabled = mouseToggleEnabled,
+                role = Role.Switch, onValueChange = onTouchMouseChanged)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+            Text(stringResource(R.string.session_touch_mouse),
+                modifier = Modifier.weight(1f, fill = false),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (mouseToggleEnabled) 1f else 0.38f))
+            IconButton(onClick = { showHelp = true }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.AutoMirrored.Filled.HelpOutline,
+                    contentDescription = stringResource(R.string.session_input_title),
+                    modifier = Modifier.size(18.dp))
+            }
         }
+        Switch(checked = touchMouseEnabled, onCheckedChange = null, enabled = mouseToggleEnabled,
+            modifier = Modifier.scale(0.75f))
     }
-    Row(modifier = Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(stringResource(R.string.session_wheel_side), style = MaterialTheme.typography.bodyMedium)
             Text(stringResource(R.string.session_wheel_side_hint), style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        SingleChoiceSegmentedButtonRow(modifier = Modifier.width(120.dp).height(48.dp)) {
-            listOf(true, false).forEachIndexed { index, onLeft ->
-                SegmentedButton(
+        Row(modifier = Modifier.width(IntrinsicSize.Max).selectableGroup(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf(true, false).forEach { onLeft ->
+                FilterChip(
                     selected = wheelOnLeft == onLeft,
                     onClick = { onWheelSideChanged(onLeft) },
-                    shape = SegmentedButtonDefaults.itemShape(index, 2),
-                    modifier = Modifier.height(36.dp),
-                    icon = {},
-                ) {
-                    Text(stringResource(if (onLeft) R.string.session_wheel_left else R.string.session_wheel_right),
-                        style = MaterialTheme.typography.labelMedium, maxLines = 1)
-                }
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.weight(1f).widthIn(min = 52.dp).semantics { role = Role.RadioButton },
+                    label = {
+                        Text(stringResource(if (onLeft) R.string.session_wheel_left else R.string.session_wheel_right),
+                            modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                    },
+                )
             }
         }
     }

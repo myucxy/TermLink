@@ -15,8 +15,7 @@
 | [知识库](../knowledge-base/README.md) | 2026-09 的会话分析与审计快照，不是当前未提交改动清单 |
 | [设计稿](../design/README.md)与 [UI 原型目录](../../ui-prototypes/) | 交互设计和样例数据，不作为当前产品截图或功能完成证据 |
 | [ConPTY 原型](../../prototypes/conpty-probe/README.md) | 技术验证与录制格式来源 |
-| [Termux 归档](../../terminal-forks/termux-terminal/UPSTREAM.md)、[补丁](../../terminal-forks/termux-patches/README.md) | 来源归档，不接回产品构建；保留许可、署名和上游版本 |
-| [旧 Android Termux 模块](../../android/terminal-engine-termux/README.md) | 已退出 Gradle 构建图 |
+| [Termux 清理与来源记录](TERMUX_CLEANUP_20261008.md) | 旧 Android 模块、上游源码、补丁、同步工具及专用对照脚本已迁到仓库外；原许可与必要来源继续保留 |
 | [xterm 参考 Harness](../../terminal-reference/xterm-harness/README.md) | 参考与兼容性材料，保留自己的第三方声明 |
 | [直连验证工具](../../technical-validation/direct-e2e/README.md) | 当前 Relay Only 范围之外，不要求重跑 LAN/NAT |
 
