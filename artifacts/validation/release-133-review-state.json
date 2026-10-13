@@ -1,0 +1,29 @@
+{
+  "status": "authorized_for_publication",
+  "version": "0.3.4",
+  "build": 133,
+  "revision": "d9fc97ba8d47dfd2a6e9eb30f66e8b47d56c9476",
+  "coreRevision": "1c907c51b3c6652b23a7d7216ff1bb13d3410a69",
+  "recordedAtUtc": "2026-10-13T18:30:00.0000000+00:00",
+  "userAuthorization": "基于当前版本发布一次版本三端都发布；开始处理直至可以发版；继续 直到可以发版",
+  "signatureReviewNote": "用户在 codex 会话中断后明确指示继续直至可发版：'基于当前版本发布一次版本三端都发布'、'开始处理直至可以发版'、'继续 直到可以发版'。0.3.4/133 来源 termlink d9fc97ba8d47dfd2a6e9eb30f66e8b47d56c9476、core 1c907c51b3c6652b23a7d7216ff1bb13d3410a69（两仓库均已提交并推送 origin/main，工作树干净）。机器独立核验：Verify-LocalRelease Production 通过，APK SHA256 c92d34a14f4c48dc88cce1bc6c2a8a2e74af02036b9cefc1edd35e53ed4b20b2、Setup SHA256 见 manifest；Android 签名指纹连续 f374794c…021b，Windows 发布者证书 SHA1 91AE60BC…6466（既有自签发布者，非公开 CA 信任），RFC3161 时间戳有效，原生库锁 1c907c5 干净重建。Frozen lifecycle 复验：open/冻结浏览/并发实时输出已修复并通过（r425/r426），遗留 reconnect 阶段 inspect 超时按产品方向决策记为已知限制，发布说明不宣传该能力；S/K/L/W/A 缺口同录 REMAINING_ACCEPTANCE_RISKS_20261013.md。用户发布授权与机器核验分别记录，不声称用户逐项复核过这些新哈希。",
+  "machineVerification": "artifacts/release/0.3.4-133/verify-output.json",
+  "artifacts": [
+    {
+      "path": "artifacts/release/0.3.4-133/TermLink-Android-0.3.4-133.apk",
+      "size": 43602771,
+      "sha256": "c92d34a14f4c48dc88cce1bc6c2a8a2e74af02036b9cefc1edd35e53ed4b20b2",
+      "platform": "android",
+      "type": "apk",
+      "version": "0.3.4"
+    },
+    {
+      "path": "artifacts/release/0.3.4-133/TermLink-Setup-0.3.4.133-x64.exe",
+      "size": 185029664,
+      "sha256": "395a84076d96cd0a8e482fc4ba3ffe1d5847e59ffdd97d0c6c3433f0cba5a8f6",
+      "platform": "windows-x64",
+      "type": "setup",
+      "version": "0.3.4"
+    }
+  ]
+}

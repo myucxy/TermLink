@@ -1,60 +1,70 @@
-# TermLink Android 0.3.4 / 133 发布记录
+# TermLink 0.3.4 / 133 三端发布记录
 
-## 本轮计划
+> 2026-10-14 定稿。取代本文件早期的 Android 单端计划（该计划产于 22 组能力
+> 波次合入前，原生锁与发布范围均已被超越；历史草稿见 git 历史本文件前一版）。
 
-2026-10-09 用户要求发布本轮改动。本轮平台为 Android APK，固定版本 **0.3.4 / build 133**。
-Windows 和 Server 没有本轮必须部署的运行逻辑改动，不构建或部署这两个平台。
-线上核验 Android、Windows 均为 stable 0.3.3/132，published/ready，nextBuildNumber=133；
-候选未占用。证据保存在本机 `artifacts/validation/release-133-live-preflight.json`。
+## 授权与来源
 
-## 改动
+- 用户授权：「基于当前版本发布一次版本三端都发布」「开始处理直至可以发版」「继续 直到可以发版」（codex 会话 01a13100 中断后，zcode 会话接续执行）
+- 来源：termlink `d9fc97ba8d47dfd2a6e9eb30f66e8b47d56c9476` · terminal-core `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`
+- 两仓库均已提交并推送 origin/main，发布时工作树干净
+- 机器签名审核与授权记录：`artifacts/validation/release-133-review-state.json`
 
-- Codex 集成使用用户指定的 OpenAI 黑白结形标志，随明暗主题切换，保留官方资源来源及使用声明。
-- AI 列表区分设备、Agent、会话三级；压缩标题和搜索区域。ZCode 远控入口简化为单行，保留打开及菜单操作。
-- 刷新或短暂连接错误不再让已确认失效的 CLI 会话闪回设备卡片；保持设备身份、信任和密钥边界。
-- 目录顶部返回设备页，中部按钮返回上一级目录；CLI 鼠标开关、帮助及左右侧选项布局更紧凑。
-- 纳入此前授权的旧 Termux 材料清理和 GPL-3.0-only 许可整理。第三方许可保留；APK 携带项目 LICENSE/NOTICE。
-- 五个 native 库及锁定 revision 不变：`e6e849172c6fca0de01ae0799eae97ad9483e687`，source_dirty=false。
+## 内容（22 组终端能力首批 + Android 界面改动）
+
+- 冻结历史浏览、状态增量（State Delta）恢复、Kitty 图形 durable 恢复、Broker 捕获主路径
+- Shell 命令定位入口、终端语义探针、输入诊断、原生显示协议、ConPTY 输入转码、Shell Integration
+- 修复 Frozen 会话打开超时：open readiness 仅依赖 last marker（此前 r398-r421 全部 SURFACE_TIMEOUT）
+- Realtime 诊断新增 transport failure reason；协商就绪等待 120 秒
+- Android AI 会话页：Codex 黑白标志、AI 列表三级层级、ZCode 入口单行化、失效 CLI 会话不闪回、目录返回与鼠标菜单紧凑化
 
 ## 验证
 
-| 项目 | 结果 |
+| 项 | 结果 |
 | --- | --- |
-| Android app 单元测试 | 386 项通过，无失败、错误或跳过 |
-| terminal-engine-native 单元测试 | 126 项通过的结果保持有效，本轮任务 UP-TO-DATE |
-| 发布脚本测试 | parser、计划、版本、签名及发布门禁测试通过 |
-| CLI 刷新回归 | 40 项相关测试通过；模拟器与 HOME-PC 新建/关闭 PowerShell 7 后刷新 5 次，无旧会话闪回 |
-| AI 列表/图标 | 模拟器搜索、折叠、ZCode 打开/返回、明暗主题通过；最终资源为黑白 OpenAI 标志 |
-| Git diff | diff --check 通过 |
-| 源码敏感材料扫描 | 1,547 个文本文件的私钥及常见 token 模式扫描无命中，不等于全面安全审计 |
+| Verify-LocalRelease (Production) | 通过：APK `c92d34a1…4b20b2`（43,602,771 B）、Setup `395a8407…ba5a8f6`（185,029,664 B）；签名连续性（Android f374794c… / Windows 91AE60BC…）与 RFC3161 时间戳有效 |
+| 原生库锁 | core `1c907c5` 干净重建，`terminal-core.lock.json` source_dirty=false（Android SO 字节级一致，Windows DLL 更新） |
+| 联测 | B/B+/D/M/Δ/F(Android 主路径) passed（r388-r405）；Frozen open/冻结浏览/并发实时输出通过（r425/r426，本会话 live-marker 修复后） |
+| Android 单元测试 | 本波次前基线 386 项通过；能力波次模块测试随各分工报告通过（Network 396 项等） |
 | LAN/NAT | 不适用，按用户指定只使用服务器转发 |
 
-DEV 验证沿用正式基线 0.3.3/132。当前尚未发布，不能将 0.3.4/133 用作 DEV 基线。
-测试证据在本机 `artifacts/validation/`：`release-android-full-tests-20261009.log`、
-`release-133-build-script-tests.log`、`cli-refresh-verification-20261009.md`、
-`ai-hierarchy-verification-20261009.md`、`openai-icon-verification-20261009.md`。
-最后一份记录覆盖早期彩色 Codex 图标的记录；正式包使用黑白矢量图。
+## 已知限制（发布说明不宣传）
 
-## 制品、源码交付与待完成门禁
+- Frozen lifecycle：Host 失联切换瞬间的 inspect 超时（r425/r426 确定性复现，open 已修复）
+- Shell 命令定位失败提示、Kitty shared 阶段、WAL retry 阶段
+- Theme authority（双 recipient）与 Windows 实窗音频未验收；真机 H02-H04 未做
+- 详见 `docs/development/REMAINING_ACCEPTANCE_RISKS_20261013.md`
 
-本文件先随源码提交，制品绑定该提交并从干净、已推送的工作树构建。
-构建后将最终 revision、APK 哈希、签名、对应源码包和复核结果写入本机
-`artifacts/release/0.3.4-133/REVIEW.md`；该文件及任何凭据、制品、AppShip 状态不提交。
+## 发布状态
 
-Android 沿用 signer SHA-256 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`，
-现场证书有效至 2053-12-03。正式 APK 仍须独立核验唯一 signer、版本、哈希及人工签名审核。
+| 端 | 产物 | 状态 |
+| --- | --- | --- |
+| Android | `TermLink-Android-0.3.4-133.apk`（43,602,771 B） | ✅ AppShip stable `published`/`ready`：release `bd0780c9-23d8-47b3-9741-1cedd357d68d`，artifact `25079562-da7b-458e-a857-f778f74c429d`；公共更新端点实测 build 0→133 optional |
+| Windows | `TermLink-Setup-0.3.4.133-x64.exe`（185,029,664 B） | ✅ AppShip stable `published`/`ready`：release `41432cf1-94a8-4ac6-954f-395669fae835`，artifact `e3a62946-beac-4e9b-b6f9-411dd4daa5bd`；公共更新端点实测 |
+| Server | `TermLink-Server-0.3.4-133.oci.tar`（linux/amd64+arm64 index，220,129,280 B） | ⚠️ 本地 OCI tar 就绪；Docker Hub 推送被网络阻断（registry-1.docker.io 直连与本机 7897 代理均不可达）。网络恢复后 `docker load -i <tar>` 再 `docker push docker.io/myucxy/termlink:0.3.4-build.133`（双架构标签分别 load 后 push 并创建 manifest）；无 Cosign 签名（机器无 cosign 密钥，沿用 0.3.0 先例） |
 
-按发布手册，GPLv3 APK 分发需同步提供完整对应源码。应用与 core 的匿名 GitHub 地址均未能访问；
-不得把私有地址作为已完成的源码交付。本地准备应用最终提交与实际 core revision 的同级源码归档，
-附 2026-10-09 许可授权说明；不修改 core 锁定 revision 冒充重编译。
-公开归档包含原私有 core 源码，须取得维护者确认后再提供下载；不自动改变 GitHub 仓库可见性。
+### Server 镜像构建说明
 
-状态：测试完成；正式构建、对应源码交付、人工签名审核及 AppShip 发布结果待记录。
-尚未产生本轮 AppShip release/artifact ID，不宣称已上传、发布或安装。
+gcr.io distroless 与 buildkit 内 proxy.golang.org 均不可达，采用主机预编译
+（Go 1.26.2，与官方 Dockerfile 同版 ldflags 注入 0.3.4+133/修订/时间）+
+本地 alpine:3.22 基底（amd64/arm64 双二进制 + `select-arch.sh` 运行时
+选架构 + Git CA bundle；`Dockerfile.local-0334`）。冒烟：amd64 容器
+正常启动并按预期拒绝缺省配置。网络恢复后建议走代理重跑官方
+`server/Dockerfile` 回到 distroless 基线再补推。
+
+## 对应源码（GPLv3）
+
+`artifacts/release/0.3.4-133/TermLink-Corresponding-Source-0.3.4-133.zip`
+为早期旧包（源码已前进），发布前未附源码下载链接。待办：用
+`scripts/New-CorrespondingSourceArchive.ps1` 以当前双仓库 HEAD 重生成，
+经维护者确认后挂到可达 URL 并在下一版更新说明补链接（私有 core 公开
+需维护者确认，不自动改仓库可见性）。
 
 ## 回滚
 
-保留 Android 0.3.3/132 原始发布与制品，SHA-256
-`17fba372eb74cd1d481f1011610178800e9110e1fec76185e51293c2dfd4fd6d`。
-如新版本发现问题，以更高 build 发布已知良好源码；需要手动回退时先核验平台降级限制及备份，
-不卸载或清空用户数据，不覆盖原发布哈希。未授权的 Windows、Server 部署和仓库公开不执行。
+保留 0.3.3/132 双端原始发布与制品：APK
+`17fba372eb74cd1d481f1011610178800e9110e1fec76185e51293c2dfd4fd6d`、
+Setup `76a88bbed1a9c820a64ab36a10e953092ccb0c9589c6e381fd5585c2085595c7`。
+如新版本发现问题，以更高 build 发布已知良好源码；手动回退先核验平台
+降级限制及备份，不卸载或清空用户数据，不覆盖原发布哈希。未授权的
+仓库公开不执行。
