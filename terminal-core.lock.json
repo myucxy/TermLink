@@ -2,38 +2,38 @@
   "schema_version": 2,
   "repository": "git@github.com:myucxy/terminal-core.git",
   "revision": "e6e849172c6fca0de01ae0799eae97ad9483e687",
-  "source_dirty": false,
+  "source_dirty": true,
   "toolchain": "1.97.1",
   "artifacts": [
     {
-      "sha256": "4463372df279f17f5c7b1f80b6f4cbed3567dd5413cb128563d8c1e400a8e63d",
-      "path": "native/terminal-core/windows-x64/termlink_terminal_ffi.dll",
       "platform": "windows",
-      "size": 686080
+      "path": "native/terminal-core/windows-x64/termlink_terminal_ffi.dll",
+      "sha256": "26fd2dd9251f8226957220bf11243b2fe581c13ca66d166a3acf1bcf7dc3f5c6",
+      "size": 1766912
     },
     {
-      "sha256": "18df04a81e8388d8f0c78f3651e5550fed36f7182808f8d6e9db63ca747fbaf4",
+      "platform": "android",
       "path": "native/terminal-core/android/arm64-v8a/libtermlink_terminal_jni.so",
-      "platform": "android",
-      "size": 956376
+      "sha256": "a22b3bccec997f2f0f598522a6e02e1cfe4b8daf1b7e6055f61f4f5014b0b713",
+      "size": 1981184
     },
     {
-      "sha256": "a516ad59b2fdc40a8927e7c02d793741e174943b8e9f1d9cebb2f1684ec584fa",
+      "platform": "android",
       "path": "native/terminal-core/android/armeabi-v7a/libtermlink_terminal_jni.so",
-      "platform": "android",
-      "size": 624240
+      "sha256": "85d931f29a562df96f46f7ceebca605fc2236473dd7e7810f9abf59c451735f3",
+      "size": 1370152
     },
     {
-      "sha256": "f6fc357707583c4d8c241d2668d9642bf561ae598dd0ad2fc791675ed7d4f809",
+      "platform": "android",
       "path": "native/terminal-core/android/x86/libtermlink_terminal_jni.so",
-      "platform": "android",
-      "size": 1061748
+      "sha256": "5a26a0bea95589b0c22fb96ea338ce37850fcfd4eee3bf91f7f3d567a26539d4",
+      "size": 2464436
     },
     {
-      "sha256": "2a47b603fc8f815b3588d32f09062a694a1dd4afd9cd365730a3ddf921bb553e",
-      "path": "native/terminal-core/android/x86_64/libtermlink_terminal_jni.so",
       "platform": "android",
-      "size": 1015232
+      "path": "native/terminal-core/android/x86_64/libtermlink_terminal_jni.so",
+      "sha256": "af44cc9ee38ea2309163ee2420f2b7e1ad9db05ae5e835859350e518767cd4cf",
+      "size": 2194720
     }
   ]
 }

@@ -174,7 +174,7 @@ namespace TermLink.Agent
                 ManagedShell = managedShell,
                 Source = detected ? "detected" : "manual",
                 Enabled = enabled,
-                RunAsAdministrator = true
+                RunAsAdministrator = runAsAdministrator
             }, requireExecutable: true);
         }
 
@@ -254,7 +254,9 @@ namespace TermLink.Agent
             executable = Path.GetFullPath(executable);
             if (requireExecutable && profile.Enabled && !File.Exists(executable))
                 throw new FileNotFoundException("The terminal command executable was not found.", executable);
-            var managedShell = detected ? id : ManagedTerminalLauncher.CustomShellType;
+            var managedShell = detected && id == ManagedTerminalLauncher.EnhancedPowerShell7CommandId
+                ? ManagedTerminalLauncher.PowerShell7ShellType
+                : detected ? id : ManagedTerminalLauncher.CustomShellType;
             if (detected && !string.Equals(profile.ManagedShell, managedShell, StringComparison.Ordinal))
                 throw new InvalidDataException("The detected terminal command shell is invalid.");
             return new TerminalCommandProfile
@@ -266,10 +268,8 @@ namespace TermLink.Agent
                 ManagedShell = managedShell,
                 Source = detected ? "detected" : "manual",
                 Enabled = profile.Enabled,
-                // Administrator launch is a product invariant. Keep the serialized
-                // field for compatibility with older clients, but ignore a legacy
-                // false value when loading or saving command configuration.
-                RunAsAdministrator = true
+                // The enhanced terminal starts under the current user; legacy commands still elevate.
+                RunAsAdministrator = id != ManagedTerminalLauncher.EnhancedPowerShell7CommandId
             };
         }
 

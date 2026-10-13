@@ -11,6 +11,30 @@
     "release_mode",
     "artifacts"
   ],
+  "allOf": [
+    {
+      "if": { "properties": { "release_mode": { "const": "production" } } },
+      "then": { "properties": { "source_revision": { "pattern": "^[0-9a-f]{40}$" } } }
+    },
+    {
+      "if": { "required": ["core_revision"] },
+      "then": { "required": ["source_revision"] }
+    },
+    {
+      "if": {
+        "required": ["source_revision"],
+        "properties": {
+          "artifacts": {
+            "contains": {
+              "properties": { "type": { "enum": ["setup", "msix", "apk", "aab"] } },
+              "required": ["type"]
+            }
+          }
+        }
+      },
+      "then": { "required": ["core_revision"] }
+    }
+  ],
   "properties": {
     "schema_version": {
       "const": 1
@@ -29,6 +53,14 @@
         "production",
         "development"
       ]
+    },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}(-dirty)?$"
+    },
+    "core_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
     },
     "artifacts": {
       "type": "array",

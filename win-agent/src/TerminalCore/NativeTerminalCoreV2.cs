@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -710,7 +711,9 @@ namespace TermLink.TerminalCore
         Output = 1,
         Resize = 2,
         Advance = 3,
-        Gap = 4
+        Gap = 4,
+        HostGeometryV1 = 5,
+        HostThemeV1 = 6
     }
 
     public sealed class NativeTerminalBatchEvent
@@ -756,6 +759,18 @@ namespace TermLink.TerminalCore
                 0,
                 0,
                 0);
+        }
+
+        public static NativeTerminalBatchEvent HostTheme(ulong sourceSequence, NativeTerminalHostThemeV1 theme)
+        {
+            return new NativeTerminalBatchEvent(NativeTerminalBatchEventKind.HostThemeV1,
+                sourceSequence, theme.Encode(), 0, 0, 0);
+        }
+
+        public static NativeTerminalBatchEvent HostGeometry(ulong sourceSequence, NativeTerminalHostGeometryV1 geometry)
+        {
+            return new NativeTerminalBatchEvent(NativeTerminalBatchEventKind.HostGeometryV1,
+                sourceSequence, geometry.Encode(), 0, 0, 0);
         }
 
         public static NativeTerminalBatchEvent Resize(
@@ -823,6 +838,14 @@ namespace TermLink.TerminalCore
         SnapshotNotEligible = 12,
         PresentationDeferred = 13,
         HostEffectVersionRequired = 14,
+        RenderFrameVersionRequired = 15,
+        HistoryStaleCapture = 16,
+        HistoryStaleRevision = 17,
+        HistoryStaleAnchor = 18,
+        HistoryPageBudget = 19,
+        MalformedDelta = 20,
+        IncompatibleDelta = 21,
+        NeedsFullSnapshot = 22,
         Panic = 255
     }
 
@@ -837,16 +860,19 @@ namespace TermLink.TerminalCore
 
     public sealed class NativeTerminalException : Exception
     {
-        internal NativeTerminalException(string operation, NativeTerminalStatus status)
+        internal NativeTerminalException(string operation, NativeTerminalStatus status, string diagnostic = null)
             : base(operation + " failed with native terminal status " +
                 status + " (" + ((uint)status).ToString() + ").")
         {
             Operation = operation;
             Status = status;
+            Diagnostic = diagnostic;
         }
 
         public string Operation { get; }
         public NativeTerminalStatus Status { get; }
+        // Local escaped evidence is deliberately excluded from generic exception telemetry.
+        public string Diagnostic { get; }
     }
 
     public sealed class NativeTerminalAbiException : Exception
@@ -973,6 +999,8 @@ namespace TermLink.TerminalCore
     public static class NativeTerminalCoreV2
     {
         public const uint AbiVersion = 1;
+        public const int MaximumSnapshotBytes = 64 * 1024 * 1024;
+        public const int MaximumGraphicsSnapshotBytes = 128 * 1024 * 1024;
 
         private static readonly Lazy<NativeTerminalAbiInfo> AbiInfo = new Lazy<NativeTerminalAbiInfo>(
             NativeTerminalInterop.ValidateAbi,
@@ -1016,6 +1044,31 @@ namespace TermLink.TerminalCore
                 outputProfile);
         }
 
+        /// <summary>Creates a V4 terminal without changing the legacy factory defaults.</summary>
+        public static NativeTerminal Create(uint columns, uint rows, ulong initialSourceSequence,
+            ulong historyCapacityRows, NativeTerminalOutputProfile outputProfile, NativeTerminalWidthProfile widthProfile)
+        {
+            _ = ValidateAbi();
+            NativeTerminalInterop.RequireV4Abi();
+            return NativeTerminal.Create(columns, rows, initialSourceSequence, historyCapacityRows, outputProfile, widthProfile);
+        }
+
+        /// <summary>Checks the optional graphics ABI; an older DLL reports false.</summary>
+        public static bool SupportsGraphicsV1()
+        {
+            _ = ValidateAbi();
+            return NativeTerminalInterop.SupportsGraphicsV1();
+        }
+
+        /// <summary>Explicitly enables the experimental graphics profile.</summary>
+        public static NativeTerminal CreateGraphicsV1(uint columns, uint rows, ulong initialSourceSequence,
+            ulong historyCapacityRows, NativeTerminalOutputProfile outputProfile, NativeTerminalWidthProfile widthProfile)
+        {
+            _ = ValidateAbi();
+            NativeTerminalInterop.RequireGraphicsV1Abi();
+            return NativeTerminal.CreateGraphicsV1(columns, rows, initialSourceSequence, historyCapacityRows, outputProfile, widthProfile);
+        }
+
         public static NativeTerminal ImportSnapshot(byte[] snapshot)
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
@@ -1024,25 +1077,52 @@ namespace TermLink.TerminalCore
 
         public static NativeTerminal ImportSnapshot(ReadOnlySpan<byte> snapshot)
         {
+            if (snapshot.Length > MaximumSnapshotBytes) throw new ArgumentOutOfRangeException(nameof(snapshot));
+            if (IsGraphicsSnapshot(snapshot))
+                throw new NativeTerminalException(nameof(ImportSnapshot), NativeTerminalStatus.IncompatibleSnapshot);
             _ = ValidateAbi();
             return NativeTerminal.ImportSnapshot(snapshot);
         }
+
+        public static NativeTerminal ImportGraphicsSnapshot(byte[] snapshot)
+        {
+            if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
+            return ImportGraphicsSnapshot((ReadOnlySpan<byte>)snapshot);
+        }
+
+        public static NativeTerminal ImportGraphicsSnapshot(ReadOnlySpan<byte> snapshot)
+        {
+            if (snapshot.Length > MaximumGraphicsSnapshotBytes) throw new ArgumentOutOfRangeException(nameof(snapshot));
+            if (!IsGraphicsSnapshot(snapshot))
+                throw new NativeTerminalException(nameof(ImportGraphicsSnapshot), NativeTerminalStatus.IncompatibleSnapshot);
+            _ = ValidateAbi();
+            NativeTerminalInterop.RequireGraphicsV1Abi();
+            return NativeTerminal.ImportSnapshot(snapshot, true);
+        }
+
+        private static bool IsGraphicsSnapshot(ReadOnlySpan<byte> snapshot) => snapshot.Length >= 12 &&
+            BinaryPrimitives.ReadUInt16LittleEndian(snapshot.Slice(8, 2)) == 2 &&
+            BinaryPrimitives.ReadUInt16LittleEndian(snapshot.Slice(10, 2)) == 22;
     }
 
-    public sealed class NativeTerminal : IDisposable
+    public sealed partial class NativeTerminal : IDisposable
     {
         public const int MaxBatchEventCount = 256;
         public const int MaxBatchOutputBytes = 4 * 1024 * 1024;
 
         private readonly object sync = new object();
-        private readonly SafeTlTerminalHandle handle;
+        private SafeTlTerminalHandle handle;
+        private bool brokerActive;
         private bool disposed;
         private bool failedClosed;
 
-        private NativeTerminal(SafeTlTerminalHandle handle)
+        internal NativeTerminal(SafeTlTerminalHandle handle, bool hasGraphicsProfile = false)
         {
             this.handle = handle;
+            HasGraphicsProfile = hasGraphicsProfile;
         }
+
+        public bool HasGraphicsProfile { get; }
 
         internal static NativeTerminal Create(
             uint columns,
@@ -1104,7 +1184,44 @@ namespace TermLink.TerminalCore
             return new NativeTerminal(NativeTerminalInterop.OwnTerminal(nativeHandle));
         }
 
-        internal static unsafe NativeTerminal ImportSnapshot(ReadOnlySpan<byte> snapshot)
+        internal static NativeTerminal Create(
+            uint columns,
+            uint rows,
+            ulong initialSourceSequence,
+            ulong historyCapacityRows,
+            NativeTerminalOutputProfile outputProfile, NativeTerminalWidthProfile widthProfile)
+        {
+            var nativeHandle = IntPtr.Zero;
+            var config = NativeTerminalInterop.CreateConfigV4(
+                columns,
+                rows,
+                initialSourceSequence,
+                historyCapacityRows,
+                outputProfile, widthProfile);
+            var status = NativeTerminalInterop.TerminalCreateV4(in config, ref nativeHandle);
+            const string operation = nameof(NativeTerminalInterop.TerminalCreateV4);
+            NativeTerminalInterop.RequireEmptyFailedTerminalHandle(
+                status,
+                nativeHandle,
+                operation);
+            NativeTerminalInterop.ThrowIfFailed(status, operation);
+            return new NativeTerminal(NativeTerminalInterop.OwnTerminal(nativeHandle));
+        }
+
+        internal static NativeTerminal CreateGraphicsV1(uint columns, uint rows, ulong initialSourceSequence,
+            ulong historyCapacityRows, NativeTerminalOutputProfile outputProfile, NativeTerminalWidthProfile widthProfile)
+        {
+            var nativeHandle = IntPtr.Zero;
+            var config = NativeTerminalInterop.CreateConfigV4(columns, rows, initialSourceSequence,
+                historyCapacityRows, outputProfile, widthProfile);
+            var status = NativeTerminalInterop.TerminalCreateGraphicsV1(in config, ref nativeHandle);
+            const string operation = nameof(NativeTerminalInterop.TerminalCreateGraphicsV1);
+            NativeTerminalInterop.RequireEmptyFailedTerminalHandle(status, nativeHandle, operation);
+            NativeTerminalInterop.ThrowIfFailed(status, operation);
+            return new NativeTerminal(NativeTerminalInterop.OwnTerminal(nativeHandle), true);
+        }
+
+        internal static unsafe NativeTerminal ImportSnapshot(ReadOnlySpan<byte> snapshot, bool hasGraphicsProfile = false)
         {
             // The native import borrows only for this call. Own the pinned bytes so
             // the published terminal never depends on caller-managed storage.
@@ -1112,18 +1229,19 @@ namespace TermLink.TerminalCore
             fixed (byte* snapshotPointer = ownedSnapshot)
             {
                 var nativeHandle = IntPtr.Zero;
-                var status = NativeTerminalInterop.TerminalImportSnapshot(
-                    snapshotPointer,
-                    checked((ulong)ownedSnapshot.LongLength),
-                    ref nativeHandle);
+                var operation = hasGraphicsProfile ? nameof(NativeTerminalInterop.TerminalImportSnapshotGraphicsV1)
+                    : nameof(NativeTerminalInterop.TerminalImportSnapshot);
+                var status = hasGraphicsProfile
+                    ? NativeTerminalInterop.TerminalImportSnapshotGraphicsV1(snapshotPointer, (ulong)ownedSnapshot.LongLength, ref nativeHandle)
+                    : NativeTerminalInterop.TerminalImportSnapshot(snapshotPointer, (ulong)ownedSnapshot.LongLength, ref nativeHandle);
                 NativeTerminalInterop.RequireEmptyFailedTerminalHandle(
                     status,
                     nativeHandle,
-                    nameof(NativeTerminalInterop.TerminalImportSnapshot));
+                    operation);
                 NativeTerminalInterop.ThrowIfFailed(
                     status,
-                    nameof(NativeTerminalInterop.TerminalImportSnapshot));
-                return new NativeTerminal(NativeTerminalInterop.OwnTerminal(nativeHandle));
+                    operation);
+                return new NativeTerminal(NativeTerminalInterop.OwnTerminal(nativeHandle), hasGraphicsProfile);
             }
         }
 
@@ -1550,6 +1668,7 @@ namespace TermLink.TerminalCore
             lock (sync)
             {
                 if (disposed) throw new ObjectDisposedException(nameof(NativeTerminal));
+                if (brokerActive) throw new InvalidOperationException("A broker Output transaction owns this terminal.");
 
                 var nativeInfo = NativeTerminalInterop.CreateEmptyPresentationInfoV1();
                 var status = NativeTerminalInterop.TerminalGetPresentationInfoV1(
@@ -1635,7 +1754,7 @@ namespace TermLink.TerminalCore
                 }
 
                 checkpoint = NativeTerminalCheckpoint.CreateOwned(
-                    NativeTerminalInterop.OwnCheckpoint(nativeHandle));
+                    NativeTerminalInterop.OwnCheckpoint(nativeHandle), HasGraphicsProfile);
                 return true;
             }
         }
@@ -1645,8 +1764,52 @@ namespace TermLink.TerminalCore
             lock (sync)
             {
                 if (disposed) return;
+                if (brokerActive) throw new InvalidOperationException("A broker Output transaction owns this terminal.");
                 disposed = true;
                 handle.Dispose();
+            }
+        }
+
+        private string failureDiagnostic;
+
+        private void ThrowApplyIfFailed(NativeTerminalStatus status, string operation)
+        {
+            if (status == NativeTerminalStatus.Ok) { failureDiagnostic = null; return; }
+            failureDiagnostic = status == NativeTerminalStatus.FailedClosed
+                ? ReadFailureDiagnostic() ?? failureDiagnostic
+                : status == NativeTerminalStatus.Unsupported || status == NativeTerminalStatus.LimitExceeded
+                    ? ReadFailureDiagnostic() : null;
+            throw new NativeTerminalException(operation, status, failureDiagnostic);
+        }
+
+        private string ReadFailureDiagnostic()
+        {
+            var buffer = NativeTerminalInterop.CreateEmptyBuffer();
+            try
+            {
+                NativeTerminalStatus status;
+                try { status = NativeTerminalInterop.TerminalExportFailureDiagnosticV3(handle, ref buffer); }
+                catch (EntryPointNotFoundException) {
+                    try { status = NativeTerminalInterop.TerminalExportFailureDiagnosticV2(handle, ref buffer); }
+                    catch (EntryPointNotFoundException) { status = NativeTerminalInterop.TerminalExportFailureDiagnosticV1(handle, ref buffer); }
+                }
+                if (status != NativeTerminalStatus.Ok || buffer.Data == IntPtr.Zero ||
+                    buffer.Length == 0 || buffer.Length > 8192 ||
+                    buffer.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
+                    buffer.StructSize != NativeTerminalInterop.BufferStructSize) return null;
+                var bytes = new byte[(int)buffer.Length];
+                Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+                foreach (var value in bytes)
+                    if (value != 10 && (value < 32 || value > 126)) return null;
+                var text = Encoding.ASCII.GetString(bytes);
+                return text.StartsWith("TL-DIAG/3\n", StringComparison.Ordinal) || (text.Length <= 4096 &&
+                    (text.StartsWith("TL-DIAG/1\n", StringComparison.Ordinal) || text.StartsWith("TL-DIAG/2\n", StringComparison.Ordinal))) ? text : null;
+            }
+            catch (EntryPointNotFoundException) { return null; }
+            finally
+            {
+                if (buffer.Data != IntPtr.Zero)
+                    NativeTerminalInterop.TerminalBufferFree(ref buffer);
             }
         }
 
@@ -1656,7 +1819,7 @@ namespace TermLink.TerminalCore
             if (status != NativeTerminalStatus.Ok &&
                 NativeTerminalInterop.RequiresTerminalRetirement(status))
                 failedClosed = true;
-            NativeTerminalInterop.ThrowIfFailed(
+            ThrowApplyIfFailed(
                 status,
                 nameof(NativeTerminalInterop.TerminalApplyEvent));
         }
@@ -1742,6 +1905,8 @@ namespace TermLink.TerminalCore
                     switch (batchEvent.Kind)
                     {
                         case NativeTerminalBatchEventKind.Output:
+                        case NativeTerminalBatchEventKind.HostGeometryV1:
+                        case NativeTerminalBatchEventKind.HostThemeV1:
                             payloadPins[payloadPinCount] = GCHandle.Alloc(
                                 batchEvent.OutputBytes,
                                 GCHandleType.Pinned);
@@ -1752,6 +1917,7 @@ namespace TermLink.TerminalCore
                                 batchEvent.SourceSequence,
                                 outputPointer,
                                 checked((ulong)batchEvent.OutputBytes.LongLength));
+                            nativeEvents[index].Kind = (uint)batchEvent.Kind;
                             break;
                         case NativeTerminalBatchEventKind.Resize:
                             nativeEvents[index] = NativeTerminalInterop.CreateResizeEvent(
@@ -1818,7 +1984,7 @@ namespace TermLink.TerminalCore
                     if (legacyStatus != NativeTerminalStatus.Ok &&
                         NativeTerminalInterop.RequiresTerminalRetirement(legacyStatus))
                         failedClosed = true;
-                    NativeTerminalInterop.ThrowIfFailed(
+                    ThrowApplyIfFailed(
                         legacyStatus,
                         nameof(NativeTerminalInterop.TerminalApplyEventBatchV1));
                     return null;
@@ -1847,6 +2013,8 @@ namespace TermLink.TerminalCore
                     switch (batchEvent.Kind)
                     {
                         case NativeTerminalBatchEventKind.Output:
+                        case NativeTerminalBatchEventKind.HostGeometryV1:
+                        case NativeTerminalBatchEventKind.HostThemeV1:
                             payloadPins[payloadPinCount] = GCHandle.Alloc(
                                 batchEvent.OutputBytes,
                                 GCHandleType.Pinned);
@@ -1857,6 +2025,7 @@ namespace TermLink.TerminalCore
                                 batchEvent.SourceSequence,
                                 outputPointer,
                                 checked((ulong)batchEvent.OutputBytes.LongLength));
+                            nativeEvents[index].Kind = (uint)batchEvent.Kind;
                             break;
                         case NativeTerminalBatchEventKind.Resize:
                             nativeEvents[index] = NativeTerminalInterop.CreateResizeEvent(
@@ -1940,7 +2109,7 @@ namespace TermLink.TerminalCore
                         ReleaseFailureSuffix(releaseError),
                         releaseError);
                 }
-                NativeTerminalInterop.ThrowIfFailed(status, operation);
+                ThrowApplyIfFailed(status, operation);
             }
 
             byte[] bytes = null;
@@ -2008,7 +2177,7 @@ namespace TermLink.TerminalCore
                         ReleaseFailureSuffix(releaseError),
                         releaseError);
                 }
-                NativeTerminalInterop.ThrowIfFailed(status, operation);
+                ThrowApplyIfFailed(status, operation);
             }
 
             byte[] bytes = null;
@@ -2131,6 +2300,12 @@ namespace TermLink.TerminalCore
                                 nameof(events),
                                 "Batch output payloads exceed 4,194,304 total bytes.");
                         break;
+                    case NativeTerminalBatchEventKind.HostThemeV1:
+                        NativeTerminalHostThemeV1.Decode(batchEvent.OutputBytes);
+                        break;
+                    case NativeTerminalBatchEventKind.HostGeometryV1:
+                        NativeTerminalHostGeometryV1.Decode(batchEvent.OutputBytes);
+                        break;
                     case NativeTerminalBatchEventKind.Resize:
                     case NativeTerminalBatchEventKind.Advance:
                     case NativeTerminalBatchEventKind.Gap:
@@ -2145,130 +2320,64 @@ namespace TermLink.TerminalCore
 
         private byte[] EncodeInput(in TlTerminalInputV1 input)
         {
-            var buffer = NativeTerminalInterop.CreateEmptyBuffer();
+            var encoded = NativeTerminalInterop.CreateEmptyBuffer();
+            var diagnostic = NativeTerminalInterop.CreateEmptyBuffer();
             try
             {
-                var status = NativeTerminalInterop.TerminalEncodeInputV1(
-                    handle,
-                    in input,
-                    ref buffer);
-                if (status != NativeTerminalStatus.Ok &&
-                    NativeTerminalInterop.RequiresTerminalRetirementAfterInput(status))
-                    failedClosed = true;
-                NativeTerminalInterop.ThrowIfFailed(
-                    status,
-                    nameof(NativeTerminalInterop.TerminalEncodeInputV1));
-                if (buffer.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
-                    buffer.StructSize != NativeTerminalInterop.BufferStructSize ||
-                    buffer.Data == IntPtr.Zero ||
-                    buffer.Length > int.MaxValue)
-                    throw new NativeTerminalAbiException(
-                        "The native terminal returned an invalid encoded-input buffer.");
-                var bytes = buffer.Length == 0
-                    ? Array.Empty<byte>()
-                    : new byte[checked((int)buffer.Length)];
-                if (bytes.Length != 0)
-                    Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
-                return bytes;
+                var status = NativeTerminalInterop.TerminalEncodeInputV1WithDiagnostic(
+                    handle, in input, ref encoded, ref diagnostic);
+                return CompleteInputEncoding(status, ref encoded, ref diagnostic,
+                    nameof(NativeTerminalInterop.TerminalEncodeInputV1WithDiagnostic));
+            }
+            catch (EntryPointNotFoundException error)
+            {
+                throw MissingInputDiagnosticAbi(error);
             }
             finally
             {
-                if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                {
-                    var freeStatus = NativeTerminalInterop.TerminalBufferFree(ref buffer);
-                    NativeTerminalInterop.ThrowIfFailed(
-                        freeStatus,
-                        nameof(NativeTerminalInterop.TerminalBufferFree));
-                    if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                        throw new NativeTerminalAbiException(
-                            "The native terminal did not clear a released input buffer.");
-                }
+                ReleaseInputBuffers(ref encoded, ref diagnostic);
             }
         }
 
         private byte[] EncodeInputV2(in TlTerminalInputV2 input)
         {
-            var buffer = NativeTerminalInterop.CreateEmptyBuffer();
+            var encoded = NativeTerminalInterop.CreateEmptyBuffer();
+            var diagnostic = NativeTerminalInterop.CreateEmptyBuffer();
             try
             {
-                var status = NativeTerminalInterop.TerminalEncodeInputV2(
-                    handle,
-                    in input,
-                    ref buffer);
-                if (status != NativeTerminalStatus.Ok &&
-                    NativeTerminalInterop.RequiresTerminalRetirementAfterInput(status))
-                    failedClosed = true;
-                NativeTerminalInterop.ThrowIfFailed(
-                    status,
-                    nameof(NativeTerminalInterop.TerminalEncodeInputV2));
-                if (buffer.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
-                    buffer.StructSize != NativeTerminalInterop.BufferStructSize ||
-                    buffer.Data == IntPtr.Zero ||
-                    buffer.Length > int.MaxValue)
-                    throw new NativeTerminalAbiException(
-                        "The native terminal returned an invalid encoded-input-v2 buffer.");
-                var bytes = buffer.Length == 0
-                    ? Array.Empty<byte>()
-                    : new byte[checked((int)buffer.Length)];
-                if (bytes.Length != 0)
-                    Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
-                return bytes;
+                var status = NativeTerminalInterop.TerminalEncodeInputV2WithDiagnostic(
+                    handle, in input, ref encoded, ref diagnostic);
+                return CompleteInputEncoding(status, ref encoded, ref diagnostic,
+                    nameof(NativeTerminalInterop.TerminalEncodeInputV2WithDiagnostic));
+            }
+            catch (EntryPointNotFoundException error)
+            {
+                throw MissingInputDiagnosticAbi(error);
             }
             finally
             {
-                if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                {
-                    var freeStatus = NativeTerminalInterop.TerminalBufferFree(ref buffer);
-                    NativeTerminalInterop.ThrowIfFailed(
-                        freeStatus,
-                        nameof(NativeTerminalInterop.TerminalBufferFree));
-                    if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                        throw new NativeTerminalAbiException(
-                            "The native terminal did not clear a released input-v2 buffer.");
-                }
+                ReleaseInputBuffers(ref encoded, ref diagnostic);
             }
         }
 
         private byte[] EncodeInputV3(in TlTerminalInputV3 input)
         {
-            var buffer = NativeTerminalInterop.CreateEmptyBuffer();
+            var encoded = NativeTerminalInterop.CreateEmptyBuffer();
+            var diagnostic = NativeTerminalInterop.CreateEmptyBuffer();
             try
             {
-                var status = NativeTerminalInterop.TerminalEncodeInputV3(
-                    handle,
-                    in input,
-                    ref buffer);
-                if (status != NativeTerminalStatus.Ok &&
-                    NativeTerminalInterop.RequiresTerminalRetirementAfterInput(status))
-                    failedClosed = true;
-                NativeTerminalInterop.ThrowIfFailed(
-                    status,
-                    nameof(NativeTerminalInterop.TerminalEncodeInputV3));
-                if (buffer.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
-                    buffer.StructSize != NativeTerminalInterop.BufferStructSize ||
-                    buffer.Data == IntPtr.Zero ||
-                    buffer.Length > int.MaxValue)
-                    throw new NativeTerminalAbiException(
-                        "The native terminal returned an invalid encoded-input-v3 buffer.");
-                var bytes = buffer.Length == 0
-                    ? Array.Empty<byte>()
-                    : new byte[checked((int)buffer.Length)];
-                if (bytes.Length != 0)
-                    Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
-                return bytes;
+                var status = NativeTerminalInterop.TerminalEncodeInputV3WithDiagnostic(
+                    handle, in input, ref encoded, ref diagnostic);
+                return CompleteInputEncoding(status, ref encoded, ref diagnostic,
+                    nameof(NativeTerminalInterop.TerminalEncodeInputV3WithDiagnostic));
+            }
+            catch (EntryPointNotFoundException error)
+            {
+                throw MissingInputDiagnosticAbi(error);
             }
             finally
             {
-                if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                {
-                    var freeStatus = NativeTerminalInterop.TerminalBufferFree(ref buffer);
-                    NativeTerminalInterop.ThrowIfFailed(
-                        freeStatus,
-                        nameof(NativeTerminalInterop.TerminalBufferFree));
-                    if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                        throw new NativeTerminalAbiException(
-                            "The native terminal did not clear a released input-v3 buffer.");
-                }
+                ReleaseInputBuffers(ref encoded, ref diagnostic);
             }
         }
 
@@ -2277,77 +2386,127 @@ namespace TermLink.TerminalCore
             lock (sync)
             {
                 ThrowIfUnavailable();
-                var buffer = NativeTerminalInterop.CreateEmptyBuffer();
+                var encoded = NativeTerminalInterop.CreateEmptyBuffer();
+                var diagnostic = NativeTerminalInterop.CreateEmptyBuffer();
                 try
                 {
-                    var status = NativeTerminalInterop.TerminalEncodeMouseInputV1(
-                        handle,
-                        in input,
-                        ref buffer);
-                    if (status != NativeTerminalStatus.Ok &&
-                        NativeTerminalInterop.RequiresTerminalRetirementAfterInput(status))
-                        failedClosed = true;
-                    NativeTerminalInterop.ThrowIfFailed(
-                        status,
-                        nameof(NativeTerminalInterop.TerminalEncodeMouseInputV1));
-                    if (buffer.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
-                        buffer.StructSize != NativeTerminalInterop.BufferStructSize ||
-                        buffer.Data == IntPtr.Zero ||
-                        buffer.Length > int.MaxValue)
-                        throw new NativeTerminalAbiException(
-                            "The native terminal returned an invalid encoded-mouse buffer.");
-                    var bytes = buffer.Length == 0
-                        ? Array.Empty<byte>()
-                        : new byte[checked((int)buffer.Length)];
-                    if (bytes.Length != 0)
-                        Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
-                    return bytes;
+                    var status = NativeTerminalInterop.TerminalEncodeMouseInputV1WithDiagnostic(
+                        handle, in input, ref encoded, ref diagnostic);
+                    return CompleteInputEncoding(status, ref encoded, ref diagnostic,
+                        nameof(NativeTerminalInterop.TerminalEncodeMouseInputV1WithDiagnostic));
+                }
+                catch (EntryPointNotFoundException error)
+                {
+                    throw MissingInputDiagnosticAbi(error);
                 }
                 finally
                 {
-                    if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                    {
-                        var freeStatus = NativeTerminalInterop.TerminalBufferFree(ref buffer);
-                        NativeTerminalInterop.ThrowIfFailed(
-                            freeStatus,
-                            nameof(NativeTerminalInterop.TerminalBufferFree));
-                        if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
-                            throw new NativeTerminalAbiException(
-                                "The native terminal did not clear a released mouse buffer.");
-                    }
+                    ReleaseInputBuffers(ref encoded, ref diagnostic);
                 }
             }
+        }
+
+        private byte[] CompleteInputEncoding(NativeTerminalStatus status,
+            ref TlTerminalBuffer encoded, ref TlTerminalBuffer diagnostic, string operation)
+        {
+            if (status != NativeTerminalStatus.Ok &&
+                NativeTerminalInterop.RequiresTerminalRetirementAfterInput(status))
+                failedClosed = true;
+            if (encoded.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
+                encoded.StructSize != NativeTerminalInterop.BufferStructSize ||
+                diagnostic.AbiVersion != NativeTerminalCoreV2.AbiVersion ||
+                diagnostic.StructSize != NativeTerminalInterop.BufferStructSize)
+                throw new NativeTerminalAbiException("The native terminal returned an invalid input buffer header.");
+
+            if (status != NativeTerminalStatus.Ok)
+            {
+                if (encoded.Data != IntPtr.Zero || encoded.Length != 0)
+                    throw new NativeTerminalAbiException("The native terminal encoded bytes after input failure.");
+                throw new NativeTerminalException(operation, status, ReadInputDiagnostic(in diagnostic));
+            }
+            if (diagnostic.Data != IntPtr.Zero || diagnostic.Length != 0 ||
+                encoded.Data == IntPtr.Zero || encoded.Length > int.MaxValue)
+                throw new NativeTerminalAbiException("The native terminal returned invalid encoded input.");
+            var bytes = encoded.Length == 0
+                ? Array.Empty<byte>() : new byte[checked((int)encoded.Length)];
+            if (bytes.Length != 0)
+                Marshal.Copy(encoded.Data, bytes, 0, bytes.Length);
+            return bytes;
+        }
+
+        private static string ReadInputDiagnostic(in TlTerminalBuffer diagnostic)
+        {
+            if (diagnostic.Data == IntPtr.Zero && diagnostic.Length == 0) return null;
+            if (diagnostic.Data == IntPtr.Zero || diagnostic.Length == 0 || diagnostic.Length > 2048)
+                throw new NativeTerminalAbiException("The native terminal returned an invalid input diagnostic buffer.");
+            var bytes = new byte[checked((int)diagnostic.Length)];
+            Marshal.Copy(diagnostic.Data, bytes, 0, bytes.Length);
+            foreach (var value in bytes)
+                if (value != 10 && (value < 32 || value > 126))
+                    throw new NativeTerminalAbiException("The native terminal returned non-ASCII input diagnostic data.");
+            var text = Encoding.ASCII.GetString(bytes);
+            if (!text.StartsWith("TL-INPUT-DIAG/1\ndirection=input_encoding\n", StringComparison.Ordinal) ||
+                text[text.Length - 1] != '\n')
+                throw new NativeTerminalAbiException("The native terminal returned an invalid input diagnostic format.");
+            return text;
+        }
+
+        private static void ReleaseInputBuffers(ref TlTerminalBuffer encoded, ref TlTerminalBuffer diagnostic)
+        {
+            try { ReleaseInputBuffer(ref encoded); }
+            finally { ReleaseInputBuffer(ref diagnostic); }
+        }
+
+        private static void ReleaseInputBuffer(ref TlTerminalBuffer buffer)
+        {
+            if (buffer.Data == IntPtr.Zero && buffer.Length == 0) return;
+            var freeStatus = NativeTerminalInterop.TerminalBufferFree(ref buffer);
+            NativeTerminalInterop.ThrowIfFailed(freeStatus,
+                nameof(NativeTerminalInterop.TerminalBufferFree));
+            if (buffer.Data != IntPtr.Zero || buffer.Length != 0)
+                throw new NativeTerminalAbiException("The native terminal did not clear a released input buffer.");
+        }
+
+        private static NativeTerminalAbiException MissingInputDiagnosticAbi(EntryPointNotFoundException error)
+        {
+            return new NativeTerminalAbiException(
+                "The installed terminal core DLL does not support input diagnostics; upgrade the native binary.",
+                error);
         }
 
         private void ThrowIfUnavailable()
         {
             if (disposed) throw new ObjectDisposedException(nameof(NativeTerminal));
+            if (brokerActive) throw new InvalidOperationException("A broker Output transaction owns this terminal.");
             if (failedClosed)
                 throw new NativeTerminalException(
                     nameof(NativeTerminal),
-                    NativeTerminalStatus.FailedClosed);
+                    NativeTerminalStatus.FailedClosed, failureDiagnostic);
         }
     }
 
-    public sealed class NativeTerminalCheckpoint : IDisposable
+    public sealed partial class NativeTerminalCheckpoint : IDisposable
     {
         private readonly object sync = new object();
         private readonly SafeTlTerminalCheckpointHandle handle;
         private readonly NativeTerminalCheckpointInfo info;
         private bool disposed;
 
-        private NativeTerminalCheckpoint(SafeTlTerminalCheckpointHandle handle)
+        private NativeTerminalCheckpoint(SafeTlTerminalCheckpointHandle handle, bool hasGraphicsProfile)
         {
             this.handle = handle;
+            HasGraphicsProfile = hasGraphicsProfile;
             info = ReadInfo();
         }
 
+        public bool HasGraphicsProfile { get; }
+
         internal static NativeTerminalCheckpoint CreateOwned(
-            SafeTlTerminalCheckpointHandle handle)
+            SafeTlTerminalCheckpointHandle handle, bool hasGraphicsProfile = false)
         {
             try
             {
-                return new NativeTerminalCheckpoint(handle);
+                return new NativeTerminalCheckpoint(handle, hasGraphicsProfile);
             }
             catch
             {
@@ -2381,10 +2540,24 @@ namespace TermLink.TerminalCore
             lock (sync)
             {
                 ThrowIfDisposed();
+                RequireTextProfile();
                 return ExportBuffer(
                     NativeTerminalInterop.TerminalCheckpointExportSnapshot,
                     nameof(NativeTerminalInterop.TerminalCheckpointExportSnapshot),
-                    copy);
+                    copy, NativeTerminalCoreV2.MaximumSnapshotBytes);
+            }
+        }
+
+        public byte[] ExportGraphicsSnapshot()
+        {
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                RequireGraphicsProfile();
+                return ExportBuffer(NativeTerminalInterop.TerminalCheckpointExportSnapshotGraphicsV1,
+                    nameof(NativeTerminalInterop.TerminalCheckpointExportSnapshotGraphicsV1),
+                    (source, destination, length) => Marshal.Copy(source, destination, 0, length),
+                    NativeTerminalCoreV2.MaximumGraphicsSnapshotBytes);
             }
         }
 
@@ -2454,6 +2627,107 @@ namespace TermLink.TerminalCore
             }
         }
 
+        public NativeTerminalShellState ShellState() => NativeTerminalShellState.Decode(ExportShellStateV1(), Info.NextSourceSequence);
+
+        public byte[] ExportShellStateV1(ulong maxBytes = NativeTerminalShellState.MaximumBytes)
+        {
+            if (maxBytes == 0 || maxBytes > NativeTerminalShellState.MaximumBytes)
+                throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                return ExportRenderFrameBuffer(
+                    NativeTerminalInterop.TerminalCheckpointExportShellStateV1,
+                    nameof(NativeTerminalInterop.TerminalCheckpointExportShellStateV1),
+                    maxBytes,
+                    (source, destination, length) =>
+                        Marshal.Copy(source, destination, 0, length));
+            }
+        }
+
+        public byte[] ExportRenderFrameV4(ulong maxBytes = 32UL * 1024UL * 1024UL)
+        {
+            if (maxBytes == 0 || maxBytes > 32UL * 1024UL * 1024UL)
+                throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                NativeTerminalInterop.RequireV4Abi();
+                RequireTextProfile();
+                return ExportRenderFrameBuffer(
+                    NativeTerminalInterop.TerminalCheckpointExportRenderFrameV4,
+                    nameof(NativeTerminalInterop.TerminalCheckpointExportRenderFrameV4),
+                    maxBytes,
+                    (source, destination, length) =>
+                        Marshal.Copy(source, destination, 0, length));
+            }
+        }
+
+        public byte[] ExportRenderFrameV4AtScrollback(uint offsetRows, ulong maxBytes = 32UL * 1024UL * 1024UL)
+        {
+            if (offsetRows > 10_000) throw new ArgumentOutOfRangeException(nameof(offsetRows));
+            if (maxBytes == 0 || maxBytes > 32UL * 1024UL * 1024UL) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                NativeTerminalInterop.RequireV4Abi();
+                RequireTextProfile();
+                return ExportRenderFrameBuffer(
+                    (SafeTlTerminalCheckpointHandle checkpoint, ulong maximum, ref TlTerminalBuffer output) =>
+                        NativeTerminalInterop.TerminalCheckpointExportRenderFrameV4AtScrollback(checkpoint, offsetRows, maximum, ref output),
+                    nameof(NativeTerminalInterop.TerminalCheckpointExportRenderFrameV4AtScrollback), maxBytes,
+                    (source, destination, length) => Marshal.Copy(source, destination, 0, length));
+            }
+        }
+
+        public byte[] ExportRenderFrameV5(uint flags = 0)
+        {
+            if (flags != 0) throw new ArgumentOutOfRangeException(nameof(flags));
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                RequireGraphicsProfile();
+                return ExportBuffer(
+                    (SafeTlTerminalCheckpointHandle checkpoint, ref TlTerminalBuffer output) =>
+                        NativeTerminalInterop.TerminalCheckpointExportRenderFrameV5(checkpoint, flags, ref output),
+                    nameof(NativeTerminalInterop.TerminalCheckpointExportRenderFrameV5),
+                    (source, destination, length) => Marshal.Copy(source, destination, 0, length),
+                    NativeTerminalRenderFrameV5Decoder.MaximumFrameBytes);
+            }
+        }
+
+        public byte[] ExportRenderFrameV5AtScrollback(uint offsetRows, uint flags = 0)
+        {
+            if (offsetRows > 10_000) throw new ArgumentOutOfRangeException(nameof(offsetRows));
+            if (flags != 0) throw new ArgumentOutOfRangeException(nameof(flags));
+            lock (sync)
+            {
+                ThrowIfDisposed();
+                RequireGraphicsProfile();
+                return ExportBuffer(
+                    (SafeTlTerminalCheckpointHandle checkpoint, ref TlTerminalBuffer output) =>
+                        NativeTerminalInterop.TerminalCheckpointExportRenderFrameV5AtScrollback(checkpoint, offsetRows, flags, ref output),
+                    nameof(NativeTerminalInterop.TerminalCheckpointExportRenderFrameV5AtScrollback),
+                    (source, destination, length) => Marshal.Copy(source, destination, 0, length),
+                    NativeTerminalRenderFrameV5Decoder.MaximumFrameBytes);
+            }
+        }
+
+        public NativeTerminalRenderFrameV5 RenderFrameV5() => NativeTerminalRenderFrameV5Decoder.Decode(ExportRenderFrameV5());
+        public NativeTerminalRenderFrameV5 RenderFrameV5AtScrollback(uint offsetRows) =>
+            NativeTerminalRenderFrameV5Decoder.Decode(ExportRenderFrameV5AtScrollback(offsetRows));
+
+        private void RequireGraphicsProfile()
+        {
+            if (!HasGraphicsProfile) throw new InvalidOperationException("This checkpoint requires an explicitly enabled graphics profile.");
+            NativeTerminalInterop.RequireGraphicsV1Abi();
+        }
+
+        private void RequireTextProfile()
+        {
+            if (HasGraphicsProfile) throw new InvalidOperationException("A graphics checkpoint requires the graphics snapshot or Render V5 API.");
+        }
+
         public void Dispose()
         {
             lock (sync)
@@ -2485,7 +2759,8 @@ namespace TermLink.TerminalCore
         private byte[] ExportBuffer(
             NativeTerminalInterop.CheckpointBufferExporter exporter,
             string operation,
-            Action<IntPtr, byte[], int> copy)
+            Action<IntPtr, byte[], int> copy,
+            ulong maxBytes = int.MaxValue)
         {
             var buffer = NativeTerminalInterop.CreateEmptyBuffer();
             try
@@ -2496,6 +2771,7 @@ namespace TermLink.TerminalCore
                     buffer.StructSize != NativeTerminalInterop.BufferStructSize ||
                     buffer.Data == IntPtr.Zero ||
                     buffer.Length == 0 ||
+                    buffer.Length > maxBytes ||
                     buffer.Length > int.MaxValue)
                     throw new NativeTerminalAbiException(
                         "The native terminal returned an invalid owned buffer.");
@@ -2638,6 +2914,29 @@ namespace TermLink.TerminalCore
         [FieldOffset(80)] internal ulong ReservedV3Tail1;
     }
 
+    [StructLayout(LayoutKind.Explicit, Size = 112)]
+    internal struct TlTerminalConfigV4
+    {
+        [FieldOffset(0)] internal uint AbiVersion;
+        [FieldOffset(4)] internal uint StructSize;
+        [FieldOffset(8)] internal uint Columns;
+        [FieldOffset(12)] internal uint Rows;
+        [FieldOffset(16)] internal ulong InitialSourceSequence;
+        [FieldOffset(24)] internal ulong ReservedV1Compat0;
+        [FieldOffset(32)] internal ulong ReservedV1Compat1;
+        [FieldOffset(40)] internal ulong HistoryCapacityRows;
+        [FieldOffset(48)] internal ulong ReservedV2Compat0;
+        [FieldOffset(56)] internal ulong ReservedV2Compat1;
+        [FieldOffset(64)] internal uint OutputProfile;
+        [FieldOffset(68)] internal uint ReservedV3Padding;
+        [FieldOffset(72)] internal ulong ReservedV3Tail0;
+        [FieldOffset(80)] internal ulong ReservedV3Tail1;
+        [FieldOffset(88)] internal uint WidthProfile;
+        [FieldOffset(92)] internal uint ReservedV4Padding;
+        [FieldOffset(96)] internal ulong ReservedV4Tail0;
+        [FieldOffset(104)] internal ulong ReservedV4Tail1;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct TlTerminalEvent
     {
@@ -2776,7 +3075,7 @@ namespace TermLink.TerminalCore
         [FieldOffset(40)] internal ulong Reserved;
     }
 
-    internal static unsafe class NativeTerminalInterop
+    internal static unsafe partial class NativeTerminalInterop
     {
         internal delegate NativeTerminalStatus CheckpointBufferExporter(
             SafeTlTerminalCheckpointHandle checkpoint,
@@ -3001,6 +3300,43 @@ namespace TermLink.TerminalCore
             };
         }
 
+        internal static void RequireV4Abi()
+        {
+            if (Marshal.SizeOf<TlTerminalConfigV4>() != 112 || TerminalConfigV4StructSize() != 112 ||
+                TerminalRenderFrameV4FormatVersion() != 4 || TerminalRenderFrameV4MaxBytes() != 32UL * 1024 * 1024)
+                throw new InvalidOperationException("terminal-core V4 configuration/render ABI mismatch");
+        }
+
+        internal static bool SupportsGraphicsV1()
+        {
+            var library = System.Runtime.InteropServices.NativeLibrary.Load(NativeLibrary,
+                typeof(NativeTerminalInterop).Assembly, DllImportSearchPath.AssemblyDirectory);
+            try
+            {
+                foreach (var entryPoint in new[]
+                {
+                    "tl_terminal_create_graphics_v1", "tl_terminal_import_snapshot_graphics_v1",
+                    "tl_terminal_checkpoint_export_snapshot_graphics_v1", "tl_terminal_max_graphics_snapshot_bytes",
+                    "tl_terminal_render_frame_v5_format_version", "tl_terminal_render_frame_v5_max_bytes",
+                    "tl_terminal_checkpoint_export_render_frame_v5", "tl_terminal_checkpoint_export_render_frame_v5_at_scrollback",
+                    "tl_terminal_history_page_v2", "tl_terminal_history_viewport_v2"
+                })
+                    if (!System.Runtime.InteropServices.NativeLibrary.TryGetExport(library, entryPoint, out _)) return false;
+                RequireV4Abi();
+                if (TerminalMaxGraphicsSnapshotBytes() != NativeTerminalCoreV2.MaximumGraphicsSnapshotBytes ||
+                    TerminalRenderFrameV5FormatVersion() != 5 ||
+                    TerminalRenderFrameV5MaxBytes() != NativeTerminalRenderFrameV5Decoder.MaximumFrameBytes)
+                    throw new NativeTerminalAbiException("terminal-core graphics snapshot/render ABI mismatch.");
+                return true;
+            }
+            finally { System.Runtime.InteropServices.NativeLibrary.Free(library); }
+        }
+
+        internal static void RequireGraphicsV1Abi()
+        {
+            if (!SupportsGraphicsV1()) throw new NotSupportedException("This terminal-core DLL does not provide the experimental graphics V1 ABI.");
+        }
+
         internal static TlTerminalConfigV3 CreateConfigV3(
             uint columns,
             uint rows,
@@ -3017,6 +3353,24 @@ namespace TermLink.TerminalCore
                 InitialSourceSequence = initialSourceSequence,
                 HistoryCapacityRows = historyCapacityRows,
                 OutputProfile = (uint)outputProfile
+            };
+        }
+        internal static TlTerminalConfigV4 CreateConfigV4(
+            uint columns,
+            uint rows,
+            ulong initialSourceSequence,
+            ulong historyCapacityRows,
+            NativeTerminalOutputProfile outputProfile, NativeTerminalWidthProfile widthProfile)
+        {
+            return new TlTerminalConfigV4
+            {
+                AbiVersion = NativeTerminalCoreV2.AbiVersion,
+                StructSize = 112,
+                Columns = columns,
+                Rows = rows,
+                InitialSourceSequence = initialSourceSequence,
+                HistoryCapacityRows = historyCapacityRows,
+                OutputProfile = (uint)outputProfile, WidthProfile = (uint)widthProfile
             };
         }
 
@@ -3285,6 +3639,7 @@ namespace TermLink.TerminalCore
                 case NativeTerminalStatus.SnapshotNotEligible:
                 case NativeTerminalStatus.PresentationDeferred:
                 case NativeTerminalStatus.HostEffectVersionRequired:
+                case NativeTerminalStatus.RenderFrameVersionRequired:
                     return false;
                 default:
                     return true;
@@ -3357,9 +3712,17 @@ namespace TermLink.TerminalCore
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         private static extern uint TerminalRenderFrameV3FormatVersion();
 
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_render_frame_v4_format_version",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        private static extern uint TerminalRenderFrameV4FormatVersion();
+
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_render_frame_v3_max_bytes",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         private static extern ulong TerminalRenderFrameV3MaxBytes();
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_render_frame_v4_max_bytes",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        private static extern ulong TerminalRenderFrameV4MaxBytes();
 
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_host_effect_frame_v1_format_version",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
@@ -3388,6 +3751,10 @@ namespace TermLink.TerminalCore
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_config_v3_struct_size",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         private static extern uint TerminalConfigV3StructSize();
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_config_v4_struct_size",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        private static extern uint TerminalConfigV4StructSize();
 
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_event_struct_size",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
@@ -3437,6 +3804,12 @@ namespace TermLink.TerminalCore
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         internal static extern NativeTerminalStatus TerminalCreateV3(
             in TlTerminalConfigV3 config,
+            ref IntPtr terminal);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_create_v4",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCreateV4(
+            in TlTerminalConfigV4 config,
             ref IntPtr terminal);
 
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_destroy",
@@ -3548,6 +3921,25 @@ namespace TermLink.TerminalCore
             ulong maxFrameBytes,
             ref TlTerminalBuffer frame);
 
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_shell_state_v1",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCheckpointExportShellStateV1(
+            SafeTlTerminalCheckpointHandle checkpoint,
+            ulong maxFrameBytes,
+            ref TlTerminalBuffer frame);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_render_frame_v4",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCheckpointExportRenderFrameV4(
+            SafeTlTerminalCheckpointHandle checkpoint,
+            ulong maxFrameBytes,
+            ref TlTerminalBuffer frame);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_render_frame_v4_at_scrollback",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCheckpointExportRenderFrameV4AtScrollback(
+            SafeTlTerminalCheckpointHandle checkpoint, uint offsetRows, ulong maxFrameBytes, ref TlTerminalBuffer frame);
+
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_delta",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         internal static extern NativeTerminalStatus TerminalCheckpointExportDelta(
@@ -3561,12 +3953,24 @@ namespace TermLink.TerminalCore
             in TlTerminalInputV1 input,
             ref TlTerminalBuffer encoded);
 
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_input_v1_with_diagnostic",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalEncodeInputV1WithDiagnostic(
+            SafeTlTerminalHandle terminal, in TlTerminalInputV1 input,
+            ref TlTerminalBuffer encoded, ref TlTerminalBuffer diagnostic);
+
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_input_v2",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         internal static extern NativeTerminalStatus TerminalEncodeInputV2(
             SafeTlTerminalHandle terminal,
             in TlTerminalInputV2 input,
             ref TlTerminalBuffer encoded);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_input_v2_with_diagnostic",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalEncodeInputV2WithDiagnostic(
+            SafeTlTerminalHandle terminal, in TlTerminalInputV2 input,
+            ref TlTerminalBuffer encoded, ref TlTerminalBuffer diagnostic);
 
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_input_v3",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
@@ -3575,12 +3979,74 @@ namespace TermLink.TerminalCore
             in TlTerminalInputV3 input,
             ref TlTerminalBuffer encoded);
 
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_input_v3_with_diagnostic",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalEncodeInputV3WithDiagnostic(
+            SafeTlTerminalHandle terminal, in TlTerminalInputV3 input,
+            ref TlTerminalBuffer encoded, ref TlTerminalBuffer diagnostic);
+
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_mouse_input_v1",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
         internal static extern NativeTerminalStatus TerminalEncodeMouseInputV1(
             SafeTlTerminalHandle terminal,
             in TlTerminalMouseInputV1 input,
             ref TlTerminalBuffer encoded);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_encode_mouse_input_v1_with_diagnostic",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalEncodeMouseInputV1WithDiagnostic(
+            SafeTlTerminalHandle terminal, in TlTerminalMouseInputV1 input,
+            ref TlTerminalBuffer encoded, ref TlTerminalBuffer diagnostic);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_export_failure_diagnostic_v1",
+            CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern NativeTerminalStatus TerminalExportFailureDiagnosticV1(
+            SafeTlTerminalHandle terminal, ref TlTerminalBuffer diagnostic);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_export_failure_diagnostic_v2",
+            CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern NativeTerminalStatus TerminalExportFailureDiagnosticV2(
+            SafeTlTerminalHandle terminal, ref TlTerminalBuffer diagnostic);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_export_failure_diagnostic_v3",
+            CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern NativeTerminalStatus TerminalExportFailureDiagnosticV3(
+            SafeTlTerminalHandle terminal, ref TlTerminalBuffer diagnostic);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_create_graphics_v1",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCreateGraphicsV1(in TlTerminalConfigV4 config, ref IntPtr terminal);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_import_snapshot_graphics_v1",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalImportSnapshotGraphicsV1(byte* bytes, ulong length, ref IntPtr terminal);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_snapshot_graphics_v1",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCheckpointExportSnapshotGraphicsV1(
+            SafeTlTerminalCheckpointHandle checkpoint, ref TlTerminalBuffer snapshot);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_max_graphics_snapshot_bytes",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        private static extern ulong TerminalMaxGraphicsSnapshotBytes();
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_render_frame_v5_format_version",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        private static extern uint TerminalRenderFrameV5FormatVersion();
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_render_frame_v5_max_bytes",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        private static extern ulong TerminalRenderFrameV5MaxBytes();
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_render_frame_v5",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCheckpointExportRenderFrameV5(
+            SafeTlTerminalCheckpointHandle checkpoint, uint flags, ref TlTerminalBuffer frame);
+
+        [DllImport(NativeLibrary, EntryPoint = "tl_terminal_checkpoint_export_render_frame_v5_at_scrollback",
+            ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern NativeTerminalStatus TerminalCheckpointExportRenderFrameV5AtScrollback(
+            SafeTlTerminalCheckpointHandle checkpoint, uint offsetRows, uint flags, ref TlTerminalBuffer frame);
 
         [DllImport(NativeLibrary, EntryPoint = "tl_terminal_buffer_free",
             ExactSpelling = true, CallingConvention = CallingConvention.Cdecl)]

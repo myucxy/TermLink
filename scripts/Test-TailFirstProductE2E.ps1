@@ -107,10 +107,134 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tok
 Assert-True ($parseErrors.Count -eq 0) `
     ("Invoke-TailFirstProductE2E.ps1 parser errors:`n" + (($parseErrors | ForEach-Object { $_.Message }) -join "`n"))
 
+$frozenTransitionFunction = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-FrozenPageTransition'
+}, $true))
+Assert-True ($frozenTransitionFunction.Count -eq 1) `
+    'The runner must use exactly one Frozen PAGE identity and anchor validator.'
+Invoke-Expression $frozenTransitionFunction[0].Extent.Text
+$frozenBegin = [pscustomobject]@{
+    frozen_active = $true; frozen_render_ready = $true; frozen_capture_id = 81L
+    frozen_revision = 42L; frozen_snapshot_sequence_s = 41L; frozen_page_count = 1
+    frozen_first_line_id = 501L; frozen_next_before_line_id = 500L; frozen_has_more_before = $true
+    frozen_head_truncated = $false
+}
+$frozenPage = [pscustomobject]@{
+    frozen_active = $true; frozen_render_ready = $true; frozen_capture_id = 81L
+    frozen_revision = 42L; frozen_snapshot_sequence_s = 41L; frozen_page_count = 2
+    frozen_first_line_id = 301L; frozen_next_before_line_id = 300L; frozen_has_more_before = $true
+    frozen_head_truncated = $false
+}
+$seenFrozenAnchors = [Collections.Generic.HashSet[uint64]]::new()
+$null = $seenFrozenAnchors.Add(500)
+Assert-True (Test-FrozenPageTransition $frozenBegin $frozenBegin $frozenPage $seenFrozenAnchors) `
+    'A valid rendered PAGE on the same capture was rejected.'
+Assert-True (-not (Test-FrozenPageTransition $frozenBegin $frozenBegin $frozenPage $seenFrozenAnchors)) `
+    'A repeated Frozen anchor was accepted.'
+$frozenFinalPage = $frozenPage | ConvertTo-Json | ConvertFrom-Json
+$frozenFinalPage.frozen_first_line_id = 101L
+$frozenFinalPage.frozen_next_before_line_id = 0L
+$frozenFinalPage.frozen_has_more_before = $false
+$frozenFinalPage.frozen_head_truncated = $true
+Assert-True (Test-FrozenPageTransition $frozenBegin $frozenPage $frozenFinalPage $seenFrozenAnchors) `
+    'The oldest rendered PAGE with no next cursor was rejected.'
+foreach ($change in @(
+    @{ frozen_capture_id = 82L }, @{ frozen_revision = 43L },
+    @{ frozen_snapshot_sequence_s = 42L }, @{ frozen_render_ready = $false },
+    @{ frozen_head_truncated = 'false' }, @{ frozen_next_before_line_id = 0L },
+    @{ frozen_first_line_id = 301L }, @{ frozen_page_count = 1 }
+)) {
+    $invalidPage = $frozenPage | ConvertTo-Json | ConvertFrom-Json
+    $invalidPage.frozen_next_before_line_id = 200L
+    foreach ($key in $change.Keys) { $invalidPage.$key = $change[$key] }
+    Assert-True (-not (Test-FrozenPageTransition $frozenBegin $frozenPage $invalidPage $seenFrozenAnchors)) `
+        "The Frozen PAGE validator accepted invalid $(@($change.Keys)[0])."
+}
+Assert-True ($source.Contains('[switch]$FrozenLifecycleAcceptance') -and
+    $source.Contains('$markerCount = if ($FrozenLifecycleAcceptance) {') -and
+    $source.Contains('1400') -and $source.Contains("'900000'") -and
+    $source.Contains('$columns = __FROZEN_COLUMNS_SOURCE__') -and
+    $source.Contains("Replace('__FROZEN_COLUMNS_SOURCE__', '[Console]::WindowWidth')") -and
+    $source.Contains('[Console]::Write([char]27 +') -and
+    $source.Contains('$resizeClock.Elapsed.TotalSeconds -lt 15') -and
+    $source.Contains('$padding = ''X'' * ($columns * 20)') -and
+    $source.Contains("'FROZEN_FIXTURE_RESIZE_FAILED'") -and
+    $source.Contains("'frozen-fixture-child-observed-32-columns'") -and
+    $source.Contains("'frozen-fixture-android-observed-32-columns'") -and
+    $source.Contains("'frozen-fixture-width-marker-visible'") -and
+    $source.Contains("'TLTF32_'") -and
+    $source.Contains('[Convert]::ToHexString($liveMarkerDigest, 0, 4).ToLowerInvariant()') -and
+    $source.Contains('$openSessionArguments = @{') -and
+    $source.Contains('$openSessionArguments.frozen_lifecycle_acceptance = ''true''') -and
+    $source.Contains("'SnapshotTranscript' -and") -and
+    $source.Contains('-not $ExpectFrozenUnsupported')) `
+    'Frozen lifecycle acceptance does not gate its oversized fixture and extended SessionHost timeout.'
+Assert-True ($source.Contains('$responseResult = Invoke-NativeCapture $script:adbPath') -and
+    $source.Contains("'Debug hook open_session failure response'") -and
+    $source.Contains('$script:hookFailureCode = $stableFailureCode') -and
+    $source.Contains('Debug hook operation ''open_session'' reported failure_code ''$stableFailureCode''.' )) `
+    'Wait-SessionArm does not fail fast with the matching open_session failure response code.'
+$frozenTerminalParameter = @($ast.ParamBlock.Parameters | Where-Object {
+    $_.Name.VariablePath.UserPath -eq 'FrozenTerminalState'
+})
+Assert-True ($frozenTerminalParameter.Count -eq 1) `
+    'The runner does not declare exactly one FrozenTerminalState parameter.'
+$frozenTerminalValidateSet = @($frozenTerminalParameter[0].Attributes | Where-Object {
+    $_.TypeName.Name -eq 'ValidateSet'
+})
+Assert-True ($frozenTerminalValidateSet.Count -eq 1 -and
+    @($frozenTerminalValidateSet[0].PositionalArguments | ForEach-Object { $_.SafeGetValue() }) -ccontains 'terminal_state_2_22_v1' -and
+    @($frozenTerminalValidateSet[0].PositionalArguments | ForEach-Object { $_.SafeGetValue() }) -ccontains 'terminal_state_2_22_v2') `
+    'FrozenTerminalState does not expose exactly the v1 and v2 state contracts.'
+Assert-True ($frozenTerminalParameter[0].DefaultValue.Extent.Text -eq "'terminal_state_2_22_v2'") `
+    'FrozenTerminalState does not default to terminal_state_2_22_v2.'
+Assert-True ($source.Contains('$FrozenGraphicsMode -or -not $PSBoundParameters.ContainsKey(''FrozenTerminalState'')') -and
+    $source.Contains('''--terminal-state'', $FrozenTerminalState')) `
+    'FrozenTerminalState is not restricted to graphics mode or forwarded explicitly.'
+foreach ($proof in @(
+    "'frozen-history-page-after-reconnect'", "'frozen-reconnect-page-same-capture'",
+    "'frozen-oldest-boundary-reached'", "'frozen-oldest-head-truncated'",
+    "'frozen-ttl-first-page-before-deadline'", "'frozen-ttl-page-does-not-renew-lease'",
+    "'frozen-expired-slot-reusable'", "'FROZEN_RECONNECT_PAGE_INVALID'",
+    "'STALE_CAPTURE'", 'Test-FrozenPageTransition $begin $afterLivePage $reconnectedPage',
+    '[Diagnostics.Stopwatch]::StartNew()', 'Wait-FrozenCaptureAge $ttlClock 240',
+    'Wait-FrozenCaptureAge $ttlClock 305', '$ttlFirstPageCompletedSeconds -lt 295',
+    '$frozenPageCalls -lt 256', '[Math]::Min(1000'
+)) {
+    Assert-True ($source.Contains($proof)) "The Frozen lifecycle runner lacks $proof."
+}
+
 $literalValues = @($ast.FindAll({
     param($node)
     $node -is [Management.Automation.Language.StringConstantExpressionAst]
 }, $true) | ForEach-Object { $_.Value })
+
+$frozenLiveInput = [regex]::Match($source,
+    '(?s)\$script:stage = ''frozen-release-live-flow''.*?(?=\$deadline =)').Value
+Assert-True (-not [string]::IsNullOrEmpty($frozenLiveInput) -and
+    -not $frozenLiveInput.Contains('StandardInput') -and
+    $frozenLiveInput.Contains("Invoke-HookOperation 'show_ime'") -and
+    $frozenLiveInput.Contains('''input'', ''text'', $liveMarker') -and
+    $frozenLiveInput.Contains("'input', 'keyevent', 'KEYCODE_ENTER'")) `
+    'Frozen native-display mode must submit the live marker through the Android keyboard, not unread host stdin.'
+Assert-True ($source.Contains('Start-ThreadJob -ArgumentList $frozenOutputTrigger') -and
+    $source.Contains('[Console]::WriteLine($marker)') -and
+    $source.Contains("'frozen-live-output-ack-advanced'") -and
+    $source.Contains("'frozen-live-output-changed-live-text'") -and
+    $source.Contains("'frozen-live-output-retains-capture'") -and
+    $source.Contains("'frozen-live-output-retains-revision'")) `
+    'Frozen concurrent output must originate in the owned Windows ConPTY and preserve its capture.'
+Assert-True ($source.Contains("'frozen-relay-disconnected'") -and
+    $source.Contains("'frozen-relay-successor-subscribed'") -and
+    $source.Contains("'frozen-reconnect-new-capture'") -and
+    $source.Contains("'frozen-rebrowse-release-clears-overlay'")) `
+    'Frozen Relay reconnect must release and reopen a new capture.'
+Assert-True ($source.Contains("'old-host-reject-clears-frozen-state'") -and
+    $source.Contains("'old-host-reject-live-continues'") -and
+    $source.Contains("'FROZEN_UNSUPPORTED_CLOSED_LIVE_CLIENT'")) `
+    'Old Host refusal must release the frozen state and leave the live Relay client usable.'
 
 $targetParameter = @($ast.ParamBlock.Parameters | Where-Object {
     $_.Name.VariablePath.UserPath -eq 'TargetMode'
@@ -624,6 +748,17 @@ $message = Get-FailureMessage { & $scriptPath @common -TargetMode 'UnknownTarget
 Assert-True ($message -match 'TargetMode') 'The runner accepted an unknown target mode.'
 $message = Get-FailureMessage { & $scriptPath @common -HistoryBootstrapMode 'UnknownBootstrap' }
 Assert-True ($message -match 'HistoryBootstrapMode') 'The runner accepted an unknown history bootstrap mode.'
+$message = Get-FailureMessage { & $scriptPath @common -FrozenTerminalState 'terminal_state_2_22_v3' }
+Assert-True ($message -match 'FrozenTerminalState') 'The runner accepted an unknown terminal state contract.'
+$message = Get-FailureMessage { & $scriptPath @common -FrozenTerminalState 'terminal_state_2_22_v1' }
+Assert-True ($message -match 'E2E_INPUT_INVALID') `
+    'The runner accepted an explicit FrozenTerminalState without FrozenGraphicsMode.'
+$message = Get-FailureMessage {
+    & $scriptPath @common -FrozenGraphicsMode -NativeDisplayPath (Join-Path $PSHOME 'pwsh.exe') `
+        -FrozenTerminalState 'terminal_state_2_22_v1'
+}
+Assert-True ($message -match 'ANDROID_APK_MISSING') `
+    'The runner did not accept an explicit v1 terminal state in FrozenGraphicsMode.'
 
 # Exercise the missing-hook failure before Docker/ADB touches a device. Both the
 # fake APK and the runner evidence live under repository artifacts.
@@ -632,6 +767,7 @@ $testRoot = Join-Path $repositoryRoot "artifacts\tail-first-e2e-static-tests\$te
 $runId = "static-missing-hook-$testId"
 $runDirectory = Join-Path $repositoryRoot "artifacts\tail-first-e2e\$runId"
 $fakeApk = Join-Path $testRoot 'missing-hook.apk'
+$legacyApk = Join-Path $testRoot 'legacy-hook-contract.apk'
 $validApk = Join-Path $testRoot 'valid-agent-contract.apk'
 $fixtureHostDirectory = Join-Path $repositoryRoot 'win-agent\src\SessionHost\bin\Release\net8.0-windows'
 $fixtureSessionHost = Join-Path $fixtureHostDirectory 'TermLink.SessionHost.exe'
@@ -690,13 +826,50 @@ try {
         terminal_snapshot_runtime = $true
         operations = @('probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime')
     }
-    $archive = [IO.Compression.ZipFile]::Open($validApk, [IO.Compression.ZipArchiveMode]::Create)
-    try {
-        $entry = $archive.CreateEntry('assets/termlink-tail-first-e2e-contract-v1.json')
-        $writer = [IO.StreamWriter]::new($entry.Open(), [Text.UTF8Encoding]::new($false))
-        try { $writer.Write(($contract | ConvertTo-Json -Depth 5)) } finally { $writer.Dispose() }
+    foreach ($apk in @($legacyApk, $validApk)) {
+        if ($apk -eq $validApk) {
+            $contract.operations += @('begin_frozen_history', 'page_frozen_history', 'release_frozen_history')
+        }
+        $archive = [IO.Compression.ZipFile]::Open($apk, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            $entry = $archive.CreateEntry('assets/termlink-tail-first-e2e-contract-v1.json')
+            $writer = [IO.StreamWriter]::new($entry.Open(), [Text.UTF8Encoding]::new($false))
+            try { $writer.Write(($contract | ConvertTo-Json -Depth 5)) } finally { $writer.Dispose() }
+        }
+        finally { $archive.Dispose() }
     }
-    finally { $archive.Dispose() }
+
+    $legacyRunId = "static-frozen-legacy-hook-$testId"
+    $legacyRunDirectory = Join-Path $repositoryRoot "artifacts\tail-first-e2e\$legacyRunId"
+    $agentRunDirectories.Add($legacyRunDirectory)
+    $legacyArguments = $common.Clone()
+    $legacyArguments.AndroidApkPath = $legacyApk
+    $legacyArguments.NativeDisplayPath = Join-Path $PSHOME 'pwsh.exe'
+    $legacyArguments.FrozenGraphicsMode = $true
+    $legacyArguments.ArtifactRunId = $legacyRunId
+    $message = Get-FailureMessage { & $scriptPath @legacyArguments }
+    Assert-True ($message -match "lacks operation 'begin_frozen_history'") `
+        'Frozen Graphics preflight accepted an APK without frozen history operations.'
+    $legacyEvidence = Get-Content -Raw -LiteralPath (Join-Path $legacyRunDirectory 'evidence.json') | ConvertFrom-Json
+    Assert-True ([string]$legacyEvidence.failure.stage -eq 'preflight-hook-contract') `
+        'Frozen Graphics hook failure was not caught before Agent/AVD preflight.'
+
+    $legacyNormalRunId = "static-normal-legacy-hook-$testId"
+    $agentRunDirectories.Add((Join-Path $repositoryRoot "artifacts\tail-first-e2e\$legacyNormalRunId"))
+    $legacyNormalPipe = "termlink-tail-first-legacy-$testId"
+    $legacyNormalServer = Start-FakeAgentStatusServer $fixtureAgentControl $legacyNormalPipe ([string]$contract.server_origin)
+    try {
+        $legacyNormalArguments = $common.Clone()
+        $legacyNormalArguments.AndroidApkPath = $legacyApk
+        $legacyNormalArguments.SessionHostPath = $fixtureSessionHost
+        $legacyNormalArguments.AgentControlPipe = $legacyNormalPipe
+        $legacyNormalArguments.DockerPath = 'termlink-intentionally-missing-docker'
+        $legacyNormalArguments.ArtifactRunId = $legacyNormalRunId
+        $message = Get-FailureMessage { & $scriptPath @legacyNormalArguments }
+        Assert-True ($message -match 'DOCKER_UNAVAILABLE') `
+            'Normal mode rejected an APK with only the original hook operations.'
+    }
+    finally { Stop-FakeAgentStatusServer $legacyNormalServer }
 
     $positiveRunId = "static-agent-ready-$testId"
     $positiveRunDirectory = Join-Path $repositoryRoot "artifacts\tail-first-e2e\$positiveRunId"
@@ -800,6 +973,175 @@ try {
                 "Agent case '$($case.Name)' wrote the wrong evidence failure stage."
         }
         finally { Stop-FakeAgentStatusServer $caseServer }
+    }
+
+    # Isolated policy checks: all ADB/aapt results below are in-memory fixtures.
+    foreach ($functionName in @('Get-AvdStartMode', 'Get-CandidateApkIdentity',
+        'Assert-InstalledCandidateApk')) {
+        $definition = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        }, $true))
+        Assert-True ($definition.Count -eq 1) "Runner function '$functionName' is missing or duplicated."
+        Invoke-Expression $definition[0].Extent.Text
+    }
+    $script:serial = 'emulator-5556'
+    $script:AvdName = 'TermLinkReleaseUpgrade_API36'
+    $script:AndroidPackageName = 'dev.termlink.harness.recovery'
+    $script:FrozenLifecycleAcceptance = $true
+    $script:adbPath = 'fixture-adb'
+    $script:avdBySerial = @{ 'emulator-5556' = $script:AvdName }
+    function Get-EmulatorAvdName { param([string]$DeviceSerial) return $script:avdBySerial[$DeviceSerial] }
+    $deviceList = "List of devices attached`nemulator-5556`tdevice`n"
+    Assert-True ((Get-AvdStartMode $deviceList) -ceq 'warm_existing') `
+        'Frozen lifecycle did not reuse the matching connected AVD.'
+    $script:avdBySerial['emulator-5556'] = 'Another_AVD'
+    Assert-True ((Get-FailureMessage { Get-AvdStartMode $deviceList }) -match 'AVD_IDENTITY_MISMATCH') `
+        'Frozen lifecycle accepted a running AVD with the wrong name.'
+    $script:avdBySerial['emulator-5556'] = $script:AvdName
+    Assert-True ((Get-FailureMessage {
+        Get-AvdStartMode "List of devices attached`nemulator-5556`toffline`n"
+    }) -match 'AVD_NOT_READY') 'Frozen lifecycle accepted an offline selected serial.'
+    Assert-True ((Get-AvdStartMode 'List of devices attached') -ceq 'owned_preserved_data') `
+        'Frozen lifecycle without a running AVD did not select the data-preserving owned path.'
+    $script:FrozenLifecycleAcceptance = $false
+    Assert-True ((Get-FailureMessage { Get-AvdStartMode $deviceList }) -match 'AVD_NOT_COLD') `
+        'Normal cold-first mode started accepting an already running emulator.'
+    $script:FrozenLifecycleAcceptance = $true
+
+    $fakeBuildTools = Join-Path $testRoot 'sdk\build-tools\36.1.0'
+    [IO.Directory]::CreateDirectory($fakeBuildTools) | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $fakeBuildTools 'aapt.exe'), [byte[]]@(0))
+    function Invoke-RequiredNative {
+        param([string]$FilePath, [string[]]$Arguments, [string]$Code, [string]$Message)
+        return "package: name='dev.termlink.harness.recovery' versionCode='132' versionName='0.3.3' platformBuildVersionName='16'"
+    }
+    $candidate = Get-CandidateApkIdentity $validApk (Join-Path $testRoot 'sdk')
+    Assert-True ($candidate.package -ceq $script:AndroidPackageName -and
+        $candidate.version_code -ceq '132' -and $candidate.version_name -ceq '0.3.3' -and
+        $candidate.sha256 -ceq (Get-FileHash -LiteralPath $validApk -Algorithm SHA256).Hash.ToLowerInvariant()) `
+        'Candidate APK identity/hash was not derived from the APK and aapt badging.'
+    $script:mockInstalledHash = $candidate.sha256
+    $script:mockInstalledVersion = '0.3.3'
+    $script:installedQueries = [Collections.Generic.List[string]]::new()
+    function Invoke-NativeCapture {
+        param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds)
+        $command = $Arguments -join ' '
+        $script:installedQueries.Add($command)
+        $output = if ($command -match ' shell pm path ') {
+            'package:/data/app/example/base.apk'
+        } elseif ($command -match ' shell sha256sum ') {
+            "$($script:mockInstalledHash)  /data/app/example/base.apk"
+        } elseif ($command -match ' shell dumpsys package ') {
+            "Packages:`n  Package [dev.termlink.harness.recovery]`n    versionCode=132 minSdk=26`n    versionName=$($script:mockInstalledVersion)`n"
+        } else { throw "Unexpected fixture ADB query: $command" }
+        return [pscustomobject]@{ ExitCode = 0; StdOut = $output; StdErr = '' }
+    }
+    $null = Assert-InstalledCandidateApk $candidate
+    Assert-True ($script:installedQueries.Count -eq 3 -and
+        -not (($script:installedQueries -join ' ') -match ' install |force-stop| run-as | rm ')) `
+        'Warm existing APK validation performed an unexpected state-changing ADB command.'
+    $script:mockInstalledHash = '0' * 64
+    Assert-True ((Get-FailureMessage { Assert-InstalledCandidateApk $candidate }) -match
+        'ANDROID_INSTALLED_APK_HASH_MISMATCH') 'Warm lifecycle accepted the wrong installed APK hash.'
+    $script:mockInstalledHash = $candidate.sha256
+    $script:mockInstalledVersion = '0.3.2'
+    Assert-True ((Get-FailureMessage { Assert-InstalledCandidateApk $candidate }) -match
+        'ANDROID_INSTALLED_APK_VERSION_MISMATCH') 'Warm lifecycle accepted the wrong installed version.'
+    Assert-True ($source.Contains("if (`$avdStartMode -cne 'warm_existing')") -and
+        $source.Contains('android_state_reset -NotePropertyValue $false') -and
+        $source.Contains("if (`$FrozenLifecycleAcceptance) {") -and
+        $source.Contains("'shell', 'am', 'force-stop', `$AndroidPackageName")) `
+        'Frozen preservation or normal cold-first behavior is missing from the runner.'
+
+    $identityFunction = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Test-FailureSessionIdentity'
+    }, $true))
+    Assert-True ($identityFunction.Count -eq 1) 'The failed-open session identity guard is missing.'
+    Invoke-Expression $identityFunction[0].Extent.Text
+    $baselineId = '11111111-1111-4111-8111-111111111111'
+    $newId = '22222222-2222-4222-8222-222222222222'
+    $otherId = '33333333-3333-4333-8333-333333333333'
+    $arm = [pscustomobject]@{ baseline_session_ids = @($baselineId); selected_session_id = $null }
+    Assert-True ((Test-FailureSessionIdentity $newId $arm) -and
+        -not (Test-FailureSessionIdentity $baselineId $arm) -and
+        -not (Test-FailureSessionIdentity 'not-a-uuid' $arm)) `
+        'Failed-open evidence can select an old or invalid session.'
+    $arm.selected_session_id = $newId
+    Assert-True ((Test-FailureSessionIdentity $newId $arm) -and
+        -not (Test-FailureSessionIdentity $otherId $arm)) `
+        'Failed-open evidence can switch away from the selected session.'
+    Assert-True ($source.Contains("`$script:stage -ceq 'tail-first-open'") -and
+        $source.Contains('-not $script:sessionProcess.HasExited') -and
+        $source.Contains('Save-FrozenOpenFailureEvidence $script:openSessionRequest') -and
+        $source.Contains("Save-Screenshot 'failed-open.png'")) `
+        'Failed-open evidence is not gated by the live owned Host and armed session.'
+    $failureCapture = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Save-FrozenOpenFailureEvidence'
+    }, $true))
+    Assert-True ($failureCapture.Count -eq 1 -and
+        $failureCapture[0].Extent.Text.Contains('AddSeconds(60)') -and
+        @([regex]::Matches($failureCapture[0].Extent.Text,
+            '\$script:sessionProcess\.HasExited')).Count -ge 2) `
+        'Failed-open inspect lacks the 60-second bound or live Host checks before screenshot.'
+
+    $frozenTemplates = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+            $node.Value.Contains("`$stem = '__MARKER_STEM__'") -and
+            $node.Value.Contains('__FROZEN_COLUMNS_SOURCE__')
+    }, $true))
+    Assert-True ($frozenTemplates.Count -eq 1) 'The Frozen child fixture template is missing or ambiguous.'
+    $statusPath = Join-Path $testRoot 'frozen-child-columns.txt'
+    $child = $frozenTemplates[0].Value.
+        Replace('__MARKER_STEM__', 'TLTF32_TEST').
+        Replace('__FROZEN_LIFECYCLE__', '$true').
+        Replace('__FROZEN_COLUMNS_SOURCE__', '32').
+        Replace('__FIXTURE_STATUS_BASE64__', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($statusPath))).
+        Replace('__FROZEN_WIDTH_MARKER__', 'TLF_COL32_TEST').
+        Replace('__MARKER_COUNT__', '1400')
+    $childStart = [Diagnostics.ProcessStartInfo]::new()
+    $childStart.FileName = Join-Path $PSHOME 'pwsh.exe'
+    $childStart.UseShellExecute = $false
+    $childStart.CreateNoWindow = $true
+    $childStart.RedirectStandardInput = $true
+    $childStart.RedirectStandardOutput = $true
+    $childStart.RedirectStandardError = $true
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child)))) {
+        $childStart.ArgumentList.Add($argument)
+    }
+    $childProcess = [Diagnostics.Process]::Start($childStart)
+    Assert-True ($null -ne $childProcess) 'Could not start the isolated Frozen child fixture.'
+    try {
+        $childOutput = $childProcess.StandardOutput.ReadToEndAsync()
+        $childError = $childProcess.StandardError.ReadToEndAsync()
+        $childProcess.StandardInput.WriteLine('__TERMLINK_TAIL_FIRST_EXIT__')
+        $childProcess.StandardInput.Close()
+        Assert-True ($childProcess.WaitForExit(30000) -and $childProcess.ExitCode -eq 0) `
+            'The isolated Frozen child fixture did not complete.'
+        $outputLines = @($childOutput.GetAwaiter().GetResult() -split '\r?\n')
+        $markerLines = @($outputLines | Where-Object { $_ -match 'TLTF32_TEST_\d{4}' })
+        Assert-True ($markerLines.Count -eq 1400) `
+            'The actual Frozen child emitted a different marker count than 1400.'
+        Assert-True (@($markerLines[0..1398] | Where-Object { $_ -notmatch 'X{640}$' }).Count -eq 0) `
+            'An earlier Frozen marker lost its 20-row history padding.'
+        Assert-True ($markerLines[1399] -ceq 'TLTF32_TEST_1400' -and
+            $outputLines[1400] -ceq 'TLF_COL32_TEST') `
+            'The final Frozen marker or following width marker is not a visible unpadded line.'
+        Assert-True ((Get-Content -LiteralPath $statusPath -Raw).Trim() -ceq '32') `
+            'The isolated Frozen child did not record the mocked 32-column terminal width.'
+        Assert-True ([string]::IsNullOrWhiteSpace($childError.GetAwaiter().GetResult())) `
+            'The isolated Frozen child wrote an error.'
+    }
+    finally {
+        if (-not $childProcess.HasExited) { $childProcess.Kill($true) }
+        $childProcess.Dispose()
     }
 }
 finally {

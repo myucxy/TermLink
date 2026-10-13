@@ -1,6 +1,9 @@
 package dev.termlink.product
 
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import android.widget.Toast
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -21,6 +24,8 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.harness.R
 import dev.termlink.terminal.api.TerminalViewportMetrics
@@ -68,34 +73,37 @@ internal fun SessionWindowSizeMenuItems(
                 throw error
             } catch (error: Exception) {
                 result = context.getString(resizeErrorResource(error.message))
+                Toast.makeText(context, result, Toast.LENGTH_LONG).show()
             } finally { busy = false }
         }
     }
+    val feedback = if (busy) stringResource(R.string.session_resize_pending) else result
+        ?: if (!enabled) stringResource(R.string.session_resize_control_required) else null
     HorizontalDivider()
     Text(stringResource(R.string.session_window_size_title),
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp).semantics { heading() },
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp).semantics { heading() },
         style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     DropdownMenuItem(
-        text = { Text(stringResource(R.string.session_resize_fit)) },
+        text = { Text(stringResource(R.string.session_resize_fit), style = MaterialTheme.typography.bodyMedium) },
         trailingIcon = {
-            Text(metrics?.let { stringResource(R.string.session_resize_preview, it.size.columns, it.size.rows) }
-                ?: stringResource(R.string.session_resize_unmeasured), style = MaterialTheme.typography.labelSmall)
+            // Reuse the preview slot so result text never adds a row or changes the popup width.
+            Text(feedback ?: metrics?.let { stringResource(R.string.session_resize_preview, it.size.columns, it.size.rows) }
+                ?: stringResource(R.string.session_resize_unmeasured),
+                modifier = Modifier.width(112.dp).semantics { liveRegion = LiveRegionMode.Polite }
+                    .testTag("session-resize-result:$sessionId"),
+                style = MaterialTheme.typography.labelSmall, textAlign = TextAlign.End,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
         },
-        modifier = Modifier.testTag("session-resize-fit:$sessionId"),
+        modifier = Modifier.height(40.dp).testTag("session-resize-fit:$sessionId"),
         enabled = enabled && !busy && metrics != null,
         onClick = { request(false) },
     )
     DropdownMenuItem(
-        text = { Text(stringResource(R.string.session_resize_restore)) },
-        modifier = Modifier.testTag("session-resize-restore:$sessionId"),
+        text = { Text(stringResource(R.string.session_resize_restore), style = MaterialTheme.typography.bodyMedium) },
+        modifier = Modifier.height(40.dp).testTag("session-resize-restore:$sessionId"),
         enabled = enabled && !busy,
         onClick = { request(true) },
     )
-    val feedback = if (busy) stringResource(R.string.session_resize_pending) else result
-        ?: if (!enabled) stringResource(R.string.session_resize_control_required) else null
-    feedback?.let { Text(it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-        .semantics { liveRegion = LiveRegionMode.Polite }
-        .testTag("session-resize-result:$sessionId"), style = MaterialTheme.typography.bodySmall) }
     HorizontalDivider()
 }
 

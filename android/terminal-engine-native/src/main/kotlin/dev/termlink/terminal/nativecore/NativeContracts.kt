@@ -7,6 +7,9 @@ import dev.termlink.terminal.api.TerminalKittyKeyInput
 import dev.termlink.terminal.api.TerminalOutputProfile
 import dev.termlink.terminal.api.TerminalRenderFrameV1
 import dev.termlink.terminal.api.TerminalRenderFrameV3
+import dev.termlink.terminal.api.TerminalRenderFrameV4
+import dev.termlink.terminal.api.TerminalRenderFrameV5
+import dev.termlink.terminal.api.TerminalTextFrame
 import dev.termlink.terminal.api.TerminalSize
 
 const val TERMLINK_TERMINAL_ABI_VERSION: Int = 1
@@ -18,6 +21,12 @@ const val TERMLINK_INPUT_V1_STRUCT_SIZE: Int = 56
 const val TERMLINK_INPUT_V2_STRUCT_SIZE: Int = 96
 const val TERMLINK_INPUT_V3_STRUCT_SIZE: Int = 160
 const val TERMLINK_CONFIG_V3_STRUCT_SIZE: Int = 88
+const val TERMLINK_CONFIG_V4_STRUCT_SIZE: Int = 112
+const val TERMLINK_RENDER_FRAME_V4_FORMAT_VERSION: Int = 4
+const val TERMLINK_RENDER_FRAME_V4_MAX_BYTES: Int = 32 * 1024 * 1024
+const val TERMLINK_RENDER_FRAME_V5_MAX_BYTES: Int = 64 * 1024 * 1024
+const val TERMLINK_GRAPHICS_SNAPSHOT_MAX_BYTES: Int = 128 * 1024 * 1024
+const val TERMLINK_STATE_DELTA_MAX_BYTES: Int = TERMLINK_GRAPHICS_SNAPSHOT_MAX_BYTES
 const val TERMLINK_MOUSE_INPUT_V1_STRUCT_SIZE: Int = 64
 const val TERMLINK_HOST_EFFECT_FRAME_V2_FORMAT_VERSION: Int = 2
 const val TERMLINK_HOST_EFFECT_FRAME_V2_MAX_BYTES: Int = 123_033_008
@@ -82,13 +91,14 @@ data class NativeTerminalLimits(
     val maxColumns: Int = 512,
     val maxRows: Int = 512,
     val maxCells: Int = 262_144,
+    val graphicsProfile: Boolean = false,
 ) {
     init {
         require(maxEventsPerBatch in 1..HARD_MAX_EVENTS_PER_BATCH)
         require(maxOutputBytesPerEvent in 1..HARD_MAX_OUTPUT_BYTES_PER_EVENT)
         require(maxOutputBytesPerBatch in maxOutputBytesPerEvent..HARD_MAX_OUTPUT_BYTES_PER_BATCH)
-        require(maxCheckpointBytes in 1..HARD_MAX_BINARY_BYTES)
-        require(maxRenderFrameBytes in 1..TERMLINK_RENDER_FRAME_V1_MAX_BYTES)
+        require(maxCheckpointBytes in 1..if (graphicsProfile) TERMLINK_GRAPHICS_SNAPSHOT_MAX_BYTES else HARD_MAX_BINARY_BYTES)
+        require(maxRenderFrameBytes in 1..if (graphicsProfile) TERMLINK_RENDER_FRAME_V5_MAX_BYTES else TERMLINK_RENDER_FRAME_V4_MAX_BYTES)
         require(maxColumns in 1..HARD_MAX_COLUMNS)
         require(maxRows in 1..HARD_MAX_ROWS)
         require(maxCells in 1..HARD_MAX_CELLS)
@@ -101,14 +111,20 @@ data class NativeTerminalLimits(
         require(cells <= maxCells.toLong()) { "$field cell count exceeds $maxCells" }
     }
 
-    private companion object {
-        const val HARD_MAX_EVENTS_PER_BATCH = 256
-        const val HARD_MAX_OUTPUT_BYTES_PER_EVENT = 1024 * 1024
-        const val HARD_MAX_OUTPUT_BYTES_PER_BATCH = 4 * 1024 * 1024
-        const val HARD_MAX_BINARY_BYTES = 64 * 1024 * 1024
-        const val HARD_MAX_COLUMNS = 512
-        const val HARD_MAX_ROWS = 512
-        const val HARD_MAX_CELLS = 262_144
+    companion object {
+        fun graphics(): NativeTerminalLimits = NativeTerminalLimits(
+            maxCheckpointBytes = TERMLINK_GRAPHICS_SNAPSHOT_MAX_BYTES,
+            maxRenderFrameBytes = TERMLINK_RENDER_FRAME_V5_MAX_BYTES,
+            graphicsProfile = true,
+        )
+
+        private const val HARD_MAX_EVENTS_PER_BATCH = 256
+        private const val HARD_MAX_OUTPUT_BYTES_PER_EVENT = 1024 * 1024
+        private const val HARD_MAX_OUTPUT_BYTES_PER_BATCH = 4 * 1024 * 1024
+        private const val HARD_MAX_BINARY_BYTES = 64 * 1024 * 1024
+        private const val HARD_MAX_COLUMNS = 512
+        private const val HARD_MAX_ROWS = 512
+        private const val HARD_MAX_CELLS = 262_144
     }
 }
 
@@ -137,6 +153,16 @@ sealed class NativeSourceEvent(open val sourceSequence: Long) {
 
         internal fun copyForBatch(): Output = Output(sourceSequence, ownedBytes)
     }
+
+    data class HostTheme(
+        override val sourceSequence: Long,
+        val theme: dev.termlink.terminal.api.TerminalHostThemeV1,
+    ) : NativeSourceEvent(sourceSequence)
+
+    data class HostGeometry(
+        override val sourceSequence: Long,
+        val geometry: dev.termlink.terminal.api.TerminalHostGeometryV1,
+    ) : NativeSourceEvent(sourceSequence)
 
     data class Resize(
         override val sourceSequence: Long,
@@ -178,6 +204,8 @@ class NativeEventBatch private constructor(
         events = events.map { event ->
             when (event) {
                 is NativeSourceEvent.Output -> event.copyForBatch()
+                is NativeSourceEvent.HostTheme -> event.copy()
+                is NativeSourceEvent.HostGeometry -> event.copy()
                 is NativeSourceEvent.Resize -> event.copy()
                 is NativeSourceEvent.Advance -> event.copy()
                 is NativeSourceEvent.Gap -> event.copy()
@@ -219,6 +247,8 @@ class NativeEventBatch private constructor(
                         limits.validateSize(event.size, "resize")
                         ownedEvents += event.copy()
                     }
+                    is NativeSourceEvent.HostTheme -> ownedEvents += event.copy()
+                    is NativeSourceEvent.HostGeometry -> ownedEvents += event.copy()
                     is NativeSourceEvent.Advance -> ownedEvents += event.copy()
                     is NativeSourceEvent.Gap -> ownedEvents += event.copy()
                 }
@@ -273,6 +303,28 @@ data class NativeTerminalConfigV3(
     val reserved0: Int = 0,
     val reserved1: Long = 0,
     val reserved2: Long = 0,
+)
+
+/** Exact 112-byte additive C ABI; profiles are immutable after creation. */
+data class NativeTerminalConfigV4(
+    val abiVersion: Int = TERMLINK_TERMINAL_ABI_VERSION,
+    val structSize: Int = TERMLINK_CONFIG_V4_STRUCT_SIZE,
+    val columns: Int,
+    val rows: Int,
+    val initialSourceSequence: Long,
+    val reservedV1Compat0: Long = 0,
+    val reservedV1Compat1: Long = 0,
+    val historyCapacityRows: Long = 0,
+    val reservedV2Compat0: Long = 0,
+    val reservedV2Compat1: Long = 0,
+    val outputProfile: Int,
+    val reserved0: Int = 0,
+    val reservedV3Compat0: Long = 0,
+    val reservedV3Compat1: Long = 0,
+    val widthProfile: Int,
+    val reserved1: Int = 0,
+    val reserved2: Long = 0,
+    val reserved3: Long = 0,
 )
 
 internal fun TerminalOutputProfile.toNativeOutputProfile(): Int = when (this) {
@@ -643,6 +695,14 @@ data class NativeBridgeCheckpoint(
     val payload: ByteArray,
 )
 
+data class NativeBridgeDeltaApply(
+    val outcome: Int,
+    val nextSourceSequence: Long,
+    val snapshotBytes: Long,
+    val snapshot: ByteArray,
+    val targetSha256: ByteArray,
+)
+
 class NativeRenderFrame internal constructor(
     val renderFrame: TerminalRenderFrameV1,
 ) {
@@ -672,7 +732,42 @@ class NativeRenderFrameV3 internal constructor(
 
 /** Immutable local-history projection returned by the production native boundary. */
 class NativeScrollbackFrameV3 internal constructor(
-    val renderFrame: TerminalRenderFrameV3,
+    override val renderFrame: TerminalRenderFrameV3,
+    availableRows: Long,
+    generationRows: Long,
+    appliedOffsetRows: Long,
+) : NativeScrollbackTextFrame(renderFrame, availableRows, generationRows, appliedOffsetRows)
+
+class NativeRenderFrameV4 internal constructor(
+    val renderFrame: TerminalRenderFrameV4,
+) {
+    val nextSourceSequence: Long
+        get() = renderFrame.nextSourceSequence
+
+    val presentationRevision: Long
+        get() = renderFrame.presentationRevision
+
+    val size: TerminalSize
+        get() = renderFrame.size
+}
+
+/** Immutable local-history projection returned by the production native boundary. */
+class NativeScrollbackFrameV4 internal constructor(
+    override val renderFrame: TerminalRenderFrameV4,
+    availableRows: Long,
+    generationRows: Long,
+    appliedOffsetRows: Long,
+) : NativeScrollbackTextFrame(renderFrame, availableRows, generationRows, appliedOffsetRows)
+
+class NativeScrollbackFrameV5 internal constructor(
+    override val renderFrame: TerminalRenderFrameV5,
+    availableRows: Long,
+    generationRows: Long,
+    appliedOffsetRows: Long,
+) : NativeScrollbackTextFrame(renderFrame, availableRows, generationRows, appliedOffsetRows)
+
+sealed class NativeScrollbackTextFrame(
+    open val renderFrame: TerminalTextFrame,
     val availableRows: Long,
     val generationRows: Long,
     val appliedOffsetRows: Long,
@@ -704,6 +799,38 @@ class NativeCheckpoint internal constructor(
  * the terminal's failed-closed flag but must not commit any preceding event state.
  */
 interface NativeBridge {
+    val renderFrameV5FormatVersion: Int get() = 0
+    val maxRenderFrameV5Bytes: Int get() = 0
+    val maxGraphicsSnapshotBytes: Int get() = 0
+    fun deltaExportV1(base: ByteArray, target: ByteArray, contextId: ByteArray, profile: Int, maxBytes: Int): NativeBridgeResult<ByteArray> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun deltaApplyV1(current: ByteArray, contextId: ByteArray, profile: Int, delta: ByteArray, maxBytes: Int): NativeBridgeResult<NativeBridgeDeltaApply> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun createGraphicsV1(config: NativeTerminalConfigV4): NativeBridgeResult<NativeBridgeTerminal> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun importSnapshotGraphicsV1(checkpoint: ByteArray): NativeBridgeResult<NativeBridgeTerminal> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun renderV5(handle: NativeBridgeHandle, request: NativeRenderRequest): NativeBridgeResult<NativeBridgeRenderFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun renderV5AtScrollback(handle: NativeBridgeHandle, offsetRows: Long, request: NativeRenderRequest): NativeBridgeResult<NativeBridgeScrollbackFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun historyPageV2(info: NativeHistoryCaptureInfo, beforeLineId: Long, maxLines: Int, maxCells: Int, maxUtf8Bytes: Int): NativeBridgeResult<NativeHistoryRead> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun historyViewportV2(info: NativeHistoryCaptureInfo, offsetRows: Long): NativeBridgeResult<NativeBridgeScrollbackFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun exportCheckpointGraphicsV1(handle: NativeBridgeHandle, maxPayloadBytes: Int): NativeBridgeResult<NativeBridgeCheckpoint> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    val supportsHistoryCapture: Boolean get() = false
+    fun historyResolveAnchor(info: NativeHistoryCaptureInfo, line: Long, cell: Long): NativeBridgeResult<Long> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun historyViewport(info: NativeHistoryCaptureInfo, offsetRows: Long): NativeBridgeResult<NativeBridgeScrollbackFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun historyBegin(handle: NativeBridgeHandle): NativeBridgeResult<NativeHistoryCaptureInfo> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun historyPage(info: NativeHistoryCaptureInfo, beforeLineId: Long, maxLines: Int, maxCells: Int, maxUtf8Bytes: Int): NativeBridgeResult<NativeHistoryRead> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun historyRelease(info: NativeHistoryCaptureInfo): NativeBridgeResult<Unit> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
     val abiVersion: Int
     val renderFrameFormatVersion: Int
     val maxRenderFrameBytes: Int
@@ -725,6 +852,9 @@ interface NativeBridge {
     val inputV3StructSize: Int
     /** Result of the C ABI's exact-size `tl_terminal_config_v3_struct_size` discovery call. */
     val configV3StructSize: Int
+    val configV4StructSize: Int get() = 0
+    val renderFrameV4FormatVersion: Int get() = 0
+    val maxRenderFrameV4Bytes: Int get() = 0
 
     fun create(
         size: TerminalSize,
@@ -733,6 +863,18 @@ interface NativeBridge {
 
     /** Maps directly to the exact-size `tl_terminal_create_v3` C ABI entry point. */
     fun createV3(config: NativeTerminalConfigV3): NativeBridgeResult<NativeBridgeTerminal>
+
+    fun createV4(config: NativeTerminalConfigV4): NativeBridgeResult<NativeBridgeTerminal> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun hostSignalsV1(handle: NativeBridgeHandle): NativeBridgeResult<NativeBridgeRenderFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    val supportsHostSignals: Boolean get() = false
+    fun shellStateV1(handle: NativeBridgeHandle): NativeBridgeResult<NativeBridgeRenderFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun renderV4(handle: NativeBridgeHandle, request: NativeRenderRequest): NativeBridgeResult<NativeBridgeRenderFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+    fun renderV4AtScrollback(handle: NativeBridgeHandle, offsetRows: Long, request: NativeRenderRequest): NativeBridgeResult<NativeBridgeScrollbackFrame> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
 
     fun importCheckpoint(checkpoint: ByteArray): NativeBridgeResult<NativeBridgeTerminal>
 
@@ -751,6 +893,12 @@ interface NativeBridge {
         handle: NativeBridgeHandle,
         batch: NativeEventBatch,
     ): NativeBridgeResult<NativeBridgeApplyWithHostEffectsV2>
+
+    fun applyBrokerCapturedV1(
+        handle: NativeBridgeHandle,
+        output: NativeBrokerOutputV1,
+    ): NativeBridgeResult<NativeBridgeApplyWithHostEffectsV2> =
+        NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
 
     fun render(
         handle: NativeBridgeHandle,

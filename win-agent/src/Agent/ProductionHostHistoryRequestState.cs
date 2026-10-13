@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using TermLink.Protocol.Realtime.V1;
 
 namespace TermLink.Agent
 {
@@ -22,17 +23,20 @@ namespace TermLink.Agent
         private bool cancelRequested;
         private bool disposed;
 
-        public ProductionHostHistoryResponseRequest(Guid sessionId, Guid deviceId)
+        public ProductionHostHistoryResponseRequest(Guid sessionId, Guid deviceId,
+            HostHistoryRequestKindV1 kind = HostHistoryRequestKindV1.Unspecified)
         {
             if (sessionId == Guid.Empty) throw new ArgumentException("Session ID is required.", nameof(sessionId));
             if (deviceId == Guid.Empty) throw new ArgumentException("Device ID is required.", nameof(deviceId));
             SessionId = sessionId;
             DeviceId = deviceId;
+            Kind = kind;
             cancellationToken = cancellation.Token;
         }
 
         public Guid SessionId { get; }
         public Guid DeviceId { get; }
+        public HostHistoryRequestKindV1 Kind { get; }
         public CancellationToken CancellationToken => cancellationToken;
         public Task Completion => completion.Task;
 

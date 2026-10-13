@@ -24,6 +24,35 @@ namespace TermLink.NativeTerminalCore.Validation
             ValidateOrdinalRejections();
             ValidateReplyGrammar();
             ValidateReplyLengthBoundary();
+            ValidateResizeRequests();
+            ValidatePlatformActions();
+        }
+
+        private static void ValidateResizeRequests()
+        {
+            var payload = new byte[8]; PutUInt32(payload, 0, 132);
+            var frame = Build(new RecordValue(7, 12, 0, payload));
+            PutUInt64(frame, 40, 3); PutUInt32(frame, 64, 2); RefreshCrc(frame);
+            var decoded = NativeTerminalHostEffectFrameV2Decoder.Decode(frame);
+            Require(decoded.Records[0].Kind == NativeTerminalHostEffectKindV2.ResizeRequest, "Resize request was interpreted as PTY input.");
+            Reject(PutUInt64AndRefresh(frame, 40, 1));
+            Reject(PutUInt32AndRefresh(frame, PayloadOffset(frame), 513));
+            Reject(PutUInt32AndRefresh(frame, PayloadOffset(frame), 0));
+            Reject(PutUInt32AndRefresh(frame, PayloadOffset(frame) + 4, 24));
+            Reject(PutUInt32AndRefresh(frame, 64, 3));
+        }
+
+        private static void ValidatePlatformActions()
+        {
+            var frame = Build(new RecordValue(7, 12, 0, new byte[] { 2, 7, 255, 3, 1, 0, 25 }));
+            PutUInt64(frame, 40, 5); PutUInt32(frame, 64, 3); RefreshCrc(frame);
+            var decoded = NativeTerminalHostEffectFrameV2Decoder.Decode(frame);
+            Require(decoded.Records[0].Kind == NativeTerminalHostEffectKindV2.PlatformAction, "Sound became PTY input.");
+            var sound = NativeTerminalPlatformAction.Decode(System.Linq.Enumerable.ToArray(decoded.Records[0].Payload));
+            Require(sound.Volume == 7 && sound.Duration32nds == 255 && sound.Notes.Count == 3 && sound.Notes[1] == 0, "Sound grammar changed.");
+            Reject(PutUInt64AndRefresh(frame, 40, 1));
+            Reject(PutUInt32AndRefresh(frame, PayloadOffset(frame), 0));
+            var bad = (byte[])frame.Clone(); bad[PayloadOffset(bad) + 4] = 26; RefreshCrc(bad); Reject(bad);
         }
 
         internal static byte[] CreateCanonicalFrame()
@@ -172,6 +201,14 @@ namespace TermLink.NativeTerminalCore.Validation
 
         private static void ValidateReplyGrammar()
         {
+            foreach (var reply in new[] { "\u001b/Z", "\u001bP1!uB\u001b\\", "\u001bP0!u%5\u001b\\", "\u0090" + "1!uB\u009c", "\u009b" + "0n" })
+            {
+                var payload = Encoding.Latin1.GetBytes(reply);
+                var result = NativeTerminalHostEffectFrameV2Decoder.Decode(Build(new RecordValue(1, 1, 0, payload)));
+                Require(BytesEqual(result.Records[0].Payload, payload), "Traditional reply bytes were rewritten");
+            }
+            foreach (var reply in new[] { "\u001bP1!u<\u001b\\", "\u001bP0!uBAD\u001b\\", "\u001bP01!uB\u001b\\", "\u0090" + "1!uB\u001b\\", "\u0090" + "1!uB", "\u009b" + "31m" })
+                Reject(Build(new RecordValue(1, 1, 0, Encoding.Latin1.GetBytes(reply))));
             foreach (var reply in new[]
             {
                 "\x1b[?1;2c",
@@ -182,6 +219,10 @@ namespace TermLink.NativeTerminalCore.Validation
                 "\x1b[?512;1R",
                 "\x1b[?0u",
                 "\x1b[?31u",
+                "\x1b[8;1;512t",
+                "\x1b[8;512;1t",
+            "\x1b[6;20;10t",
+            "\x1b[4;524288;524288t",
                 "\x1b[4;2$y",
                 "\x1b[?9999;0$y",
                 "\x1bP0$r\x1b\\",
@@ -192,6 +233,15 @@ namespace TermLink.NativeTerminalCore.Validation
                 "\x1bP1$r2\"q\x1b\\",
                 "\x1bP1$r2*x\x1b\\",
                 "\x1bP>|TermLink(1)\x1b\\",
+                "\u001bP!|00000000\u001b\\",
+                "\u001bP1$u1;1;1;@;@;@;0;2;L;BBAA\u001b\\",
+                "\u001bP2$u1/9/512\u001b\\", "\u001bP2$u\u001b\\", "\u001bP2$s\u001b\\",
+                "\u001bP2$s0;2;100;0;0/255;1;360;50;100\u001b\\",
+                "\u001b[2;1;1;128;128;1;0x",
+                "\u001b[3;1;1;128;128;1;0x",
+                "\u001b[?13n", "\u001b[?23n", "\u001b[?27;0;0;5n",
+                "\u001b[?53n", "\u001b[?57;0n", "\u001b[?70n", "\u001b[?83n",
+                "\u001b[24;80;1;1;1\"w", "\u001bP42!~FE9D\u001b\\",
                 "\x1bP0+r\x1b\\",
                 "\x1bP1+r436f=323536;524742=382f382f38\x1b\\",
                 "\x1b]4;255;rgb:ffff/0000/1212\x1b\\",
@@ -207,6 +257,18 @@ namespace TermLink.NativeTerminalCore.Validation
             foreach (var reply in new[]
             {
                 "\x1b[31m",
+                "\u001bP!|12345678\u001b\\", "\u001b[?99n",
+                "\u001bP1$u1;1;1;@;@;@;0;2;L;BBZZ\u001b\\",
+                "\u001bP2$u9/9\u001b\\", "\u001bP2$u513\u001b\\", "\u001bP2$u9/\u001b\\",
+                "\u001bP2$s0;2;101;0;0\u001b\\", "\u001bP2$s0;2;1;0;0/0;2;1;0;0\u001b\\",
+                "\u001b[0;80;1;1;1\"w", "\u001b[24;513;1;1;1\"w",
+                "\u001bP00!~1234\u001b\\", "\u001bP1!~ffff\u001b\\",
+                "\u001bP1!~FFFFX\u001b\\", "\u001bP65535!~FFFF\u001b\\",
+                "\x1b[8;0;1t",
+                "\x1b[8;1;513t",
+                "\x1b[8;01;1t",
+                "\x1b[8;1;1;1t",
+                "\x1b[6;1025;10t",
                 "\x1b[?32u",
                 "\x1b[01;1R",
                 "\x1b[?025;1$y",

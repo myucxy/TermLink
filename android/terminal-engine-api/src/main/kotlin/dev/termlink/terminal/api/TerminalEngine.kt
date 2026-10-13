@@ -49,11 +49,28 @@ interface TerminalEngine {
 
     suspend fun feed(seq: Long, bytes: ByteBuffer)
 
+    /** Applies an already authenticated broker capture group with its ordered raw Output. */
+    suspend fun applyBrokerCapturedOutput(seq: Long, output: ByteArray, canonicalCaptures: ByteArray): Unit =
+        error("This terminal engine does not support broker captured Output")
+
     /** Consumes one ordered non-output source event without changing terminal presentation. */
     suspend fun advance(seq: Long) = Unit
 
+    /** Live foreground notice only; never called during checkpoint/history replay. */
+    fun notifyHostResizeResult(result: TerminalHostResizeResultV1) = Unit
+
+    /** Called once after a newly applied live Output; absent for history, duplicates and checkpoints. */
+    fun notifyLiveOutputApplied(sequence: Long) = Unit
+
     /** Applies one ordered remote grid change. */
     suspend fun resize(seq: Long, columns: Int, rows: Int) = resize(columns, rows)
+
+    /** Selected-host geometry is ordered state, never a local view measurement. */
+    suspend fun applyHostGeometry(seq: Long, geometry: TerminalHostGeometryV1): Unit =
+        error("This terminal engine does not support ordered host geometry")
+
+    suspend fun applyHostTheme(seq: Long, theme: TerminalHostThemeV1): Unit =
+        error("This terminal engine does not support ordered host theme")
 
     /** Permanently fails the current renderer generation closed at an unrecoverable gap. */
     suspend fun reportGap(seq: Long) = Unit
@@ -77,4 +94,8 @@ interface TerminalEngineFailureDiagnostics {
     val terminalOperation: String
     val terminalStatusName: String
     val terminalStatusCode: Int
+    /** Escaped, redacted evidence for local error UI only; never transport logging. */
+    val terminalProtocolDiagnostic: TerminalProtocolDiagnostic? get() = null
+    /** Bounded input encoding evidence for local error UI only; never raw paste or text. */
+    val terminalInputDiagnostic: TerminalInputDiagnostic? get() = null
 }

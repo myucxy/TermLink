@@ -15,6 +15,12 @@ if (args.Contains("--print-snapshot-vector", StringComparer.Ordinal))
     return;
 }
 
+if (args.Contains("--print-terminal-core-graphics-snapshot-vector", StringComparer.Ordinal))
+{
+    Console.WriteLine(TerminalCoreGraphicsSnapshotVectorValidation.CreateVectorJson());
+    return;
+}
+
 if (args.Contains("--print-terminal-core-snapshot-vector", StringComparer.Ordinal))
 {
     Console.WriteLine(TerminalCoreSnapshotVectorValidation.CreateVectorJson());
@@ -296,6 +302,8 @@ SnapshotVectorValidation.Run();
 Console.WriteLine("TermLink terminal snapshot/transcript vector validation passed.");
 TerminalCoreSnapshotVectorValidation.Run();
 Console.WriteLine("TermLink terminal-core snapshot V2 vector validation passed.");
+TerminalCoreGraphicsSnapshotVectorValidation.Run();
+Console.WriteLine("TermLink terminal-core graphics snapshot V1 vector and boundary validation passed.");
 
 static bool LegacySessionUpsertCanIgnoreTitle(byte[] bytes)
 {

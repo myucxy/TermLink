@@ -123,6 +123,27 @@ public static class Program
         var terminalAddNoLogo = RequireControl<CheckBox>(window, "TerminalAddNoLogoCheckBox");
         var terminalAddNoProfile = RequireControl<CheckBox>(window, "TerminalAddNoProfileCheckBox");
         Require(viewModel.Sessions.Sessions.Count == 100, "The 100-session snapshot was not applied.");
+        var diagnosticItem = viewModel.Sessions.Items[0] with { TerminalDiagnostic = "TL-DIAG/2\nsequence=<ESC>[?9999h\n" };
+        var diagnosticSnapshot = viewModel.Sessions.Sessions[0] with { TerminalDiagnostic = diagnosticItem.TerminalDiagnostic };
+        Require(!diagnosticItem.ToString().Contains("9999", StringComparison.Ordinal) &&
+            !diagnosticSnapshot.ToString().Contains("9999", StringComparison.Ordinal) &&
+            !System.Text.Json.JsonSerializer.Serialize(diagnosticItem).Contains("9999", StringComparison.Ordinal) &&
+            !System.Text.Json.JsonSerializer.Serialize(diagnosticSnapshot).Contains("9999", StringComparison.Ordinal),
+            "Terminal evidence escaped into general record logging or serialization.");
+        viewModel.ShowTerminalDiagnosticCommand.Execute(diagnosticItem);
+        await DrainCommandAsync(viewModel.ShowTerminalDiagnosticCommand);
+        Dispatcher.UIThread.RunJobs();
+        Require(viewModel.TerminalDiagnosticVisible && viewModel.BlockingOverlayVisible &&
+            RequireControl<Control>(window, "TerminalDiagnosticOverlay").IsVisible,
+            "The protocol diagnostic overlay did not open and block underlying actions.");
+        Require(RequireControl<TextBox>(window, "TerminalDiagnosticTextBox").Text == diagnosticItem.TerminalDiagnostic &&
+            RequireControl<TextBox>(window, "TerminalDiagnosticTextBox").IsReadOnly,
+            "Protocol evidence must remain selectable, read-only, and unchanged.");
+        viewModel.CloseTerminalDiagnosticCommand.Execute(null);
+        await DrainCommandAsync(viewModel.CloseTerminalDiagnosticCommand);
+        Dispatcher.UIThread.RunJobs();
+        Require(!viewModel.TerminalDiagnosticVisible && !viewModel.BlockingOverlayVisible && viewModel.TerminalDiagnosticText.Length == 0,
+            "Closing protocol details retained sensitive text or blocked normal actions.");
         Require(viewModel.Devices.Devices.Count == 100, "The 100-device snapshot was not applied.");
         Require(viewModel.Settings.TerminalCommands.Count == 2, "Terminal commands were not applied.");
         Require(viewModel.SessionCountText == PresentationText.SessionCount(100),
@@ -253,6 +274,31 @@ public static class Program
         Require(client.SavedTerminalCommands.Any(command =>
                 command.Id == "pwsh" && command.Detected && !command.Enabled),
             "Deleting an auto-detected command did not persist a disabled override.");
+
+        var enhancedCommand = new TerminalCommandCapability(
+            "powershell-7-enhanced", "PowerShell 7（增强终端）", "pwsh.exe",
+            new[] { "-NoLogo" }, true, false);
+        client.CurrentSnapshot = snapshot with
+        {
+            Revision = 2,
+            TerminalCommands = terminalCommands.Append(enhancedCommand).ToArray()
+        };
+        await stateStore.RefreshAsync(true);
+        Dispatcher.UIThread.RunJobs();
+        var enhancedSetting = viewModel.Settings.TerminalCommands.Single(command =>
+            command.Id == enhancedCommand.Id);
+        Require(!enhancedSetting.RunAsAdministrator,
+            "Refreshing Windows settings changed the enhanced terminal to administrator launch.");
+        viewModel.OpenTerminalCommandEditorCommand.Execute(enhancedSetting);
+        await DrainCommandAsync(viewModel.OpenTerminalCommandEditorCommand);
+        viewModel.Settings.NewCommandName = "Enhanced edited";
+        viewModel.AddTerminalCommandCommand.Execute(null);
+        await DrainCommandAsync(viewModel.AddTerminalCommandCommand);
+        viewModel.SaveTerminalCommandsCommand.Execute(null);
+        await DrainCommandAsync(viewModel.SaveTerminalCommandsCommand);
+        Require(client.SavedTerminalCommands.Single(command => command.Id == enhancedCommand.Id)
+                .RunAsAdministrator == false,
+            "Editing or saving Windows settings changed the enhanced terminal to administrator launch.");
 
         viewModel.SelectSettingsSection("about");
         Dispatcher.UIThread.RunJobs();

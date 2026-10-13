@@ -18,6 +18,10 @@ namespace TermLink.Agent
         internal const int MaximumCapabilityBytes = 64;
         internal const string DirectTransportDataV1 = "direct_transport_data_v1";
         internal const string DirectSessionCutoverV1 = "direct_session_cutover_v1";
+        internal const string TerminalHostThemeV1 = "terminal_host_theme_v1";
+        internal const string TerminalHostResizeV1 = "terminal_host_resize_v1";
+        internal const string TerminalHostGeometryV1 = "terminal_host_geometry_v1";
+        internal const string TerminalBrokerCapturesV1 = "terminal_broker_captures_v1";
 
         private static readonly string[] Required =
         {
@@ -30,7 +34,8 @@ namespace TermLink.Agent
         internal static IReadOnlyList<string> BuildAdvertisedCapabilities(
             bool terminalSnapshotEnabled,
             bool typedInputEnabled,
-            bool directTransportDataEnabled)
+            bool directTransportDataEnabled,
+            bool brokerCaptureEnabled = false)
         {
             var capabilities = new List<string>
             {
@@ -43,16 +48,39 @@ namespace TermLink.Agent
                 "remote_agent_update_v1",
                 "host_history_v1",
                 "host_session_catalog_v1",
-                "host_session_cleanup_v1", "ai_agent_v1"
+                "host_session_cleanup_v1", "ai_agent_v1",
+                TerminalHostGeometryV1,
+                TerminalHostThemeV1,
+                TerminalHostResizeV1,
+                ProductionTerminalStateContract.Attach
             };
             if (terminalSnapshotEnabled) capabilities.Add("terminal_snapshot_v2");
             if (typedInputEnabled) capabilities.Add("terminal_typed_input_v1");
+            if (brokerCaptureEnabled) capabilities.Add(TerminalBrokerCapturesV1);
             if (directTransportDataEnabled)
             {
                 capabilities.Add(DirectTransportDataV1);
                 capabilities.Add(DirectSessionCutoverV1);
             }
             return capabilities.AsReadOnly();
+        }
+
+        internal static string ValidateBrokerCaptureSession(
+            bool brokerCaptureEnabled,
+            bool isGraphics,
+            IEnumerable<string> relayCapabilities,
+            IEnumerable<string> subscriberCapabilities)
+        {
+            if (!brokerCaptureEnabled || !isGraphics) return string.Empty;
+            if (relayCapabilities == null ||
+                !relayCapabilities.Contains("host_history_v1", StringComparer.Ordinal) ||
+                !relayCapabilities.Contains(TerminalBrokerCapturesV1, StringComparer.Ordinal))
+                return "TERMINAL_RELAY_UPGRADE_REQUIRED";
+            if (subscriberCapabilities == null ||
+                !subscriberCapabilities.Contains("host_history_v1", StringComparer.Ordinal) ||
+                !subscriberCapabilities.Contains(TerminalBrokerCapturesV1, StringComparer.Ordinal))
+                return "TERMINAL_CLIENT_UPGRADE_REQUIRED";
+            return string.Empty;
         }
 
         internal static ProductionRealtimeWelcome ParseWelcome(
@@ -147,7 +175,7 @@ namespace TermLink.Agent
             }
         }
 
-        private static bool ValidCapability(string value)
+        internal static bool ValidCapability(string value)
         {
             if (string.IsNullOrEmpty(value) || value.Length > MaximumCapabilityBytes)
                 return false;

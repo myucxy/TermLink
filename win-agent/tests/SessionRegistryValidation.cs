@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -9,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using TermLink.LocalIpc;
+using TermLink.TerminalCore;
 
 namespace TermLink.Agent
 {
@@ -18,6 +20,25 @@ namespace TermLink.Agent
 
         public static int Main(string[] args)
         {
+            if (args.Length == 1 && args[0] == "--completion-persistence-only")
+            {
+                ValidateCompletionPersistenceFailure();
+                Console.WriteLine("Registry completion persistence: retained and non-retained failures passed.");
+                return 0;
+            }
+            if (args.Length == 2 && args[0] == "--profile-only")
+            {
+                ValidateTerminalProtocolAdmission(args[1]);
+                ValidateBrokerCaptureRootHandshake(Path.Combine(args[1], "broker-root"));
+                ValidateBrokerOutputAckDurability(Path.Combine(args[1], "broker-ack"));
+                var recoveryRoot = Path.Combine(args[1], "recovery-" + Guid.NewGuid().ToString("N"));
+                ValidateCompletedBufferRecovery(Path.Combine(recoveryRoot, "completed"));
+                ValidateRemoteInputReplayDurability(Path.Combine(recoveryRoot, "input"));
+                ValidateLiveInterruptedLifecycle(Path.Combine(recoveryRoot, "lost"));
+                ValidateControlledInterruptedLifecycle(Path.Combine(recoveryRoot, "stopped"));
+                Console.WriteLine("Registry profile recovery: completed, durable input, host loss and controlled stop passed.");
+                return 0;
+            }
             if (args.Length == 5 && args[0] == "--fake-lost-host")
             {
                 return RunFakeLostHost(args[1], Guid.Parse(args[2]), Convert.FromBase64String(args[3]), int.Parse(args[4]));
@@ -41,10 +62,14 @@ namespace TermLink.Agent
                 Directory.CreateDirectory(bufferRoot);
                 ValidateActualAgentEntry(agentExecutable, Path.Combine(bufferRoot, "external-entry"));
                 ValidateLocalIpcCapabilities();
+                ValidateTerminalProtocolAdmission(Path.Combine(bufferRoot, "terminal-protocol"));
+                ValidateBrokerCaptureRootHandshake(Path.Combine(bufferRoot, "broker-root"));
+                ValidateBrokerOutputAckDurability(Path.Combine(bufferRoot, "broker-ack"));
                 ValidateBoundedLargeBuffer(Path.Combine(bufferRoot, "bounded-large-buffer"));
                 ValidateRemoteControlDispatch();
                 ValidateRemoteInputReplayDurability(Path.Combine(bufferRoot, "remote-input-replay"));
                 ValidateActiveCapacityAccounting();
+                ValidateCompletionPersistenceFailure();
                 ValidateCompletedHistoryCapacity(
                     hostExecutable,
                     Path.Combine(bufferRoot, "completed-history-capacity"));
@@ -453,6 +478,7 @@ namespace TermLink.Agent
             var payload = Enumerable.Repeat((byte)'x', 8193).ToArray();
             using (var buffer = new EncryptedEventBuffer(directory, sessionId, 64L * 1024 * 1024))
             {
+                buffer.BindAuthenticatedProfile();
                 for (var sequence = 1; sequence <= frameCount; sequence++)
                 {
                     buffer.Append(new LocalFrame(
@@ -525,6 +551,8 @@ namespace TermLink.Agent
         {
             Directory.CreateDirectory(directory);
             var sessionId = Guid.NewGuid();
+            using (var buffer = new EncryptedEventBuffer(directory, sessionId, 4 * 1024 * 1024))
+                buffer.BindAuthenticatedProfile();
             var senderDeviceId = Guid.NewGuid();
             var inputId = Guid.NewGuid();
             var digest = new byte[32];
@@ -615,6 +643,127 @@ namespace TermLink.Agent
                     "Retiring-capacity fixture could not finish its deferred stop.");
                 Require(registry.TryRegister(nextRegistration, out error),
                     "A completed retiring worker did not release its active Session slot: " + error);
+            }
+        }
+
+        private static void ValidateCompletionPersistenceFailure()
+        {
+            foreach (var retain in new[] { false, true })
+            {
+                var factory = new FakeManagedSessionFactory();
+                var store = new FailingCompletionRegistrationStore();
+                var diagnostics = new List<string>();
+                Action<ManagedShellType, LocalFrame> committed = retain ? (_, _) => { } : null;
+                using var registry = new SessionRegistry(factory, 1, store,
+                    new NullRemoteAccessPolicyStore(), committed, diagnostics.Add);
+                var firstId = Guid.NewGuid();
+                var nextId = Guid.NewGuid();
+                Require(registry.TryRegister(CreateFakeRegistration(firstId), out var error),
+                    "Completion persistence fixture did not register: " + error);
+                if (retain)
+                    store.RecoveryUpsertFailure = new IOException("injected completion write failure");
+                else
+                {
+                    factory.Get(firstId).Lifecycle = SessionAgentLifecycle.Ended;
+                    store.RetireFailure = new IOException("injected retirement write failure");
+                }
+                if (retain)
+                {
+                    var stopped = registry.StopSession(firstId);
+                    Require(stopped.Success && stopped.CompletedSessions == 1,
+                        "A retained completion storage failure escaped StopSession.");
+                    Require(registry.ContainsSession(firstId),
+                        "A failed recovery-only write discarded retained completed history.");
+                    var releaseFailed = false;
+                    try { registry.ReleaseBufferedSession(firstId); }
+                    catch (IOException) { releaseFailed = true; }
+                    Require(releaseFailed && registry.ContainsSession(firstId),
+                        "A failed retained-history release lost its retryable wrapper.");
+                    store.RecoveryUpsertFailure = null;
+                    registry.ReleaseBufferedSession(firstId);
+                    Require(!registry.ContainsSession(firstId),
+                        "A recovered registration write did not release completed history.");
+                }
+                else
+                {
+                    Require(factory.Get(firstId).WaitForStop(),
+                        "A non-retained completion storage failure escaped its worker.");
+                    Require(!registry.ContainsSession(firstId),
+                        "A non-retained completion storage failure left a live wrapper.");
+                }
+                Require(registry.Count == 0 && diagnostics.Count == 1 &&
+                    diagnostics[0].Contains("failure=IOException", StringComparison.Ordinal),
+                    "Completion failure lost its active slot cleanup or bounded diagnostic.");
+                store.RecoveryUpsertFailure = null;
+                store.RetireFailure = null;
+                Require(registry.TryRegister(CreateFakeRegistration(nextId), out error),
+                    "Completion storage failure kept the active capacity occupied: " + error);
+                Require(registry.StopSession(nextId).Success,
+                    "Stopping a later session failed after completion storage recovered.");
+            }
+
+            foreach (var storageError in new Exception[]
+                { new UnauthorizedAccessException("injected access failure"),
+                  new CryptographicException("injected encryption failure") })
+            {
+                var factory = new FakeManagedSessionFactory();
+                var store = new FailingCompletionRegistrationStore { RetireFailure = storageError };
+                var diagnostics = new List<string>();
+                using var registry = new SessionRegistry(factory, 1, store,
+                    new NullRemoteAccessPolicyStore(), null, diagnostics.Add);
+                var sessionId = Guid.NewGuid();
+                Require(registry.TryRegister(CreateFakeRegistration(sessionId), out var error),
+                    "Storage-error fixture did not register: " + error);
+                factory.Get(sessionId).Lifecycle = SessionAgentLifecycle.Ended;
+                Require(factory.Get(sessionId).WaitForStop() && registry.Count == 0 &&
+                    diagnostics.Count == 1 && diagnostics[0].Contains(
+                        "failure=" + storageError.GetType().Name, StringComparison.Ordinal),
+                    "Expected storage error escaped completion or occupied the active slot.");
+                store.RetireFailure = null;
+                Require(registry.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error),
+                    "Expected storage error kept active capacity occupied: " + error);
+            }
+
+            var raceFactory = new FakeManagedSessionFactory();
+            var raceStore = new FailingCompletionRegistrationStore();
+            using (var registry = new SessionRegistry(raceFactory, 1, raceStore,
+                new NullRemoteAccessPolicyStore(), (_, _) => { }, _ => { }))
+            {
+                var sessionId = Guid.NewGuid();
+                raceFactory.SetWaitsBeforeSuccess(sessionId, 2);
+                Require(registry.TryRegister(CreateFakeRegistration(sessionId), out var error),
+                    "Early-release fixture did not register: " + error);
+                var stopping = registry.StopSession(sessionId);
+                Require(stopping.TimedOutSessions == 1,
+                    "Early-release fixture did not keep its worker retiring.");
+                registry.ReleaseBufferedSession(sessionId);
+                raceStore.RecoveryUpsertFailure = new IOException("injected early-release write failure");
+                Require(raceFactory.Get(sessionId).WaitForStop() && registry.Count == 0 &&
+                    registry.ContainsSession(sessionId),
+                    "Early release lost its retryable wrapper after completion storage failed.");
+                raceStore.RecoveryUpsertFailure = null;
+                registry.ReleaseBufferedSession(sessionId);
+                Require(!registry.ContainsSession(sessionId),
+                    "Early release was not finalized after storage recovered.");
+            }
+
+            var programmingFactory = new FakeManagedSessionFactory();
+            var programmingStore = new FailingCompletionRegistrationStore();
+            using (var registry = new SessionRegistry(programmingFactory, 1, programmingStore,
+                new NullRemoteAccessPolicyStore()))
+            {
+                var firstId = Guid.NewGuid();
+                Require(registry.TryRegister(CreateFakeRegistration(firstId), out var error),
+                    "Unexpected-error fixture did not register: " + error);
+                programmingStore.RecoveryUpsertFailure = new InvalidOperationException("injected programming failure");
+                var propagated = false;
+                try { programmingFactory.Get(firstId).WaitForStop(); }
+                catch (InvalidOperationException) { propagated = true; }
+                Require(propagated && registry.Count == 0,
+                    "Unexpected completion errors were swallowed or leaked the running slot.");
+                programmingStore.RecoveryUpsertFailure = null;
+                Require(registry.TryRegister(CreateFakeRegistration(Guid.NewGuid()), out error),
+                    "Unexpected completion error kept the active capacity occupied: " + error);
             }
         }
 
@@ -717,6 +866,7 @@ namespace TermLink.Agent
                 sessionId,
                 4 * 1024 * 1024))
             {
+                buffer.BindAuthenticatedProfile();
                 buffer.Append(new LocalFrame(
                     LocalFrameType.Lifecycle,
                     sessionId,
@@ -750,6 +900,7 @@ namespace TermLink.Agent
             var bufferDirectory = Path.Combine(bufferRoot, sessionId.ToString("N"));
             using (var buffer = new EncryptedEventBuffer(bufferDirectory, sessionId, 4 * 1024 * 1024))
             {
+                buffer.BindAuthenticatedProfile();
                 buffer.Append(new LocalFrame(
                     LocalFrameType.Lifecycle,
                     sessionId,
@@ -1262,6 +1413,234 @@ namespace TermLink.Agent
                 "Registry Dispose did not retry a worker after restart timeout.");
         }
 
+        private static void ValidateTerminalProtocolAdmission(string bufferRoot)
+        {
+            var session = Guid.NewGuid();
+            bufferRoot = Path.Combine(bufferRoot, session.ToString("N"));
+            Directory.CreateDirectory(bufferRoot);
+            var pipeName = "termlink-profile-test-" + session.ToString("N");
+            var token = new byte[32];
+            using (var random = RandomNumberGenerator.Create()) random.GetBytes(token);
+            var options = AgentOptions.CreateManaged(pipeName,session,token,bufferRoot,Process.GetCurrentProcess().Id,10000,1024*1024);
+            using (var agent = new SessionAgent(options))
+            {
+                var worker = Task.Run((Action)agent.RunManaged);
+                try
+                {
+                    using (var legacy = new NamedPipeClientStream(".",pipeName,PipeDirection.InOut,PipeOptions.None))
+                    {
+                        legacy.Connect(5000);
+                        LocalFrameCodec.Write(legacy,new LocalFrame(LocalFrameType.HostHello,session,0,
+                            LocalPayloadCodec.Hello(Process.GetCurrentProcess().Id,token)));
+                        WaitUntil(delegate { return agent.TerminalCompatibilityError.Length != 0; },5000,"Legacy Host was not rejected");
+                        Require(agent.TerminalCompatibilityError == "TERMINAL_LOCAL_PROTOCOL_MISMATCH", "Wrong compatibility error");
+                        Require(agent.Snapshot.LastSequence == 0 && agent.Snapshot.Lifecycle != SessionAgentLifecycle.Connected,
+                            "Rejected Host became a terminal authority");
+                    }
+                    using (var compatible = new NamedPipeClientStream(".",pipeName,PipeDirection.InOut,PipeOptions.None))
+                    {
+                        compatible.Connect(5000);
+                        LocalFrameCodec.Write(compatible,new LocalFrame(LocalFrameType.HostHello,session,0,
+                            LocalPayloadCodec.TerminalHello(Process.GetCurrentProcess().Id,token)));
+                        var reply = LocalFrameCodec.Read(compatible);
+                        Require(reply != null && reply.Type == LocalFrameType.AgentHello,"No compatible handshake reply");
+                        LocalPayloadCodec.ParseTerminalHello(reply.Payload,token);
+                        LocalFrameCodec.Write(compatible,new LocalFrame(LocalFrameType.Output,session,1,Encoding.ASCII.GetBytes("accepted")));
+                        Require(LocalFrameCodec.Read(compatible).Type == LocalFrameType.Ack,"Compatible output was not ACKed");
+                        Require(agent.TerminalCompatibilityError.Length == 0 && agent.Snapshot.LastSequence == 1,"Admission did not recover");
+                    }
+                }
+                finally { agent.RequestRemoteStop(false); Require(worker.Wait(5000),"Protocol test Agent did not stop"); }
+            }
+            Console.WriteLine("Real local IPC: legacy Host rejected before durable output; compatible reconnect accepted and ACKed.");
+        }
+
+        private static void ValidateBrokerCaptureRootHandshake(string bufferRoot)
+        {
+            var session = Guid.NewGuid();
+            var root = Path.Combine(bufferRoot, "broker-captures");
+            var events = Path.Combine(bufferRoot, session.ToString("N"), "events");
+            Directory.CreateDirectory(root);
+            var token = RandomNumberGenerator.GetBytes(32);
+            var pipeName = "termlink-broker-root-" + session.ToString("N");
+            var options = AgentOptions.CreateManaged(pipeName, session, token,
+                events, Environment.ProcessId, 10000, 1024 * 1024);
+            using var agent = new SessionAgent(options, brokerCaptureRootProvider: () => root);
+            var worker = Task.Run((Action)agent.RunManaged);
+            try
+            {
+                using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None);
+                pipe.Connect(5000);
+                LocalFrameCodec.Write(pipe, new LocalFrame(LocalFrameType.HostHello, session, 0,
+                    LocalPayloadCodec.TerminalHello(Environment.ProcessId, token, TerminalSemanticProfile.Graphics)));
+                var hello = LocalFrameCodec.Read(pipe);
+                Require(hello != null && hello.Type == LocalFrameType.AgentHello &&
+                    hello.SessionId == session && hello.Sequence == 0 &&
+                    LocalPayloadCodec.ParseTerminalHello(hello.Payload, token,
+                        TerminalSemanticProfile.Graphics) == Environment.ProcessId,
+                    "Graphics Agent handshake changed.");
+                var rootFrame = LocalFrameCodec.Read(pipe);
+                Require(rootFrame != null && rootFrame.Type == LocalFrameType.BrokerCaptureRoot &&
+                    rootFrame.SessionId == session && rootFrame.Sequence == 0 &&
+                    LocalPayloadCodec.ParseBrokerCaptureRoot(rootFrame.Payload) == root,
+                    "Graphics Agent did not send its capture root immediately after authentication.");
+            }
+            finally
+            {
+                agent.RequestRemoteStop(false);
+                Require(worker.Wait(5000), "Graphics broker root Agent did not stop.");
+            }
+            var foreignSession = Guid.NewGuid();
+            var foreignToken = RandomNumberGenerator.GetBytes(32);
+            var foreignPipeName = "termlink-broker-root-" + foreignSession.ToString("N");
+            var foreignOptions = AgentOptions.CreateManaged(foreignPipeName, foreignSession,
+                foreignToken, events, Environment.ProcessId, 10000, 1024 * 1024);
+            using var foreignAgent = new SessionAgent(foreignOptions,
+                brokerCaptureRootProvider: () => root);
+            var foreignWorker = Task.Run((Action)foreignAgent.RunManaged);
+            try
+            {
+                using var foreignPipe = new NamedPipeClientStream(".", foreignPipeName,
+                    PipeDirection.InOut, PipeOptions.None);
+                foreignPipe.Connect(5000);
+                LocalFrameCodec.Write(foreignPipe, new LocalFrame(LocalFrameType.HostHello,
+                    foreignSession, 0, LocalPayloadCodec.TerminalHello(Environment.ProcessId,
+                        foreignToken, TerminalSemanticProfile.Graphics)));
+                var reply = Task.Run(() => LocalFrameCodec.Read(foreignPipe));
+                Require(reply.Wait(5000) && reply.Result == null &&
+                    foreignAgent.TerminalCompatibilityError == TerminalSessionProfile.Invalid,
+                    "A new session accepted or mislabeled another session's broker journal.");
+            }
+            finally
+            {
+                foreignAgent.RequestRemoteStop(false);
+                Require(foreignWorker.Wait(5000), "Rejected broker root Agent did not stop.");
+            }
+        }
+
+        private static void ValidateBrokerOutputAckDurability(string bufferRoot)
+        {
+            var session = Guid.NewGuid();
+            var root = Path.Combine(bufferRoot, "broker-captures");
+            var sessionRoot = Path.Combine(bufferRoot, session.ToString("N"));
+            var events = Path.Combine(sessionRoot, "events");
+            Directory.CreateDirectory(root);
+            var token = RandomNumberGenerator.GetBytes(32);
+            var pipeName = "termlink-broker-ack-" + session.ToString("N");
+            var options = AgentOptions.CreateManaged(pipeName, session, token, events,
+                Environment.ProcessId, 10000, 1024 * 1024);
+            var identity = new byte[96];
+            BinaryPrimitives.WriteUInt32LittleEndian(identity, 1);
+            BinaryPrimitives.WriteUInt32LittleEndian(identity.AsSpan(4), 96);
+            BinaryPrimitives.WriteUInt32LittleEndian(identity.AsSpan(8), 1);
+            BinaryPrimitives.WriteUInt32LittleEndian(identity.AsSpan(12), 'f');
+            BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(16), 1);
+            BinaryPrimitives.WriteUInt32LittleEndian(identity.AsSpan(24), 1);
+            identity[32] = 1;
+            using var record = NativeTerminalBrokerRecordV1.FromStored(identity,
+                (uint)NativeTerminalBrokerFailure.Denied, Array.Empty<byte>());
+            var canonical = NativeTerminalBrokerCaptureCodecV1.Encode(1, new[] { record });
+            using var reference = NativeTerminalBrokerOutputReferenceV1.InlineFailures(1,
+                Encoding.ASCII.GetBytes("x"), canonical);
+            var broker = new LocalFrame(LocalFrameType.BrokerOutput, session, 1, reference.Encode());
+
+            using (var small = new EncryptedEventBuffer(Path.Combine(sessionRoot, "small"), session, 1024))
+            {
+                small.BindAuthenticatedProfile(TerminalSemanticProfile.Graphics);
+                try
+                {
+                    small.Append(new LocalFrame(LocalFrameType.BrokerOutput, session, 1, new byte[2048]));
+                    throw new InvalidOperationException("Oversized BrokerOutput was accepted by the Agent buffer.");
+                }
+                catch (InvalidDataException) { }
+                Require(small.LastSequence == 0 && !small.IsRetained(1),
+                    "Oversized BrokerOutput advanced the durable buffer cursor.");
+                small.Append(broker);
+                Require(small.IsRetained(1), "In-budget BrokerOutput was trimmed before ACK.");
+            }
+
+            using (var first = new SessionAgent(options, _ => throw new IOException("injected WAL failure"),
+                brokerCaptureRootProvider: () => root))
+            {
+                var worker = Task.Run((Action)first.RunManaged);
+                try
+                {
+                    using var pipe = ConnectBrokerHost(pipeName, session, token, root);
+                    LocalFrameCodec.Write(pipe, broker);
+                    var read = Task.Run(() =>
+                    {
+                        try { return LocalFrameCodec.Read(pipe); }
+                        catch (IOException) { return null; }
+                    });
+                    Require(read.Wait(5000) && read.Result == null && !worker.IsCompleted,
+                        "Failed production WAL was ACKed or terminated the managed Agent.");
+                    Require(File.Exists(Path.Combine(events, "00000000000000000001.chunk")),
+                        "Unacknowledged BrokerOutput was not retained for retry.");
+                    Require(!File.Exists(Path.Combine(events, "00000000000000000002.chunk")),
+                        "Failed Broker WAL incorrectly appended an Interrupted lifecycle before replay.");
+                }
+                finally
+                {
+                    first.RequestRemoteStop(false);
+                    Require(worker.Wait(5000) && !worker.IsFaulted,
+                        "Retrying Broker Agent did not stop cleanly.");
+                }
+            }
+            using (var retained = new EncryptedEventBuffer(events, session, 1024 * 1024))
+            using (var changed = NativeTerminalBrokerOutputReferenceV1.InlineFailures(1,
+                Encoding.ASCII.GetBytes("y"), canonical))
+            {
+                Require(retained.LatestFrameIsBrokerOutput(),
+                    "Restart did not recognize the pending BrokerOutput tail.");
+                retained.RequireMatchingRetained(broker);
+                try
+                {
+                    retained.RequireMatchingRetained(new LocalFrame(LocalFrameType.BrokerOutput,
+                        session, 1, changed.Encode()));
+                    throw new InvalidOperationException("Changed BrokerOutput matched the retained Agent frame.");
+                }
+                catch (InvalidDataException) { }
+            }
+            var committed = 0;
+            using (var recovered = new SessionAgent(options, _ => committed++,
+                brokerCaptureRootProvider: () => root))
+            {
+                var worker = Task.Run((Action)recovered.RunManaged);
+                try
+                {
+                    using var pipe = ConnectBrokerHost(pipeName, session, token, root);
+                    LocalFrameCodec.Write(pipe, broker);
+                    var ack = LocalFrameCodec.Read(pipe);
+                    Require(ack?.Type == LocalFrameType.Ack && ack.Sequence == 1 && committed == 2,
+                        "Recovered duplicate BrokerOutput was ACKed before its production commit.");
+                }
+                finally
+                {
+                    recovered.RequestRemoteStop(false);
+                    Require(worker.Wait(5000), "Recovered broker Agent did not stop.");
+                }
+            }
+        }
+
+        private static NamedPipeClientStream ConnectBrokerHost(string pipeName, Guid session, byte[] token, string root)
+        {
+            var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None);
+            try
+            {
+                pipe.Connect(5000);
+                LocalFrameCodec.Write(pipe, new LocalFrame(LocalFrameType.HostHello, session, 0,
+                    LocalPayloadCodec.TerminalHello(Environment.ProcessId, token, TerminalSemanticProfile.Graphics)));
+                Require(LocalFrameCodec.Read(pipe)?.Type == LocalFrameType.AgentHello,
+                    "Broker Agent did not authenticate the Host.");
+                var captureRoot = LocalFrameCodec.Read(pipe);
+                Require(captureRoot?.Type == LocalFrameType.BrokerCaptureRoot &&
+                    LocalPayloadCodec.ParseBrokerCaptureRoot(captureRoot.Payload) == root,
+                    "Broker Agent did not send its capture root.");
+                return pipe;
+            }
+            catch { pipe.Dispose(); throw; }
+        }
+
         private static void RegisterFake(string controlPipe, Guid sessionId)
         {
             var response = Send(controlPipe, new RegistryRequest
@@ -1295,12 +1674,12 @@ namespace TermLink.Agent
                         LocalFrameType.HostHello,
                         sessionId,
                         0,
-                        LocalPayloadCodec.Hello(Process.GetCurrentProcess().Id, token)));
+                        LocalPayloadCodec.TerminalHello(Process.GetCurrentProcess().Id, token)));
                     var response = LocalFrameCodec.Read(pipe);
                     Require(response != null && response.Type == LocalFrameType.AgentHello &&
                         response.SessionId == sessionId && response.Sequence == 0,
                         "Fake Host received an invalid Agent handshake.");
-                    LocalPayloadCodec.ParseHello(response.Payload, token);
+                    LocalPayloadCodec.ParseTerminalHello(response.Payload, token);
                     LocalFrameCodec.Write(pipe, new LocalFrame(
                         LocalFrameType.Lifecycle,
                         sessionId,
@@ -1452,6 +1831,32 @@ namespace TermLink.Agent
         }
     }
 
+    internal sealed class FailingCompletionRegistrationStore : IRegistryRegistrationStore
+    {
+        private readonly Dictionary<Guid, SessionRegistration> registrations = new();
+        internal Exception RecoveryUpsertFailure { get; set; }
+        internal Exception RetireFailure { get; set; }
+
+        public IList<SessionRegistration> Load() => registrations.Values.ToList();
+
+        public void Upsert(SessionRegistration registration)
+        {
+            if (registration.RecoveryOnly && RecoveryUpsertFailure != null)
+                throw RecoveryUpsertFailure;
+            registrations[registration.SessionId] = registration;
+        }
+
+        public void Retire(Guid sessionId)
+        {
+            if (RetireFailure != null) throw RetireFailure;
+            if (registrations.TryGetValue(sessionId, out var registration))
+                registrations[sessionId] = registration.AsRetired();
+        }
+
+        public void Remove(Guid sessionId) => registrations.Remove(sessionId);
+        public void Clear() => registrations.Clear();
+    }
+
     internal sealed class FakeManagedSession : IRegistryManagedSession, IIdempotentRemoteControllableSession,
         IRecoveryRegistrationSession
     {
@@ -1475,6 +1880,7 @@ namespace TermLink.Agent
         public SessionRegistration Registration { get; private set; }
         public int WaitsBeforeSuccess { get; private set; }
         public int WaitCalls { get { return Volatile.Read(ref waitCalls); } }
+        public SessionAgentLifecycle Lifecycle { get; set; } = SessionAgentLifecycle.Connected;
         public Guid RemoteInputId { get; private set; }
         public ulong RemoteInputEpoch { get; private set; }
         public byte[] RemoteInputBytes { get; private set; }
@@ -1492,7 +1898,7 @@ namespace TermLink.Agent
             {
                 SessionId = SessionId,
                 ShellType = ManagedShellType.Custom,
-                Lifecycle = SessionAgentLifecycle.Connected,
+                Lifecycle = Lifecycle,
                 HostProcessId = Process.GetCurrentProcess().Id,
                 LastSequence = 2,
                 RegisteredAtUtc = DateTime.UtcNow,

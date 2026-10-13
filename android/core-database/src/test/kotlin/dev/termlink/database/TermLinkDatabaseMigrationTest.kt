@@ -40,6 +40,36 @@ class TermLinkDatabaseMigrationTest {
     }
 
     @Test
+    fun migrateV6ToV7AddsEmptyBrokerCaptureCacheWithoutChangingLegacyRows() {
+        createDatabaseAtVersion(6) {
+            execSQL(
+                """
+                INSERT INTO ack_cursors(sessionId, direction, rendererGeneration, highestContiguousSequence, updatedAtEpochMillis)
+                VALUES ('session-v6', 'PC_TO_ANDROID', 3, 42, 1234)
+                """.trimIndent(),
+            )
+        }
+
+        val migrated = openMigratedDatabase()
+        try {
+            val database = migrated.openHelper.writableDatabase
+            database.query(
+                "SELECT rendererGeneration, highestContiguousSequence FROM ack_cursors WHERE sessionId = 'session-v6'",
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(3L, cursor.getLong(0))
+                assertEquals(42L, cursor.getLong(1))
+            }
+            database.query("SELECT COUNT(*) FROM broker_captures").use { cursor ->
+                check(cursor.moveToFirst())
+                assertEquals(0L, cursor.getLong(0))
+            }
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
     fun migrateV4ToV5AddsEmptyEncryptedTranscriptCacheWithoutChangingExistingRows() {
         createDatabaseAtVersion(4) {
             execSQL(
@@ -180,25 +210,33 @@ class TermLinkDatabaseMigrationTest {
         val database = seed.openHelper.writableDatabase
         when (version) {
             1 -> {
+                downgradeV7ToV6(database)
                 downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
                 downgradeV4ToV1(database)
             }
             2 -> {
+                downgradeV7ToV6(database)
                 downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
                 downgradeV4ToV2(database)
             }
             3 -> {
+                downgradeV7ToV6(database)
                 downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
                 downgradeV4ToV3(database)
             }
             4 -> {
+                downgradeV7ToV6(database)
                 downgradeV6ToV5(database)
                 downgradeV5ToV4(database)
             }
-            5 -> downgradeV6ToV5(database)
+            5 -> {
+                downgradeV7ToV6(database)
+                downgradeV6ToV5(database)
+            }
+            6 -> downgradeV7ToV6(database)
             else -> error("Unsupported test database version: $version")
         }
         database.insertRows()
@@ -214,6 +252,7 @@ class TermLinkDatabaseMigrationTest {
                 TermLinkDatabase.MIGRATION_3_4,
                 TermLinkDatabase.MIGRATION_4_5,
                 TermLinkDatabase.MIGRATION_5_6,
+                TermLinkDatabase.MIGRATION_6_7,
             )
             .allowMainThreadQueries()
             .build()
@@ -248,6 +287,13 @@ class TermLinkDatabaseMigrationTest {
         database.execSQL("CREATE INDEX index_pcs_deviceId ON pcs(deviceId)")
         database.execSQL("CREATE INDEX index_pcs_online_lastSeenAtEpochMillis ON pcs(online, lastSeenAtEpochMillis)")
         setRoomVersion(database, 5, V5_IDENTITY_HASH)
+    }
+
+    private fun downgradeV7ToV6(database: SupportSQLiteDatabase) {
+        database.execSQL("DROP INDEX IF EXISTS index_broker_captures_sessionId_sourceSequence_keyEpoch")
+        database.execSQL("DROP INDEX IF EXISTS index_broker_captures_sessionId_sourceSequence")
+        database.execSQL("DROP TABLE IF EXISTS broker_captures")
+        setRoomVersion(database, 6, V6_IDENTITY_HASH)
     }
 
     private fun downgradeV5ToV4(database: SupportSQLiteDatabase) {
@@ -352,5 +398,6 @@ class TermLinkDatabaseMigrationTest {
         const val V3_IDENTITY_HASH = "1ff9378e8357f8db649a79c32492baec"
         const val V4_IDENTITY_HASH = "5256cfab24318a815b71dfa8dcbdca0e"
         const val V5_IDENTITY_HASH = "67871d1456c2ccef2e9d2d23526a07c3"
+        const val V6_IDENTITY_HASH = "9b1ee94f8153940fcae082a821b3096e"
     }
 }

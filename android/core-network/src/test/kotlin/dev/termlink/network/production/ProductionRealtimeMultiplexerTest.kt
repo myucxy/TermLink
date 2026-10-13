@@ -557,6 +557,58 @@ class ProductionRealtimeMultiplexerTest {
     }
 
     @Test
+    fun abandonedConnectCannotBlockTheNextEndpoint(): Unit = runTest {
+        val socket = FakeSocket()
+        val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+        val oldEndpoint = multiplexer.register(UUID.randomUUID())
+
+        oldEndpoint.connect()
+        assertEquals(1, socket.connectCount)
+        oldEndpoint.close()
+        runCurrent() // The old socket's queued Connecting event must not revive its owner.
+        assertEquals("IDLE", oldEndpoint.diagnostics().phase)
+
+        val newEndpoint = multiplexer.register(UUID.randomUUID())
+        newEndpoint.connect()
+        assertEquals(2, socket.connectCount)
+        runCurrent()
+        assertEquals("CONNECTING", newEndpoint.diagnostics().phase)
+
+        socket.emitState(RealtimeState.Connected)
+        runCurrent()
+        assertEquals("CONNECTED", newEndpoint.diagnostics().phase)
+        assertEquals(2, newEndpoint.currentConnectedGeneration())
+        multiplexer.close()
+    }
+
+    @Test
+    fun abandonedSocketEventsCannotTakeOverAReplacementConnect(): Unit = runTest {
+        listOf(
+            RealtimeState.Connected,
+            RealtimeState.Failed("retired socket failed"),
+        ).forEach { retiredEvent ->
+            val socket = FakeSocket()
+            val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)
+            val oldEndpoint = multiplexer.register(UUID.randomUUID())
+            oldEndpoint.connect()
+            oldEndpoint.close()
+            socket.emitState(retiredEvent)
+
+            val newEndpoint = multiplexer.register(UUID.randomUUID())
+            newEndpoint.connect()
+            runCurrent()
+            assertEquals("retired=$retiredEvent", "CONNECTING", newEndpoint.diagnostics().phase)
+            assertEquals("retired=$retiredEvent", 2, socket.connectCount)
+
+            socket.emitState(RealtimeState.Connected)
+            runCurrent()
+            assertEquals("retired=$retiredEvent", "CONNECTED", newEndpoint.diagnostics().phase)
+            assertEquals("retired=$retiredEvent", 2, newEndpoint.currentConnectedGeneration())
+            multiplexer.close()
+        }
+    }
+
+    @Test
     fun ownerCloseLinearizesAgainstClaimedConnectAndClosedNeverRevives(): Unit = runTest {
         val socket = FakeSocket()
         val multiplexer = ProductionRealtimeMultiplexer.forTest(socket, backgroundScope)

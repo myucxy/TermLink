@@ -51,6 +51,10 @@ const (
 	LeaseDenied              MessageType = 62
 	LeaseRevoked             MessageType = 63
 	ThemeChanged             MessageType = 70
+	HostGeometry             MessageType = 71
+	HostTheme                MessageType = 72
+	HostResizeResult         MessageType = 73
+	BrokerOutput             MessageType = 74
 	SessionStarted           MessageType = 80
 	SessionInterrupted       MessageType = 81
 	SessionEnded             MessageType = 82
@@ -65,6 +69,7 @@ const (
 	SessionCleanupResponse   MessageType = 91
 	AiAgentRequest           MessageType = 92
 	AiAgentResponse          MessageType = 93
+	TerminalAttachResult     MessageType = 94
 )
 
 var ErrInvalidEnvelope = errors.New("invalid production envelope")
@@ -177,6 +182,29 @@ func Unmarshal(frame []byte) (Envelope, error) {
 				return Envelope{}, parseError(n)
 			}
 			frame = frame[n:]
+			// Reject oversized length-delimited fields before copying attacker input.
+			switch number {
+			case 3, 4:
+				if len(value) != 16 {
+					return Envelope{}, fmt.Errorf("%w: invalid ID length", ErrInvalidEnvelope)
+				}
+			case 9:
+				if len(value) < 8 || len(value) > 128 {
+					return Envelope{}, fmt.Errorf("%w: invalid key ID length", ErrInvalidEnvelope)
+				}
+			case 10:
+				if len(value) != 12 {
+					return Envelope{}, fmt.Errorf("%w: invalid nonce length", ErrInvalidEnvelope)
+				}
+			case 11:
+				if len(value) < 16 || len(value) > MaxCiphertextBytes {
+					return Envelope{}, fmt.Errorf("%w: invalid ciphertext length", ErrInvalidEnvelope)
+				}
+			case 12:
+				if len(value) != 0 && len(value) != 16 {
+					return Envelope{}, fmt.Errorf("%w: invalid recipient ID length", ErrInvalidEnvelope)
+				}
+			}
 			value = append([]byte(nil), value...)
 			switch number {
 			case 3:
@@ -245,11 +273,11 @@ func knownMessage(value MessageType) bool {
 	switch value {
 	case Heartbeat, Goodbye, SessionUpsert, SessionRemoved, Subscribe, Unsubscribe,
 		OutputChunk, OutputACK, FlowControl, Gap, InputEvent, InputAccepted,
-		InputRejected, ResizeRequest, ResizeApplied, ResizeResponse, SnapshotOffer, SnapshotChunk,
+		InputRejected, ResizeRequest, ResizeApplied, ResizeResponse, HostGeometry, HostTheme, HostResizeResult, SnapshotOffer, SnapshotChunk,
 		ResumeRequest, LeaseRequest, LeaseGranted, LeaseDenied, LeaseRevoked,
-		ThemeChanged, SessionStarted, SessionInterrupted, SessionEnded,
+		ThemeChanged, BrokerOutput, SessionStarted, SessionInterrupted, SessionEnded,
 		SessionTerminateRequest, HostHistoryRequest, HostHistoryResponse, HostHistoryControl,
-		SessionTerminateResponse, SessionCatalogRequest, SessionCatalogResponse, SessionCleanupRequest, SessionCleanupResponse, AiAgentRequest, AiAgentResponse:
+		SessionTerminateResponse, SessionCatalogRequest, SessionCatalogResponse, SessionCleanupRequest, SessionCleanupResponse, AiAgentRequest, AiAgentResponse, TerminalAttachResult:
 		return true
 	default:
 		return false

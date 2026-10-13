@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using TermLink.LocalIpc;
 
 namespace TermLink.Agent
 {
@@ -578,6 +579,7 @@ namespace TermLink.Agent
         internal const string CommandPromptShellType = "command-prompt";
         internal const string WindowsPowerShellShellType = "windows-powershell";
         internal const string PowerShell7ShellType = "powershell-7";
+        internal const string EnhancedPowerShell7CommandId = "powershell-7-enhanced";
         internal const string WslShellType = "wsl";
         internal const string CustomShellType = "custom";
         internal const int DefaultRegistrationTimeoutMilliseconds = 30000;
@@ -590,6 +592,7 @@ namespace TermLink.Agent
         private readonly string powerShell7Path;
         private readonly string wslPath;
         private readonly string registryControlPipeName;
+        private readonly string nativeDisplayExecutable;
 
         internal ManagedTerminalLauncher()
             : this(
@@ -609,11 +612,12 @@ namespace TermLink.Agent
                 ResolvePreferredExecutable(
                     Path.Combine(Environment.SystemDirectory, "wsl.exe"),
                     "wsl.exe"),
-                null)
+                null,
+                Path.Combine(AppContext.BaseDirectory, "TermLink.exe"))
         {
         }
 
-        internal ManagedTerminalLauncher(string registryControlPipeName)
+        internal ManagedTerminalLauncher(string registryControlPipeName, string nativeDisplayExecutable = null)
             : this(
                 new WindowsPathService(),
                 new SystemProcessStarter(),
@@ -631,7 +635,8 @@ namespace TermLink.Agent
                 ResolvePreferredExecutable(
                     Path.Combine(Environment.SystemDirectory, "wsl.exe"),
                     "wsl.exe"),
-                registryControlPipeName)
+                registryControlPipeName,
+                nativeDisplayExecutable ?? Path.Combine(AppContext.BaseDirectory, "TermLink.exe"))
         {
         }
 
@@ -644,7 +649,8 @@ namespace TermLink.Agent
             string windowsPowerShellPath,
             string powerShell7Path = null,
             string wslPath = null,
-            string registryControlPipeName = null)
+            string registryControlPipeName = null,
+            string nativeDisplayExecutable = null)
         {
             this.paths = paths ?? throw new ArgumentNullException(nameof(paths));
             this.processes = processes ?? throw new ArgumentNullException(nameof(processes));
@@ -657,6 +663,7 @@ namespace TermLink.Agent
             this.registryControlPipeName = string.IsNullOrWhiteSpace(registryControlPipeName)
                 ? TermLinkControlPipe.DefaultName()
                 : registryControlPipeName.Trim();
+            this.nativeDisplayExecutable = nativeDisplayExecutable == null ? null : Path.GetFullPath(nativeDisplayExecutable);
             if (this.registryControlPipeName.Length > 200 ||
                 this.registryControlPipeName.IndexOfAny(new[] { '\\', '/' }) >= 0)
             {
@@ -668,10 +675,13 @@ namespace TermLink.Agent
         {
             var directory = paths.NormalizeExistingDirectory(workingDirectory);
             var profile = ResolveCommand(shellType);
+            var enhanced = string.Equals(profile.Id, EnhancedPowerShell7CommandId, StringComparison.Ordinal);
             if (!File.Exists(sessionHostPath))
                 throw new FileOperationException("SESSION_HOST_NOT_FOUND", "TermLink.SessionHost.exe is not installed.");
             if (!File.Exists(profile.ExecutablePath))
                 throw new FileOperationException("SHELL_NOT_FOUND", "The requested Windows shell is not installed.");
+            if (enhanced && (nativeDisplayExecutable == null || !File.Exists(nativeDisplayExecutable)))
+                throw new FileOperationException("NATIVE_DISPLAY_NOT_FOUND", "TermLink.exe is not installed for the enhanced terminal.");
 
             var sessionId = requestedSessionId.GetValueOrDefault(Guid.NewGuid());
             if (sessionId == Guid.Empty)
@@ -680,7 +690,33 @@ namespace TermLink.Agent
                 profile,
                 directory,
                 sessionId,
-                registryControlPipeName);
+                registryControlPipeName,
+                enhanced ? nativeDisplayExecutable : null);
+            if (enhanced)
+            {
+                var nativeStart = new ProcessStartInfo
+                {
+                    FileName = sessionHostPath,
+                    WorkingDirectory = directory,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                SanitizeTerminalEnvironment(nativeStart);
+                foreach (var argument in arguments) nativeStart.ArgumentList.Add(argument);
+                try
+                {
+                    if (processes.TryStart(nativeStart)) return sessionId;
+                    throw new FileOperationException("TERMINAL_LAUNCH_FAILED", "The enhanced terminal process could not be started.");
+                }
+                catch (FileOperationException) { throw; }
+                catch (Exception error) when (
+                    error is IOException || error is UnauthorizedAccessException ||
+                    error is InvalidOperationException || error is System.ComponentModel.Win32Exception)
+                {
+                    throw new FileOperationException("TERMINAL_LAUNCH_FAILED", "The enhanced terminal process could not be started.", error);
+                }
+            }
             var windowsTerminal = windowsTerminalResolver();
             if (!string.IsNullOrWhiteSpace(windowsTerminal))
             {
@@ -797,8 +833,11 @@ namespace TermLink.Agent
 
         internal static TerminalCommandCapability[] DetectTerminalCommandCapabilities()
         {
-            var launcher = new ManagedTerminalLauncher();
-            return launcher.AvailableProfiles()
+            return new ManagedTerminalLauncher().AdvertisedCommands();
+        }
+
+        internal TerminalCommandCapability[] AdvertisedCommands() =>
+            AvailableProfiles()
                 .Select(profile => new TerminalCommandCapability
                 {
                     Id = profile.Id,
@@ -807,7 +846,6 @@ namespace TermLink.Agent
                     Source = profile.Source
                 })
                 .ToArray();
-        }
 
         internal static TerminalCommandProfile[] LoadAvailableTerminalCommandProfiles() =>
             new ManagedTerminalLauncher().AvailableProfiles().ToArray();
@@ -862,7 +900,8 @@ namespace TermLink.Agent
             TerminalCommandProfile profile,
             string workingDirectory,
             Guid sessionId,
-            string registryControlPipeName = null)
+            string registryControlPipeName = null,
+            string nativeDisplayExecutable = null)
         {
             if (profile == null) throw new ArgumentNullException(nameof(profile));
             ValidateManagedShellType(profile.ManagedShell);
@@ -885,6 +924,16 @@ namespace TermLink.Agent
                 arguments.Add("--registry-pipe");
                 arguments.Add(normalizedPipe);
             }
+            if (nativeDisplayExecutable != null)
+            {
+                var executable = Path.GetFullPath(nativeDisplayExecutable);
+                if (!File.Exists(executable)) throw new ArgumentException("Native display executable does not exist.", nameof(nativeDisplayExecutable));
+                arguments.Add("--native-display");
+                arguments.Add(executable);
+                arguments.Add("--terminal-state");
+                arguments.Add(TerminalSemanticProfile.GraphicsUnicode16.StateContract);
+                arguments.Add("--broker-captures");
+            }
             return arguments.ToArray();
         }
 
@@ -905,6 +954,7 @@ namespace TermLink.Agent
             string.Equals(shellType, CommandPromptShellType, StringComparison.Ordinal) ||
             string.Equals(shellType, WindowsPowerShellShellType, StringComparison.Ordinal) ||
             string.Equals(shellType, PowerShell7ShellType, StringComparison.Ordinal) ||
+            string.Equals(shellType, EnhancedPowerShell7CommandId, StringComparison.Ordinal) ||
             string.Equals(shellType, WslShellType, StringComparison.Ordinal);
 
         private static void ValidateManagedShellType(string shellType)
@@ -915,6 +965,9 @@ namespace TermLink.Agent
 
         private TerminalCommandProfile ResolveCommand(string commandId)
         {
+            if (commandId == EnhancedPowerShell7CommandId &&
+                (nativeDisplayExecutable == null || !File.Exists(nativeDisplayExecutable)))
+                throw new FileOperationException("NATIVE_DISPLAY_NOT_FOUND", "TermLink.exe is not installed for the enhanced terminal.");
             var profile = AvailableProfiles().FirstOrDefault(item =>
                 string.Equals(item.Id, commandId, StringComparison.Ordinal));
             if (profile != null) return profile;
@@ -923,7 +976,7 @@ namespace TermLink.Agent
                 "Only terminal commands currently advertised by this PC are supported.");
         }
 
-        private IReadOnlyList<TerminalCommandProfile> AvailableProfiles()
+        internal IReadOnlyList<TerminalCommandProfile> AvailableProfiles()
         {
             if (!File.Exists(sessionHostPath)) return Array.Empty<TerminalCommandProfile>();
             var configured = TerminalCommandProfileStore.LoadConfiguredProfiles();
@@ -940,6 +993,12 @@ namespace TermLink.Agent
             {
                 if (profile.Enabled && File.Exists(profile.ExecutablePath)) result.Add(profile);
             }
+            var powerShell7 = result.FirstOrDefault(profile => profile.Id == PowerShell7ShellType);
+            if (result.Count < 24 && powerShell7 != null && nativeDisplayExecutable != null &&
+                File.Exists(nativeDisplayExecutable))
+                AddBuiltIn(result, overrides, EnhancedPowerShell7CommandId,
+                    "PowerShell 7（增强终端）", powerShell7.ExecutablePath, powerShell7.Arguments,
+                    PowerShell7ShellType);
             return result;
         }
 
@@ -949,7 +1008,8 @@ namespace TermLink.Agent
             string id,
             string displayName,
             string executablePath,
-            string arguments)
+            string arguments,
+            string managedShell = null)
         {
             if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath)) return;
             if (overrides.TryGetValue(id, out var configured))
@@ -963,10 +1023,10 @@ namespace TermLink.Agent
                 DisplayName = displayName,
                 ExecutablePath = executablePath,
                 Arguments = arguments,
-                ManagedShell = id,
+                ManagedShell = managedShell ?? id,
                 Source = "detected",
                 Enabled = true,
-                RunAsAdministrator = true
+                RunAsAdministrator = id != EnhancedPowerShell7CommandId
             });
         }
 

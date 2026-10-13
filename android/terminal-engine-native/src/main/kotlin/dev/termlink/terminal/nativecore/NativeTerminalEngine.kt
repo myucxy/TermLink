@@ -8,6 +8,7 @@ import android.view.View
 import dev.termlink.terminal.api.ArgbColor
 import dev.termlink.terminal.api.TerminalCellPosition
 import dev.termlink.terminal.api.TerminalInputModifiers
+import dev.termlink.terminal.api.TerminalInputDiagnostic
 import dev.termlink.terminal.api.TerminalHostEffectFrameV2
 import dev.termlink.terminal.api.TerminalHostEffectKindV2
 import dev.termlink.terminal.api.TerminalKey
@@ -19,12 +20,14 @@ import dev.termlink.terminal.api.TerminalMouseInput
 import dev.termlink.terminal.api.TerminalMousePosition
 import dev.termlink.terminal.api.TerminalOutputProfile
 import dev.termlink.terminal.api.TerminalPixelPosition
-import dev.termlink.terminal.api.TerminalRenderFrameV3
+import dev.termlink.terminal.api.TerminalTextFrame
+import dev.termlink.terminal.api.TerminalWidthProfile
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.api.TerminalViewportEngine
 import java.lang.ref.WeakReference
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.channels.Channel
@@ -41,6 +44,8 @@ internal enum class NativeHistoryScrollResult {
     CANCELLED,
     OLDEST_BOUNDARY,
     LIVE_BOUNDARY,
+    CAPTURE_EXPIRED,
+    CAPTURE_LIMIT,
 }
 
 /** Production Android terminal whose parser, render frame, and input modes are terminal-core. */
@@ -49,33 +54,86 @@ class NativeTerminalEngine(
     private val bridge: NativeBridge = JniNativeBridge,
     private val outputProfile: TerminalOutputProfile = TerminalOutputProfile.UTF8,
     private val historyCapacityRows: Long = DEFAULT_HISTORY_CAPACITY_ROWS,
-    private val limits: NativeTerminalLimits = NativeTerminalLimits(),
+    limits: NativeTerminalLimits? = null,
+    private val widthProfile: TerminalWidthProfile = TerminalWidthProfile.LEGACY_V1,
+    private val platformActionSink: dev.termlink.terminal.api.TerminalPlatformActionSink? = null,
+    val graphicsProfile: Boolean = false,
 ) : TerminalViewportEngine {
+    val stateDeltaWidthProfile: TerminalWidthProfile get() = widthProfile
+    val stateDeltaOutputProfile: TerminalOutputProfile get() = outputProfile
+
+    private val limits = limits ?: if (graphicsProfile) NativeTerminalLimits.graphics()
+        else NativeTerminalLimits(maxRenderFrameBytes = TERMLINK_RENDER_FRAME_V4_MAX_BYTES)
+    private var lastResizeNoticeMillis = -3000L
+
+    override fun notifyHostResizeResult(result: dev.termlink.terminal.api.TerminalHostResizeResultV1) {
+        if (result.error == 0) return
+        val view = synchronized(lock) { if (disposed) null else viewReference?.get() } ?: return
+        view.post {
+            val now = android.os.SystemClock.uptimeMillis()
+            if (view.isShown && now - lastResizeNoticeMillis >= 3000 && synchronized(lock) { !disposed && viewReference?.get() === view }) {
+                lastResizeNoticeMillis = now
+                android.widget.Toast.makeText(view.context, result.describe(), android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+    }
     private val lock = Any()
     private val inputChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private val mutableSize = MutableStateFlow(initialSize)
     private val mutableTitle = MutableStateFlow("")
     private val mutableMouseReporting = MutableStateFlow(false)
+    private val mutableInputDiagnostic = MutableStateFlow<TerminalInputDiagnostic?>(null)
+    val inputDiagnostic: StateFlow<TerminalInputDiagnostic?> = mutableInputDiagnostic.asStateFlow()
+    fun dismissInputDiagnostic(expected: TerminalInputDiagnostic) {
+        mutableInputDiagnostic.compareAndSet(expected, null)
+    }
+    private val mutableHostSignals = MutableStateFlow(dev.termlink.terminal.api.TerminalHostSignals())
+    override val hostSignals = mutableHostSignals.asStateFlow()
+    private var pendingPlatformActions = emptyList<dev.termlink.terminal.api.TerminalHostEffectV2>()
+
+    override fun notifyLiveOutputApplied(sequence: Long) {
+        val effects = synchronized(lock) {
+            if (disposed || failedClosed) return
+            val records = pendingPlatformActions.filter { it.sourceSequence == sequence }
+            pendingPlatformActions = emptyList()
+            records
+        }
+        if (effects.isNotEmpty()) platformActionSink?.offer(effects)
+    }
     @Volatile internal var touchMouseEnabled = false
         private set
-    private val mutableFrame: MutableStateFlow<TerminalRenderFrameV3>
+    /** UI-thread visibility check for foreground-only, explicitly confirmed platform actions. */
+    fun hasVisibleDisplay(): Boolean {
+        val view = synchronized(lock) { if (disposed || failedClosed) null else viewReference?.get() }
+        return view != null && view.isLiveViewportUncovered() && view.isShown && view.windowVisibility == View.VISIBLE
+    }
+
+    /** Compose's covering history layers do not change the Android View's visibility. */
+    fun setLiveViewportUncovered(view: View, uncovered: Boolean) {
+        synchronized(lock) {
+            val attached = viewReference?.get()
+            if (attached === view) attached?.setLiveViewportUncovered(uncovered)
+        }
+    }
+    private val mutableFrame: MutableStateFlow<TerminalTextFrame>
     private val mainHandler = Handler(Looper.getMainLooper())
     private var terminal = createTerminal(initialSize)
     private var scrollbackOffsetRows = 0L
     private var scrollbackAvailableRows = 0L
     private var scrollbackGenerationRows = 0L
+    @Volatile private var historyCapture: NativeHistoryCapture? = null
     private var currentTheme = DEFAULT_THEME
     private var readOnly = true
-    private var disposed = false
+    @Volatile private var disposed = false
     private var failedClosed = false
     private val historyNavigationGeneration = AtomicLong()
-    private val historyFrameCache = object : LinkedHashMap<Long, NativeScrollbackFrameV3>(
+    private val historyFrameCache = object : LinkedHashMap<Long, NativeScrollbackTextFrame>(
         HISTORY_FRAME_CACHE_SIZE,
         0.75f,
         true,
     ) {
         override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<Long, NativeScrollbackFrameV3>,
+            eldest: MutableMap.MutableEntry<Long, NativeScrollbackTextFrame>,
         ): Boolean = size > HISTORY_FRAME_CACHE_SIZE
     }
     private var viewReference: WeakReference<NativeTerminalView>? = null
@@ -83,7 +141,7 @@ class NativeTerminalEngine(
     private var listenerGeneration = 0L
 
     init {
-        val firstFrame = terminal.renderV3AtScrollback(0)
+        val firstFrame = terminal.renderTextAtScrollback(0)
         acceptScrollbackFrame(firstFrame)
         mutableFrame = MutableStateFlow(firstFrame.renderFrame)
         publishFrame(firstFrame.renderFrame, notify = false)
@@ -94,7 +152,9 @@ class NativeTerminalEngine(
     override val authoritativeSize: StateFlow<TerminalSize> = mutableSize.asStateFlow()
     override val title: StateFlow<String> = mutableTitle.asStateFlow()
     override val mouseReporting: StateFlow<Boolean> = mutableMouseReporting.asStateFlow()
-    internal val frames: StateFlow<TerminalRenderFrameV3> = mutableFrame.asStateFlow()
+    internal val frames: StateFlow<TerminalTextFrame> = mutableFrame.asStateFlow()
+
+    fun currentTextFrame(): TerminalTextFrame? = frames.value
 
     data class InstalledCheckpoint(
         val sequence: Long,
@@ -104,22 +164,36 @@ class NativeTerminalEngine(
     /** Atomically replaces the live parser with an authenticated canonical Snapshot V2. */
     fun installCheckpoint(checkpoint: ByteArray): InstalledCheckpoint {
         require(checkpoint.isNotEmpty()) { "Native terminal checkpoint must not be empty" }
-        val replacement = NativeTerminalHandle.importCheckpoint(bridge, checkpoint, limits)
-        val (frame, reporting) = try {
-            replacement.renderV3AtScrollback(0) to reportsMouse(replacement)
-        } catch (error: Throwable) {
-            runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
-            throw error
+        require(checkpoint.size <= limits.maxCheckpointBytes) { "Native terminal checkpoint exceeds ${limits.maxCheckpointBytes} bytes" }
+        // Inspect the same owned bytes that native validates, even if the caller later edits its array.
+        val ownedCheckpoint = checkpoint.copyOf()
+        val (replacement, candidateState) = try {
+            val candidate = NativeTerminalHandle.importCheckpoint(bridge, ownedCheckpoint, limits, graphicsProfile)
+            try {
+                require(candidate.nextSourceSequence > FIRST_SOURCE_SEQUENCE) {
+                    "Native terminal checkpoint must follow at least one ordered source event"
+                }
+                val frame = candidate.renderTextAtScrollback(0)
+                validateCheckpointProfiles(ownedCheckpoint, frame.renderFrame)
+                candidate to Triple(frame, reportsMouse(candidate),
+                    if (bridge.supportsHostSignals) candidate.hostSignals() else dev.termlink.terminal.api.TerminalHostSignals())
+            } catch (error: Throwable) {
+                runCatching(candidate::close).exceptionOrNull()?.let(error::addSuppressed)
+                throw error
+            }
+        } finally {
+            ownedCheckpoint.fill(0)
         }
+        val (frame, reporting, signals) = candidateState
         val nextSourceSequence = replacement.nextSourceSequence
-        require(nextSourceSequence > FIRST_SOURCE_SEQUENCE) {
-            "Native terminal checkpoint must follow at least one ordered source event"
-        }
         val previous = try {
             synchronized(lock) {
                 checkActive()
                 val owned = terminal
+                releaseHistoryCapture()
                 terminal = replacement
+                pendingPlatformActions = emptyList()
+                mutableHostSignals.value = signals
                 mutableMouseReporting.value = reporting
                 historyNavigationGeneration.incrementAndGet()
                 failedClosed = false
@@ -151,12 +225,43 @@ class NativeTerminalEngine(
         )
     }
 
+    private fun validateCheckpointProfiles(checkpoint: ByteArray, frame: TerminalTextFrame) {
+        if (checkpoint.size < 104 || !checkpoint.copyOfRange(0, 8).contentEquals(SNAPSHOT_V2_MAGIC)) {
+            throw NativeTerminalContractException("installCheckpoint.profile", "native import accepted an unknown snapshot envelope")
+        }
+        val header = ByteBuffer.wrap(checkpoint).order(ByteOrder.LITTLE_ENDIAN)
+        val minor = header.getShort(10).toInt() and 0xffff
+        if (header.getShort(8).toInt() != 2 || header.getShort(12).toInt() != minor ||
+            header.getShort(14).toInt() != 104 ||
+            if (graphicsProfile) minor != 22 else minor !in 0..21
+        ) {
+            throw NativeTerminalContractException("installCheckpoint.profile", "native import accepted an unsupported snapshot header")
+        }
+        val snapshotOutputProfile = if (header.getLong(64) and 0x10_0000L != 0L)
+            TerminalOutputProfile.UTF8_WITH_STANDALONE_C1 else TerminalOutputProfile.UTF8
+        if (frame.widthProfile != widthProfile || snapshotOutputProfile != outputProfile) {
+            throw NativeTerminalException("installCheckpoint.profile", NativeTerminalStatus.INCOMPATIBLE_SNAPSHOT,
+                diagnostic = "Snapshot width/output profiles do not match the configured terminal")
+        }
+    }
+
     override suspend fun feed(seq: Long, bytes: ByteBuffer) {
         require(seq > 0) { "Terminal sequence must be positive" }
         val owned = ByteArray(bytes.remaining())
         bytes.get(owned)
         require(owned.isNotEmpty()) { "Terminal output must not be empty" }
         applyOrdered { it.feedWithHostEffectsV2(seq, owned) }
+    }
+
+    override suspend fun applyBrokerCapturedOutput(seq: Long, output: ByteArray, canonicalCaptures: ByteArray) {
+        require(graphicsProfile) { "Broker captured Output requires the graphics profile" }
+        require(seq > 0 && output.size in 1..64 * 1024) { "Broker Output sequence or size is invalid" }
+        NativeBrokerCaptureCodecV1.decode(canonicalCaptures).use { group ->
+            require(group.sourceSequence == seq) { "Broker capture source sequence differs from Output" }
+            NativeBrokerOutputV1(seq, output, group.captures).use { replay ->
+                applyOrdered { it.applyBrokerCapturedV1(replay) }
+            }
+        }
     }
 
     override suspend fun advance(seq: Long) {
@@ -166,6 +271,14 @@ class NativeTerminalEngine(
     override suspend fun resize(seq: Long, columns: Int, rows: Int) {
         val size = TerminalSize(columns, rows)
         applyOrdered { it.resizeWithHostEffectsV2(seq, size) }
+    }
+
+    override suspend fun applyHostTheme(seq: Long, theme: dev.termlink.terminal.api.TerminalHostThemeV1) {
+        applyOrdered { it.applyWithHostEffectsV2(NativeEventBatch.of(listOf(NativeSourceEvent.HostTheme(seq, theme)), limits)) }
+    }
+
+    override suspend fun applyHostGeometry(seq: Long, geometry: dev.termlink.terminal.api.TerminalHostGeometryV1) {
+        applyOrdered { it.applyWithHostEffectsV2(NativeEventBatch.of(listOf(NativeSourceEvent.HostGeometry(seq, geometry)), limits)) }
     }
 
     override suspend fun reportGap(seq: Long) {
@@ -235,6 +348,7 @@ class NativeTerminalEngine(
             replaceTerminal(mutableSize.value)
             failedClosed = false
             readOnly = true
+            mutableInputDiagnostic.value = null
         }
     }
 
@@ -242,7 +356,10 @@ class NativeTerminalEngine(
         val owned = synchronized(lock) {
             if (disposed) return
             disposed = true
+            pendingPlatformActions = emptyList()
+            releaseHistoryCapture()
             mutableMouseReporting.value = false
+            mutableInputDiagnostic.value = null
             listenerGeneration = Math.addExact(listenerGeneration, 1)
             historyNavigationGeneration.incrementAndGet()
             acceptedInputListener = null
@@ -252,7 +369,7 @@ class NativeTerminalEngine(
             terminal
         }
         inputChannel.close()
-        owned.close()
+        try { owned.close() } finally { runCatching { platformActionSink?.close() } }
     }
 
     override fun createView(
@@ -278,9 +395,45 @@ class NativeTerminalEngine(
         return view
     }
 
-    override fun visibleText(): String = synchronized(lock) {
+    override fun visibleText(): String {
+        // The published frame is immutable and StateFlow provides a thread-safe value read.
+        // Do not take the reducer lock here: a native reduction may legitimately hold it for
+        // seconds while the UI only needs the last frame that has already been published.
         checkActive()
-        frameText(mutableFrame.value)
+        return frameText(mutableFrame.value)
+    }
+
+    override fun shellState(): dev.termlink.terminal.api.TerminalShellState = synchronized(lock) {
+        checkActive()
+        terminal.shellState()
+    }
+
+    override fun showShellCommand(commandId: Long): Boolean {
+        val generation = historyNavigationGeneration.incrementAndGet()
+        val frame = synchronized(lock) {
+            checkActive()
+            val command = terminal.shellState().commands.firstOrNull { it.id == commandId } ?: return false
+            val point = command.prompt
+            if (point.alternate || point.page != 1) return false
+            if (historyCapture?.let { point.sequence >= it.info.revision } == true) releaseHistoryCapture()
+            val existing = historyCapture
+            val capture = existing ?: terminal.captureHistory()
+            try {
+                val offset = capture.resolveAnchor(point.lineId, point.cellOffset)
+                val frame = capture.viewport(offset)
+                if (historyNavigationGeneration.get() != generation) { if (existing == null) capture.close(); return false }
+                historyCapture = capture
+                historyFrameCache.clear()
+                acceptScrollbackFrame(frame)
+                frame
+            } catch (error: Throwable) {
+                if (existing == null) capture.close()
+                if (error is NativeTerminalException && error.status == NativeTerminalStatus.HISTORY_STALE_ANCHOR) return false
+                throw error
+            }
+        }
+        publishFrame(frame.renderFrame, notify = true)
+        return true
     }
 
     override fun currentSize(): TerminalSize = synchronized(lock) {
@@ -302,7 +455,7 @@ class NativeTerminalEngine(
     override fun resumeViewportAfterLocalInput() {
         val cursorVisible = synchronized(lock) {
             checkActive()
-            mutableFrame.value.cursor.visible
+            historyCapture != null || mutableFrame.value.cursor.visible
         }
         if (cursorVisible) scrollToLatest()
     }
@@ -311,11 +464,13 @@ class NativeTerminalEngine(
         historyNavigationGeneration.incrementAndGet()
         val result = synchronized(lock) {
             checkActive()
-            val frame = if (scrollbackOffsetRows == 0L) {
+            val wasFrozen = historyCapture != null
+            releaseHistoryCapture()
+            val frame = if (scrollbackOffsetRows == 0L && !wasFrozen) {
                 null
             } else {
                 try {
-                    terminal.renderV3AtScrollback(0).also {
+                    terminal.renderTextAtScrollback(0).also {
                         acceptScrollbackFrame(it)
                         cacheHistoryFrame(it)
                     }
@@ -344,7 +499,10 @@ class NativeTerminalEngine(
             val iterator = text.codePoints().iterator()
             while (iterator.hasNext()) {
                 val codePoint = iterator.nextInt()
-                if (codePoint in 0x80..0x9f) return false
+                if (codePoint in 0x80..0x9f) {
+                    mutableInputDiagnostic.value = TerminalInputDiagnostic.androidC1Blocked(codePoint)
+                    return false
+                }
                 val payload = encodeInputOrNull {
                     when (codePoint) {
                         '\n'.code, '\r'.code -> terminal.encodeKey(TerminalKey.ENTER)
@@ -470,7 +628,7 @@ class NativeTerminalEngine(
         if (text.isEmpty()) return canAcceptInput()
         val payload = synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            terminal.encodePaste(text.encodeToByteArray())
+            encodeInputOrNull { terminal.encodePaste(text.encodeToByteArray()) } ?: return false
         }
         return emitPayloads(listOf(payload))
     }
@@ -478,7 +636,7 @@ class NativeTerminalEngine(
     internal fun submitFocus(focused: Boolean): Boolean {
         val payload = synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            terminal.encodeFocus(focused)
+            encodeInputOrNull(recordDiagnostic = false) { terminal.encodeFocus(focused) } ?: return false
         }
         return emitPayloads(listOf(payload), notifyAccepted = false)
     }
@@ -486,7 +644,7 @@ class NativeTerminalEngine(
     internal fun submitMouse(input: TerminalMouseInput): Boolean {
         val payload = synchronized(lock) {
             if (!canAcceptInputLocked()) return false
-            terminal.encodeMouse(input)
+            encodeInputOrNull { terminal.encodeMouse(input) } ?: return false
         }
         if (payload.isEmpty()) return false
         return emitPayloads(listOf(payload))
@@ -526,14 +684,21 @@ class NativeTerminalEngine(
                 }
             }
             try {
-                val projected = cachedHistoryFrame(requested)
-                    ?: terminal.renderV3AtScrollback(requested)
+                val projected = if (requested == 0L) {
+                    releaseHistoryCapture()
+                    terminal.renderTextAtScrollback(0)
+                } else if (bridge.supportsHistoryCapture) {
+                    val capture = historyCapture ?: terminal.captureHistory().also { historyCapture = it; historyFrameCache.clear() }
+                    capture.viewport(requested)
+                } else cachedHistoryFrame(requested) ?: terminal.renderTextAtScrollback(requested)
                 if (navigationGeneration != historyNavigationGeneration.get()) {
                     return NativeHistoryScrollResult.CANCELLED
                 }
                 cacheHistoryFrame(projected)
                 projected.also(::acceptScrollbackFrame)
             } catch (error: NativeTerminalException) {
+                if (error.status == NativeTerminalStatus.HISTORY_STALE_CAPTURE) return NativeHistoryScrollResult.CAPTURE_EXPIRED
+                if (error.status == NativeTerminalStatus.LIMIT_EXCEEDED) return NativeHistoryScrollResult.CAPTURE_LIMIT
                 if (!error.isTemporaryPresentationFailure()) throw error
                 return NativeHistoryScrollResult.UNCHANGED
             }
@@ -547,6 +712,7 @@ class NativeTerminalEngine(
         synchronized(lock) {
             checkActive()
             if (navigationGeneration != historyNavigationGeneration.get()) return
+            if (historyCapture != null) return
             val distance = kotlin.math.abs(deltaRows.toLong())
             val requested = if (deltaRows > 0) {
                 saturatedAdd(scrollbackOffsetRows, distance).coerceAtMost(scrollbackAvailableRows)
@@ -555,7 +721,7 @@ class NativeTerminalEngine(
             }
             if (requested == scrollbackOffsetRows || cachedHistoryFrame(requested) != null) return
             try {
-                val frame = terminal.renderV3AtScrollback(requested)
+                val frame = terminal.renderTextAtScrollback(requested)
                 if (navigationGeneration == historyNavigationGeneration.get()) {
                     cacheHistoryFrame(frame)
                 }
@@ -588,11 +754,22 @@ class NativeTerminalEngine(
             checkActive()
             check(!failedClosed) { "Native terminal renderer is failed closed" }
             try {
-                discardMirrorHostEffects(apply(terminal))
+                pendingPlatformActions = emptyList()
+                val effects = apply(terminal)
+                discardMirrorHostEffects(effects)
+                if (platformActionSink != null) pendingPlatformActions = effects.effects.filter { it.kind == TerminalHostEffectKindV2.PLATFORM_ACTION }
+                if (bridge.supportsHostSignals) mutableHostSignals.value = terminal.hostSignals()
                 mutableMouseReporting.value = reportsMouse(terminal)
+                if (historyCapture != null) {
+                    // The live mirror continues reducing and ACKing output. Its
+                    // arrival never replaces the frozen browsing presentation.
+                    try { mutableSize.value = terminal.renderTextAtScrollback(0).renderFrame.size }
+                    catch (error: NativeTerminalException) { if (!error.isTemporaryPresentationFailure()) throw error }
+                    return@synchronized null
+                }
                 historyFrameCache.clear()
                 try {
-                    val live = terminal.renderV3AtScrollback(0)
+                    val live = terminal.renderTextAtScrollback(0)
                     val generationDelta = if (live.generationRows >= scrollbackGenerationRows) {
                         live.generationRows - scrollbackGenerationRows
                     } else {
@@ -607,7 +784,7 @@ class NativeTerminalEngine(
                     val visible = if (anchoredOffset == 0L) {
                         live
                     } else {
-                        terminal.renderV3AtScrollback(anchoredOffset)
+                        terminal.renderTextAtScrollback(anchoredOffset)
                     }
                     acceptScrollbackFrame(visible)
                     cacheHistoryFrame(visible)
@@ -635,7 +812,7 @@ class NativeTerminalEngine(
 
     private fun discardMirrorHostEffects(hostEffects: TerminalHostEffectFrameV2) {
         check(hostEffects.formatVersion == TerminalHostEffectFrameV2.FORMAT_VERSION)
-        check(hostEffects.effects.all { it.kind == TerminalHostEffectKindV2.PTY_REPLY })
+        check(hostEffects.effects.all { it.kind == TerminalHostEffectKindV2.PTY_REPLY || it.kind == TerminalHostEffectKindV2.RESIZE_REQUEST || it.kind == TerminalHostEffectKindV2.PLATFORM_ACTION })
         // This engine mirrors a remote Windows PTY. Replies were already emitted by the host,
         // so replaying them through inputEvents would duplicate terminal protocol responses.
     }
@@ -644,12 +821,15 @@ class NativeTerminalEngine(
         val previous = terminal
         val replacement = createTerminal(size)
         val frame = try {
-            replacement.renderV3AtScrollback(0)
+            replacement.renderTextAtScrollback(0)
         } catch (error: Throwable) {
             runCatching(replacement::close).exceptionOrNull()?.let(error::addSuppressed)
             throw error
         }
+        releaseHistoryCapture()
         terminal = replacement
+        pendingPlatformActions = emptyList()
+        mutableHostSignals.value = dev.termlink.terminal.api.TerminalHostSignals()
         mutableMouseReporting.value = false
         historyNavigationGeneration.incrementAndGet()
         historyFrameCache.clear()
@@ -665,18 +845,27 @@ class NativeTerminalEngine(
         publishFrame(frame.renderFrame, notify = true)
     }
 
-    private fun createTerminal(size: TerminalSize): NativeTerminalHandle = NativeTerminalHandle.create(
+    private fun createTerminal(size: TerminalSize): NativeTerminalHandle = if (!graphicsProfile && widthProfile == TerminalWidthProfile.LEGACY_V1) NativeTerminalHandle.create(
         bridge = bridge,
         size = size,
         initialNextSourceSequence = FIRST_SOURCE_SEQUENCE,
         outputProfile = outputProfile,
         historyCapacityRows = historyCapacityRows,
         limits = limits,
+    ) else NativeTerminalHandle.createWithProfiles(
+        bridge = bridge,
+        size = size,
+        initialNextSourceSequence = FIRST_SOURCE_SEQUENCE,
+        outputProfile = outputProfile,
+        widthProfile = widthProfile,
+        historyCapacityRows = historyCapacityRows,
+        limits = limits,
+        graphicsProfile = graphicsProfile,
     )
 
-    private fun publishFrame(frame: TerminalRenderFrameV3, notify: Boolean) {
+    private fun publishFrame(frame: TerminalTextFrame, notify: Boolean) {
         mutableFrame.value = frame
-        mutableSize.value = frame.size
+        if (historyCapture == null) mutableSize.value = frame.size
         mutableTitle.value = frame.title.take(MAX_TITLE_CHARACTERS)
         if (notify) notifyView()
     }
@@ -691,22 +880,29 @@ class NativeTerminalEngine(
             ),
         ).isNotEmpty()
 
-    private fun acceptScrollbackFrame(frame: NativeScrollbackFrameV3) {
+    private fun acceptScrollbackFrame(frame: NativeScrollbackTextFrame) {
         scrollbackAvailableRows = frame.availableRows
         scrollbackGenerationRows = frame.generationRows
         scrollbackOffsetRows = frame.appliedOffsetRows
     }
 
-    private fun cacheHistoryFrame(frame: NativeScrollbackFrameV3) {
+    private fun cacheHistoryFrame(frame: NativeScrollbackTextFrame) {
         historyFrameCache[frame.appliedOffsetRows] = frame
     }
 
-    private fun cachedHistoryFrame(offsetRows: Long): NativeScrollbackFrameV3? =
+    private fun cachedHistoryFrame(offsetRows: Long): NativeScrollbackTextFrame? =
         historyFrameCache[offsetRows]?.takeIf { frame ->
             frame.availableRows == scrollbackAvailableRows &&
                 frame.generationRows == scrollbackGenerationRows &&
                 frame.renderFrame.presentationRevision == terminal.presentationRevision
         }
+
+    private fun releaseHistoryCapture() {
+        val capture = historyCapture ?: return
+        historyCapture = null
+        historyFrameCache.clear()
+        capture.close()
+    }
 
     private fun notifyView() {
         val view = synchronized(lock) { if (disposed) null else viewReference?.get() } ?: return
@@ -746,14 +942,21 @@ class NativeTerminalEngine(
 
     private fun canAcceptInputLocked(): Boolean = !disposed && !readOnly && !failedClosed
 
-    private inline fun encodeInputOrNull(block: () -> ByteArray): ByteArray? = try {
-        block()
+    private inline fun encodeInputOrNull(
+        recordDiagnostic: Boolean = true,
+        block: () -> ByteArray,
+    ): ByteArray? = try {
+        block().also { if (recordDiagnostic) mutableInputDiagnostic.value = null }
     } catch (_: IllegalArgumentException) {
         null
     } catch (error: NativeTerminalException) {
         if (error.status == NativeTerminalStatus.INVALID_ARGUMENT ||
-            error.status == NativeTerminalStatus.UNSUPPORTED
-        ) null else throw error
+            error.status == NativeTerminalStatus.UNSUPPORTED ||
+            error.status == NativeTerminalStatus.LIMIT_EXCEEDED
+        ) {
+            if (recordDiagnostic) mutableInputDiagnostic.value = error.terminalInputDiagnostic
+            null
+        } else throw error
     }
 
     private fun checkActive() {
@@ -770,6 +973,7 @@ class NativeTerminalEngine(
         const val TERMINAL_KEYMOD_ALT = Int.MIN_VALUE
         const val TERMINAL_KEYMOD_CTRL = 0x4000_0000
         const val TERMINAL_KEYMOD_SHIFT = 0x2000_0000
+        private val SNAPSHOT_V2_MAGIC = "TLSNP2S\u0000".encodeToByteArray()
 
         val DEFAULT_THEME = TerminalThemeV1(
             name = "TermLink",
@@ -839,7 +1043,7 @@ private fun androidTerminalKey(keyCode: Int): TerminalKittyFunctionalKey? = when
     else -> null
 }
 
-internal fun frameText(frame: TerminalRenderFrameV3): String = buildString {
+internal fun frameText(frame: TerminalTextFrame): String = buildString {
     frame.rows.forEachIndexed { rowIndex, row ->
         var lastNonBlank = -1
         val values = ArrayList<String>(frame.size.columns)

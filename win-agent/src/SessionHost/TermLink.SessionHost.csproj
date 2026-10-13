@@ -9,6 +9,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\Common\LocalIpc.cs" Link="Common\LocalIpc.cs" />
+    <Compile Include="..\Common\KittyCaptureStore.cs" Link="Common\KittyCaptureStore.cs" />
+    <Compile Include="..\Common\NativeDisplayProtocol.cs" Link="Common\NativeDisplayProtocol.cs" />
+    <Compile Include="..\Common\NativeDisplaySignals.cs" Link="Common\NativeDisplaySignals.cs" />
     <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
     <ProjectReference Include="..\TerminalCore\TermLink.TerminalCore.csproj" />
     <InternalsVisibleTo Include="TermLink.SessionHost.Validation" />

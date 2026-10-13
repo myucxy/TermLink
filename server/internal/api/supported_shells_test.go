@@ -35,6 +35,10 @@ func TestNormalizeSupportedShells(t *testing.T) {
 func TestNormalizeTerminalCommands(t *testing.T) {
 	valid := []store.TerminalCommandCapability{
 		{ID: "command-prompt", DisplayName: "Command Prompt", ShellType: "command-prompt", Source: "detected"},
+		{ID: "windows-powershell", DisplayName: "Windows PowerShell", ShellType: "windows-powershell", Source: "detected"},
+		{ID: "powershell-7", DisplayName: "PowerShell 7", ShellType: "powershell-7", Source: "detected"},
+		{ID: "wsl", DisplayName: "WSL", ShellType: "wsl", Source: "detected"},
+		{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "powershell-7", Source: "detected"},
 		{ID: "custom-123", DisplayName: "Project CLI", ShellType: "custom", Source: "manual"},
 	}
 	got, err := normalizeTerminalCommands(valid)
@@ -46,6 +50,10 @@ func TestNormalizeTerminalCommands(t *testing.T) {
 		{{ID: "custom-1", DisplayName: " Bad", ShellType: "custom", Source: "manual"}},
 		{{ID: "custom-1", DisplayName: "Bad", ShellType: "wsl", Source: "manual"}},
 		{{ID: "command-prompt", DisplayName: "Bad", ShellType: "custom", Source: "detected"}},
+		{{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "custom", Source: "detected"}},
+		{{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "wsl", Source: "detected"}},
+		{{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "powershell-7", Source: "manual"}},
+		{{ID: "other-enhanced", DisplayName: "Other Enhanced", ShellType: "powershell-7", Source: "detected"}},
 		{{ID: "custom-1", DisplayName: "One", ShellType: "custom", Source: "manual"}, {ID: "custom-1", DisplayName: "Two", ShellType: "custom", Source: "manual"}},
 	} {
 		if _, err := normalizeTerminalCommands(invalid); err == nil {

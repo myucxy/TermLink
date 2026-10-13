@@ -106,6 +106,11 @@ class TerminalRenderPaletteV1(
     val defaultForegroundRgb: Int?,
     val defaultBackgroundRgb: Int?,
     val defaultCursorRgb: Int?,
+    val selectionBackgroundRgb: Int? = null,
+    val foregroundAlias: Int? = null,
+    val backgroundAlias: Int? = null,
+    val frameForegroundAlias: Int? = null,
+    val frameBackgroundAlias: Int? = null,
 ) {
     val colorsRgb: List<Int?> = immutableCopy(colorsRgb)
 
@@ -117,6 +122,10 @@ class TerminalRenderPaletteV1(
         validateRgb(defaultForegroundRgb, "default foreground")
         validateRgb(defaultBackgroundRgb, "default background")
         validateRgb(defaultCursorRgb, "default cursor")
+        validateRgb(selectionBackgroundRgb, "selection background")
+        listOf(foregroundAlias, backgroundAlias, frameForegroundAlias, frameBackgroundAlias).forEachIndexed { index, alias ->
+            require(alias == null || alias in 0..257 && alias != 256 + index % 2) { "invalid color alias" }
+        }
     }
 
     private fun validateRgb(value: Int?, field: String) {
@@ -138,15 +147,23 @@ data class TerminalRenderHyperlinkV1(
     }
 }
 
+enum class TerminalLineRendition(val wireValue: Int, val horizontalScale: Int) {
+    SINGLE_WIDTH(0, 1), DOUBLE_WIDTH(1, 2), DOUBLE_HEIGHT_TOP(2, 2), DOUBLE_HEIGHT_BOTTOM(3, 2);
+
+    fun columns(physicalColumns: Int): Int = (physicalColumns / horizontalScale).coerceAtLeast(1)
+}
+
 class TerminalRenderRowV1(
     val meaningfulEnd: Int,
     val softWrapped: Boolean,
     cells: List<TerminalRenderCellV1>,
+    val lineRendition: TerminalLineRendition = TerminalLineRendition.SINGLE_WIDTH,
 ) {
     val cells: List<TerminalRenderCellV1> = immutableCopy(cells)
 
     init {
-        require(meaningfulEnd in 0..this.cells.size) { "meaningful end is outside the row" }
+        require(meaningfulEnd in 0..lineRendition.columns(this.cells.size)) { "meaningful end is outside the row" }
+        require(!softWrapped || lineRendition == TerminalLineRendition.SINGLE_WIDTH)
     }
 }
 

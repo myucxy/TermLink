@@ -55,6 +55,10 @@ enum MessageType {
   LEASE_DENIED = 62;
   LEASE_REVOKED = 63;
   THEME_CHANGED = 70;
+  HOST_GEOMETRY = 71; // Ordered selected-display measurements; PC authority only.
+  HOST_THEME = 72; // Ordered selected-display theme/palette; PC authority only.
+  HOST_RESIZE_RESULT = 73; // Ordered result of an application-requested terminal resize.
+  BROKER_OUTPUT = 74; // Ordered Output plus an immutable, path-free capture reference.
   SESSION_STARTED = 80;
   SESSION_INTERRUPTED = 81;
   SESSION_ENDED = 82;
@@ -75,6 +79,7 @@ enum MessageType {
   SESSION_CLEANUP_RESPONSE = 91;
   AI_AGENT_REQUEST = 92; // Device-scoped MANAGE lane; never a terminal subscription.
   AI_AGENT_RESPONSE = 93;
+  TERMINAL_ATTACH_RESULT = 94; // Encrypted SUBSCRIBE result, never an ordered event/ACK.
 }
 
 message AiAgentRequestPayload { bytes request_id = 1; string json = 2; }
@@ -128,6 +133,9 @@ message OutputChunkPayload {
   // while retaining the source event anchor.
   uint64 presentation_revision = 3;
 }
+// The bounded TLBROV1 reference is specified in BROKER_CAPTURES_V1.md.
+// Required capability: terminal_broker_captures_v1; never ignore this event.
+message BrokerOutputPayload { bytes reference_v1 = 1; }
 message OutputAckPayload { uint64 highest_contiguous_seq = 1; repeated SequenceRange missing = 2; }
 message SequenceRange { uint64 start = 1; uint64 end = 2; }
 // Android sends this encrypted payload to advertise an absolute bound for the
@@ -155,6 +163,10 @@ message InputEventPayload {
   optional TerminalInputV1 typed_input = 7;
 }
 message InputResultPayload { bytes input_id = 1; bool accepted = 2; string reason_code = 3; }
+// Fixed, versioned core event bytes; encrypted like terminal output.
+message HostGeometryPayload { bytes geometry_v1 = 1; }
+message HostThemePayload { bytes theme_v1 = 1; }
+message HostResizeResultPayload { bytes result_v1 = 1; }
 message ResizePayload {
   uint32 columns = 1;
   uint32 rows = 2;
@@ -187,6 +199,8 @@ message SessionUpsertPayload {
   // This payload is already sealed inside the recipient-specific Envelope.
   // Absence retains the current title; a present empty value clears it.
   optional string title = 9;
+  // Present only inside a recipient-specific sealed SessionEnded Envelope.
+  optional string terminal_protocol_diagnostic = 10;
 }
 message SessionTerminateRequestPayload {
   bytes request_id = 1;
@@ -204,6 +218,42 @@ enum HostHistoryRequestKindV1 {
   HOST_HISTORY_REQUEST_KIND_V1_LATEST_SNAPSHOT = 1;
   HOST_HISTORY_REQUEST_KIND_V1_TRANSCRIPT_PAGE = 2;
   HOST_HISTORY_REQUEST_KIND_V1_EVENT_RANGE = 3;
+  HOST_HISTORY_REQUEST_KIND_V1_FROZEN_BEGIN = 4;
+  HOST_HISTORY_REQUEST_KIND_V1_FROZEN_PAGE = 5;
+  HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE = 6;
+  HOST_HISTORY_REQUEST_KIND_V1_STATE_DELTA = 7;
+  HOST_HISTORY_REQUEST_KIND_V1_BROKER_CAPTURE = 8;
+}
+
+// Frozen history uses a host-issued opaque token. BEGIN leaves token empty;
+// PAGE and RELEASE must echo the 32-byte token and capture identity.
+message FrozenHistoryRequest {
+  bytes token = 1;
+  uint64 capture_id = 2;
+  uint64 capture_revision = 3;
+  uint32 max_lines = 4;
+  uint32 max_cells = 5;
+  uint32 max_utf8_bytes = 6;
+  uint32 page_format_version = 7;
+}
+
+// A Delta request identifies the Android checkpoint, not a frozen-history
+// capture. snapshot_seq=0 on the outer request selects the Host's latest S;
+// nonzero selects that exact S.
+message StateDeltaRequestV1 {
+  bytes context_id = 1; // 32 bytes, bound to the session/stream/branch.
+  uint32 profile = 2; // One of the four terminal-core Delta V1 profiles.
+  uint64 base_next_source_sequence = 3;
+  uint64 base_snapshot_bytes = 4;
+  bytes base_snapshot_sha256 = 5; // 32 bytes.
+}
+
+// Repeats the identity authenticated by an ordered BrokerOutput reference.
+message BrokerCaptureSelectionV1 {
+  bytes object_id = 1; // RFC4122 UUID, 16 bytes, nonzero.
+  uint64 source_event_seq = 2;
+  uint32 canonical_bytes = 3; // 136..32 MiB including the TLCAPV1 header.
+  bytes canonical_sha256 = 4; // 32 bytes.
 }
 
 message HostHistoryRequestPayload {
@@ -214,6 +264,10 @@ message HostHistoryRequestPayload {
   uint64 after_seq = 5;
   uint64 through_seq = 6;
   uint32 max_events = 7;
+  repeated string subscriber_capabilities = 8;
+  FrozenHistoryRequest frozen_history = 9;
+  StateDeltaRequestV1 state_delta = 10;
+  BrokerCaptureSelectionV1 broker_capture = 11;
 }
 
 enum HostHistoryResponseStatusV1 {
@@ -230,6 +284,62 @@ enum HostHistoryObjectKindV1 {
   HOST_HISTORY_OBJECT_KIND_V1_SNAPSHOT = 1;
   HOST_HISTORY_OBJECT_KIND_V1_TRANSCRIPT = 2;
   HOST_HISTORY_OBJECT_KIND_V1_EVENT_CHUNK = 3;
+  HOST_HISTORY_OBJECT_KIND_V1_FROZEN_PAGE = 4;
+  HOST_HISTORY_OBJECT_KIND_V1_STATE_DELTA = 5;
+  HOST_HISTORY_OBJECT_KIND_V1_BROKER_CAPTURE = 6;
+}
+
+message FrozenHistoryMetadata {
+  bytes token = 1;
+  uint64 capture_id = 2;
+  uint64 capture_revision = 3;
+  uint64 lease_remaining_ms = 4;
+  string state_contract = 5;
+  bool head_truncated = 6;
+  uint64 required_cells = 7;
+  uint64 required_utf8_bytes = 8;
+  // Also present on an empty RELEASE response, which has no outer page object.
+  uint64 snapshot_seq = 9;
+}
+
+// Repeated identically on every chunk of a TLDSEAL1 Delta object. The
+// encrypted TLDELTA1 header must repeat these checkpoint identities.
+message StateDeltaMetadataV1 {
+  bytes context_id = 1; // 32 bytes.
+  uint32 profile = 2;
+  uint64 base_next_source_sequence = 3;
+  uint64 target_next_source_sequence = 4;
+  uint64 base_snapshot_bytes = 5;
+  uint64 target_snapshot_bytes = 6;
+  bytes base_snapshot_sha256 = 7; // 32 bytes.
+  bytes target_snapshot_sha256 = 8; // 32 bytes.
+}
+
+// A separate AEAD container for one immutable native history page. The
+// selection fields are authenticated as AAD; ciphertext includes its AEAD tag.
+message FrozenHistoryCiphertextV1 {
+  uint32 container_version = 1;
+  bytes session_id = 2;
+  bytes pc_device_id = 3;
+  bytes recipient_device_id = 4;
+  int64 key_epoch = 5;
+  string key_id = 6;
+  bytes token = 7;
+  uint64 capture_id = 8;
+  uint64 capture_revision = 9;
+  uint64 snapshot_seq = 10;
+  uint64 request_before_line_id = 11;
+  uint32 max_lines = 12;
+  uint32 max_cells = 13;
+  uint32 max_utf8_bytes = 14;
+  uint32 page_format_version = 15;
+  uint64 plaintext_bytes = 16;
+  bytes nonce = 17;
+  bytes ciphertext = 18;
+  uint64 first_line_id = 19;
+  uint64 last_line_id = 20;
+  bool has_more_before = 21;
+  uint64 next_before_line_id = 22;
 }
 
 // Each response chunk repeats authenticated selection metadata. The opaque
@@ -262,6 +372,9 @@ message HostHistoryResponsePayload {
   uint32 chunk_count = 23;
   bytes object_chunk = 24;
   string error_code = 25;
+  FrozenHistoryMetadata frozen_history = 26;
+  StateDeltaMetadataV1 state_delta = 27;
+  BrokerCaptureSelectionV1 broker_capture = 28;
 }
 
 enum HostHistoryControlActionV1 {
@@ -278,7 +391,22 @@ message HostHistoryControlPayload {
   bytes object_id = 3;
   uint32 chunk_index = 4;
 }
-message SubscribePayload { uint64 resume_from_seq = 1; bytes subscriber_exchange_public_key = 2; }
+// Decoder support is distinct from Relay routing support. Capabilities do not
+// change the session's fixed parser/width profile. Missing required support
+// rejects this attachment before any terminal event or snapshot is delivered.
+message SubscribePayload {
+  uint64 resume_from_seq = 1;
+  bytes subscriber_exchange_public_key = 2;
+  repeated string subscriber_capabilities = 3;
+  bytes request_id = 4;
+}
+message TerminalAttachResultPayload {
+  bytes request_id = 1;
+  string required_state = 2;
+  string error_code = 3; // Empty only when the terminal state contract was accepted.
+  // Host features are separate from parser/profile compatibility and may be absent on old hosts.
+  repeated string host_capabilities = 4;
+}
 message LeasePayload { bytes lease_id = 1; int64 version = 2; int64 expires_at_ms = 3; string reason_code = 4; uint64 local_input_epoch = 5; }
 message GapPayload { uint64 start = 1; uint64 end = 2; string reason_code = 3; }
 message SnapshotOfferPayload { uint64 snapshot_seq = 1; uint32 columns = 2; uint32 rows = 3; string format_name = 4; uint32 format_version = 5; uint64 ciphertext_bytes = 6; }

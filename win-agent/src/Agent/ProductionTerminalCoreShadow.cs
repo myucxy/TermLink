@@ -59,6 +59,11 @@ namespace TermLink.Agent
         {
             if (frame == null) throw new ArgumentNullException(nameof(frame));
             if (disposed || terminal == null) return;
+            if (frame.Type == LocalFrameType.BrokerOutput)
+            {
+                Retire("BROKER_CAPTURE_UNSUPPORTED");
+                return;
+            }
             try
             {
                 NativeTerminalHostEffectFrameV2 effects;
@@ -69,6 +74,14 @@ namespace TermLink.Agent
                             frame.Sequence,
                             frame.Payload);
                         break;
+                    case LocalFrameType.HostTheme:
+                        effects = terminal.ApplyBatchWithHostEffectsV2(NativeTerminalBatchEvent.HostTheme(
+                            frame.Sequence, NativeTerminalHostThemeV1.Decode(frame.Payload)));
+                        break;
+                    case LocalFrameType.HostGeometry:
+                        effects = terminal.ApplyBatchWithHostEffectsV2(NativeTerminalBatchEvent.HostGeometry(
+                            frame.Sequence, NativeTerminalHostGeometryV1.Decode(frame.Payload)));
+                        break;
                     case LocalFrameType.Resize:
                         LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
                         effects = terminal.ApplyResizeWithHostEffectsV2(
@@ -78,6 +91,11 @@ namespace TermLink.Agent
                         break;
                     case LocalFrameType.Gap:
                         effects = terminal.ApplyGapWithHostEffectsV2(frame.Sequence);
+                        break;
+                    case LocalFrameType.HostResizeResult:
+                        if (LocalPayloadCodec.ParseHostResizeResult(frame.Payload).SourceSequence >= frame.Sequence)
+                            throw new InvalidDataException("Host resize result precedes its source request.");
+                        effects = terminal.ApplyAdvanceWithHostEffectsV2(frame.Sequence, 0);
                         break;
                     case LocalFrameType.Title:
                         // A structured Title frame is out-of-band REST metadata rather than VT
@@ -115,7 +133,7 @@ namespace TermLink.Agent
                 // authoritative PTY response; accepting and discarding this validated record
                 // prevents capability queries from retiring the shadow without duplicating it.
                 if (frame.Type != LocalFrameType.Output ||
-                    effect.Kind != NativeTerminalHostEffectKindV2.PtyReply ||
+                    (effect.Kind != NativeTerminalHostEffectKindV2.PtyReply && effect.Kind != NativeTerminalHostEffectKindV2.ResizeRequest && effect.Kind != NativeTerminalHostEffectKindV2.PlatformAction) ||
                     effect.SourceSequence != frame.Sequence ||
                     effect.SourceOffsetEnd < 1 ||
                     effect.SourceOffsetEnd > frame.Payload.Length ||

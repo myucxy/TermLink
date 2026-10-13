@@ -945,7 +945,41 @@ func (a *API) listPCs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	projectPCServerCapabilities(items)
+	projectPCCommandCapabilities(items, pcCommandCapabilitiesRequested(r))
 	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+const (
+	pcCommandCapabilitiesHeader = "X-TermLink-PC-Command-Capabilities"
+	enhancedPowerShellCommandID = "powershell-7-enhanced"
+)
+
+func pcCommandCapabilitiesRequested(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL == nil || r.URL.Path != "/v1/pcs" {
+		return false
+	}
+	values := r.Header.Values(pcCommandCapabilitiesHeader)
+	return len(values) == 1 && strings.TrimSpace(values[0]) == enhancedPowerShellCommandID
+}
+
+func projectPCCommandCapabilities(items []store.PCRecord, exposeEnhanced bool) {
+	if exposeEnhanced {
+		return
+	}
+	for index := range items {
+		commands := items[index].TerminalCommands
+		if len(commands) == 0 {
+			continue
+		}
+		projected := make([]store.TerminalCommandCapability, 0, len(commands))
+		for _, command := range commands {
+			if command.ID == enhancedPowerShellCommandID && command.ShellType == "powershell-7" && command.Source == "detected" {
+				continue
+			}
+			projected = append(projected, command)
+		}
+		items[index].TerminalCommands = projected
+	}
 }
 
 func projectPCServerCapabilities(items []store.PCRecord) {
@@ -1181,9 +1215,11 @@ func normalizeTerminalCommands(values []store.TerminalCommandCapability) ([]stor
 		}
 		switch value.Source {
 		case "detected":
-			if value.ShellType != value.ID ||
-				(value.ID != "command-prompt" && value.ID != "windows-powershell" &&
-					value.ID != "powershell-7" && value.ID != "wsl") {
+			legacyDetected := value.ShellType == value.ID &&
+				(value.ID == "command-prompt" || value.ID == "windows-powershell" ||
+					value.ID == "powershell-7" || value.ID == "wsl")
+			enhancedPowerShell := value.ID == "powershell-7-enhanced" && value.ShellType == "powershell-7"
+			if !legacyDetected && !enhancedPowerShell {
 				return nil, errors.New("invalid detected terminal command capability")
 			}
 		case "manual":
@@ -2702,6 +2738,13 @@ func (a *API) idempotency(next http.Handler) http.Handler {
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
+			// PC metadata is a periodically refreshed current-state declaration,
+			// not a replayable command. Keep the request/key guards above, but do
+			// not let a stale response prevent the next state from being stored.
+			if isCurrentPCUpsertRequest(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			digest := idempotencyRequestDigest(r, body)
 			p := principal(r)
 			result, err := a.Store.ClaimIdempotency(r.Context(), p.UserID, key, digest)
@@ -2740,6 +2783,22 @@ func (a *API) idempotency(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isCurrentPCUpsertRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodPut || r.URL == nil {
+		return false
+	}
+	const prefix = "/v1/pcs/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	id := strings.TrimPrefix(r.URL.Path, prefix)
+	if id == "" || strings.Contains(id, "/") {
+		return false
+	}
+	_, err := uuid.Parse(id)
+	return err == nil
 }
 
 func idempotencyRequestDigest(r *http.Request, body []byte) [32]byte {

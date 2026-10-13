@@ -29,6 +29,18 @@ namespace TermLink.ProductionDirectTransport.Validation
         {
             try
             {
+                if (args.SequenceEqual(new[] { "--relay-outbox-only" }))
+                {
+                    await ProductionRelayExactOutboxValidation.ValidateAsync().ConfigureAwait(false);
+                    Console.WriteLine("Relay exact outbox validation passed (no LAN/NAT tests).");
+                    return 0;
+                }
+                if (args.SequenceEqual(new[] { "--broker-capabilities-only" }))
+                {
+                    ValidateBrokerCaptureCapabilityNegotiation();
+                    Console.WriteLine("Broker capture Relay capability validation passed.");
+                    return 0;
+                }
                 var unsupportedArguments = args.Where(value =>
                         !string.Equals(
                             value,
@@ -329,6 +341,53 @@ namespace TermLink.ProductionDirectTransport.Validation
                     new byte[ProductionRealtimeCapabilities.MaximumWelcomeBytes + 1],
                     advertised),
                 "An oversized Welcome payload was accepted.");
+        }
+
+        private static void ValidateBrokerCaptureCapabilityNegotiation()
+        {
+            var broker = ProductionRealtimeCapabilities.TerminalBrokerCapturesV1;
+            var relay = new[] { "host_history_v1", broker };
+            var subscriber = new[] { "host_history_v1", broker };
+            var advertised = ProductionRealtimeCapabilities.BuildAdvertisedCapabilities(
+                terminalSnapshotEnabled: true, typedInputEnabled: true,
+                directTransportDataEnabled: false, brokerCaptureEnabled: true);
+            Require(advertised.Count(value => value == broker) == 1,
+                "The Broker capture feature was not advertised exactly once.");
+            using (var hello = JsonDocument.Parse(ProductionAgentRuntime.BuildHelloPayloadWithFeatures(
+                terminalSnapshotEnabled: true, typedInputEnabled: true,
+                directTransportDataEnabled: false, brokerCaptureEnabled: true)))
+            {
+                var values = hello.RootElement.GetProperty("capabilities").EnumerateArray()
+                    .Select(value => value.GetString()).ToArray();
+                Require(values.Count(value => value == broker) == 1 &&
+                    values.SequenceEqual(advertised),
+                    "The actual Relay HELLO and Welcome allowlist advertised different capabilities.");
+            }
+            Require(!ProductionRealtimeCapabilities.BuildAdvertisedCapabilities(
+                    true, true, false, brokerCaptureEnabled: false).Contains(broker),
+                "The disabled Broker capture feature leaked into Relay HELLO.");
+            Require(ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    true, true, relay, subscriber).Length == 0,
+                "A fully negotiated Broker capture session was rejected.");
+            Require(ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    true, true, new[] { "host_history_v1" }, subscriber) ==
+                    "TERMINAL_RELAY_UPGRADE_REQUIRED" &&
+                ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    true, true, new[] { broker }, subscriber) ==
+                    "TERMINAL_RELAY_UPGRADE_REQUIRED",
+                "An old Relay was misreported as an old Android client.");
+            Require(ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    true, true, relay, new[] { "host_history_v1" }) ==
+                    "TERMINAL_CLIENT_UPGRADE_REQUIRED" &&
+                ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    true, true, relay, new[] { broker }) ==
+                    "TERMINAL_CLIENT_UPGRADE_REQUIRED",
+                "An old Android client was accepted for Broker capture.");
+            Require(ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    true, false, Array.Empty<string>(), Array.Empty<string>()).Length == 0 &&
+                ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                    false, true, Array.Empty<string>(), Array.Empty<string>()).Length == 0,
+                "Legacy and disabled sessions incorrectly require Broker capture capabilities.");
         }
 
         private static void ValidateDirectDataPlaneAdmission()

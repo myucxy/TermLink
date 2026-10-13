@@ -314,10 +314,14 @@
                         <TextBlock Text="{Binding StateText}" FontWeight="SemiBold" />
                         <TextBlock Text="{Binding ViewerText}" Classes="muted" FontSize="12" />
                       </StackPanel>
-                      <Button Grid.Column="3" Classes="danger" Content="{x:Static text:PresentationText.StopSession}"
+                      <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="6">
+                      <Button Classes="subtle" Content="{x:Static text:PresentationText.TerminalProtocolDiagnostic}"
+                              IsVisible="{Binding HasTerminalDiagnostic}" Command="{Binding $parent[Window].DataContext.ShowTerminalDiagnosticCommand}" CommandParameter="{Binding}" />
+                      <Button Classes="danger" Content="{x:Static text:PresentationText.StopSession}"
                               IsVisible="{Binding CanStop}"
                               Command="{Binding $parent[Window].DataContext.StopSessionCommand}"
                               CommandParameter="{Binding SessionId}" />
+                      </StackPanel>
                     </Grid>
                   </Border>
                 </DataTemplate>
@@ -555,6 +559,20 @@
         </Grid>
       </Grid>
     </Grid>
+
+    <Border x:Name="TerminalDiagnosticOverlay" KeyboardNavigation.TabNavigation="Cycle" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding TerminalDiagnosticVisible}" ZIndex="106">
+      <Border Classes="card" MaxWidth="700" Margin="24" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="18">
+        <StackPanel Spacing="10">
+          <TextBlock Text="{x:Static text:PresentationText.TerminalProtocolDiagnostic}" FontSize="18" FontWeight="SemiBold" />
+          <TextBlock Text="{x:Static text:PresentationText.TerminalProtocolDiagnosticContext}" TextWrapping="Wrap" Classes="muted" />
+          <TextBox x:Name="TerminalDiagnosticTextBox" Text="{Binding TerminalDiagnosticText, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="380" />
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <Button Content="{x:Static text:PresentationText.CopyTerminalDiagnostic}" Click="CopyTerminalDiagnostic" />
+            <Button x:Name="CloseTerminalDiagnosticButton" Content="{x:Static text:PresentationText.CloseTerminalDiagnostic}" Command="{Binding CloseTerminalDiagnosticCommand}" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Border>
 
     <Border x:Name="ConfirmationOverlay" KeyboardNavigation.TabNavigation="Cycle" Grid.ColumnSpan="2" Background="{DynamicResource TermLinkScrimBrush}" IsVisible="{Binding ConfirmationVisible}" ZIndex="100">
       <Border Classes="card" Width="460" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="24">

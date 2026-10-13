@@ -81,6 +81,8 @@ namespace TermLink.Agent
         private sealed class ProductionState : IDisposable
         {
             public readonly object Sync = new object();
+            public readonly TerminalSemanticProfile Profile;
+            public readonly bool NativeAuthority;
             public readonly PortableTerminalModelV1 Model;
             public TerminalLifecycleV1 Lifecycle = TerminalLifecycleV1.Running;
             public bool HasExitCode;
@@ -95,10 +97,13 @@ namespace TermLink.Agent
             public bool TerminalCoreSequenceRebuildPending;
 
             public ProductionState(
+                TerminalSemanticProfile profile,
                 bool terminalCoreSnapshotAuthorityEnabled,
                 Action<IReadOnlyList<PortableTerminalRowV1>> transcriptArchiveSink)
             {
-                if (!terminalCoreSnapshotAuthorityEnabled)
+                Profile = profile ?? throw new ArgumentNullException(nameof(profile));
+                NativeAuthority = profile.IsGraphics || terminalCoreSnapshotAuthorityEnabled;
+                if (!NativeAuthority)
                 {
                     Model = new PortableTerminalModelV1(
                         DefaultColumns,
@@ -128,7 +133,13 @@ namespace TermLink.Agent
             {
                 try
                 {
-                    TerminalCore = NativeTerminalCoreV2.Create(
+                    TerminalCore = Profile.IsGraphics ? NativeTerminalCoreV2.CreateGraphicsV1(
+                        DefaultColumns,
+                        DefaultRows,
+                        initialSourceSequence: 1,
+                        historyCapacityRows: 20_000,
+                        outputProfile: NativeTerminalOutputProfile.Utf8,
+                        widthProfile: (NativeTerminalWidthProfile)Profile.WidthProfile) : NativeTerminalCoreV2.Create(
                         DefaultColumns,
                         DefaultRows,
                         initialSourceSequence: 1,
@@ -351,7 +362,8 @@ namespace TermLink.Agent
             }
 
             var outputAnchor = state.PendingFrames.Values
-                .Where(value => value.Type == LocalFrameType.Output)
+                .Where(value => value.Type == LocalFrameType.Output ||
+                    value.Type == LocalFrameType.BrokerOutput)
                 .Select(value => value.Sequence)
                 .DefaultIfEmpty(0UL)
                 .Max();
@@ -380,10 +392,10 @@ namespace TermLink.Agent
             var applied = outputAnchor == 0
                 ? Array.Empty<ulong>()
                 : state.PendingFrames.Keys.Where(value => value <= outputAnchor).ToArray();
-            var shadowFrames = terminalCoreShadowEnabled
+            var shadowFrames = terminalCoreShadowEnabled && !state.Profile.IsGraphics
                 ? new List<LocalFrame>(applied.Length)
                 : null;
-            if (terminalCoreSnapshotAuthorityEnabled && state.TerminalCore != null)
+            if (state.NativeAuthority && state.TerminalCore != null)
                 ValidateTerminalCoreReplayPrefix(sessionId, state, applied);
             foreach (var sequence in applied)
             {
@@ -393,7 +405,10 @@ namespace TermLink.Agent
                 // A later pass ignores <= AppliedSequence and resumes exactly.
                 if (shouldYield?.Invoke() == true) return null;
                 var frame = state.PendingFrames[sequence];
-                if (terminalCoreSnapshotAuthorityEnabled)
+                if (frame.Type == LocalFrameType.HostResizeResult &&
+                    LocalPayloadCodec.ParseHostResizeResult(frame.Payload).SourceSequence >= frame.Sequence)
+                    throw new InvalidDataException("Host resize result precedes its source request.");
+                if (state.NativeAuthority)
                 {
                     // Once native Snapshot production is retired, continue the
                     // lightweight durable projection through the output anchor.
@@ -413,12 +428,13 @@ namespace TermLink.Agent
                     ref state.ExitCode,
                     ref state.LocalInputEpoch);
                 state.AppliedSequence = frame.Sequence;
-                if (frame.Type == LocalFrameType.Output) state.HasOutput = true;
+                if (frame.Type == LocalFrameType.Output || frame.Type == LocalFrameType.BrokerOutput)
+                    state.HasOutput = true;
                 state.PendingFrames.Remove(sequence);
             }
 
             if (shouldYield?.Invoke() == true) return null;
-            if (terminalCoreSnapshotAuthorityEnabled && state.TerminalCore != null)
+            if (state.NativeAuthority && state.TerminalCore != null)
                 state.TerminalCoreSequenceRebuildPending = false;
 
             return ProduceCheckpoint(
@@ -440,12 +456,12 @@ namespace TermLink.Agent
             var result = new ProductionTerminalHistoryProductionResult
             {
                 SessionId = sessionId,
-                // Snapshot S is deliberately the latest Output sequence. REST
+                // Snapshot S is deliberately the latest Output or BrokerOutput sequence. REST
                 // last_output_seq therefore selects the same state, while any
                 // Resize/Title/Lifecycle at S+1 is replayed as a normal suffix.
                 LastSequence = state.AppliedSequence
             };
-            if (!terminalCoreSnapshotAuthorityEnabled &&
+            if (!state.NativeAuthority &&
                 (state.Model.Columns > MaximumWireColumns || state.Model.Rows > MaximumWireRows))
             {
                 shadowDispatch = CreateShadowDispatchRequest(
@@ -460,7 +476,7 @@ namespace TermLink.Agent
                 return result;
             }
             PortableTerminalSnapshotV1 portable = null;
-            if (!terminalCoreSnapshotAuthorityEnabled &&
+            if (!state.NativeAuthority &&
                 !state.Model.TryCreateSnapshot(out portable))
             {
                 result.PermanentlyIneligible = !string.IsNullOrWhiteSpace(
@@ -492,7 +508,7 @@ namespace TermLink.Agent
                 return result;
             }
 
-            if (terminalCoreSnapshotAuthorityEnabled)
+            if (state.NativeAuthority)
                 return ProduceTerminalCoreCheckpoint(sessionId, state, result);
 
             var styleTable = BuildStyleTable(portable);
@@ -605,14 +621,30 @@ namespace TermLink.Agent
                     if (checkpoint.Info.NextSourceSequence != checked(state.AppliedSequence + 1))
                         throw new InvalidDataException(
                             "terminal-core checkpoint source sequence does not match the durable anchor.");
-                    var frameBytes = checkpoint.ExportRenderFrameV3();
-                    NativeTerminalRenderFrameV3 frame;
+                    var frameBytes = state.Profile.IsGraphics
+                        ? checkpoint.ExportRenderFrameV5() : checkpoint.ExportRenderFrameV3();
                     try
                     {
-                        frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
-                        if (frame.NextSourceSequence != checkpoint.Info.NextSourceSequence ||
-                            frame.Columns < 1 || frame.Columns > MaximumWireColumns ||
-                            frame.Rows < 1 || frame.Rows > MaximumWireRows)
+                        ulong nextSourceSequence;
+                        if (state.Profile.IsGraphics)
+                        {
+                            var frame = NativeTerminalRenderFrameV5Decoder.Decode(frameBytes).Text;
+                            if (frame.WidthProfile != (NativeTerminalWidthProfile)state.Profile.WidthProfile)
+                                throw new InvalidDataException("Graphics checkpoint width profile does not match the session.");
+                            snapshotColumns = frame.Columns;
+                            snapshotRows = frame.Rows;
+                            nextSourceSequence = frame.NextSourceSequence;
+                        }
+                        else
+                        {
+                            var frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
+                            snapshotColumns = frame.Columns;
+                            snapshotRows = frame.Rows;
+                            nextSourceSequence = frame.NextSourceSequence;
+                        }
+                        if (nextSourceSequence != checkpoint.Info.NextSourceSequence ||
+                            snapshotColumns < 1 || snapshotColumns > MaximumWireColumns ||
+                            snapshotRows < 1 || snapshotRows > MaximumWireRows)
                         {
                             throw new InvalidDataException(
                                 "terminal-core checkpoint presentation metadata is invalid.");
@@ -620,9 +652,8 @@ namespace TermLink.Agent
                     }
                     finally { CryptographicOperations.ZeroMemory(frameBytes); }
 
-                    snapshotColumns = frame.Columns;
-                    snapshotRows = frame.Rows;
-                    snapshotBytes = checkpoint.ExportSnapshot();
+                    snapshotBytes = state.Profile.IsGraphics
+                        ? checkpoint.ExportGraphicsSnapshot() : checkpoint.ExportSnapshot();
                 }
             }
             catch (Exception error)
@@ -640,7 +671,8 @@ namespace TermLink.Agent
                 var sizeError = ValidateArtifactSizes(
                     snapshotBytes,
                     Array.Empty<byte[]>(),
-                    terminalCoreSnapshot: true);
+                    terminalCoreSnapshot: true,
+                    graphicsSnapshot: state.Profile.IsGraphics);
                 if (sizeError != null) return RejectCheckpoint(result, sizeError);
 
                 // The canonical native checkpoint owns the bounded scrollback restored by
@@ -668,7 +700,8 @@ namespace TermLink.Agent
                     snapshotRows,
                     initialTranscriptBeforeLineId,
                     state.LocalInputEpoch,
-                    snapshotBytes);
+                    snapshotBytes,
+                    state.Profile);
                 store.SaveProduction(productionCheckpoint, productionOutbox);
             }
             finally
@@ -706,6 +739,7 @@ namespace TermLink.Agent
         private ProductionState CreateProductionState(Guid sessionId)
         {
             return new ProductionState(
+                store.GetSessionProfile(sessionId),
                 terminalCoreSnapshotAuthorityEnabled,
                 rows => store.AppendTranscriptArchivePage(sessionId, rows));
         }
@@ -913,7 +947,8 @@ namespace TermLink.Agent
             {
                 SessionId = result.SessionId,
                 LastSequence = result.LastSequence,
-                AuthorityVersion = terminalCoreSnapshotAuthorityEnabled ? 2 : 1,
+                AuthorityVersion = terminalCoreSnapshotAuthorityEnabled ||
+                    store.GetSessionProfile(result.SessionId).IsGraphics ? 2 : 1,
                 SnapshotEligible = false,
                 IneligibilityCode = result.IneligibilityCode,
                 SnapshotPlaintext = null,
@@ -928,6 +963,8 @@ namespace TermLink.Agent
                 case LocalFrameType.Output:
                     model.ApplyOutput(frame.Sequence, frame.Payload);
                     return;
+                case LocalFrameType.BrokerOutput:
+                    throw new ProductionBrokerCaptureReplayException("BROKER_CAPTURE_UNSUPPORTED");
                 case LocalFrameType.Resize:
                     LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
                     model.ApplyResize(frame.Sequence, columns, rows);
@@ -975,7 +1012,7 @@ namespace TermLink.Agent
             }
         }
 
-        private static bool ApplyTerminalCoreFrame(
+        private bool ApplyTerminalCoreFrame(
             Guid sessionId,
             ProductionState state,
             LocalFrame frame)
@@ -984,12 +1021,25 @@ namespace TermLink.Agent
             try
             {
                 NativeTerminalHostEffectFrameV2 effects;
+                var sourceOutputLength = frame.Payload.Length;
                 switch (frame.Type)
                 {
                     case LocalFrameType.Output:
                         effects = state.TerminalCore.ApplyOutputWithHostEffectsV2(
                             frame.Sequence,
                             frame.Payload);
+                        break;
+                    case LocalFrameType.BrokerOutput:
+                        effects = ProductionBrokerCaptureReplay.Apply(store, sessionId, frame,
+                            state.TerminalCore, out sourceOutputLength);
+                        break;
+                    case LocalFrameType.HostTheme:
+                        effects = state.TerminalCore.ApplyBatchWithHostEffectsV2(NativeTerminalBatchEvent.HostTheme(
+                            frame.Sequence, NativeTerminalHostThemeV1.Decode(frame.Payload)));
+                        break;
+                    case LocalFrameType.HostGeometry:
+                        effects = state.TerminalCore.ApplyBatchWithHostEffectsV2(NativeTerminalBatchEvent.HostGeometry(
+                            frame.Sequence, NativeTerminalHostGeometryV1.Decode(frame.Payload)));
                         break;
                     case LocalFrameType.Resize:
                         LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);
@@ -1008,7 +1058,7 @@ namespace TermLink.Agent
                             0);
                         break;
                 }
-                ValidateAndDiscardHostEffects(frame, effects);
+                ValidateAndDiscardHostEffects(frame, effects, sourceOutputLength);
                 return true;
             }
             catch (NativeTerminalException error)
@@ -1043,7 +1093,8 @@ namespace TermLink.Agent
 
         private static void ValidateAndDiscardHostEffects(
             LocalFrame frame,
-            NativeTerminalHostEffectFrameV2 effects)
+            NativeTerminalHostEffectFrameV2 effects,
+            int sourceOutputLength)
         {
             if (effects == null)
                 throw new InvalidDataException("terminal-core returned no Host Effect V2 frame.");
@@ -1052,11 +1103,11 @@ namespace TermLink.Agent
                 // History reconstruction is a mirror. Query replies were already emitted by
                 // SessionHost when the source Output became durable, so replay validates the
                 // canonical V2 result but must never write or feed the reply back into the PTY.
-                if (frame.Type != LocalFrameType.Output ||
-                    effect.Kind != NativeTerminalHostEffectKindV2.PtyReply ||
+                if ((frame.Type != LocalFrameType.Output && frame.Type != LocalFrameType.BrokerOutput) ||
+                    (effect.Kind != NativeTerminalHostEffectKindV2.PtyReply && effect.Kind != NativeTerminalHostEffectKindV2.ResizeRequest && effect.Kind != NativeTerminalHostEffectKindV2.PlatformAction) ||
                     effect.SourceSequence != frame.Sequence ||
                     effect.SourceOffsetEnd < 1 ||
-                    effect.SourceOffsetEnd > frame.Payload.Length ||
+                    effect.SourceOffsetEnd > sourceOutputLength ||
                     effect.Payload == null ||
                     effect.Payload.Count == 0)
                 {
@@ -1068,6 +1119,7 @@ namespace TermLink.Agent
 
         private static string NativeFailureCode(Exception error)
         {
+            if (error is ProductionBrokerCaptureReplayException broker) return broker.Code;
             if (error is NativeTerminalException native)
                 return "NATIVE_" + native.Status.ToString().ToUpperInvariant();
             if (error is DllNotFoundException) return "NATIVE_DLL_NOT_FOUND";
@@ -1247,12 +1299,15 @@ namespace TermLink.Agent
         private static string ValidateArtifactSizes(
             byte[] snapshot,
             IList<byte[]> transcriptPages,
-            bool terminalCoreSnapshot)
+            bool terminalCoreSnapshot,
+            bool graphicsSnapshot = false)
         {
-            var maximumPlaintextBytes = terminalCoreSnapshot
+            var maximumPlaintextBytes = graphicsSnapshot
+                ? SnapshotCrypto.MaxTerminalCoreGraphicsSnapshotPlaintextBytes : terminalCoreSnapshot
                 ? SnapshotCrypto.MaxTerminalCoreSnapshotPlaintextBytes
                 : SnapshotCrypto.MaxSnapshotPlaintextBytes;
-            var maximumObjectBytes = terminalCoreSnapshot
+            var maximumObjectBytes = graphicsSnapshot
+                ? SnapshotCrypto.MaxTerminalCoreGraphicsSnapshotObjectBytes : terminalCoreSnapshot
                 ? SnapshotCrypto.MaxTerminalCoreSnapshotObjectBytes
                 : SnapshotCrypto.MaxSnapshotObjectBytes;
             if (snapshot.Length > maximumPlaintextBytes)
@@ -1818,7 +1873,8 @@ namespace TermLink.Agent
             int rows,
             ulong initialTranscriptBeforeLineId,
             ulong observedLocalInputEpoch,
-            byte[] snapshotBytes)
+            byte[] snapshotBytes,
+            TerminalSemanticProfile profile)
         {
             return new ProductionTerminalHistoryOutbox
             {
@@ -1837,8 +1893,11 @@ namespace TermLink.Agent
                         TranscriptPageCount = 0,
                         Columns = columns,
                         Rows = rows,
-                        FormatName = SnapshotCrypto.TerminalCoreSnapshotFormatName,
-                        FormatVersion = checked((int)SnapshotCrypto.TerminalCoreSnapshotFormatVersion),
+                        FormatName = profile.IsGraphics ? SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName
+                            : SnapshotCrypto.TerminalCoreSnapshotFormatName,
+                        FormatVersion = checked((int)(profile.IsGraphics
+                            ? SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion
+                            : SnapshotCrypto.TerminalCoreSnapshotFormatVersion)),
                         Plaintext = (byte[])snapshotBytes.Clone()
                     }
                 }
@@ -1850,6 +1909,12 @@ namespace TermLink.Agent
             ProductionHistoryRecipient recipient,
             ProductionTerminalHistoryArtifact artifact)
         {
+            var profile = store.GetSessionProfile(sessionId);
+            var graphicsSnapshot = artifact.Kind == ProductionTerminalHistoryArtifactKind.Snapshot &&
+                artifact.FormatName == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName &&
+                artifact.FormatVersion == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion;
+            if (profile.IsGraphics != graphicsSnapshot)
+                throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
             if (artifact.Kind == ProductionTerminalHistoryArtifactKind.Transcript)
             {
                 var page = TerminalTranscriptPageV1.Parser.ParseFrom(artifact.Plaintext);
@@ -1864,6 +1929,22 @@ namespace TermLink.Agent
             }
             if (artifact.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
             {
+                if (graphicsSnapshot)
+                {
+                    return SnapshotCrypto.SealTerminalCoreGraphicsSnapshot(
+                        recipient.PairwiseKey,
+                        sessionId,
+                        pcDeviceId,
+                        recipient.DeviceId,
+                        recipient.KeyEpoch,
+                        artifact.SnapshotSequence,
+                        checked((uint)artifact.Columns),
+                        checked((uint)artifact.Rows),
+                        artifact.InitialTranscriptBeforeLineId,
+                        artifact.ObservedLocalInputEpoch,
+                        artifact.Plaintext,
+                        stateContract: profile.StateContract);
+                }
                 if (artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
                     artifact.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion)
                 {
@@ -1880,6 +1961,9 @@ namespace TermLink.Agent
                         artifact.ObservedLocalInputEpoch,
                         artifact.Plaintext);
                 }
+                if (artifact.FormatName != SnapshotCrypto.SnapshotFormatName ||
+                    artifact.FormatVersion != SnapshotCrypto.FormatVersion)
+                    throw new InvalidDataException("Terminal snapshot format is unsupported.");
                 var snapshot = TerminalSnapshotV1.Parser.ParseFrom(artifact.Plaintext);
                 return SnapshotCrypto.SealSnapshot(
                     recipient.PairwiseKey,

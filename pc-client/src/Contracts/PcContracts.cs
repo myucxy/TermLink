@@ -199,7 +199,12 @@ public sealed record ManagedSessionSnapshot(
     int ViewerCount,
     DateTimeOffset LastActivityAt,
     ulong LastSequence,
-    SessionDataPlaneCarrier Carrier = SessionDataPlaneCarrier.Relay);
+    SessionDataPlaneCarrier Carrier = SessionDataPlaneCarrier.Relay)
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? TerminalDiagnostic { get; init; }
+    public override string ToString() => $"ManagedSessionSnapshot {{ SessionId = {SessionId}, State = {State} }}";
+}
 
 public sealed record AiSessionSummary(string Id, string Title, string Agent, string Directory, string State);
 

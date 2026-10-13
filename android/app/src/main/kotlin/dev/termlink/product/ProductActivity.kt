@@ -217,6 +217,8 @@ import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportMetrics
 import dev.termlink.terminal.api.TerminalViewportEngine
 import dev.termlink.terminal.nativecore.NativeTranscriptViewport
+import dev.termlink.terminal.nativecore.NativeFrozenHistoryViewport
+import dev.termlink.terminal.nativecore.NativeTerminalEngine
 import java.time.Instant
 import java.time.LocalTime
 import java.time.ZoneId
@@ -543,11 +545,20 @@ internal object TailFirstE2EProductBridge {
     @Volatile
     private var selectedSessionId: java.util.UUID? = null
     @Volatile
+    private var closedSelectedSessionId: java.util.UUID? = null
+    @Volatile
     private var firstMarker: String? = null
     @Volatile
     private var lastMarker: String? = null
     @Volatile
     private var liveMarker: String? = null
+    @Volatile
+    private var debugRecipientIdentity: DebugIdentity? = null
+
+    internal data class DebugIdentity(
+        val androidDeviceId: String,
+        val terminalThemeScheme: Int,
+    )
 
     fun register(value: Controller) {
         if (BuildConfig.DEBUG) controller = value
@@ -556,16 +567,50 @@ internal object TailFirstE2EProductBridge {
     fun unregister() {
         controller = null
         selectedSessionId = null
+        closedSelectedSessionId = null
         firstMarker = null
         lastMarker = null
         liveMarker = null
+        debugRecipientIdentity = null
+    }
+
+    /** Debug-only evidence configured from the real account-scoped local state. */
+    fun configureDebugIdentity(androidDeviceId: String?, terminalThemeScheme: Int?) {
+        if (!BuildConfig.DEBUG) return
+        val parsed = androidDeviceId?.let { value ->
+            runCatching { java.util.UUID.fromString(value) }.getOrNull()
+                ?.takeIf { it != java.util.UUID(0, 0) && it.toString() == value }
+                ?.toString()
+        }
+        debugRecipientIdentity = if (parsed != null && (terminalThemeScheme == 1 || terminalThemeScheme == 2)) {
+            DebugIdentity(parsed, requireNotNull(terminalThemeScheme))
+        } else null
+    }
+
+    fun debugIdentity(): DebugIdentity? {
+        if (!BuildConfig.DEBUG) return null
+        return debugRecipientIdentity
     }
 
     fun selectSession(sessionId: java.util.UUID) {
         selectedSessionId = sessionId
+        closedSelectedSessionId = null
     }
 
     fun selectedSession(): java.util.UUID? = selectedSessionId
+
+    fun markSelectedViewClosed(sessionId: java.util.UUID) {
+        check(selectedSessionId == sessionId)
+        closedSelectedSessionId = sessionId
+    }
+
+    fun closedSelectedSession(): java.util.UUID? =
+        closedSelectedSessionId?.takeIf { it == selectedSessionId }
+
+    fun markSelectedViewReopened(sessionId: java.util.UUID) {
+        check(closedSelectedSession() == sessionId)
+        closedSelectedSessionId = null
+    }
 
     fun rememberMarkers(arguments: Map<String, String>) {
         arguments["first_marker"]?.let { firstMarker = it }
@@ -837,6 +882,10 @@ class ProductActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         intent.getStringExtra(AI_NOTIFICATION_TICKET)?.let { ViewModelProvider(this)[AiNotificationInbox::class.java].ticket = it }
+        cliNotificationTicket(intent)?.let {
+            ViewModelProvider(this)[CliNotificationInbox::class.java].ticket = it
+            intent.removeExtra(CLI_NOTIFICATION_TICKET)
+        }
         repositoryOwner = ViewModelProvider(
             this,
             ProductRepositoryViewModel.Factory(applicationContext),
@@ -904,6 +953,10 @@ class ProductActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         intent.getStringExtra(AI_NOTIFICATION_TICKET)?.let { ViewModelProvider(this)[AiNotificationInbox::class.java].ticket = it }
+        cliNotificationTicket(intent)?.let {
+            ViewModelProvider(this)[CliNotificationInbox::class.java].ticket = it
+            intent.removeExtra(CLI_NOTIFICATION_TICKET)
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -1213,6 +1266,13 @@ fun ProductApp(
         return true
     }
 
+    CliNotificationNavigation(snapshot) { sessionId ->
+        if (selectSessionTab(sessionId, addIfMissing = true)) {
+            navigateTo(ProductDestination.SESSIONS)
+            true
+        } else false
+    }
+
     fun removeSessionTabState(sessionId: java.util.UUID) {
         val value = sessionId.toString()
         if (value !in openedSessionIds) return
@@ -1254,6 +1314,12 @@ fun ProductApp(
         openedSessionIds,
     ) {
         val retained = retainedCliSessionTabs(snapshot, openedSessionIds).toHashSet()
+        // A host protocol failure is actionable only while the user still has
+        // that tab open and the catalog row remains present. Keep the tab long
+        // enough to read/copy its authenticated TL-DIAG; this never restores a
+        // renderer or its old buffer and is cleared by the normal close path.
+        retained += retainedProtocolDiagnosticSessionIds(snapshot, openedSessionIds)
+            .map { it.toString() }
         // Use the same local close path as a manual tab close: persist selection,
         // prune per-tab input preferences, and release renderers/subscriptions.
         openedSessionIds.filterNot(retained::contains).forEach { closeLocalSessionTab(java.util.UUID.fromString(it)) }
@@ -1364,17 +1430,28 @@ fun ProductApp(
     }
 
     if (BuildConfig.DEBUG) {
+        TailFirstE2EProductBridge.configureDebugIdentity(
+            androidDeviceId = debugAndroidDeviceId(context),
+            terminalThemeScheme = tailFirstTerminalThemeScheme(terminalPreferences),
+        )
         val tailFirstController = TailFirstE2EProductBridge.Controller { operation, requestId, arguments ->
             executeTailFirstProductOperation(
                 repository = repository,
                 operation = operation,
                 requestId = requestId,
                 arguments = arguments,
+                foregroundWindowFocused = {
+                    val activity = context as? android.app.Activity
+                    activity != null && !activity.isFinishing && !activity.isDestroyed && activity.hasWindowFocus()
+                },
                 onSelectSession = { sessionId ->
                     withContext(Dispatchers.Main.immediate) {
-                        selectSessionTab(sessionId, addIfMissing = true)
+                        check(selectSessionTab(sessionId, addIfMissing = true))
                         navigateTo(ProductDestination.SESSIONS)
                     }
+                },
+                onCloseSession = { sessionId ->
+                    withContext(Dispatchers.Main.immediate) { removeSessionTabState(sessionId) }
                 },
             )
         }
@@ -1587,6 +1664,16 @@ fun ProductApp(
                         scope.launch { runSessionOperation { repository.loadTranscriptBefore(sessionId) } }
                     },
                     onClearTranscript = repository::clearTranscript,
+                    onBeginFrozenHistory = { sessionId ->
+                        scope.launch { runSessionOperation { repository.beginFrozenHistory(sessionId) } }
+                    },
+                    onLoadFrozenHistory = { sessionId ->
+                        scope.launch { runSessionOperation { repository.loadFrozenHistoryBefore(sessionId) } }
+                    },
+                    onReleaseFrozenHistory = { sessionId ->
+                        scope.launch { runSessionOperation { repository.releaseFrozenHistory(sessionId) } }
+                    },
+                    frozenHistorySupport = repository::supportsFrozenHistory,
                     terminalEngine = repository::terminalEngine,
                     historyEngine = repository::historyEngine,
                     selectedHistoryId = selectedHistoryId,
@@ -1601,6 +1688,16 @@ fun ProductApp(
                         val value = pcId.toString()
                         expandedPcIds = if (value in expandedPcIds) expandedPcIds - value else expandedPcIds + value
                         saveExpandedProductPcs(context, expandedPcIds)
+                    },
+                    onOpenShellDirectory = { pcId, path ->
+                        val pc = snapshot.pcs.firstOrNull { it.id == pcId }
+                        if (pc != null && pc.online) {
+                            aiWorkspace.fileLocation = null
+                            selectedRemotePcId = pc.id.toString()
+                            selectedRemotePcName = pc.name
+                            navigateTo(ProductDestination.FILES)
+                            runOperation { repository.browseRemoteDirectory(pc.id, pc.name, path, null) }
+                        }
                     },
                     onBrowsePc = { pc ->
                         aiWorkspace.fileLocation = null
@@ -2298,24 +2395,133 @@ private suspend fun executeTailFirstProductOperation(
     operation: String,
     requestId: String,
     arguments: Map<String, String>,
+    foregroundWindowFocused: () -> Boolean,
     onSelectSession: suspend (java.util.UUID) -> Unit,
+    onCloseSession: suspend (java.util.UUID) -> Unit,
 ): JsonObject {
     TailFirstE2EProductBridge.rememberMarkers(arguments)
+    val openStartedAt = android.os.SystemClock.elapsedRealtime()
+    var openStage = ""
+    var openSessionId: java.util.UUID? = null
+    var surfaceSeen = false
+    var lastMarkerVisible = false
+    var liveMarkerVisible = false
+    fun logOpenStage(stage: String) {
+        if (operation != "open_session" || !BuildConfig.DEBUG) return
+        val snapshot = repository.snapshot.value
+        val sessionId = openSessionId
+        val realtime = sessionId?.let { (repository as? ProductionProductRepository)?.debugRealtimeDiagnostics(it) }
+        Log.i(
+            TAIL_FIRST_E2E_LOG_TAG,
+            "open_session stage=$stage elapsed_ms=${android.os.SystemClock.elapsedRealtime() - openStartedAt} " +
+                "session_count=${snapshot.sessions.size} " +
+                "terminal_columns=${sessionId?.let { id -> snapshot.sessions.firstOrNull { it.id == id }?.columns } ?: 0} " +
+                "marker_length=${arguments["last_marker"]?.length ?: 0} " +
+                "live_ack=${sessionId?.let { snapshot.liveAcknowledgements[it] } ?: 0uL} " +
+                "bootstrap_source=${sessionId?.let { snapshot.bootstrapSources[it]?.name } ?: "UNKNOWN"} " +
+                "subscriber_ready=${realtime?.subscriberReady == true} " +
+                "surface_registered=${sessionId?.let { TailFirstTerminalSurfaceRegistry.get(it) != null } == true} " +
+                "surface_seen=$surfaceSeen last_marker_visible=$lastMarkerVisible " +
+                "live_marker_visible=$liveMarkerVisible " +
+                "session_failure=${sessionId?.let { snapshot.sessionOpenFailures[it]?.code?.name } ?: "NONE"}",
+        )
+    }
     return try {
         when (operation) {
             "probe" -> tailFirstProbeResponse(repository, requestId, operation)
             "open_session" -> {
                 val minimumTail = arguments["minimum_tail"]?.toULongOrNull() ?: 0uL
+                openStage = "WAIT_SESSION"
+                logOpenStage(openStage)
                 val session = awaitNewTailFirstSession(repository, minimumTail)
                     ?: return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
+                openSessionId = session.id
                 TailFirstE2EProductBridge.selectSession(session.id)
                 onSelectSession(session.id)
+                openStage = "OPEN"
+                logOpenStage(openStage)
                 repository.openSession(session.id)
+                openStage = "SURFACE"
+                logOpenStage(openStage)
                 val lastMarker = arguments["last_marker"]
-                awaitTailFirstSurface(session.id) { surface ->
-                    lastMarker == null || surface.observe().liveText.contains(lastMarker)
+                // The large prefix and the final live marker are separate
+                // ordered output events.  Waiting only for the prefix tail
+                // can return while the live marker is still in flight; keep
+                // the optional marker for strict debug runs while preserving
+                // the historical behavior of every other open request.
+                val liveMarker = arguments["live_marker"]
+                awaitTailFirstSurface(session.id,
+                    timeoutMillis = tailFirstOpenSurfaceTimeoutMillis(arguments["frozen_lifecycle_acceptance"]),
+                ) { surface ->
+                    val liveText = surface.observe().liveText
+                    surfaceSeen = true
+                    lastMarkerVisible = lastMarker == null || tailFirstTextContainsMarker(liveText, lastMarker)
+                    liveMarkerVisible = liveMarker == null || tailFirstTextContainsMarker(liveText, liveMarker)
+                    tailFirstOpenMarkersReady(liveText, lastMarker, liveMarker)
                 }
-                tailFirstStateResponse(repository, session.id, requestId, operation)
+                openStage = "STATE"
+                logOpenStage(openStage)
+                tailFirstStateResponse(repository, session.id, requestId, operation).also {
+                    logOpenStage("DONE")
+                }
+            }
+            "close_view" -> {
+                val sessionId = tailFirstSelectedSession(requestId, operation)
+                    ?: return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
+                if (TailFirstE2EProductBridge.closedSelectedSession() != null ||
+                    !tailFirstSessionIsRunning(repository, sessionId) ||
+                    repository.terminalEngine(sessionId) == null ||
+                    TailFirstTerminalSurfaceRegistry.get(sessionId) == null
+                ) return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
+                onCloseSession(sessionId)
+                repository.closeSessionView(sessionId)
+                withTimeout(45_000) {
+                    while (TailFirstTerminalSurfaceRegistry.get(sessionId) != null) delay(50)
+                }
+                check(repository.terminalEngine(sessionId) == null)
+                TailFirstE2EProductBridge.markSelectedViewClosed(sessionId)
+                buildJsonObject {
+                    put("schema_version", 1)
+                    put("request_id", requestId)
+                    put("operation", operation)
+                    put("ok", true)
+                    put("session_id", sessionId.toString())
+                    put("view_closed", true)
+                    put("session_running", tailFirstSessionIsRunning(repository, sessionId))
+                }
+            }
+            "reopen_selected" -> {
+                val sessionId = TailFirstE2EProductBridge.closedSelectedSession()
+                    ?: return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
+                if (!tailFirstSessionIsRunning(repository, sessionId)) {
+                    return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
+                }
+                repository.openSession(sessionId)
+                onSelectSession(sessionId)
+                awaitTailFirstSurface(sessionId) {
+                    repository.terminalEngine(sessionId) != null &&
+                        (repository as? ProductionProductRepository)
+                            ?.debugRealtimeDiagnostics(sessionId)?.subscriberReady == true
+                }
+                val response = tailFirstStateResponse(repository, sessionId, requestId, operation)
+                TailFirstE2EProductBridge.markSelectedViewReopened(sessionId)
+                response
+            }
+            "reselect_armed_session" -> {
+                val sessionId = arguments["session_id"]?.let { runCatching {
+                    java.util.UUID.fromString(it)
+                }.getOrNull() } ?: return tailFirstFailure(requestId, operation, "SESSION_ARM_UNAVAILABLE")
+                if (!tailFirstArmedSessionEligible(repository.snapshot.value, sessionId))
+                    return tailFirstFailure(requestId, operation, "SESSION_UNAVAILABLE")
+                onSelectSession(sessionId)
+                repository.openSession(sessionId)
+                awaitTailFirstSurface(sessionId) {
+                    repository.terminalEngine(sessionId) != null &&
+                        (repository as? ProductionProductRepository)
+                            ?.debugRealtimeDiagnostics(sessionId)?.subscriberReady == true
+                }
+                TailFirstE2EProductBridge.selectSession(sessionId)
+                tailFirstStateResponse(repository, sessionId, requestId, operation)
             }
             "open_history" -> {
                 val sessionId = tailFirstSelectedSession(requestId, operation) ?: return tailFirstFailure(
@@ -2432,13 +2638,38 @@ private suspend fun executeTailFirstProductOperation(
                 awaitTailFirstSurface(sessionId) { !it.observe().historyOverlay }
                 tailFirstStateResponse(repository, sessionId, requestId, operation)
             }
+            "begin_frozen_history", "page_frozen_history", "release_frozen_history" -> {
+                val sessionId = tailFirstSelectedSession(requestId, operation) ?: return tailFirstFailure(
+                    requestId, operation, "SESSION_UNAVAILABLE",
+                )
+                when (operation) {
+                    "begin_frozen_history" -> repository.beginFrozenHistory(sessionId)
+                    "page_frozen_history" -> repository.loadFrozenHistoryBefore(sessionId)
+                    else -> repository.releaseFrozenHistory(sessionId)
+                }
+                val frozen = repository.snapshot.value.frozenHistoryViewports[sessionId]
+                frozen?.error?.let { return tailFirstFailure(requestId, operation, it.substringBefore(' ')) }
+                awaitTailFirstUiFrame()
+                tailFirstFrozenStateResponse(repository, sessionId, requestId, operation)
+            }
             "inspect" -> {
                 val sessionId = tailFirstSelectedSession(requestId, operation) ?: return tailFirstFailure(
                     requestId,
                     operation,
                     "SESSION_UNAVAILABLE",
                 )
-                tailFirstStateResponse(repository, sessionId, requestId, operation)
+                val fixtureRequested = arguments["clipboard_fixture"] != null
+                if (fixtureRequested && !tailFirstClipboardFixtureEligible(
+                        repository.snapshot.value, sessionId, foregroundWindowFocused(),
+                        TailFirstE2EProductBridge.selectedSession(),
+                        TailFirstTerminalSurfaceRegistry.get(sessionId) != null,
+                        System.currentTimeMillis(),
+                    )) return tailFirstFailure(requestId, operation, "FIXTURE_NOT_READY")
+                val state = tailFirstStateResponse(repository, sessionId, requestId, operation)
+                if (!fixtureRequested) state else buildJsonObject {
+                    state.forEach { (key, value) -> put(key, value) }
+                    put("clipboard_fixture_ready", true)
+                }
             }
             "show_ime" -> {
                 val sessionId = tailFirstSelectedSession(requestId, operation) ?: return tailFirstFailure(
@@ -2465,10 +2696,15 @@ private suspend fun executeTailFirstProductOperation(
     } catch (error: TimeoutCancellationException) {
         val observedFailure = TailFirstE2EProductBridge.selectedSession()
             ?.let(repository.snapshot.value.sessionOpenFailures::get)
+        logOpenStage("${openStage.ifBlank { "OTHER" }}_TIMEOUT")
         tailFirstFailure(
             requestId,
             operation,
-            observedFailure?.let(::tailFirstSessionOpenFailureCode) ?: "OPERATION_TIMEOUT",
+            observedFailure?.let(::tailFirstSessionOpenFailureCode) ?: when (openStage) {
+                "OPEN" -> "OPEN_TIMEOUT"
+                "SURFACE" -> "SURFACE_TIMEOUT"
+                else -> "OPERATION_TIMEOUT"
+            },
         )
     } catch (error: CancellationException) {
         throw error
@@ -2485,11 +2721,88 @@ private suspend fun executeTailFirstProductOperation(
     }
 }
 
+private suspend fun tailFirstFrozenStateResponse(
+    repository: ProductRepository,
+    sessionId: java.util.UUID,
+    requestId: String,
+    operation: String,
+): JsonObject {
+    val frozen = repository.snapshot.value.frozenHistoryViewports[sessionId]
+    val firstPage = frozen?.pages?.firstOrNull()
+    return buildJsonObject {
+        tailFirstStateResponse(repository, sessionId, requestId, operation).forEach { (key, value) ->
+            put(key, value)
+        }
+        put("frozen_active", frozen != null)
+        put("frozen_render_ready", frozen != null && !frozen.loading && frozen.error == null &&
+            frozen.pages.isNotEmpty())
+        put("frozen_capture_id", (frozen?.captureId ?: 0uL).toLong())
+        put("frozen_revision", (frozen?.revision ?: 0uL).toLong())
+        put("frozen_snapshot_sequence_s", (frozen?.snapshotSequence ?: 0uL).toLong())
+        put("frozen_page_count", frozen?.pages?.size ?: 0)
+        put("frozen_first_line_id", firstPage?.lines?.firstOrNull()?.id ?: 0L)
+        put("frozen_last_line_id", firstPage?.lines?.lastOrNull()?.id ?: 0L)
+        put("frozen_next_before_line_id", (frozen?.nextBeforeLineId ?: 0uL).toLong())
+        put("frozen_has_more_before", frozen?.hasMoreBefore == true)
+        put("frozen_head_truncated", firstPage?.headTruncated == true)
+    }
+}
+
 internal fun tailFirstSessionOpenFailureCode(failure: SessionOpenFailure): String =
     "SESSION_OPEN_${failure.code.stableCode.replace('-', '_')}"
 
+/** A 32-column fixture can wrap an otherwise short marker across terminal rows; whitespace is never marker content. */
+internal fun tailFirstTextContainsMarker(text: String, marker: String): Boolean =
+    text.replace(Regex("[\\s\\r\\n]+"), "").contains(marker.replace(Regex("[\\s\\r\\n]+"), ""))
+
+/**
+ * Live marker follows the last fixture marker in the ordered stream.  By the
+ * time it is visible, the last marker has been applied even if a 31-row
+ * viewport has already scrolled it out of live text.
+ */
+internal fun tailFirstOpenMarkersReady(
+    liveText: String,
+    lastMarker: String?,
+    liveMarker: String?,
+): Boolean = when {
+    liveMarker != null -> tailFirstTextContainsMarker(liveText, liveMarker)
+    lastMarker != null -> tailFirstTextContainsMarker(liveText, lastMarker)
+    else -> true
+}
+// The debug stress fixture must stream past the Host's 20,000-row history limit.
+internal fun tailFirstOpenSurfaceTimeoutMillis(frozenLifecycleAcceptance: String?): Long =
+    if (frozenLifecycleAcceptance == "true") 600_000L else 150_000L
+
 private fun tailFirstSelectedSession(requestId: String, operation: String): java.util.UUID? =
     TailFirstE2EProductBridge.selectedSession()
+
+private fun tailFirstSessionIsRunning(repository: ProductRepository, sessionId: java.util.UUID): Boolean {
+    val snapshot = repository.snapshot.value
+    val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return false
+    return session.online && session.state == SessionState.RUNNING &&
+        snapshot.pcs.any { it.id == session.pcId && it.online }
+}
+
+internal fun tailFirstArmedSessionEligible(snapshot: ProductSnapshot, sessionId: java.util.UUID): Boolean {
+    if (!snapshot.signedIn || snapshot.authenticationState != ProductAuthenticationState.AUTHENTICATED) return false
+    val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return false
+    return session.online && session.state == SessionState.RUNNING &&
+        snapshot.pcs.any { it.id == session.pcId && it.online }
+}
+
+internal fun tailFirstClipboardFixtureEligible(
+    snapshot: ProductSnapshot,
+    sessionId: java.util.UUID,
+    foregroundWindowFocused: Boolean,
+    selectedSessionId: java.util.UUID?,
+    surfacePresent: Boolean,
+    nowMillis: Long,
+): Boolean {
+    val control = snapshot.sessionStates[sessionId] as? RemoteSessionState.Controlling
+    return foregroundWindowFocused && tailFirstArmedSessionEligible(snapshot, sessionId) &&
+        control != null && control.expiresAtEpochMillis > nowMillis &&
+        selectedSessionId == sessionId && surfacePresent
+}
 
 private suspend fun awaitNewTailFirstSession(
     repository: ProductRepository,
@@ -2530,12 +2843,20 @@ private fun tailFirstProbeResponse(
         put("ok", true)
         put("account_ready", snapshot.signedIn && !snapshot.serverUrl.isNullOrBlank())
         put("server_origin", snapshot.serverUrl.orEmpty())
+        if (BuildConfig.DEBUG) {
+            TailFirstE2EProductBridge.debugIdentity()?.let { identity ->
+                put("android_device_id", identity.androidDeviceId)
+                put("terminal_theme_scheme", identity.terminalThemeScheme)
+            }
+        }
         put(
             "capabilities",
             JsonArray(
                 listOf(
                     "probe",
                     "open_session",
+                    "close_view",
+                    "reopen_selected",
                     "inspect",
                     "page_up",
                     "open_history",
@@ -2561,7 +2882,21 @@ private suspend fun tailFirstStateResponse(
     val observation = observationOverride ?: withContext(Dispatchers.Main.immediate) { surface.observe() }
     val snapshot = repository.snapshot.value
     val session = snapshot.sessions.firstOrNull { it.id == sessionId }
-        ?: error("Tail-first session metadata is unavailable")
+        ?: run {
+            // A freshly opened session can appear in the surface registry one
+            // frame before its authoritative catalog snapshot is published.
+            val metadataDeadline = android.os.SystemClock.elapsedRealtime() + 5_000L
+            var pendingSession: SessionSummary? = null
+            while (pendingSession == null &&
+                android.os.SystemClock.elapsedRealtime() < metadataDeadline
+            ) {
+                delay(50)
+                pendingSession = repository.snapshot.value.sessions.firstOrNull {
+                    it.id == sessionId
+                }
+            }
+            pendingSession ?: error("Tail-first session metadata is unavailable")
+        }
     val viewport = snapshot.transcriptViewports[sessionId]
     val counts = (repository as? ProductionProductRepository)?.debugHistoryObjectCounts(sessionId)
     val realtime = (repository as? ProductionProductRepository)?.debugRealtimeDiagnostics(sessionId)
@@ -2574,6 +2909,63 @@ private suspend fun tailFirstStateResponse(
         put("operation", operation)
         put("ok", true)
         put("session_id", sessionId.toString())
+        if (BuildConfig.DEBUG) {
+            val identity = requireNotNull(TailFirstE2EProductBridge.debugIdentity()) {
+                "Debug recipient identity is unavailable"
+            }
+            put("android_device_id", identity.androidDeviceId)
+            put("terminal_theme_scheme", identity.terminalThemeScheme)
+        }
+        if (BuildConfig.DEBUG && operation == "inspect") {
+            (repository.terminalEngine(sessionId) as? NativeTerminalEngine)?.let { engine ->
+                engine.currentTextFrame()?.let {
+                    put("terminal_semantics", TerminalSemanticProbe.summarize(it))
+                }
+                put("shell_semantics", TerminalSemanticProbe.summarizeShell(engine.shellState()))
+            }
+            (repository as? ProductionProductRepository)?.debugRestoreDiagnostics(sessionId)?.let { diagnostics ->
+                put("restore_diagnostics", buildJsonObject {
+                    put("attempt", diagnostics.attempt)
+                    put("delta_request_count", diagnostics.deltaRequestCount)
+                    put("delta_install_count", diagnostics.deltaInstallCount)
+                    diagnostics.deltaFallbackReason?.let { put("delta_fallback_reason", it) }
+                    diagnostics.baseSnapshotSequence?.let { put("base_snapshot_sequence", it) }
+                    diagnostics.baseSha256?.let { put("base_sha256", it) }
+                    diagnostics.targetSnapshotSequence?.let { put("target_snapshot_sequence", it) }
+                    diagnostics.targetSha256?.let { put("target_sha256", it) }
+                    put("delta_expected_chunk_count", diagnostics.deltaExpectedChunkCount)
+                    diagnostics.deltaRequestId?.let { put("delta_request_id", it) }
+                    put("delta_chunks_accepted", diagnostics.deltaChunksAccepted)
+                    put("delta_duplicate_chunks", diagnostics.deltaDuplicateChunks)
+                    put("delta_chunk_acks_sent", diagnostics.deltaChunkAcksSent)
+                    put("broker_resolved_count", diagnostics.brokerResolvedCount)
+                    diagnostics.brokerRequestId?.let { put("broker_request_id", it) }
+                    put("broker_chunks_accepted", diagnostics.brokerChunksAccepted)
+                    put("broker_duplicate_chunks", diagnostics.brokerDuplicateChunks)
+                    put("broker_chunk_acks_sent", diagnostics.brokerChunkAcksSent)
+                    put("full_snapshot_install_count", diagnostics.fullSnapshotInstallCount)
+                    diagnostics.fullSnapshotSequence?.let { put("full_snapshot_sequence", it) }
+                    diagnostics.fullSnapshotSha256?.let { put("full_snapshot_sha256", it) }
+                })
+            }
+            val frozen = snapshot.frozenHistoryViewports[sessionId]
+            put("frozen_history", buildJsonObject {
+                put("active", frozen != null)
+                put("capture_id", (frozen?.captureId ?: 0uL).toLong())
+                put("revision", (frozen?.revision ?: 0uL).toLong())
+                put("page_count", frozen?.pages?.size ?: 0)
+                val firstPage = frozen?.pages?.firstOrNull()
+                val lastPage = frozen?.pages?.lastOrNull()
+                put("first_line_id", firstPage?.lines?.firstOrNull()?.id ?: 0L)
+                put("last_line_id", lastPage?.lines?.lastOrNull()?.id ?: 0L)
+                put("first_page_first_logical_row", firstPage?.lines?.firstOrNull()?.firstRow ?: 0L)
+                put("first_page_last_logical_row", firstPage?.lines?.lastOrNull()?.let {
+                    it.firstRow + it.rowCount - 1
+                } ?: 0L)
+                put("loaded_state_sha256", frozen?.let(::tailFirstFrozenLoadedStateSha256)
+                    ?: tailFirstTextSha256(""))
+            })
+        }
         put("snapshot_count", counts?.snapshots ?: 0)
         put("transcript_count", counts?.transcripts ?: 0)
         put("chunk_count", counts?.chunks ?: 0)
@@ -2586,6 +2978,9 @@ private suspend fun tailFirstStateResponse(
         put("realtime_socket_state", realtime?.socketState ?: "UNKNOWN")
         put("realtime_endpoint_count", realtime?.endpointCount ?: 0)
         put("realtime_transport_state", realtime?.transportState ?: "UNKNOWN")
+        put("realtime_transport_failure_reason", realtime?.transportFailureReason ?: "NONE")
+        put("realtime_terminal_accepted_generation", realtime?.terminalAcceptedGeneration ?: 0)
+        put("realtime_accepted_terminal_profile", realtime?.acceptedTerminalProfile ?: "NONE")
         put("realtime_remote_state", realtime?.remoteState ?: "UNKNOWN")
         put("realtime_transport_collector_active", realtime?.transportCollectorActive == true)
         put("realtime_reconnect_active", realtime?.reconnectActive == true)
@@ -2602,9 +2997,9 @@ private suspend fun tailFirstStateResponse(
         put("terminal_columns", session.columns.coerceAtLeast(1))
         put("terminal_rows", session.rows.coerceAtLeast(1))
         put("history_overlay", observation.historyOverlay)
-        put("first_marker_visible", markers.first?.let(displayText::contains) == true)
-        put("last_marker_visible", markers.second?.let(displayText::contains) == true)
-        put("live_marker_visible", markers.third?.let(observation.liveText::contains) == true)
+        put("first_marker_visible", markers.first == null || tailFirstTextContainsMarker(displayText, markers.first!!))
+        put("last_marker_visible", markers.second == null || tailFirstTextContainsMarker(displayText, markers.second!!))
+        put("live_marker_visible", markers.third == null || tailFirstTextContainsMarker(observation.liveText, markers.third!!))
         put("viewport_signature", observation.viewportSignature)
         put("first_visible_line_id", observation.firstVisibleLineId ?: 0L)
         put("visible_text_sha256", observation.visibleTextSha256)
@@ -2690,8 +3085,9 @@ private fun tailFirstFailure(requestId: String, operation: String, failureCode: 
 
 private suspend fun awaitTailFirstSurface(
     sessionId: java.util.UUID,
+    timeoutMillis: Long = 45_000L,
     ready: (TailFirstTerminalSurfaceController) -> Boolean = { true },
-): TailFirstTerminalSurfaceController = withTimeout(45_000) {
+): TailFirstTerminalSurfaceController = withTimeout(timeoutMillis) {
     while (true) {
         val surface = TailFirstTerminalSurfaceRegistry.get(sessionId)
         if (surface != null && withContext(Dispatchers.Main.immediate) { ready(surface) }) return@withTimeout surface
@@ -2795,6 +3191,69 @@ private fun tailFirstTextSha256(text: String): String = MessageDigest.getInstanc
     .digest(text.encodeToByteArray())
     .joinToString("") { byte -> "%02x".format(Locale.ROOT, byte.toInt() and 0xff) }
 
+/** Hashes the loaded decoded pages, including text cells and graphics resources, not the wire payload. */
+private fun tailFirstFrozenLoadedStateSha256(frozen: FrozenHistoryViewportState): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val length = ByteArray(4)
+    fun add(value: Any?) {
+        val bytes = value.toString().encodeToByteArray()
+        length[0] = (bytes.size ushr 24).toByte()
+        length[1] = (bytes.size ushr 16).toByte()
+        length[2] = (bytes.size ushr 8).toByte()
+        length[3] = bytes.size.toByte()
+        digest.update(length)
+        digest.update(bytes)
+    }
+    add(frozen.captureId)
+    add(frozen.revision)
+    add(frozen.pages.size)
+    frozen.pages.forEach { page ->
+        add(page.revision)
+        add(page.requestedAnchor)
+        add(page.nextBeforeLineId)
+        add(page.hasMoreBefore)
+        add(page.columns)
+        add(page.lines)
+        page.frames.forEach { frame ->
+            add(frame.formatVersion)
+            add(frame.widthProfile)
+            add(frame.presentationRevision)
+            add(frame.size)
+            add(frame.activeScreen)
+            add(frame.reverseVideo)
+            add(frame.cursor)
+            add(frame.title)
+            add(frame.graphemes)
+            add(frame.renditions)
+            add(frame.hyperlinks)
+            val palette = frame.palette
+            add(palette.colorsRgb)
+            add(listOf(palette.defaultForegroundRgb, palette.defaultBackgroundRgb,
+                palette.defaultCursorRgb, palette.selectionBackgroundRgb, palette.foregroundAlias,
+                palette.backgroundAlias, palette.frameForegroundAlias, palette.frameBackgroundAlias))
+            frame.rows.forEach { row ->
+                add(row.meaningfulEnd)
+                add(row.softWrapped)
+                add(row.lineRendition)
+                add(row.cells)
+            }
+            (frame as? dev.termlink.terminal.api.TerminalRenderFrameV5)?.let { graphics ->
+                add(graphics.images)
+                add(graphics.glyphs)
+                add(graphics.resources.nextId)
+                graphics.resources.entries.forEach { resource ->
+                    add(resource.id)
+                    add(resource.width)
+                    add(resource.height)
+                    add(resource.format)
+                    digest.update(resource.readOnlyPixels())
+                }
+            }
+        }
+    }
+    return digest.digest().joinToString("") { byte -> "%02x".format(Locale.ROOT, byte.toInt() and 0xff) }
+}
+
 private fun loadTerminalDisplayPreferences(context: android.content.Context): TerminalDisplayPreferences {
     val preferences = context.getSharedPreferences(PRODUCT_PREFERENCES, android.content.Context.MODE_PRIVATE)
     val loaded = TerminalDisplayPreferences(
@@ -2809,6 +3268,34 @@ private fun loadTerminalDisplayPreferences(context: android.content.Context): Te
     return if (loaded.fontScheme == TerminalFontScheme.CUSTOM && !TerminalFontStore.hasCustomFont(context)) {
         loaded.copy(fontScheme = TerminalFontScheme.BUNDLED_NERD_FONT)
     } else loaded
+}
+
+/**
+ * Reads only the persisted account-scoped device UUID used by DeviceKeyVault.
+ * This is a Debug acceptance probe; it never opens or exports private key
+ * material and does not create an identity when the repository has none.
+ */
+private fun debugAndroidDeviceId(context: android.content.Context): String? = runCatching {
+    val scope = OidcSessionStore(context).accountScope?.trim()?.takeIf { it.isNotEmpty() } ?: return@runCatching null
+    val scopeKey = MessageDigest.getInstance("SHA-256")
+        .digest(scope.encodeToByteArray())
+        .joinToString("") { byte -> "%02x".format(Locale.ROOT, byte.toInt() and 0xff) }
+    val raw = context.applicationContext
+        .getSharedPreferences("termlink-device-identity-v2", android.content.Context.MODE_PRIVATE)
+        .getString("device_id-$scopeKey", null)
+        ?: return@runCatching null
+    val parsed = java.util.UUID.fromString(raw)
+    parsed.takeIf { it != java.util.UUID(0, 0) && it.toString() == raw }?.toString()
+}.getOrNull()
+
+/** Maps the actual local terminal background palette to the E04 dark/light scheme. */
+internal fun tailFirstTerminalThemeScheme(preferences: TerminalDisplayPreferences): Int {
+    val background = preferences.normalized.backgroundArgb
+    val red = (background ushr 16) and 0xff
+    val green = (background ushr 8) and 0xff
+    val blue = background and 0xff
+    val luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return if (luminance < 128.0) 1 else 2
 }
 
 private fun saveTerminalDisplayPreferences(
@@ -3205,6 +3692,10 @@ private fun ProductContent(
     onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
+    onBeginFrozenHistory: (java.util.UUID) -> Unit,
+    onLoadFrozenHistory: (java.util.UUID) -> Unit,
+    onReleaseFrozenHistory: (java.util.UUID) -> Unit,
+    frozenHistorySupport: (java.util.UUID) -> Boolean?,
     terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
     historyEngine: (java.util.UUID) -> TerminalViewportEngine?,
     selectedHistoryId: String?,
@@ -3216,6 +3707,7 @@ private fun ProductContent(
     remoteDirectoryFavorites: List<RemoteDirectoryFavorite>,
     expandedPcIds: Set<String>,
     onTogglePcExpanded: (java.util.UUID) -> Unit,
+    onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
@@ -3392,6 +3884,7 @@ private fun ProductContent(
     }
     if (destination == ProductDestination.SESSIONS) {
         SessionsPage(
+            onOpenShellDirectory = onOpenShellDirectory,
             snapshot = snapshot,
             contentBottomPixels = sessionContentBottomPixels,
             foreground = foreground,
@@ -3413,6 +3906,10 @@ private fun ProductContent(
             directRoutingPolicy = directRoutingPolicy,
             onLoadTranscript = onLoadTranscript,
             onClearTranscript = onClearTranscript,
+            onBeginFrozenHistory = onBeginFrozenHistory,
+            onLoadFrozenHistory = onLoadFrozenHistory,
+            onReleaseFrozenHistory = onReleaseFrozenHistory,
+            frozenHistorySupport = frozenHistorySupport,
             terminalEngine = terminalEngine,
             onTerminalAction = onTerminalAction,
             onTerminalCustomShortcut = onTerminalCustomShortcut,
@@ -4014,6 +4511,7 @@ internal fun sessionDestructiveAction(sessionOnline: Boolean): SessionDestructiv
 
 @Composable
 private fun SessionsPage(
+    onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     snapshot: ProductSnapshot,
     contentBottomPixels: Int,
     foreground: Boolean,
@@ -4032,6 +4530,10 @@ private fun SessionsPage(
     directRoutingPolicy: DirectRoutingPolicy,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
+    onBeginFrozenHistory: (java.util.UUID) -> Unit,
+    onLoadFrozenHistory: (java.util.UUID) -> Unit,
+    onReleaseFrozenHistory: (java.util.UUID) -> Unit,
+    frozenHistorySupport: (java.util.UUID) -> Boolean?,
     terminalEngine: (java.util.UUID) -> TerminalViewportEngine?,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
     onTerminalCustomShortcut: (java.util.UUID, TerminalCustomShortcut) -> Unit,
@@ -4058,11 +4560,12 @@ private fun SessionsPage(
     }
     val readOnlyOpenableSessionIds = openedSessions.asSequence()
         .filter { session ->
-            isSessionTabOpenable(
+            session.id in retainedProtocolDiagnosticSessionIds(snapshot, openedSessionIds) ||
+                isSessionTabOpenable(
                 session = session,
                 pc = pcsById[session.pcId],
                 hasReadOnlyRenderer = terminalEngine(session.id) != null,
-            )
+                )
         }
         .mapTo(hashSetOf(), SessionSummary::id)
     val requestedSelected = openedSessions.firstOrNull { it.id == requestedSelectedId }
@@ -4112,6 +4615,14 @@ private fun SessionsPage(
             } else {
                 terminalEngine(selected.id)
             }
+            val selectedFailure = snapshot.sessionOpenFailures[selected.id]
+            val selectedHasEndedDiagnostic = selectedFailure?.protocolDiagnostic != null &&
+                (selected.state == SessionState.EXITED ||
+                    snapshot.sessionStates[selected.id] is RemoteSessionState.Exited)
+            // A host fail-closed session must show only its authenticated
+            // diagnostic. Do not render a retired engine's stale buffer and do
+            // not let the ended-session effect reopen it.
+            val selectedDisplayEngine = selectedEngine.takeUnless { selectedHasEndedDiagnostic }
             val controlRequestKey = if (selected.state != SessionState.RUNNING || selected.pcId in snapshot.pcSessionCatalogErrors) null else {
                 sessionControlRequestEffectKey(
                     foreground = foreground,
@@ -4125,8 +4636,13 @@ private fun SessionsPage(
                     onOpenSession(selected.id)
                 }
             }
-            LaunchedEffect(selected.id, selected.state, selectedEngine) {
-                if (selected.state != SessionState.RUNNING && selectedEngine == null) {
+            LaunchedEffect(selected.id, selected.state, selectedDisplayEngine, selectedFailure?.protocolDiagnostic) {
+                if (shouldAutoReopenSession(
+                        sessionState = selected.state,
+                        hasEngine = selectedDisplayEngine != null,
+                        hasProtocolDiagnostic = selectedFailure?.protocolDiagnostic != null,
+                    )
+                ) {
                     onOpenSession(selected.id)
                 }
             }
@@ -4168,12 +4684,14 @@ private fun SessionsPage(
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
                     )
                     SessionDetail(
+                        onOpenShellDirectory = { path -> onOpenShellDirectory(selected.pcId, path) },
                         session = selected,
                         displayState = displayStates.getValue(selected.id),
                         displayTitle = displaySessionTitle(selected, snapshot.sessionTitles[selected.id]),
                         pcLabel = pcLabel(selected),
                         carrier = snapshot.carrierForSession(selected),
                         sessionOnline = selected.online,
+                        hostOnline = snapshot.pcs.any { it.id == selected.pcId && it.online },
                         directRoutingPolicy = directRoutingPolicy,
                         networkCheckState = snapshot.directNetworkChecks[selected.pcId],
                         onRequestControl = { sessionOpenScope.launch { onOpenSession(selected.id) } },
@@ -4185,18 +4703,23 @@ private fun SessionsPage(
                         onPasteRequested = onPasteRequested,
                         terminalInputResumeRegistry = terminalInputResumeRegistry,
                         transcriptState = snapshot.transcriptViewports[selected.id],
+                        frozenState = snapshot.frozenHistoryViewports[selected.id],
+                        frozenHostSupport = frozenHistorySupport(selected.id),
                         liveAcknowledgement = snapshot.liveAcknowledgements[selected.id],
                         bootstrapSource = snapshot.bootstrapSources[selected.id],
                         sessionOpenFailure = snapshot.sessionOpenFailures[selected.id],
                         onLoadTranscript = { onLoadTranscript(selected.id) },
                         onClearTranscript = { onClearTranscript(selected.id) },
+                        onBeginFrozenHistory = { onBeginFrozenHistory(selected.id) },
+                        onLoadFrozenHistory = { onLoadFrozenHistory(selected.id) },
+                        onReleaseFrozenHistory = { onReleaseFrozenHistory(selected.id) },
                         onRetryOpen = {
                             sessionOpenScope.launch { onOpenSession(selected.id) }
                         },
                         terminalPreferences = terminalPreferences,
                         shortcutPreferences = shortcutPreferences,
                         remoteState = selected.resolveDisplayedRemoteState(snapshot.sessionStates[selected.id]),
-                        engine = selectedEngine,
+                        engine = selectedDisplayEngine,
                         modifier = Modifier
                             .fillMaxHeight()
                             .weight(1f),
@@ -4204,6 +4727,7 @@ private fun SessionsPage(
                 }
             } else {
                 MobileSessionContent(
+                    onOpenShellDirectory = onOpenShellDirectory,
                     sessions = activeSessions,
                     displayStates = displayStates,
                     sessionTitles = snapshot.sessionTitles,
@@ -4212,7 +4736,8 @@ private fun SessionsPage(
                     onCloseSessionTab = onCloseSessionTab,
                     onDestructiveActionRequested = ::requestSessionDestructiveAction,
                     pcLabel = ::pcLabel,
-                    selectedEngine = selectedEngine,
+                    selectedEngine = selectedDisplayEngine,
+                    hostOnline = snapshot.pcs.any { it.id == selected.pcId && it.online },
                     sessionStates = snapshot.sessionStates,
                     sessionCarrierStates = snapshot.sessionCarrierStates,
                     onTerminalAction = onTerminalAction,
@@ -4220,11 +4745,16 @@ private fun SessionsPage(
                     onPasteRequested = onPasteRequested,
                     terminalInputResumeRegistry = terminalInputResumeRegistry,
                     transcriptViewports = snapshot.transcriptViewports,
+                    frozenHistoryViewports = snapshot.frozenHistoryViewports,
+                    frozenHistorySupport = frozenHistorySupport,
                     liveAcknowledgements = snapshot.liveAcknowledgements,
                     bootstrapSources = snapshot.bootstrapSources,
                     sessionOpenFailures = snapshot.sessionOpenFailures,
                     onLoadTranscript = onLoadTranscript,
                     onClearTranscript = onClearTranscript,
+                    onBeginFrozenHistory = onBeginFrozenHistory,
+                    onLoadFrozenHistory = onLoadFrozenHistory,
+                    onReleaseFrozenHistory = onReleaseFrozenHistory,
                     onRetryOpen = { sessionId ->
                         sessionOpenScope.launch { onOpenSession(sessionId) }
                     },
@@ -4248,6 +4778,7 @@ private fun SessionsPage(
 
 @Composable
 private fun MobileSessionContent(
+    onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     sessions: List<SessionSummary>,
     displayStates: Map<java.util.UUID, SessionDisplayState>,
     sessionTitles: Map<java.util.UUID, String>,
@@ -4257,6 +4788,7 @@ private fun MobileSessionContent(
     onDestructiveActionRequested: (SessionSummary) -> Unit,
     pcLabel: (SessionSummary) -> String,
     selectedEngine: TerminalViewportEngine?,
+    hostOnline: Boolean,
     sessionStates: Map<java.util.UUID, RemoteSessionState>,
     sessionCarrierStates: Map<java.util.UUID, PcCarrierState>,
     onTerminalAction: (java.util.UUID, TerminalAction) -> Unit,
@@ -4264,11 +4796,16 @@ private fun MobileSessionContent(
     onPasteRequested: (java.util.UUID) -> Unit,
     terminalInputResumeRegistry: TerminalInputResumeRegistry,
     transcriptViewports: Map<java.util.UUID, TranscriptViewportState>,
+    frozenHistoryViewports: Map<java.util.UUID, FrozenHistoryViewportState>,
+    frozenHistorySupport: (java.util.UUID) -> Boolean?,
     liveAcknowledgements: Map<java.util.UUID, ULong>,
     bootstrapSources: Map<java.util.UUID, ProductBootstrapSource>,
     sessionOpenFailures: Map<java.util.UUID, SessionOpenFailure>,
     onLoadTranscript: (java.util.UUID) -> Unit,
     onClearTranscript: (java.util.UUID) -> Unit,
+    onBeginFrozenHistory: (java.util.UUID) -> Unit,
+    onLoadFrozenHistory: (java.util.UUID) -> Unit,
+    onReleaseFrozenHistory: (java.util.UUID) -> Unit,
     onRetryOpen: (java.util.UUID) -> Unit,
     directRoutingPolicy: DirectRoutingPolicy,
     networkCheckStates: Map<java.util.UUID, DirectNetworkCheckState>,
@@ -4310,6 +4847,7 @@ private fun MobileSessionContent(
             }
         }
         SessionDetail(
+            onOpenShellDirectory = { path -> onOpenShellDirectory(session.pcId, path) },
             session = session,
             displayState = displayStates.getValue(session.id),
             displayTitle = displaySessionTitle(session, sessionTitles[session.id]),
@@ -4319,6 +4857,7 @@ private fun MobileSessionContent(
                 sessionCarrierStates = sessionCarrierStates,
             ),
             sessionOnline = session.online,
+            hostOnline = hostOnline,
             directRoutingPolicy = directRoutingPolicy,
             networkCheckState = networkCheckStates[session.pcId],
             onRequestControl = { onRequestControl(session.id) },
@@ -4330,11 +4869,16 @@ private fun MobileSessionContent(
             onPasteRequested = onPasteRequested,
             terminalInputResumeRegistry = terminalInputResumeRegistry,
             transcriptState = transcriptViewports[session.id],
+            frozenState = frozenHistoryViewports[session.id],
+            frozenHostSupport = frozenHistorySupport(session.id),
             liveAcknowledgement = liveAcknowledgements[session.id],
             bootstrapSource = bootstrapSources[session.id],
             sessionOpenFailure = sessionOpenFailures[session.id],
             onLoadTranscript = { onLoadTranscript(session.id) },
             onClearTranscript = { onClearTranscript(session.id) },
+            onBeginFrozenHistory = { onBeginFrozenHistory(session.id) },
+            onLoadFrozenHistory = { onLoadFrozenHistory(session.id) },
+            onReleaseFrozenHistory = { onReleaseFrozenHistory(session.id) },
             onRetryOpen = { onRetryOpen(session.id) },
             remoteState = session.resolveDisplayedRemoteState(sessionStates[session.id]),
             engine = selectedEngine,
@@ -4514,6 +5058,41 @@ internal fun liveSessionPageSessions(
     }
 }
 
+/** Catalog rows with parsed TL-DIAG evidence are eligible for one error card. */
+internal fun catalogProtocolDiagnosticSessionIds(
+    snapshot: ProductSnapshot,
+): Set<java.util.UUID> {
+    val catalogIds = snapshot.sessions.mapTo(hashSetOf(), SessionSummary::id)
+    return snapshot.sessionOpenFailures.asSequence()
+        .filter { (sessionId, failure) ->
+            sessionId in catalogIds && failure.protocolDiagnostic != null
+        }
+        .map { it.key }
+        .toSet()
+}
+
+/**
+ * Keeps only currently opened catalog rows that carry validated protocol
+ * evidence. The renderer is intentionally not part of this projection: host
+ * fail-closed sessions have already retired it, and the UI should show the
+ * diagnostic card over an empty surface rather than resurrecting old output.
+ */
+internal fun retainedProtocolDiagnosticSessionIds(
+    snapshot: ProductSnapshot,
+    openedSessionIds: List<String>,
+): Set<java.util.UUID> {
+    val opened = openedSessionIds.mapNotNull { value ->
+        runCatching { java.util.UUID.fromString(value) }.getOrNull()
+    }.toSet()
+    return catalogProtocolDiagnosticSessionIds(snapshot).intersect(opened)
+}
+
+internal fun shouldAutoReopenSession(
+    sessionState: SessionState,
+    hasEngine: Boolean,
+    hasProtocolDiagnostic: Boolean,
+): Boolean = sessionState != SessionState.RUNNING && !hasEngine && !hasProtocolDiagnostic
+
 internal data class SessionImeAvoidance(
     val scaffoldBottom: Int,
     val contentBottom: Int,
@@ -4650,12 +5229,14 @@ private fun SessionListRow(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SessionDetail(
+    onOpenShellDirectory: (String) -> Unit,
     session: SessionSummary,
     displayState: SessionDisplayState,
     displayTitle: String,
     pcLabel: String,
     carrier: PcCarrierState,
     sessionOnline: Boolean,
+    hostOnline: Boolean,
     directRoutingPolicy: DirectRoutingPolicy,
     networkCheckState: DirectNetworkCheckState?,
     onRequestControl: () -> Unit,
@@ -4667,11 +5248,16 @@ private fun SessionDetail(
     onPasteRequested: (java.util.UUID) -> Unit,
     terminalInputResumeRegistry: TerminalInputResumeRegistry,
     transcriptState: TranscriptViewportState?,
+    frozenState: FrozenHistoryViewportState?,
+    frozenHostSupport: Boolean?,
     liveAcknowledgement: ULong?,
     bootstrapSource: ProductBootstrapSource?,
     sessionOpenFailure: SessionOpenFailure?,
     onLoadTranscript: () -> Unit,
     onClearTranscript: () -> Unit,
+    onBeginFrozenHistory: () -> Unit,
+    onLoadFrozenHistory: () -> Unit,
+    onReleaseFrozenHistory: () -> Unit,
     onRetryOpen: () -> Unit,
     remoteState: RemoteSessionState?,
     engine: TerminalViewportEngine?,
@@ -4719,6 +5305,12 @@ private fun SessionDetail(
                         softWrap = false,
                     )
                     SessionConnectionStatusMenu(
+                        onOpenShellDirectory = onOpenShellDirectory,
+                        onPrepareShellCommand = {
+                            terminalInputResumeRegistry.resume(session.id)
+                            onClearTranscript()
+                            if (frozenState != null) onReleaseFrozenHistory()
+                        },
                         sessionId = session.id,
                         engine = engine,
                         touchMouseEnabled = touchMouseEnabled,
@@ -4739,6 +5331,13 @@ private fun SessionDetail(
                         onReleaseControl = onReleaseControl,
                         onRequestNetworkCheck = onRequestNetworkCheck,
                         onResizeSessionWindow = onResizeSessionWindow,
+                        frozenAvailable = shouldOfferFrozenHistory(
+                            hostOnline, transcriptState != null,
+                            (engine as? NativeTerminalEngine)?.graphicsProfile == true, frozenHostSupport),
+                        frozenAvailabilityPending = frozenHostSupport == null,
+                        frozenActive = frozenState != null,
+                        onBeginFrozenHistory = onBeginFrozenHistory,
+                        onReleaseFrozenHistory = onReleaseFrozenHistory,
                     )
                 }
             }
@@ -4761,10 +5360,14 @@ private fun SessionDetail(
                     onPasteRequested = { onPasteRequested(session.id) },
                     terminalInputResumeRegistry = terminalInputResumeRegistry,
                     transcriptState = transcriptState,
+                    frozenState = frozenState,
                     liveAcknowledgement = liveAcknowledgement,
                     bootstrapSource = bootstrapSource,
                     onLoadTranscript = onLoadTranscript,
                     onClearTranscript = onClearTranscript,
+                    onBeginFrozenHistory = onBeginFrozenHistory,
+                    onLoadFrozenHistory = onLoadFrozenHistory,
+                    onReleaseFrozenHistory = onReleaseFrozenHistory,
                     modifier = Modifier.fillMaxSize(),
                 )
                 sessionOpenFailure?.let { failure ->
@@ -4779,9 +5382,18 @@ private fun SessionDetail(
     }
 }
 
+internal fun shouldOfferFrozenHistory(
+    hostOnline: Boolean,
+    hasAuthenticatedSnapshot: Boolean,
+    graphicsProfile: Boolean,
+    hostSupport: Boolean?,
+): Boolean = hostOnline && hasAuthenticatedSnapshot && graphicsProfile && hostSupport != false
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SessionConnectionStatusMenu(
+    onOpenShellDirectory: (String) -> Unit,
+    onPrepareShellCommand: () -> Unit,
     sessionId: java.util.UUID,
     engine: TerminalViewportEngine?,
     touchMouseEnabled: Boolean,
@@ -4798,6 +5410,11 @@ private fun SessionConnectionStatusMenu(
     onReleaseControl: () -> Unit,
     onRequestNetworkCheck: (DirectNetworkCheckKind) -> Unit,
     onResizeSessionWindow: suspend (java.util.UUID, TerminalViewportMetrics?) -> TerminalSize,
+    frozenAvailable: Boolean,
+    frozenActive: Boolean,
+    frozenAvailabilityPending: Boolean,
+    onBeginFrozenHistory: () -> Unit,
+    onReleaseFrozenHistory: () -> Unit,
     networkCheckState: DirectNetworkCheckState?,
 ) {
     var expanded by remember(sessionId) { mutableStateOf(false) }
@@ -4839,6 +5456,7 @@ private fun SessionConnectionStatusMenu(
                 maxLines = 1,
             )
             PcCarrierIcon(carrier = carrier)
+            TerminalProgressLabel(engine)
             if (touchMouseEnabled && mouseReporting && canReleaseControl) {
                 Icon(Icons.Filled.Mouse, contentDescription = stringResource(R.string.session_touch_mouse),
                     tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
@@ -4848,13 +5466,13 @@ private fun SessionConnectionStatusMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
             properties = PopupProperties(focusable = false),
-            modifier = Modifier.widthIn(min = 280.dp, max = 320.dp),
+            modifier = Modifier.width(320.dp),
         ) {
             Text(
                 "$statusLabel · ${stringResource(carrier.labelResource())}",
                 modifier = Modifier.fillMaxWidth()
                     .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .padding(horizontal = 16.dp, vertical = 2.dp)
                     .semantics { heading() },
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
@@ -4862,18 +5480,38 @@ private fun SessionConnectionStatusMenu(
             HorizontalDivider()
             if (canRequestControl) {
                 DropdownMenuItem(
-                    text = { Text(stringResource(R.string.session_request_control)) },
-                    leadingIcon = { Icon(Icons.Filled.Lock, contentDescription = null) },
+                    text = { Text(stringResource(R.string.session_request_control), style = MaterialTheme.typography.bodyMedium) },
+                    leadingIcon = { Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                    modifier = Modifier.height(40.dp),
                     onClick = { expanded = false; onRequestControl() },
                 )
             }
             if (canReleaseControl) {
                 DropdownMenuItem(
-                    text = { Text(stringResource(R.string.session_release_control)) },
-                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null) },
+                    text = { Text(stringResource(R.string.session_release_control), style = MaterialTheme.typography.bodyMedium) },
+                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                    modifier = Modifier.height(40.dp),
                     onClick = { expanded = false; onReleaseControl() },
                 )
             }
+            ShellIntegrationMenuItems(engine, sessionOnline, onOpenShellDirectory,
+                onPrepareCommand = onPrepareShellCommand, onDismissMenu = { expanded = false })
+            if (frozenAvailable || frozenActive) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(when {
+                        frozenActive -> R.string.terminal_frozen_history_close
+                        frozenAvailabilityPending -> R.string.terminal_frozen_history_check
+                        else -> R.string.terminal_frozen_history_open
+                    }), style = MaterialTheme.typography.bodyMedium) },
+                    leadingIcon = { Icon(Icons.Filled.History, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                    modifier = Modifier.height(40.dp),
+                    onClick = {
+                        expanded = false
+                        if (frozenActive) onReleaseFrozenHistory() else onBeginFrozenHistory()
+                    },
+                )
+            }
+            TerminalSignalMenuItems()
             SessionInputMenuItems(
                 controlling = sessionOnline && canReleaseControl && engine != null,
                 mouseReporting = mouseReporting,
@@ -4893,14 +5531,15 @@ private fun SessionConnectionStatusMenu(
                     Text(
                         stringResource(R.string.session_network_checks_title),
                         modifier = Modifier
-                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .padding(horizontal = 16.dp, vertical = 2.dp)
                             .semantics { heading() },
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     DropdownMenuItem(
-                        text = { Text(stringResource(R.string.session_check_lan)) },
+                        text = { Text(stringResource(R.string.session_check_lan), style = MaterialTheme.typography.bodyMedium) },
+                        modifier = Modifier.height(40.dp),
                         leadingIcon = { Icon(Icons.Filled.Wifi, contentDescription = null) },
                         trailingIcon = {
                             Text(
@@ -4913,7 +5552,8 @@ private fun SessionConnectionStatusMenu(
                         enabled = canCheckNetwork,
                     )
                     DropdownMenuItem(
-                        text = { Text(stringResource(R.string.session_check_nat)) },
+                        text = { Text(stringResource(R.string.session_check_nat), style = MaterialTheme.typography.bodyMedium) },
+                        modifier = Modifier.height(40.dp),
                         leadingIcon = { Icon(Icons.Filled.Public, contentDescription = null) },
                         trailingIcon = {
                             Text(
@@ -4936,7 +5576,7 @@ private fun SessionConnectionStatusMenu(
                             else -> R.string.session_direct_policy_loading
                         },
                     ),
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -4996,6 +5636,37 @@ private fun SessionOpenFailureCard(
     testTag: String,
 ) {
     val context = LocalContext.current
+    var showDiagnostic by remember(failure) { mutableStateOf(false) }
+    val protocolDiagnostic = failure.protocolDiagnostic
+    val diagnosticDisplay = protocolDiagnostic?.let {
+        context.getString(sessionProtocolDiagnosticContextResource(failure.protocolDiagnosticSource)) + "\n\n" + it.text
+    }
+    if (showDiagnostic && protocolDiagnostic != null) {
+        AlertDialog(
+            onDismissRequest = { showDiagnostic = false },
+            title = { Text(stringResource(R.string.terminal_protocol_details)) },
+            text = {
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(
+                        diagnosticDisplay.orEmpty(),
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText(
+                        context.getString(R.string.terminal_protocol_details), diagnosticDisplay,
+                    ))
+                }) { Text(stringResource(R.string.terminal_protocol_copy)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDiagnostic = false }) { Text(stringResource(R.string.action_close)) }
+            },
+        )
+    }
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -5014,11 +5685,15 @@ private fun SessionOpenFailureCard(
                 contentDescription = null,
                 modifier = Modifier.size(18.dp),
             )
-            Text(
-                text = failure.localizedMessage(context),
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.bodySmall,
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(text = failure.localizedMessage(context), style = MaterialTheme.typography.bodySmall)
+                protocolDiagnostic?.let {
+                    Text(it.sequence, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    TextButton(onClick = { showDiagnostic = true }) {
+                        Text(stringResource(R.string.terminal_protocol_details))
+                    }
+                }
+            }
             if (failure.code.retryable) {
                 TextButton(
                     onClick = onRetry,
@@ -5458,6 +6133,7 @@ internal fun SessionSummary.resolveDisplayedRemoteState(actual: RemoteSessionSta
     state == SessionState.EXITED -> RemoteSessionState.Exited(
         lastAckedSequence = actual?.lastAckedSequence ?: 0,
         exitCode = (actual as? RemoteSessionState.Exited)?.exitCode,
+        protocolDiagnostic = (actual as? RemoteSessionState.Exited)?.protocolDiagnostic,
     )
     actual is RemoteSessionState.Exited -> actual
     !online -> actual as? RemoteSessionState.Reconnecting
@@ -5478,10 +6154,14 @@ private fun TerminalSurface(
     wheelOnLeft: Boolean,
     remoteState: RemoteSessionState?,
     transcriptState: TranscriptViewportState?,
+    frozenState: FrozenHistoryViewportState?,
     liveAcknowledgement: ULong?,
     bootstrapSource: ProductBootstrapSource?,
     onLoadTranscript: () -> Unit,
     onClearTranscript: () -> Unit,
+    onBeginFrozenHistory: () -> Unit,
+    onLoadFrozenHistory: () -> Unit,
+    onReleaseFrozenHistory: () -> Unit,
     terminalPreferences: TerminalDisplayPreferences,
     shortcutPreferences: TerminalShortcutPreferences,
     onTerminalAction: (TerminalAction) -> Unit,
@@ -5492,18 +6172,25 @@ private fun TerminalSurface(
 ) {
     val activeEngine = engine
     val transcriptViewport = remember(session.id) { NativeTranscriptViewport() }
+    val frozenViewport = remember(session.id) { NativeFrozenHistoryViewport() }
     val liveViewHolder = remember(session.id) { arrayOfNulls<View>(1) }
     var dockBounds by remember(session.id) { mutableStateOf<TailFirstPixelBounds?>(null) }
     val latestTranscriptState = rememberUpdatedState(transcriptState)
     val latestLoadTranscript = rememberUpdatedState(onLoadTranscript)
     val latestClearTranscript = rememberUpdatedState(onClearTranscript)
+    val latestFrozenState = rememberUpdatedState(frozenState)
+    val latestLoadFrozenHistory = rememberUpdatedState(onLoadFrozenHistory)
     var overlayRequested by remember(session.id) { mutableStateOf(false) }
     var localLoadingGuard by remember(session.id) { mutableStateOf(false) }
     var transcriptRendererFailed by remember(session.id) { mutableStateOf(false) }
     var transcriptRendererRetryToken by remember(session.id) { mutableStateOf(false) }
+    var frozenLoadingGuard by remember(session.id) { mutableStateOf(false) }
+    var frozenRendererFailed by remember(session.id) { mutableStateOf(false) }
+    var frozenRendererRetryToken by remember(session.id) { mutableStateOf(false) }
     val overlayVisible = shouldShowTranscriptOverlay(overlayRequested, transcriptState)
 
     fun requestOlderRows() {
+        if (latestFrozenState.value != null) return
         val state = latestTranscriptState.value ?: return
         // StateFlow is the authoritative in-flight state. Compose may apply the
         // LaunchedEffect that clears this frame-local guard one frame later;
@@ -5516,6 +6203,16 @@ private fun TerminalSurface(
         localLoadingGuard = true
         latestLoadTranscript.value()
     }
+
+    fun requestOlderFrozenRows() {
+        val state = latestFrozenState.value ?: return
+        if (frozenLoadingGuard && !state.loading) frozenLoadingGuard = false
+        if (state.loading || frozenLoadingGuard || !state.hasMoreBefore || frozenRendererFailed) return
+        frozenLoadingGuard = true
+        latestLoadFrozenHistory.value()
+    }
+
+    BackHandler(enabled = frozenState != null) { onReleaseFrozenHistory() }
 
     fun retryTranscript() {
         dispatchTranscriptRetry(
@@ -5539,6 +6236,10 @@ private fun TerminalSurface(
         transcriptRendererFailed = false
         activeEngine?.scrollToLatest()
         latestClearTranscript.value()
+    }
+
+    LaunchedEffect(frozenState?.generation) {
+        if (frozenState != null && overlayRequested) returnToLiveTail()
     }
 
     fun resumeLiveAfterAcceptedInput(resumeViewport: Boolean = true) {
@@ -5630,8 +6331,10 @@ private fun TerminalSurface(
 
             override fun openHistory(): Boolean {
                 if (overlayVisible || activeEngine == null) return false
-                activeEngine?.scrollPastTopBoundary()
-                return true
+                // Debug acceptance exercises the same product boundary path as a
+                // real scroll, but does not depend on native callback timing.
+                requestOlderRows()
+                return overlayRequested
             }
 
             override fun closeHistory() = returnToLiveTail()
@@ -5652,8 +6355,10 @@ private fun TerminalSurface(
     SideEffect {
         val theme = productTerminalTheme(terminalPreferences)
         activeEngine?.applyTheme(theme)
-        activeEngine?.setReadOnly(!sessionOnline || remoteState !is RemoteSessionState.Controlling)
+        activeEngine?.setReadOnly(frozenState != null || !sessionOnline ||
+            remoteState !is RemoteSessionState.Controlling)
         transcriptViewport.applyTheme(theme)
+        frozenViewport.applyTheme(theme)
     }
     LaunchedEffect(
         transcriptState?.viewportGeneration,
@@ -5693,10 +6398,20 @@ private fun TerminalSurface(
     DisposableEffect(transcriptViewport) {
         onDispose { transcriptViewport.close() }
     }
+    LaunchedEffect(frozenState?.generation, frozenState?.pages, frozenRendererRetryToken) {
+        frozenRendererFailed = runCatching { frozenViewport.replacePages(frozenState?.pages.orEmpty()) }.isFailure
+    }
+    LaunchedEffect(frozenState?.loading) {
+        if (frozenState?.loading == false) frozenLoadingGuard = false
+    }
+    DisposableEffect(frozenViewport) { onDispose { frozenViewport.close() } }
     val keyboardVisible = WindowInsets.isImeVisible
     val keyboardController = LocalSoftwareKeyboardController.current
-    val canInput = sessionOnline && remoteState is RemoteSessionState.Controlling && activeEngine != null
+    val canInput = frozenState == null && sessionOnline &&
+        remoteState is RemoteSessionState.Controlling && activeEngine != null
     val mouseReporting = activeEngine?.mouseReporting?.collectAsState()?.value ?: false
+    val inputEngine = activeEngine as? NativeTerminalEngine
+    val inputDiagnostic = inputEngine?.inputDiagnostic?.collectAsState()?.value
     Column(
         modifier = modifier
             .clipToBounds()
@@ -5728,6 +6443,11 @@ private fun TerminalSurface(
                         .fillMaxSize()
                         .clipToBounds()
                         .testTag(terminalTestTag(session.id)),
+                    update = { view ->
+                        (activeEngine as? NativeTerminalEngine)?.setLiveViewportUncovered(
+                            view, !overlayVisible && frozenState == null,
+                        )
+                    },
                 )
             }
             if (overlayVisible) {
@@ -5809,6 +6529,81 @@ private fun TerminalSurface(
                     }
                 }
             }
+            if (frozenState != null) {
+                Box(
+                    modifier = Modifier.fillMaxSize()
+                        .background(Color(terminalPreferences.backgroundArgb))
+                        .testTag("frozen-history-overlay:${session.id}"),
+                ) {
+                    if (frozenState.pages.isNotEmpty() && !frozenRendererFailed) {
+                        key(frozenViewport, terminalPreferences.fontScheme,
+                            terminalPreferences.customFontSha256, terminalPreferences.fontSizeSp,
+                            terminalPreferences.lineSpacingMultiplier) {
+                            AndroidView(
+                                factory = { context -> frozenViewport.createView(
+                                    context = context,
+                                    textSizeSp = terminalPreferences.fontSizeSp,
+                                    lineSpacingMultiplier = terminalPreferences.lineSpacingMultiplier,
+                                    onScrollPastTop = ::requestOlderFrozenRows,
+                                    onScrollPastBottom = {},
+                                ) },
+                                modifier = Modifier.fillMaxSize().testTag("frozen-history-viewport:${session.id}"),
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.align(Alignment.TopEnd)
+                            .background(Color.Black.copy(alpha = 0.86f), RoundedCornerShape(6.dp))
+                            .padding(start = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(stringResource(R.string.terminal_frozen_history_open),
+                            color = Color.White, style = MaterialTheme.typography.labelSmall)
+                        TextButton(onClick = onReleaseFrozenHistory,
+                            modifier = Modifier.testTag("frozen-history-close:${session.id}")) {
+                            Text(stringResource(R.string.terminal_live))
+                        }
+                    }
+                    if (frozenState.loading || frozenLoadingGuard) {
+                        Row(
+                            modifier = Modifier.align(Alignment.TopStart)
+                                .background(Color.Black.copy(alpha = 0.86f), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 8.dp, vertical = 5.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Text(stringResource(R.string.terminal_history_loading), color = Color.White,
+                                style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                    if (frozenState.error != null || frozenRendererFailed) {
+                        Row(
+                            modifier = Modifier.align(Alignment.Center)
+                                .background(Color.Black.copy(alpha = 0.9f), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(stringResource(R.string.terminal_frozen_history_error,
+                                frozenState.error ?: "RENDERER_LIMIT"),
+                                color = Color.White, style = MaterialTheme.typography.labelSmall)
+                            if (frozenRendererFailed || frozenState.error?.let {
+                                    it != "PAGE_LIMIT" && it != "BROWSE_LIMIT" &&
+                                        it != "TERMINAL_HISTORY_MEMORY_LIMIT" && !it.startsWith("PAGE_BUDGET")
+                                } == true) {
+                                TextButton(onClick = {
+                                    if (frozenRendererFailed) {
+                                        frozenRendererRetryToken = !frozenRendererRetryToken
+                                    } else if (frozenState.captureId == null ||
+                                        frozenState.error in setOf("STALE_CAPTURE", "STALE_REVISION", "ANCHOR_CHANGED")) {
+                                        onBeginFrozenHistory()
+                                    } else onLoadFrozenHistory()
+                                }) { Text(stringResource(R.string.terminal_history_retry)) }
+                            }
+                        }
+                    }
+                }
+            }
             if (canInput && mouseReporting && !touchMouseEnabled && !overlayVisible) {
                 // Replacing the View cancels an active drag before moving to the other edge.
                 key(session.id, activeEngine, wheelOnLeft) {
@@ -5819,6 +6614,14 @@ private fun TerminalSurface(
                             .width(48.dp).height(120.dp).testTag("terminal-mouse-wheel:${session.id}"),
                     )
                 }
+            }
+            if (inputEngine != null && inputDiagnostic != null && !overlayVisible) {
+                InputEncodingDiagnosticOverlay(
+                    diagnostic = inputDiagnostic,
+                    onDismiss = { inputEngine.dismissInputDiagnostic(inputDiagnostic) },
+                    modifier = Modifier.align(Alignment.TopCenter)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                )
             }
         }
         TerminalActionBar(
@@ -5858,6 +6661,64 @@ private fun TerminalSurface(
                 }
                 .testTag(terminalDockTestTag(session.id)),
         )
+    }
+}
+
+@Composable
+private fun InputEncodingDiagnosticOverlay(
+    diagnostic: dev.termlink.terminal.api.TerminalInputDiagnostic,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var showDetails by remember(diagnostic) { mutableStateOf(false) }
+    val sourceTitle = if (diagnostic.origin == dev.termlink.terminal.api.TerminalInputDiagnosticOrigin.ANDROID_VALIDATION) {
+        R.string.terminal_input_diagnostic_android_title
+    } else {
+        R.string.terminal_input_diagnostic_title
+    }
+    if (showDetails) {
+        AlertDialog(
+            onDismissRequest = { showDetails = false },
+            title = { Text(stringResource(sourceTitle)) },
+            text = {
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(diagnostic.text, modifier = Modifier.verticalScroll(rememberScrollState()),
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDetails = false }) {
+                    Text(stringResource(R.string.action_close))
+                }
+            },
+        )
+    }
+    Surface(
+        modifier = modifier.fillMaxWidth().testTag("terminal-input-diagnostic"),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 8.dp, top = 4.dp, end = 2.dp, bottom = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(stringResource(sourceTitle),
+                    style = MaterialTheme.typography.labelSmall)
+                val character = diagnostic.characterPreview?.let { " ('$it')" }.orEmpty()
+                Text("${diagnostic.reason} · ${diagnostic.key} · ${diagnostic.codepoint}$character · ${diagnostic.modifiers}",
+                    style = MaterialTheme.typography.bodySmall, maxLines = 2)
+            }
+            TextButton(onClick = { showDetails = true }) {
+                Text(stringResource(R.string.terminal_input_diagnostic_details))
+            }
+            IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Filled.Close, contentDescription = stringResource(R.string.action_close),
+                    modifier = Modifier.size(16.dp))
+            }
+        }
     }
 }
 

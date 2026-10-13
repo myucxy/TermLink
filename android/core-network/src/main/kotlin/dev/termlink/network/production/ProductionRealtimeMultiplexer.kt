@@ -75,6 +75,9 @@ interface ProductionRealtimeSessionTransport : Closeable {
     val receivedEnvelopes: Flow<ProductionReceivedEnvelope>
     val receivePressure: StateFlow<ProductionReceivePressure>
     val state: SharedFlow<RealtimeState>
+    /** Capability intersection for the current authenticated socket generation. */
+    val negotiatedCapabilities: StateFlow<ProductionRealtimeNegotiatedCapabilities>
+        get() = EMPTY_SESSION_NEGOTIATED_CAPABILITIES
     val connectionEvents: Flow<ProductionRealtimeSessionConnectionEvent>
         get() = state.map { state ->
             ProductionRealtimeSessionConnectionEvent(
@@ -124,6 +127,10 @@ interface ProductionRealtimeSessionTransport : Closeable {
         socket = ProductionRealtimeSocketDiagnostics(0, 0, false, "UNKNOWN", 0, 0),
     )
 }
+
+private val EMPTY_SESSION_NEGOTIATED_CAPABILITIES = MutableStateFlow(
+    ProductionRealtimeNegotiatedCapabilities(0, emptySet()),
+)
 
 data class ProductionRealtimeSessionConnectionEvent(
     val state: RealtimeState,
@@ -589,6 +596,8 @@ class ProductionRealtimeMultiplexer private constructor(
             get() = supervisor.state
         override val connectionEvents: Flow<ProductionRealtimeSessionConnectionEvent>
             get() = supervisor.connectionEvents
+        override val negotiatedCapabilities: StateFlow<ProductionRealtimeNegotiatedCapabilities>
+            get() = socket.negotiatedCapabilities
 
         override fun connect() {
             check(!endpointClosed.get()) { "production session transport is closed" }

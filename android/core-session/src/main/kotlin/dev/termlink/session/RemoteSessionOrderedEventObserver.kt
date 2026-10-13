@@ -83,8 +83,13 @@ internal class FailIsolatedOrderedEventDispatcher(
 
     fun offerApplied(rendererGeneration: Long, event: RemoteSessionEvent) {
         if (retired.get()) return
-        val outputBytes = (event as? RemoteSessionEvent.Output)?.bytes?.size ?: 0
-        if (outputBytes > MAX_OUTPUT_BYTES_PER_EVENT || !reserveOutputBytes(outputBytes)) {
+        val outputBytes = when (event) {
+            is RemoteSessionEvent.Output -> event.bytes.size.toLong()
+            is RemoteSessionEvent.BrokerOutput -> event.outputByteCount.toLong() + event.canonicalByteCount
+            else -> 0L
+        }
+        if ((event is RemoteSessionEvent.Output && outputBytes > MAX_OUTPUT_BYTES_PER_EVENT) ||
+            outputBytes > MAX_QUEUED_OUTPUT_BYTES || !reserveOutputBytes(outputBytes)) {
             retire()
             return
         }
@@ -119,18 +124,18 @@ internal class FailIsolatedOrderedEventDispatcher(
         }
     }
 
-    private fun reserveOutputBytes(byteCount: Int): Boolean {
-        if (byteCount == 0) return true
+    private fun reserveOutputBytes(byteCount: Long): Boolean {
+        if (byteCount == 0L) return true
         while (true) {
             val current = queuedOutputBytes.get()
-            val next = current + byteCount.toLong()
+            val next = current + byteCount
             if (next > MAX_QUEUED_OUTPUT_BYTES) return false
             if (queuedOutputBytes.compareAndSet(current, next)) return true
         }
     }
 
-    private fun releaseOutputBytes(byteCount: Int) {
-        if (byteCount != 0) queuedOutputBytes.addAndGet(-byteCount.toLong())
+    private fun releaseOutputBytes(byteCount: Long) {
+        if (byteCount != 0L) queuedOutputBytes.addAndGet(-byteCount)
     }
 
     private fun retire() {
@@ -154,7 +159,7 @@ internal class FailIsolatedOrderedEventDispatcher(
 
     private inner class QueuedNotification(
         val notification: OrderedRemoteSessionNotification,
-        private val outputByteCount: Int,
+        private val outputByteCount: Long,
     ) {
         private val released = AtomicBoolean(false)
 
@@ -162,13 +167,14 @@ internal class FailIsolatedOrderedEventDispatcher(
             if (!released.compareAndSet(false, true)) return
             val event = (notification as? OrderedRemoteSessionNotification.Applied)?.event
             (event as? RemoteSessionEvent.Output)?.bytes?.fill(0)
+            (event as? RemoteSessionEvent.BrokerOutput)?.close()
             releaseOutputBytes(outputByteCount)
         }
     }
 
     private companion object {
         const val MAX_CAPACITY = 4_096
-        const val MAX_OUTPUT_BYTES_PER_EVENT = 1024 * 1024
+        const val MAX_OUTPUT_BYTES_PER_EVENT = 1024 * 1024L
         const val MAX_QUEUED_OUTPUT_BYTES = 4L * 1024L * 1024L
 
         fun validatedCapacity(capacity: Int): Int {
@@ -182,6 +188,17 @@ internal class FailIsolatedOrderedEventDispatcher(
 
 private fun RemoteSessionEvent.copyForObserver(): RemoteSessionEvent = when (this) {
     is RemoteSessionEvent.Output -> copy(bytes = bytes.copyOf())
+    is RemoteSessionEvent.BrokerOutput -> {
+        val output = copyOutput()
+        try {
+            val captures = copyCanonicalCaptures()
+            try { RemoteSessionEvent.BrokerOutput(sequence, output, captures, presentationRevision) }
+            finally { captures.fill(0) }
+        } finally { output.fill(0) }
+    }
+    is RemoteSessionEvent.HostTheme -> copy()
+    is RemoteSessionEvent.HostResizeResult -> copy()
+    is RemoteSessionEvent.HostGeometry -> copy()
     is RemoteSessionEvent.Resize -> copy()
     is RemoteSessionEvent.Title -> copy()
     is RemoteSessionEvent.InputResult -> copy()

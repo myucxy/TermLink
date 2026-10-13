@@ -252,6 +252,9 @@
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
+      },
+      "termlink.terminalcore": {
+        "type": "Project"
       }
     },
     "net8.0/linux-arm64": {
@@ -765,6 +768,9 @@
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
+      },
+      "termlink.terminalcore": {
+        "type": "Project"
       },
       "termlink.updatecore": {
         "type": "Project"

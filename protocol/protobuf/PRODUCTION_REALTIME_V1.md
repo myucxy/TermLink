@@ -241,6 +241,40 @@ the authoritative SessionHost journal sequence and a monotonic
 must resync instead of applying an update whose non-zero source anchor differs
 from `Envelope.seq` or whose presentation revision regresses.
 
+### Persistent terminal state profile
+
+The graphics state contracts are distinct persistent profiles, not alternate
+decoders for the same running session:
+
+| State contract | Local descriptor | Width profile | Graphics resources |
+| --- | --- | --- | --- |
+| `terminal_state_2_22_v1` | `terminal_state_2_22_v1;width=1;output=0;resources=2` | `LEGACY_V1` (1) | 2 |
+| `terminal_state_2_22_v2` | `terminal_state_2_22_v2;width=2;output=0;resources=2` | `UNICODE_16` (2) | 2 |
+
+Windows persists the exact descriptor with each session and restores that
+profile when reopening its history. New Unicode16 sessions use v2; an existing
+v1 session remains v1. Android lists the state contracts it can decode in
+`SUBSCRIBE.subscriber_capabilities`; this list does not select a profile.
+The authoritative Windows Agent checks the session's persisted state against
+that list and returns the exact `required_state` in `TERMINAL_ATTACH_RESULT`.
+Android accepts that result only for the current request and connection
+generation, and rejects a change from its already accepted or expected profile.
+The Relay must have negotiated `terminal_attach_v1` and the host geometry,
+theme, and resize capabilities before the attachment is used. An unsupported
+v2 session fails with an explicit upgrade error; it cannot be decoded as v1.
+History selection, snapshots, Delta, frozen pages, and Broker captures must
+match this accepted persistent profile. Advertised decoder support alone never
+converts old history or changes a running session's width rules.
+
+The native Graphics snapshot keeps its existing outer container version 3 and
+format version 1 in both contracts. Its v1 Key ID and key/AAD prefixes remain
+unchanged. V2 uses `terminal-core-graphics-snapshot-v2:` and the separate
+`TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-KEY-V2\0` and
+`TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-OBJECT-V2\0` prefixes; its AAD also
+authenticates the exact state contract. Open validates the canonical checkpoint
+width at byte offset 48 against that contract (1 for v1, 2 for v2). A v2
+snapshot cannot be opened as v1 or used to upgrade stored v1 history.
+
 ## Direction and message ACL
 
 The authenticated WebSocket role fixes the Envelope direction. The Relay
@@ -350,6 +384,110 @@ next chunk for that request until the acknowledgement arrives. Timeout,
 endpoint close, unsubscribe, or explicit cancellation sends/acts as
 `HOST_HISTORY_CONTROL(CANCEL)`. These messages are request-scoped and never
 advance the ordered terminal replay high-water mark.
+
+The additive frozen history field and enum numbers are fixed in
+`FROZEN_HOST_HISTORY_V1.md`. Its Windows capture lease and Android encrypted
+page path are connected behind the peer `host_history_frozen_v1` and `tlhp_v2`
+capabilities; full product acceptance still requires the documented end-to-end
+tests. A Relay Welcome containing only `host_history_v1` does not enable it.
+
+### State Delta V1 over Host History
+
+This is an additive wire allocation with Windows and Android product adapters.
+It remains optional and must fall back to a full snapshot whenever either peer
+does not negotiate `state_delta_v1` or the selected base is unsuitable.
+
+`state_delta_v1` is a separate **peer** capability: both the authoritative
+Windows Host and the Android subscriber must support it for the session's
+persistent terminal profile. It is carried in Host attach capabilities and
+`HostHistoryRequestPayload.subscriber_capabilities`; the Relay continues to
+negotiate only `host_history_v1` for opaque routing. A Relay Welcome that lists
+`host_history_v1` does not prove either peer can encode or install Delta.
+Older clients continue using the existing full-snapshot path.
+
+`HOST_HISTORY_REQUEST_KIND_V1_STATE_DELTA = 7` carries
+`HostHistoryRequestPayload.state_delta = 10`. Its `StateDeltaRequestV1`
+identifies a 32-byte context, one supported Delta V1 profile, and the exact
+base checkpoint's exclusive next source sequence, byte count, and 32-byte
+SHA-256. Graphics v1 requires native Delta profile 1 (`LegacyV1`);
+Unicode16 Graphics v2 requires profile 2 (`Unicode16V1`). The host maps this
+from its persisted session profile and rejects a different request profile
+with `NEEDS_FULL_SNAPSHOT`; the Android base checkpoint must carry that same
+width and output profile. Native profiles 3/4 describe standalone-C1 output;
+the current persisted Graphics descriptors use UTF-8 output 0 and do not
+select them. Outer `snapshot_seq = 0` asks Windows to pin its
+latest current snapshot sequence S when it accepts the request; nonzero selects
+that exact S.
+The response always states the actual S. A base/target mismatch, missing
+journal entry, incompatible persistent profile, or ineffective/oversized
+Delta returns `REJECTED` with `NEEDS_FULL_SNAPSHOT`, without an object. Android
+then requests the existing full snapshot explicitly; it must not guess a new
+Delta base or silently reinterpret the response as frozen history.
+For this empty failure only, `snapshot_seq` may be zero when no valid target
+exists, or the known current S; it is not used as a replacement Delta base.
+
+`HOST_HISTORY_OBJECT_KIND_V1_STATE_DELTA = 5` has
+`format_name = TERMLINK_STATE_DELTA_V1`, `format_version = 1`, and repeats
+`HostHistoryResponsePayload.state_delta = 27` on every chunk. The metadata
+contains context/profile and base/target exclusive next source sequences,
+canonical snapshot byte counts, and 32-byte SHA-256 hashes. It requires
+`target_next_source_sequence = response.snapshot_seq + 1` and a strictly newer
+target than base. The object is a separate `TLDSEAL1` binary AEAD container
+with a fixed 336-byte header, wrapping one complete `TLDELTA1` packet. Its
+authenticated identity includes session, sender and recipient devices, key
+epoch, persistent state contract, context, profile, and both checkpoint
+identities. The outer 16-byte `request_id` correlates this transfer and its
+chunk ACKs; it is not a field in the sealed object. The
+outer request, every response chunk, sealed container, and decrypted core
+packet must agree on these values and on the session's persistent profile.
+`object_sha256` checks the sealed object bytes; the base/target hashes
+identify canonical snapshot bytes. No frozen-history token or lease is used.
+The outer `columns`, `rows` and `initial_transcript_before_line_id` fields are
+zero for Delta objects. Dimensions come from the validated reconstructed
+native snapshot, and the transcript anchor comes from the sealed header.
+
+For `terminal_state_2_22_v1`, the context is
+`SHA256(UTF8("TermLink state delta context V1\n") || RFC4122(session_id) ||
+RFC4122(pc_device_id) || UTF8(state_contract))`. For
+`terminal_state_2_22_v2`, the same construction uses the distinct
+`TermLink state delta context V2\n` prefix. The v1 and v2 sealed objects also
+use separate `TERMLINK-STATE-DELTA-KEY-V1\0` / `-V2\0` HKDF prefixes,
+`TERMLINK-STATE-DELTA-OBJECT-V1\0` / `-V2\0` AAD prefixes, and
+`delta-v1:` / `delta-v2:` Key IDs. `TLDSEAL1`, its container version, the
+`TERMLINK_STATE_DELTA_V1` object format, and the v1 test vector retain their
+existing meanings; the authenticated state contract selects the crypto domain.
+Its derivation is identical on Windows and Android; a request cannot select
+another session's context. The authenticated header also carries the target
+`observedLocalInputEpoch` as a big-endian uint64 at offset 306 and the target
+`initialTranscriptBeforeLineId` at offset 314. Bytes 322 through 335 are zero.
+The target input epoch must be within signed 64-bit range and no smaller than
+the trusted base snapshot's epoch. The native graphics transcript anchor is
+currently 1. These two product fields are not part of `TLDELTA1`; Android must
+use the authenticated target values when sealing the reconstructed snapshot,
+never copy them from the base. AEAD failures and malformed native state are
+errors, not `NEEDS_FULL_SNAPSHOT` responses.
+
+The **sealed** object must be at least 608 bytes (336-byte header, 256-byte
+native packet minimum, 16-byte AEAD tag) and at most 8 MiB inclusive.
+`object_chunk` is at most
+512 KiB; `chunk_count` is exactly `ceil(object_bytes / 512 KiB)` and at most
+16, with contiguous indices and exact final-chunk length. The existing
+`HOST_HISTORY_CONTROL(CHUNK_ACK/CANCEL)` provides request-scoped backpressure
+and cancellation. Host and client each admit at most one pending Delta per
+session/recipient; timeout, disconnect, cancellation, and failed verification
+release its memory. The Relay forwards only the original encrypted Envelope
+bytes under its existing 1 MiB frame and 8 MiB peer queue limits. Delta
+chunks do not consume terminal event sequence, advance replay high-water, or
+advance durable ACK. Android may change its durable recovery checkpoint only
+after the complete sealed object and reconstructed target pass all identity,
+hash, profile, and atomic-install checks, then resumes the ordered suffix.
+Admission covers the base and reconstructed target as well as the wire
+object before decryption or native apply; a small Delta does not authorize an
+unbounded target allocation. The existing full snapshot cache and renderer
+binding transaction persist the reconstructed state before terminal ACK
+advances. The shared AEAD fixture is
+`protocol/test-vectors/state-delta-sealed-v1.json`; native packet validity is
+tested separately by terminal-core and is not implied by that crypto fixture.
 
 Legacy Phase 1 Termux Snapshot V1 objects contain both visible terminal buffers
 but an empty snapshot scrollback. Terminal-core Snapshot V2.10 instead retains

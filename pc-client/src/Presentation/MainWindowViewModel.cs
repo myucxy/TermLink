@@ -71,6 +71,10 @@ public sealed record SessionListItemViewModel(
     bool CanStop)
 {
     public SessionDataPlaneCarrier Carrier { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? TerminalDiagnostic { get; init; }
+    public override string ToString() => $"SessionListItemViewModel {{ SessionId = {SessionId} }}";
+    public bool HasTerminalDiagnostic => !string.IsNullOrEmpty(TerminalDiagnostic);
     public string CarrierText => PresentationText.SessionCarrier(Carrier);
     public string DetailText => $"{ShellType} · {CarrierText} · {LastActivityText}";
 }
@@ -291,6 +295,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private string noticeCode = string.Empty;
     private long noticeVersion;
     private bool confirmationVisible;
+    private string terminalDiagnosticText = string.Empty;
     private string confirmationTitle = string.Empty;
     private string confirmationDetail = string.Empty;
     private TaskCompletionSource<bool>? pendingConfirmation;
@@ -425,6 +430,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
         OpenDiagnosticsDirectoryCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().OpenDiagnosticsDirectoryAsync(token), cancellationToken));
+        ShowTerminalDiagnosticCommand = new AsyncCommand((parameter, _) => {
+            if (parameter is SessionListItemViewModel item && item.HasTerminalDiagnostic && !BlockingOverlayVisible)
+                TerminalDiagnosticText = item.TerminalDiagnostic!;
+            return Task.CompletedTask;
+        });
+        CloseTerminalDiagnosticCommand = new AsyncCommand((_, _) => { TerminalDiagnosticText = string.Empty; return Task.CompletedTask; });
         OpenSessionDirectoryCommand = new AsyncCommand((path, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenSessionDirectoryAsync(path as string ?? "", t), token));
         OpenAgentHelpCommand = new AsyncCommand((id, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenAgentHelpAsync(id as string ?? "", t), token));
         OpenZcodeRemoteCommand = new AsyncCommand((_, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenZcodeRemoteAsync(t), token));
@@ -482,6 +493,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand OpenAccountSettingsCommand { get; }
     public AsyncCommand OpenAboutUpdatesCommand { get; }
     public AsyncCommand StopSessionCommand { get; }
+    public AsyncCommand ShowTerminalDiagnosticCommand { get; }
+    public AsyncCommand CloseTerminalDiagnosticCommand { get; }
     public AsyncCommand GrantDeviceCommand { get; }
     public AsyncCommand RevokeDeviceCommand { get; }
     public AsyncCommand BeginAccountAuthorizationCommand { get; }
@@ -555,7 +568,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public bool IsWarningNotice => NoticeSeverity == UiNoticeSeverity.Warning;
     public bool IsErrorNotice => NoticeSeverity == UiNoticeSeverity.Error;
     public bool ConfirmationVisible { get => confirmationVisible; private set { if (SetProperty(ref confirmationVisible, value)) RaisePropertyChanged(nameof(BlockingOverlayVisible)); } }
-    public bool BlockingOverlayVisible => ConfirmationVisible || UpdateProgressVisible;
+    public bool BlockingOverlayVisible => ConfirmationVisible || UpdateProgressVisible || TerminalDiagnosticVisible;
+    public string TerminalDiagnosticText {
+        get => terminalDiagnosticText;
+        private set { if (SetProperty(ref terminalDiagnosticText, value)) {
+            RaisePropertyChanged(nameof(TerminalDiagnosticVisible)); RaisePropertyChanged(nameof(BlockingOverlayVisible));
+        } }
+    }
+    public bool TerminalDiagnosticVisible => TerminalDiagnosticText.Length > 0;
     public string ConfirmationTitle { get => confirmationTitle; private set => SetProperty(ref confirmationTitle, value); }
     public string ConfirmationDetail { get => confirmationDetail; private set => SetProperty(ref confirmationDetail, value); }
     public bool ConfirmationDanger { get; private set; } = true;
@@ -717,7 +737,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         if (!Settings.HasUnsavedCommands && !Settings.CommandEditorOpen)
             ObservableCollectionDiff.Apply(
                 Settings.TerminalCommands,
-                snapshot.TerminalCommands.Select(command => command with { RunAsAdministrator = true }).ToArray(),
+                snapshot.TerminalCommands.ToArray(),
                 item => item.Id);
         Diagnostics.PcId = snapshot.Identity.PcId.ToString("D");
         Diagnostics.Revision = snapshot.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -1182,7 +1202,6 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 DisplayName = name,
                 Executable = executable,
                 Arguments = arguments,
-                RunAsAdministrator = true,
             };
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandUpdated, string.Empty);
         }
@@ -1420,6 +1439,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             session.State is not ManagedSessionState.Ended)
         {
             Carrier = SessionDataPlaneCarrierContract.Normalize(session.Carrier),
+            TerminalDiagnostic = session.TerminalDiagnostic,
         };
     }
 

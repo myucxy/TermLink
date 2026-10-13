@@ -20,6 +20,7 @@ import org.robolectric.annotation.Config
 class ProductionRoomCacheTest {
     private lateinit var database: TermLinkDatabase
     private lateinit var historyRepository: HistoryRepository
+    private val loadedCheckpoints = mutableListOf<AutoCloseable>()
 
     @Before
     fun setUp() {
@@ -32,6 +33,8 @@ class ProductionRoomCacheTest {
 
     @After
     fun tearDown() {
+        loadedCheckpoints.forEach(AutoCloseable::close)
+        loadedCheckpoints.clear()
         database.close()
     }
 
@@ -60,7 +63,7 @@ class ProductionRoomCacheTest {
             snapshotId = snapshotId,
             snapshotSequence = 40u,
             ciphertextSha256 = HistoryRepository.sha256(ciphertext),
-        )
+        ).close()
 
         clearProductRoomCache(historyRepository)
 
@@ -97,7 +100,7 @@ class ProductionRoomCacheTest {
             snapshotId = localSnapshotId,
             snapshotSequence = 7uL,
             ciphertextSha256 = HistoryRepository.sha256(localCiphertext),
-        )
+        ).also(loadedCheckpoints::add)
         historyRepository.putAckCursor(
             sessionId = sessionId,
             direction = direction,
@@ -124,7 +127,7 @@ class ProductionRoomCacheTest {
             snapshotId = remoteSnapshotId,
             snapshotSequence = 1629uL,
             ciphertextSha256 = HistoryRepository.sha256(remoteCiphertext),
-        )
+        ).also(loadedCheckpoints::add)
 
         assertEquals(2L, localBound.rendererGeneration)
         assertEquals(3L, remoteBound.rendererGeneration)
@@ -136,7 +139,7 @@ class ProductionRoomCacheTest {
         )
         assertEquals(
             remoteSnapshotId,
-            historyRepository.rendererCheckpointState(sessionId, direction)?.snapshot?.metadata?.id,
+            historyRepository.rendererCheckpointState(sessionId, direction)?.use { it.snapshot.metadata.id },
         )
     }
 }

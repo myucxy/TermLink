@@ -66,8 +66,10 @@ class RemoteTerminalSession(
     private var lastAppliedSequence = initialAcknowledgedSequence
     private var lastAckedSequence = initialAcknowledgedSequence
     private var lastPresentationRevision = initialAcknowledgedSequence
-    private var rendererGeneration = initialRendererState.rendererGeneration
+    @Volatile private var rendererGeneration = initialRendererState.rendererGeneration
+    val currentRendererGeneration: Long get() = rendererGeneration
     private var gapGeneration = 0L
+    private var hasProjectedConnection = false
     private var leaseExpiryJob: Job? = null
     private var leaseRenewalJob: Job? = null
     private val orderedEventDispatcher = orderedEventObserver?.let {
@@ -122,10 +124,13 @@ class RemoteTerminalSession(
             if (closed.get() || mutableState.value is RemoteSessionState.Exited) return false
             historyRecoveryRequired = mutableState.value is RemoteSessionState.HistoryGap
             durableCursor = lastAckedSequence
-            if (!historyRecoveryRequired) {
+            // REST may grant the first lease before the initial connection projection runs.
+            val preserveInitialControl = !hasProjectedConnection && mutableState.value is RemoteSessionState.Controlling
+            hasProjectedConnection = true
+            if (!historyRecoveryRequired && !preserveInitialControl) {
                 mutableState.value = RemoteSessionState.Live(durableCursor)
             }
-            engine.setReadOnly(true)
+            engine.setReadOnly(!preserveInitialControl)
         }
         // A gap cannot safely advertise any cursor until the renderer has been
         // rebuilt and the cumulative ACK has been persisted. REST history
@@ -232,13 +237,28 @@ class RemoteTerminalSession(
         markReadOnly(reason)
     }
 
-    suspend fun accept(event: RemoteSessionEvent): EventAcceptance = accept(event, sendAcknowledgement = true)
+    suspend fun accept(event: RemoteSessionEvent): EventAcceptance = try {
+        accept(event, sendAcknowledgement = true, expectedRendererGeneration = null)
+    } finally {
+        (event as? RemoteSessionEvent.BrokerOutput)?.close()
+    }
+
+    /** Fences a resolved resource against a renderer reset between resolution and ordered apply. */
+    suspend fun accept(event: RemoteSessionEvent, expectedRendererGeneration: Long): EventAcceptance = try {
+        accept(event, sendAcknowledgement = true, expectedRendererGeneration = expectedRendererGeneration)
+    } finally {
+        (event as? RemoteSessionEvent.BrokerOutput)?.close()
+    }
 
     private suspend fun accept(
         event: RemoteSessionEvent,
         sendAcknowledgement: Boolean,
+        expectedRendererGeneration: Long?,
     ): EventAcceptance = mutex.withLock {
         check(!closed.get()) { "RemoteTerminalSession is closed" }
+        if (expectedRendererGeneration != null) {
+            check(expectedRendererGeneration == rendererGeneration) { "renderer generation changed before broker Output apply" }
+        }
         check(!rebuildingRenderer.get()) { "RemoteTerminalSession renderer is rebuilding" }
         require(event.sequence > 0) { "event sequence must be positive" }
         if (event.sequence <= lastAppliedSequence) {
@@ -278,9 +298,10 @@ class RemoteTerminalSession(
             enterHistoryGap(expected, event.sequence)
             return EventAcceptance.HistoryGap(expected, event.sequence)
         }
-        if (event is RemoteSessionEvent.Output &&
+        if ((event is RemoteSessionEvent.Output &&
             (event.sourceEventSequence != event.sequence ||
-                event.presentationRevision <= lastPresentationRevision)
+                event.presentationRevision <= lastPresentationRevision)) ||
+            (event is RemoteSessionEvent.BrokerOutput && event.presentationRevision <= lastPresentationRevision)
         ) {
             enterHistoryGap(expected, event.sequence)
             return EventAcceptance.HistoryGap(expected, event.sequence)
@@ -292,6 +313,10 @@ class RemoteTerminalSession(
                     require(event.bytes.isNotEmpty()) { "output event is empty" }
                     applyOutput(event)
                 }
+                is RemoteSessionEvent.BrokerOutput -> applyBrokerOutput(event)
+                is RemoteSessionEvent.HostResizeResult -> engine.advance(event.sequence)
+                is RemoteSessionEvent.HostTheme -> engine.applyHostTheme(event.sequence, event.theme)
+                is RemoteSessionEvent.HostGeometry -> engine.applyHostGeometry(event.sequence, event.geometry)
                 is RemoteSessionEvent.Resize -> engine.resize(event.sequence, event.size.columns, event.size.rows)
                 is RemoteSessionEvent.Title -> {
                     engine.advance(event.sequence)
@@ -313,6 +338,12 @@ class RemoteTerminalSession(
 
             lastAppliedSequence = event.sequence
             mutableState.value = stateAfterAppliedEvent(event)
+            if (sendAcknowledgement && event is RemoteSessionEvent.HostResizeResult) {
+                runCatching { engine.notifyHostResizeResult(event.result) }
+            }
+            if (sendAcknowledgement && (event is RemoteSessionEvent.Output || event is RemoteSessionEvent.BrokerOutput)) {
+                runCatching { engine.notifyLiveOutputApplied(event.sequence) }
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -372,9 +403,14 @@ class RemoteTerminalSession(
         events: List<RemoteSessionEvent>,
         acknowledgeEach: Boolean = true,
     ): Long {
-        check(!closed.get()) { "RemoteTerminalSession is closed" }
-        validateHistoryReplay(events, events.lastOrNull()?.sequence ?: 0)
-        check(rebuildingRenderer.compareAndSet(false, true)) { "RemoteTerminalSession renderer is already rebuilding" }
+        try {
+            check(!closed.get()) { "RemoteTerminalSession is closed" }
+            validateHistoryReplay(events, events.lastOrNull()?.sequence ?: 0)
+            check(rebuildingRenderer.compareAndSet(false, true)) { "RemoteTerminalSession renderer is already rebuilding" }
+        } catch (error: Throwable) {
+            events.forEach { (it as? RemoteSessionEvent.BrokerOutput)?.close() }
+            throw error
+        }
         try {
             return acknowledgementCommitMutex.withLock {
                 mutex.withLock {
@@ -398,6 +434,10 @@ class RemoteTerminalSession(
                             currentCoroutineContext().ensureActive()
                             when (event) {
                                 is RemoteSessionEvent.Output -> applyOutput(event)
+                                is RemoteSessionEvent.BrokerOutput -> applyBrokerOutput(event)
+                                is RemoteSessionEvent.HostResizeResult -> engine.advance(event.sequence)
+                                is RemoteSessionEvent.HostTheme -> engine.applyHostTheme(event.sequence, event.theme)
+                                is RemoteSessionEvent.HostGeometry -> engine.applyHostGeometry(event.sequence, event.geometry)
                                 is RemoteSessionEvent.Resize -> engine.resize(
                                     event.sequence,
                                     event.size.columns,
@@ -447,6 +487,7 @@ class RemoteTerminalSession(
             }
         } finally {
             rebuildingRenderer.set(false)
+            events.forEach { (it as? RemoteSessionEvent.BrokerOutput)?.close() }
         }
     }
 
@@ -462,10 +503,16 @@ class RemoteTerminalSession(
         persist: suspend (Long, Long) -> DurableAckCommit,
         publish: suspend (Long) -> Unit,
     ): Long {
-        check(!closed.get()) { "RemoteTerminalSession is closed" }
-        val target = expectedGap.receivedSequence - 1
-        validateHistoryReplay(events, target)
-        check(rebuildingRenderer.compareAndSet(false, true)) { "RemoteTerminalSession renderer is already rebuilding" }
+        val target = try {
+            check(!closed.get()) { "RemoteTerminalSession is closed" }
+            val candidate = expectedGap.receivedSequence - 1
+            validateHistoryReplay(events, candidate)
+            check(rebuildingRenderer.compareAndSet(false, true)) { "RemoteTerminalSession renderer is already rebuilding" }
+            candidate
+        } catch (error: Throwable) {
+            events.forEach { (it as? RemoteSessionEvent.BrokerOutput)?.close() }
+            throw error
+        }
         try {
             return acknowledgementCommitMutex.withLock {
                 mutex.withLock {
@@ -512,6 +559,10 @@ class RemoteTerminalSession(
                         currentCoroutineContext().ensureActive()
                         when (event) {
                             is RemoteSessionEvent.Output -> applyOutput(event)
+                            is RemoteSessionEvent.BrokerOutput -> applyBrokerOutput(event)
+                            is RemoteSessionEvent.HostResizeResult -> engine.advance(event.sequence)
+                            is RemoteSessionEvent.HostTheme -> engine.applyHostTheme(event.sequence, event.theme)
+                            is RemoteSessionEvent.HostGeometry -> engine.applyHostGeometry(event.sequence, event.geometry)
                             is RemoteSessionEvent.Resize -> engine.resize(
                                 event.sequence,
                                 event.size.columns,
@@ -540,7 +591,7 @@ class RemoteTerminalSession(
                                 RemoteLifecycle.INTERRUPTED ->
                                     RemoteSessionState.Reconnecting(lastAckedSequence, "remote session interrupted")
                                 RemoteLifecycle.ENDED ->
-                                    RemoteSessionState.Exited(lastAckedSequence, event.exitCode)
+                                    RemoteSessionState.Exited(lastAckedSequence, event.exitCode, event.protocolDiagnostic)
                             }
                             else -> recoveredState
                         }
@@ -593,6 +644,7 @@ class RemoteTerminalSession(
             }
         } finally {
             rebuildingRenderer.set(false)
+            events.forEach { (it as? RemoteSessionEvent.BrokerOutput)?.close() }
         }
     }
 
@@ -601,8 +653,10 @@ class RemoteTerminalSession(
         persist: suspend (Long, Long) -> DurableAckCommit,
         publish: suspend (Long) -> Unit,
     ): Long {
-        val expected = state.value as? RemoteSessionState.HistoryGap
-            ?: error("history recovery requires an active History Gap")
+        val expected = state.value as? RemoteSessionState.HistoryGap ?: run {
+            events.forEach { (it as? RemoteSessionEvent.BrokerOutput)?.close() }
+            error("history recovery requires an active History Gap")
+        }
         return recoverFromHistory(events, expected, persist, publish)
     }
 
@@ -618,6 +672,9 @@ class RemoteTerminalSession(
             require(event !is RemoteSessionEvent.Gap) { "raw replay contains a permanent gap" }
             if (event is RemoteSessionEvent.Output) {
                 require(event.bytes.isNotEmpty()) { "output event is empty" }
+            }
+            if (event is RemoteSessionEvent.BrokerOutput) {
+                require(event.outputByteCount > 0 && event.presentationRevision > 0) { "broker output event is invalid" }
             }
             ended = event is RemoteSessionEvent.Lifecycle && event.state == RemoteLifecycle.ENDED
             expected++
@@ -643,6 +700,22 @@ class RemoteTerminalSession(
         }
         engine.feed(event.sequence, ByteBuffer.wrap(event.bytes).asReadOnlyBuffer())
         lastPresentationRevision = event.presentationRevision
+    }
+
+    private suspend fun applyBrokerOutput(event: RemoteSessionEvent.BrokerOutput) {
+        require(event.presentationRevision > lastPresentationRevision) {
+            "broker output presentation revision did not advance"
+        }
+        val output = event.copyOutput()
+        try {
+            val captures = event.copyCanonicalCaptures()
+            try {
+                engine.applyBrokerCapturedOutput(event.sequence, output, captures)
+                lastPresentationRevision = event.presentationRevision
+            } finally { captures.fill(0) }
+        } finally {
+            output.fill(0)
+        }
     }
 
     suspend fun submitInput(bytes: ByteArray): InputSubmission = submitInput(bytes, null)
@@ -719,7 +792,7 @@ class RemoteTerminalSession(
                     leaseRenewalJob?.cancel()
                     leaseRenewalJob = null
                     engine.setReadOnly(true)
-                    RemoteSessionState.Exited(lastAckedSequence, event.exitCode)
+                    RemoteSessionState.Exited(lastAckedSequence, event.exitCode, event.protocolDiagnostic)
                 }
             }
         }
@@ -782,6 +855,7 @@ class RemoteTerminalSession(
             if (closed.get() || mutableState.value is RemoteSessionState.Exited ||
                 mutableState.value is RemoteSessionState.HistoryGap
             ) return
+            hasProjectedConnection = true
             leaseExpiryJob?.cancel()
             leaseExpiryJob = null
             leaseRenewalJob?.cancel()

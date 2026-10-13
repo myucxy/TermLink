@@ -16,6 +16,7 @@ interface TerminalViewportEngine : TerminalEngine {
 
     /** Current core mouse-reporting capability; null for non-interactive projections. */
     val mouseReporting: StateFlow<Boolean>? get() = null
+    val hostSignals: StateFlow<TerminalHostSignals>? get() = null
 
     /** Local finger routing only; never changes the host's terminal modes. */
     fun setTouchMouseEnabled(enabled: Boolean) = Unit
@@ -35,6 +36,12 @@ interface TerminalViewportEngine : TerminalEngine {
     ): View
 
     fun visibleText(): String
+
+    /** Read-only shell annotations, fetched only when a user opens the shell menu. */
+    fun shellState(): TerminalShellState = TerminalShellState.EMPTY
+
+    /** Freeze retained primary history at a command anchor. False means the anchor is unavailable. */
+    fun showShellCommand(commandId: Long): Boolean = false
 
     fun currentSize(): TerminalSize
 

@@ -756,12 +756,16 @@ data class HistoryEntry(
     val createdAt: Instant? = null,
 )
 
+/** Line ID 1 is the terminal-core V2 sentinel for an empty external transcript prefix. */
+internal fun externalTranscriptContinuation(initialBeforeLineId: ULong): ULong? =
+    initialBeforeLineId.takeIf { it > 1u }
+
 /** Independent read-only scrollback anchored to the snapshot installed for one live session. */
 data class TranscriptViewportState(
     val sessionId: UUID,
     val snapshotAnchorSequence: ULong,
     val initialBeforeLineId: ULong,
-    val nextBeforeLineId: ULong? = initialBeforeLineId.takeIf { it > 0u },
+    val nextBeforeLineId: ULong? = externalTranscriptContinuation(initialBeforeLineId),
     /**
      * Server-authenticated continuation. The initial request deliberately has
      * no opaque cursor and is selected by [snapshotAnchorSequence] plus
@@ -932,6 +936,8 @@ data class ProductSnapshot(
     val history: List<HistoryEntry> = emptyList(),
     val replayedHistoryObjectIds: Set<UUID> = emptySet(),
     val transcriptViewports: Map<UUID, TranscriptViewportState> = emptyMap(),
+    /** Detached authenticated HistoryV2 pages; never part of live VT or durable ACK. */
+    val frozenHistoryViewports: Map<UUID, FrozenHistoryViewportState> = emptyMap(),
     /** Diagnostics only; these mirrors do not participate in ACK or bootstrap decisions. */
     val liveAcknowledgements: Map<UUID, ULong> = emptyMap(),
     val bootstrapSources: Map<UUID, ProductBootstrapSource> = emptyMap(),
@@ -974,6 +980,7 @@ internal fun ProductSnapshot.withoutSession(sessionId: UUID): ProductSnapshot {
         history = history.filterNot { it.sessionId == sessionId },
         replayedHistoryObjectIds = replayedHistoryObjectIds - removedHistoryObjectIds,
         transcriptViewports = transcriptViewports - sessionId,
+        frozenHistoryViewports = frozenHistoryViewports - sessionId,
         liveAcknowledgements = liveAcknowledgements - sessionId,
         bootstrapSources = bootstrapSources - sessionId,
     )
@@ -1076,6 +1083,8 @@ interface ProductRepository : Closeable {
     /** Closes only this Android viewer/transport; the Windows shell remains running. */
     suspend fun closeSessionView(sessionId: UUID) = Unit
     fun terminalEngine(sessionId: UUID): TerminalViewportEngine?
+    /** Null while no authenticated live attachment has reported Host support. */
+    fun supportsFrozenHistory(sessionId: UUID): Boolean? = null
     fun historyEngine(historyObjectId: UUID): TerminalViewportEngine?
     suspend fun stopSession(sessionId: UUID)
     suspend fun deleteSession(sessionId: UUID)
@@ -1089,6 +1098,9 @@ interface ProductRepository : Closeable {
     suspend fun replayHistory(entry: HistoryEntry)
     suspend fun loadTranscriptBefore(sessionId: UUID)
     fun clearTranscript(sessionId: UUID)
+    suspend fun beginFrozenHistory(sessionId: UUID): Unit = error("Frozen history is unavailable")
+    suspend fun loadFrozenHistoryBefore(sessionId: UUID): Unit = error("Frozen history is unavailable")
+    suspend fun releaseFrozenHistory(sessionId: UUID): Unit = Unit
 }
 
 enum class DirectNetworkCheckKind {

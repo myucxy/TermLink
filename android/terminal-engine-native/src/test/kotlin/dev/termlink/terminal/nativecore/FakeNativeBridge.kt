@@ -299,6 +299,8 @@ internal class FakeNativeBridge : NativeBridge {
                     candidateOutput = bytes
                 }
                 is NativeSourceEvent.Resize -> candidate.size = event.size
+                is NativeSourceEvent.HostTheme -> return NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
+                is NativeSourceEvent.HostGeometry -> return NativeBridgeResult.Failure(NativeTerminalStatus.UNSUPPORTED.code)
                 is NativeSourceEvent.Advance -> {
                     candidate.logicalMicros = try {
                         Math.addExact(candidate.logicalMicros, event.micros)

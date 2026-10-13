@@ -20,6 +20,12 @@ param(
     [string]$HookReceiverClass = 'dev.termlink.product.debug.TailFirstE2EReceiver',
 
     [string]$SessionHostPath = 'win-agent\src\SessionHost\bin\Release\net8.0-windows\TermLink.SessionHost.exe',
+    [string]$NativeDisplayPath,
+    [switch]$FrozenGraphicsMode,
+    [ValidateSet('terminal_state_2_22_v1', 'terminal_state_2_22_v2')]
+    [string]$FrozenTerminalState = 'terminal_state_2_22_v2',
+    [switch]$ExpectFrozenUnsupported,
+    [switch]$FrozenLifecycleAcceptance,
     [ValidatePattern('^[^\\/]{1,200}$')]
     [string]$AgentControlPipe,
 
@@ -67,11 +73,15 @@ $script:sessionOutputTask = $null
 $script:sessionErrorTask = $null
 $script:airplaneModeEnabled = $false
 $script:adbPath = $null
+$script:frozenCaptureActive = $false
+$script:openSessionRequest = $null
+$script:liveMarker = $null
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'artifacts\tail-first-e2e'))
 $artifactDirectory = [IO.Path]::GetFullPath((Join-Path $artifactRoot $ArtifactRunId))
 $evidencePath = Join-Path $artifactDirectory 'evidence.json'
+$frozenFixtureStatusPath = Join-Path $artifactDirectory 'frozen-fixture-columns.txt'
 $hookContractEntry = 'assets/termlink-tail-first-e2e-contract-v1.json'
 $hookAction = 'dev.termlink.product.debug.TAIL_FIRST_E2E'
 $hookResponsePath = 'no_backup/tail-first-e2e/response.json'
@@ -79,12 +89,17 @@ $hookSessionArmPath = 'no_backup/tail-first-e2e/session-arm.json'
 $requiredHookOperations = @(
     'probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime'
 )
+if ($FrozenGraphicsMode) {
+    $requiredHookOperations += @('begin_frozen_history', 'page_frozen_history', 'release_frozen_history')
+}
 $snapshotMarkerCount = 5200
 $snapshotTranscriptPageCount = 26
 $snapshotTailFirstBeforeLineId = [uint64]5177
 $streamedPrefixMarkerCount = 5200
 $streamedPrefixMinimumTail = [uint64]4097
-$markerCount = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
+$markerCount = if ($FrozenLifecycleAcceptance) {
+    1400
+} elseif ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
     $streamedPrefixMarkerCount
 } else {
     $snapshotMarkerCount
@@ -135,6 +150,69 @@ function Assert-E2E {
         [Parameter(Mandatory)][string]$Message
     )
     if (-not $Condition) { Stop-TailFirstE2E -Code $Code -PublicMessage $Message }
+}
+
+function Test-FrozenPageTransition {
+    param(
+        [Parameter(Mandatory)]$Reference,
+        [Parameter(Mandatory)]$Previous,
+        [Parameter(Mandatory)]$Current,
+        [Parameter(Mandatory)][Collections.Generic.HashSet[uint64]]$SeenAnchors
+    )
+    $fields = @('frozen_active', 'frozen_render_ready', 'frozen_capture_id',
+        'frozen_revision', 'frozen_snapshot_sequence_s', 'frozen_page_count',
+        'frozen_first_line_id', 'frozen_next_before_line_id',
+        'frozen_has_more_before', 'frozen_head_truncated')
+    if (@($fields | Where-Object { $_ -notin $Current.PSObject.Properties.Name }).Count -gt 0) {
+        return $false
+    }
+    if ($Current.frozen_active -isnot [bool] -or $Current.frozen_render_ready -isnot [bool] -or
+        $Current.frozen_has_more_before -isnot [bool] -or $Current.frozen_head_truncated -isnot [bool] -or
+        -not $Current.frozen_active -or -not $Current.frozen_render_ready) {
+        return $false
+    }
+    try {
+        $anchor = [uint64]$Current.frozen_next_before_line_id
+        $previousAnchor = [uint64]$Previous.frozen_next_before_line_id
+        $firstLine = [uint64]$Current.frozen_first_line_id
+        $previousFirstLine = [uint64]$Previous.frozen_first_line_id
+        $capture = [uint64]$Current.frozen_capture_id
+        $revision = [uint64]$Current.frozen_revision
+        $snapshot = [uint64]$Current.frozen_snapshot_sequence_s
+        $pageCount = [int]$Current.frozen_page_count
+        if ($previousAnchor -eq 0 -or -not $SeenAnchors.Contains($previousAnchor) -or
+            $firstLine -eq 0 -or $firstLine -eq $previousFirstLine -or
+            $capture -eq 0 -or $capture -ne [uint64]$Reference.frozen_capture_id -or
+            $revision -ne [uint64]$Reference.frozen_revision -or
+            $snapshot -ne [uint64]$Reference.frozen_snapshot_sequence_s -or $pageCount -ne 2) {
+            return $false
+        }
+        if ($Current.frozen_has_more_before) {
+            if ($anchor -eq 0 -or $anchor -eq $previousAnchor -or $SeenAnchors.Contains($anchor)) {
+                return $false
+            }
+            return $SeenAnchors.Add($anchor)
+        }
+        return $anchor -eq 0
+    }
+    catch { return $false }
+}
+
+function Wait-FrozenCaptureAge {
+    param(
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$Clock,
+        [Parameter(Mandatory)][int]$TargetSeconds,
+        [Parameter(Mandatory)][string]$Phase
+    )
+    $nextReport = $Clock.Elapsed.TotalSeconds
+    while ($Clock.Elapsed.TotalSeconds -lt $TargetSeconds) {
+        $remaining = $TargetSeconds - $Clock.Elapsed.TotalSeconds
+        if ($Clock.Elapsed.TotalSeconds -ge $nextReport) {
+            Write-Host ("{0}: {1:N0}s remaining" -f $Phase, [Math]::Ceiling($remaining))
+            $nextReport = $Clock.Elapsed.TotalSeconds + 30
+        }
+        Start-Sleep -Milliseconds ([int][Math]::Min(1000, [Math]::Max(1, $remaining * 1000)))
+    }
 }
 
 function Test-StrictChildPath {
@@ -703,7 +781,7 @@ function Invoke-Adb {
 
 function Start-HookOperation {
     param(
-        [Parameter(Mandatory)][ValidateSet('probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime')][string]$Operation,
+        [Parameter(Mandatory)][ValidateSet('probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime', 'begin_frozen_history', 'page_frozen_history', 'release_frozen_history')][string]$Operation,
         [hashtable]$Arguments = @{}
     )
     $requestId = [Guid]::NewGuid().ToString('N')
@@ -759,6 +837,12 @@ function Wait-HookOperation {
                     Assert-E2E ($response.ok -is [bool]) 'E2E_HOOK_RESPONSE_INVALID' `
                         'The Debug hook response ok field is not a JSON boolean.'
                     if (-not [bool]$response.ok) {
+                        if ($FrozenLifecycleAcceptance -and $Operation -ceq 'open_session' -and
+                            (Test-Path -LiteralPath $frozenFixtureStatusPath -PathType Leaf) -and
+                            (Get-Content -LiteralPath $frozenFixtureStatusPath -Raw).StartsWith('FROZEN_FIXTURE_RESIZE_FAILED')) {
+                            Stop-TailFirstE2E 'FROZEN_FIXTURE_RESIZE_FAILED' `
+                                'The owned ConPTY child did not observe the requested 32-column terminal width within 15 seconds.'
+                        }
                         Assert-JsonProperties $response @('failure_code') "Debug hook operation '$Operation' failure"
                         Assert-E2E ([string]$response.failure_code -match '^[A-Z0-9_]{1,64}$') `
                             'E2E_HOOK_RESPONSE_INVALID' "Debug hook operation '$Operation' returned an invalid failure code."
@@ -773,6 +857,12 @@ function Wait-HookOperation {
                 }
             }
         }
+        if ($FrozenLifecycleAcceptance -and $Operation -ceq 'open_session' -and
+            (Test-Path -LiteralPath $frozenFixtureStatusPath -PathType Leaf) -and
+            (Get-Content -LiteralPath $frozenFixtureStatusPath -Raw).StartsWith('FROZEN_FIXTURE_RESIZE_FAILED')) {
+            Stop-TailFirstE2E 'FROZEN_FIXTURE_RESIZE_FAILED' `
+                'The owned ConPTY child did not observe the requested 32-column terminal width within 15 seconds.'
+        }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($invalidJsonSeen) {
@@ -783,7 +873,7 @@ function Wait-HookOperation {
 
 function Invoke-HookOperation {
     param(
-        [Parameter(Mandatory)][ValidateSet('probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime')][string]$Operation,
+        [Parameter(Mandatory)][ValidateSet('probe', 'open_session', 'inspect', 'page_up', 'open_history', 'close_history', 'show_ime', 'begin_frozen_history', 'page_frozen_history', 'release_frozen_history')][string]$Operation,
         [hashtable]$Arguments = @{},
         [switch]$AcceptFailure
     )
@@ -830,9 +920,45 @@ function Wait-SessionArm {
                         armed_at_utc = [DateTimeOffset]::FromUnixTimeMilliseconds(
                             [int64]$arm.armed_at_epoch_millis
                         ).UtcDateTime.ToString('o')
+                        arm_received_at_utc = [DateTime]::UtcNow.ToString('o')
                         baseline_session_ids = $baselineIds
                         baseline_session_count = $baselineIds.Count
                     }
+                }
+            }
+        }
+        # open_session arms the baseline before SessionHost starts. If Android
+        # rejects that exact request, consume its response now instead of
+        # waiting for the unrelated session-arm timeout.
+        $responseResult = Invoke-NativeCapture $script:adbPath `
+            @('-s', $serial, 'exec-out', 'run-as', $AndroidPackageName, 'cat', $hookResponsePath) 10
+        if ($responseResult.ExitCode -eq 0 -and
+            -not [string]::IsNullOrWhiteSpace([string]$responseResult.StdOut)) {
+            Assert-E2E ([Text.Encoding]::UTF8.GetByteCount([string]$responseResult.StdOut) -le 1048576) `
+                'E2E_HOOK_RESPONSE_TOO_LARGE' 'The Debug hook response exceeded 1 MiB.'
+            $response = $null
+            try { $response = [string]$responseResult.StdOut | ConvertFrom-Json -ErrorAction Stop }
+            catch { $invalidJsonSeen = $true }
+            if ($null -ne $response) {
+                Assert-NoSensitiveFields $response
+                Assert-JsonProperties $response @('schema_version', 'request_id', 'operation', 'ok') `
+                    'Debug hook open_session failure response'
+                if ([string]$response.request_id -ceq [string]$Request.request_id) {
+                    Assert-E2E ([int]$response.schema_version -eq 1 -and
+                        [string]$response.operation -ceq 'open_session' -and
+                        $response.ok -is [bool]) 'E2E_HOOK_RESPONSE_INVALID' `
+                        'The Debug hook open_session failure response does not match the pending request.'
+                    if (-not [bool]$response.ok) {
+                        Assert-JsonProperties $response @('failure_code') 'Debug hook open_session failure response'
+                        Assert-E2E ([string]$response.failure_code -match '^[A-Z0-9_]{1,64}$') `
+                            'E2E_HOOK_RESPONSE_INVALID' 'The Debug hook open_session failure code is invalid.'
+                        $stableFailureCode = [string]$response.failure_code
+                        $script:hookFailureCode = $stableFailureCode
+                        Stop-TailFirstE2E 'E2E_HOOK_OPERATION_FAILED' `
+                            "Debug hook operation 'open_session' reported failure_code '$stableFailureCode'."
+                    }
+                    Stop-TailFirstE2E 'E2E_HOOK_RESPONSE_INVALID' `
+                        'The Debug hook completed open_session without arming its session baseline.'
                 }
             }
         }
@@ -950,6 +1076,10 @@ function Get-StateObservation {
         Assert-E2E ($Response.$field -is [bool]) 'E2E_HOOK_RESPONSE_INVALID' `
             "Debug hook state for '$Phase' has a non-boolean $field."
     }
+    if ($Response.PSObject.Properties['realtime_transport_failure_reason']) {
+        Assert-E2E ([string]$Response.realtime_transport_failure_reason -cmatch '^[\x20-\x7e]{1,256}$') `
+            'E2E_HOOK_RESPONSE_INVALID' "Debug hook state has an invalid transport failure reason."
+    }
     Assert-E2E ([string]$Response.viewport_signature -match '^[A-Za-z0-9:_-]{1,128}$') `
         'E2E_HOOK_RESPONSE_INVALID' "Debug hook state for '$Phase' has an invalid viewport signature."
     Assert-E2E ([string]$Response.visible_text_sha256 -cmatch '^[0-9a-f]{64}$') `
@@ -1001,6 +1131,9 @@ function Get-StateObservation {
         realtime_socket_phase = [string]$Response.realtime_socket_phase
         realtime_socket_state = [string]$Response.realtime_socket_state
         realtime_transport_state = [string]$Response.realtime_transport_state
+        realtime_transport_failure_reason = if ($Response.PSObject.Properties['realtime_transport_failure_reason']) { [string]$Response.realtime_transport_failure_reason } else { $null }
+        realtime_terminal_accepted_generation = if ($Response.PSObject.Properties['realtime_terminal_accepted_generation']) { [uint64]$Response.realtime_terminal_accepted_generation } else { [uint64]0 }
+        realtime_accepted_terminal_profile = if ($Response.PSObject.Properties['realtime_accepted_terminal_profile']) { [string]$Response.realtime_accepted_terminal_profile } else { $null }
         realtime_remote_state = [string]$Response.realtime_remote_state
         realtime_socket_generation = [uint64]$Response.realtime_socket_generation
         realtime_connected_generation = [uint64]$Response.realtime_connected_generation
@@ -1155,6 +1288,172 @@ function Get-EmulatorAvdName {
         Select-Object -First 1)[0]
 }
 
+function Get-AvdStartMode {
+    param([Parameter(Mandatory)][string]$DevicesOutput)
+    $selected = [regex]::Match($DevicesOutput, "(?m)^$([regex]::Escape($serial))\s+(\S+)\s*`$")
+    if ($selected.Success) {
+        Assert-E2E $FrozenLifecycleAcceptance 'AVD_NOT_COLD' `
+            'The selected emulator port is already in use; a cold start is required.'
+        Assert-E2E ($selected.Groups[1].Value -ceq 'device') 'AVD_NOT_READY' `
+            'The selected emulator is connected but not ready.'
+        Assert-E2E ((Get-EmulatorAvdName $serial) -ceq $AvdName) 'AVD_IDENTITY_MISMATCH' `
+            'The running emulator does not match the requested AVD.'
+        return 'warm_existing'
+    }
+    foreach ($runningSerial in @([regex]::Matches($DevicesOutput, '(?m)^(emulator-\d+)\s+device\s*$') |
+        ForEach-Object { $_.Groups[1].Value })) {
+        $runningAvd = Get-EmulatorAvdName $runningSerial
+        Assert-E2E ([string]::IsNullOrWhiteSpace($runningAvd) -or $runningAvd -cne $AvdName) 'AVD_NOT_COLD' `
+            'The requested AVD is already running on another serial.'
+    }
+    return $(if ($FrozenLifecycleAcceptance) { 'owned_preserved_data' } else { 'cold_owned' })
+}
+
+function Get-CandidateApkIdentity {
+    param([Parameter(Mandatory)][string]$ApkPath, [Parameter(Mandatory)][string]$SdkRoot)
+    $buildTools = Join-Path $SdkRoot 'build-tools'
+    $aapt = @(Get-ChildItem -LiteralPath $buildTools -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d+(?:\.\d+)+$' -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName 'aapt.exe') -PathType Leaf) } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'aapt.exe' })
+    Assert-E2E ($aapt.Count -eq 1) 'ANDROID_AAPT_UNAVAILABLE' `
+        'Android SDK build-tools with aapt.exe are required to verify the candidate APK.'
+    $badging = Invoke-RequiredNative $aapt[0] @('dump', 'badging', $ApkPath) `
+        'ANDROID_APK_IDENTITY_INVALID' 'Could not read the candidate APK identity.'
+    $match = [regex]::Match($badging, "(?m)^package: name='([^']+)' versionCode='(\d+)' versionName='([^']+)'(?:\s|`$)")
+    Assert-E2E $match.Success 'ANDROID_APK_IDENTITY_INVALID' 'The candidate APK package/version is unavailable.'
+    Assert-E2E ($match.Groups[1].Value -ceq $AndroidPackageName) 'ANDROID_APK_PACKAGE_MISMATCH' `
+        'The candidate APK package differs from AndroidPackageName.'
+    return [pscustomobject][ordered]@{
+        package = $match.Groups[1].Value
+        version_code = $match.Groups[2].Value
+        version_name = $match.Groups[3].Value
+        sha256 = (Get-FileHash -LiteralPath $ApkPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
+function Test-FailureSessionIdentity {
+    param([Parameter(Mandatory)][string]$CandidateId, [Parameter(Mandatory)]$Arm)
+    $parsed = [Guid]::Empty
+    if (-not [Guid]::TryParse($CandidateId, [ref]$parsed) -or $parsed -eq [Guid]::Empty) { return $false }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Arm.selected_session_id)) {
+        return $CandidateId -ceq [string]$Arm.selected_session_id
+    }
+    return $Arm.baseline_session_ids -cnotcontains $CandidateId
+}
+
+function Save-FrozenOpenFailureEvidence {
+    param([Parameter(Mandatory)]$OpenRequest, [Parameter(Mandatory)]$Arm,
+        [Parameter(Mandatory)][string]$Marker)
+    $capture = [pscustomobject][ordered]@{
+        status = 'no_verified_session'
+        hook_response_saved = $false
+        inspect_saved = $false
+        screenshot_saved = $false
+    }
+    $script:evidence | Add-Member -NotePropertyName failure_capture -NotePropertyValue $capture
+    $openResponse = $null
+    try {
+        $result = Invoke-NativeCapture $script:adbPath `
+            @('-s', $serial, 'exec-out', 'run-as', $AndroidPackageName, 'cat', $hookResponsePath) 10
+        if ($result.ExitCode -eq 0 -and
+            [Text.Encoding]::UTF8.GetByteCount([string]$result.StdOut) -le 1048576) {
+            $candidate = [string]$result.StdOut | ConvertFrom-Json -ErrorAction Stop
+            Assert-NoSensitiveFields $candidate
+            if ([string]$candidate.request_id -ceq [string]$OpenRequest.request_id -and
+                [string]$candidate.operation -ceq 'open_session' -and
+                $candidate.ok -is [bool]) {
+                $failureCode = if ($candidate.PSObject.Properties['failure_code']) {
+                    [string]$candidate.failure_code
+                } else { $null }
+                $sessionId = if ($candidate.PSObject.Properties['session_id']) {
+                    [string]$candidate.session_id
+                } else { $null }
+                $openResponse = [pscustomobject][ordered]@{
+                    request_id = [string]$candidate.request_id
+                    operation = 'open_session'
+                    ok = [bool]$candidate.ok
+                    failure_code = if ($failureCode -match '^[A-Z0-9_]{1,64}$') {
+                        $failureCode
+                    } else { $null }
+                    session_id = if ($sessionId -match '^[0-9a-fA-F-]{36}$') {
+                        $sessionId
+                    } else { $null }
+                }
+                [IO.File]::WriteAllText((Join-Path $artifactDirectory 'failed-open-hook-response.json'),
+                    ($openResponse | ConvertTo-Json -Depth 3), [Text.UTF8Encoding]::new($false))
+                $capture.hook_response_saved = $true
+            }
+        }
+    }
+    catch {}
+
+    try {
+        $inspectRequest = Start-HookOperation 'inspect' @{ live_marker = $Marker }
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        do {
+            if ($script:sessionProcess.HasExited) {
+                $capture.status = 'host_exited_before_capture'
+                break
+            }
+            $result = Invoke-NativeCapture $script:adbPath `
+                @('-s', $serial, 'exec-out', 'run-as', $AndroidPackageName, 'cat', $hookResponsePath) 10
+            if ($result.ExitCode -eq 0 -and
+                [Text.Encoding]::UTF8.GetByteCount([string]$result.StdOut) -le 1048576) {
+                $response = $null
+                try { $response = [string]$result.StdOut | ConvertFrom-Json -ErrorAction Stop } catch {}
+                if ($null -ne $response -and [string]$response.request_id -ceq [string]$inspectRequest.request_id -and
+                    [string]$response.operation -ceq 'inspect' -and $response.ok -is [bool] -and $response.ok) {
+                    Assert-NoSensitiveFields $response
+                    $observation = Get-StateObservation 'failed-open' $response
+                    if (-not (Test-FailureSessionIdentity $observation.session_id $Arm)) { break }
+                    if ($null -ne $openResponse -and $null -ne $openResponse.session_id -and
+                        $openResponse.session_id -cne $observation.session_id) { break }
+                    [IO.File]::WriteAllText((Join-Path $artifactDirectory 'failed-open-inspect.json'),
+                        ($observation | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+                    $capture.inspect_saved = $true
+                    if ($script:sessionProcess.HasExited) {
+                        $capture.status = 'host_exited_before_capture'
+                        break
+                    }
+                    $script:evidence.screenshots += Save-Screenshot 'failed-open.png'
+                    $capture.screenshot_saved = $true
+                    $capture.status = 'captured_unverified_failure'
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $deadline)
+    }
+    catch {}
+}
+
+function Assert-InstalledCandidateApk {
+    param([Parameter(Mandatory)]$Candidate)
+    $pathResult = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'shell', 'pm', 'path', $AndroidPackageName) 20
+    $paths = @(([string]$pathResult.StdOut -split '\r?\n') | Where-Object { $_ -match '^package:' })
+    Assert-E2E ($pathResult.ExitCode -eq 0 -and $paths.Count -eq 1 -and
+        $paths[0] -match '^package:/\S+/base\.apk\s*$') 'ANDROID_INSTALLED_APK_MISSING' `
+        'The selected emulator lacks the expected single-base APK package.'
+    $installedPath = $paths[0].Substring('package:'.Length).Trim()
+    $hashResult = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'shell', 'sha256sum', $installedPath) 20
+    $hash = [regex]::Match([string]$hashResult.StdOut, '(?i)^([0-9a-f]{64})\s+\S+\s*$')
+    Assert-E2E ($hashResult.ExitCode -eq 0 -and $hash.Success -and
+        $hash.Groups[1].Value -ieq $Candidate.sha256) 'ANDROID_INSTALLED_APK_HASH_MISMATCH' `
+        'The installed APK SHA-256 differs from the candidate APK.'
+    $dump = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'shell', 'dumpsys', 'package', $AndroidPackageName) 20
+    $packageBlock = [regex]::Match([string]$dump.StdOut,
+        "(?ms)^\s*Package \[$([regex]::Escape($AndroidPackageName))\].*?(?=^\s*Package \[|\z)")
+    $versionCode = [regex]::Match($packageBlock.Value, '(?m)^\s*versionCode=(\d+)\b')
+    $versionName = [regex]::Match($packageBlock.Value, '(?m)^\s*versionName=(\S+)\s*$')
+    Assert-E2E ($dump.ExitCode -eq 0 -and $packageBlock.Success -and $versionCode.Success -and
+        $versionName.Success -and $versionCode.Groups[1].Value -ceq $Candidate.version_code -and
+        $versionName.Groups[1].Value -ceq $Candidate.version_name) 'ANDROID_INSTALLED_APK_VERSION_MISMATCH' `
+        'The installed APK package/version differs from the candidate APK.'
+    return $Candidate
+}
+
 function Write-Evidence {
     $script:evidence.finished_at_utc = [DateTime]::UtcNow.ToString('o')
     $json = $script:evidence | ConvertTo-Json -Depth 12
@@ -1184,6 +1483,7 @@ $script:evidence = [pscustomobject][ordered]@{
         android_package = $AndroidPackageName
         marker_count = $markerCount
         minimum_open_tail = $minimumOpenTail
+        frozen_terminal_state = if ($FrozenGraphicsMode) { $FrozenTerminalState } else { $null }
         history_page_count = $HistoryPageCount
         history_page_size = $HistoryPageSize
     }
@@ -1204,8 +1504,21 @@ $script:evidence = [pscustomobject][ordered]@{
 try {
     $script:stage = 'preflight-inputs'
     $script:evidence.stage = $script:stage
+    Assert-E2E (-not $ExpectFrozenUnsupported -or $FrozenGraphicsMode) 'E2E_INPUT_INVALID' `
+        'Old Host gating requires FrozenGraphicsMode.'
+    Assert-E2E ($FrozenGraphicsMode -or -not $PSBoundParameters.ContainsKey('FrozenTerminalState')) `
+        'E2E_INPUT_INVALID' 'FrozenTerminalState is only valid with FrozenGraphicsMode.'
+    Assert-E2E (-not $FrozenLifecycleAcceptance -or
+        ($FrozenGraphicsMode -and $HistoryBootstrapMode -ceq 'SnapshotTranscript' -and
+            -not $ExpectFrozenUnsupported)) 'E2E_INPUT_INVALID' `
+        'FrozenLifecycleAcceptance requires FrozenGraphicsMode and SnapshotTranscript without ExpectFrozenUnsupported.'
     $resolvedApk = Resolve-RepositoryFile $AndroidApkPath 'ANDROID_APK_MISSING' 'The Android Debug APK'
     $resolvedSessionHost = Resolve-RepositoryFile $SessionHostPath 'SESSION_HOST_MISSING' 'The Windows SessionHost executable'
+    $resolvedNativeDisplay = if ($FrozenGraphicsMode) {
+        Assert-E2E (-not [string]::IsNullOrWhiteSpace($NativeDisplayPath)) 'NATIVE_DISPLAY_MISSING' `
+            'Graphics acceptance requires NativeDisplayPath.'
+        Resolve-RepositoryFile $NativeDisplayPath 'NATIVE_DISPLAY_MISSING' 'The Windows native display executable'
+    } else { $null }
     $agentControlAssembly = Join-Path (Split-Path -Parent $resolvedSessionHost) 'TermLink.AgentControl.dll'
     $script:stage = 'preflight-tools'
     $script:evidence.stage = $script:stage
@@ -1261,15 +1574,19 @@ try {
     Assert-E2E ($avds -ccontains $AvdName) 'AVD_MISSING' 'The requested Android virtual device is unavailable.'
     $devices = Invoke-NativeCapture $script:adbPath @('devices') 30
     Assert-E2E ($devices.ExitCode -eq 0) 'ADB_UNAVAILABLE' 'ADB could not inspect connected devices.'
-    Assert-E2E ([string]$devices.StdOut -notmatch "(?m)^$([regex]::Escape($serial))\s+") 'AVD_NOT_COLD' `
-        'The selected emulator port is already in use; a cold start is required.'
-    foreach ($runningSerial in @([regex]::Matches([string]$devices.StdOut, '(?m)^(emulator-\d+)\s+device\s*$') |
-        ForEach-Object { $_.Groups[1].Value })) {
-        $runningAvd = Get-EmulatorAvdName $runningSerial
-        Assert-E2E ([string]::IsNullOrWhiteSpace($runningAvd) -or $runningAvd -ne $AvdName) 'AVD_NOT_COLD' `
-            'The requested AVD is already running; a cold start is required.'
+    $avdStartMode = Get-AvdStartMode ([string]$devices.StdOut)
+    $script:evidence.preflight | Add-Member -NotePropertyName avd_start_mode -NotePropertyValue $avdStartMode
+    if ($FrozenLifecycleAcceptance) {
+        $candidateApk = Get-CandidateApkIdentity $resolvedApk $sdkRoot
+        $script:evidence.preflight | Add-Member -NotePropertyName candidate_apk -NotePropertyValue $candidateApk
+        $script:evidence.preflight | Add-Member -NotePropertyName android_state_reset -NotePropertyValue $false
+        if ($avdStartMode -ceq 'warm_existing') {
+            $installedApk = Assert-InstalledCandidateApk $candidateApk
+            $script:evidence.preflight | Add-Member -NotePropertyName installed_apk -NotePropertyValue $installedApk
+        }
+    } else {
+        $script:evidence.preflight | Add-Member -NotePropertyName avd_cold_start_ready -NotePropertyValue $true
     }
-    $script:evidence.preflight | Add-Member -NotePropertyName avd_cold_start_ready -NotePropertyValue $true
     $script:evidence.preflight | Add-Member -NotePropertyName session_host -NotePropertyValue ([IO.Path]::GetFileName($resolvedSessionHost))
 
     if ($PreflightOnly) {
@@ -1279,64 +1596,81 @@ try {
         return
     }
 
-    $script:stage = 'android-cold-start'
+    $script:stage = if ($avdStartMode -ceq 'warm_existing') { 'android-warm-existing' } else { 'android-cold-start' }
     $script:evidence.stage = $script:stage
-    $emulatorStart = [Diagnostics.ProcessStartInfo]::new()
-    $emulatorStart.FileName = $emulatorPath
-    $emulatorStart.UseShellExecute = $false
-    $emulatorStart.CreateNoWindow = -not $ShowEmulator
-    $emulatorStart.WindowStyle = if ($ShowEmulator) {
-        [Diagnostics.ProcessWindowStyle]::Normal
-    } else {
-        [Diagnostics.ProcessWindowStyle]::Hidden
-    }
-    $emulatorStart.RedirectStandardOutput = $true
-    $emulatorStart.RedirectStandardError = $true
-    $emulatorArguments = @('-avd', $AvdName, '-port', [string]$EmulatorPort, '-no-snapshot-load', '-no-snapshot-save', '-no-boot-anim')
-    if (-not $ShowEmulator) { $emulatorArguments += '-no-window' }
-    foreach ($argument in $emulatorArguments) {
-        $emulatorStart.ArgumentList.Add($argument)
-    }
-    $script:emulatorProcess = [Diagnostics.Process]::Start($emulatorStart)
-    Assert-E2E ($null -ne $script:emulatorProcess) 'AVD_START_FAILED' 'The requested AVD could not be started.'
-    $script:emulatorOwned = $true
-    $script:emulatorOutputTask = $script:emulatorProcess.StandardOutput.ReadToEndAsync()
-    $script:emulatorErrorTask = $script:emulatorProcess.StandardError.ReadToEndAsync()
-    $bootDeadline = [DateTime]::UtcNow.AddSeconds($BootTimeoutSeconds)
-    $booted = $false
-    do {
-        if ($script:emulatorProcess.HasExited) { break }
-        $state = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'get-state') 5
-        if ($state.ExitCode -eq 0 -and ([string]$state.StdOut).Trim() -eq 'device') {
-            $boot = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'shell', 'getprop', 'sys.boot_completed') 5
-            if ($boot.ExitCode -eq 0 -and ([string]$boot.StdOut).Trim() -eq '1') { $booted = $true; break }
+    if ($avdStartMode -cne 'warm_existing') {
+        $emulatorStart = [Diagnostics.ProcessStartInfo]::new()
+        $emulatorStart.FileName = $emulatorPath
+        $emulatorStart.UseShellExecute = $false
+        $emulatorStart.CreateNoWindow = -not $ShowEmulator
+        $emulatorStart.WindowStyle = if ($ShowEmulator) {
+            [Diagnostics.ProcessWindowStyle]::Normal
+        } else {
+            [Diagnostics.ProcessWindowStyle]::Hidden
         }
-        Start-Sleep -Milliseconds 500
-    } while ([DateTime]::UtcNow -lt $bootDeadline)
-    Assert-E2E $booted 'AVD_BOOT_TIMEOUT' 'The requested AVD did not complete a cold boot in time.'
+        $emulatorStart.RedirectStandardOutput = $true
+        $emulatorStart.RedirectStandardError = $true
+        $emulatorArguments = @('-avd', $AvdName, '-port', [string]$EmulatorPort, '-no-snapshot-load', '-no-snapshot-save', '-no-boot-anim')
+        if (-not $ShowEmulator) { $emulatorArguments += '-no-window' }
+        foreach ($argument in $emulatorArguments) { $emulatorStart.ArgumentList.Add($argument) }
+        $script:emulatorProcess = [Diagnostics.Process]::Start($emulatorStart)
+        Assert-E2E ($null -ne $script:emulatorProcess) 'AVD_START_FAILED' 'The requested AVD could not be started.'
+        $script:emulatorOwned = $true
+        $script:emulatorOutputTask = $script:emulatorProcess.StandardOutput.ReadToEndAsync()
+        $script:emulatorErrorTask = $script:emulatorProcess.StandardError.ReadToEndAsync()
+        $bootDeadline = [DateTime]::UtcNow.AddSeconds($BootTimeoutSeconds)
+        $booted = $false
+        do {
+            if ($script:emulatorProcess.HasExited) { break }
+            $state = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'get-state') 5
+            if ($state.ExitCode -eq 0 -and ([string]$state.StdOut).Trim() -eq 'device') {
+                $boot = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'shell', 'getprop', 'sys.boot_completed') 5
+                if ($boot.ExitCode -eq 0 -and ([string]$boot.StdOut).Trim() -eq '1') { $booted = $true; break }
+            }
+            Start-Sleep -Milliseconds 500
+        } while ([DateTime]::UtcNow -lt $bootDeadline)
+        Assert-E2E $booted 'AVD_BOOT_TIMEOUT' 'The requested AVD did not complete booting in time.'
+    }
     $actualAvd = Get-EmulatorAvdName $serial
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($actualAvd)) 'AVD_IDENTITY_FAILED' 'Could not verify the running AVD.'
     Assert-E2E ($actualAvd -eq $AvdName) 'AVD_IDENTITY_MISMATCH' 'ADB connected to a different AVD than requested.'
 
-    $null = Invoke-Adb @('install', '-r', '-t', $resolvedApk) 'ANDROID_INSTALL_FAILED' 'The Debug APK could not be installed.' 180
-    $null = Invoke-Adb @('shell', 'am', 'force-stop', $AndroidPackageName) 'ANDROID_COLD_START_FAILED' 'The app could not be force-stopped for a cold launch.'
-    $null = Invoke-Adb @(
-        'shell', 'run-as', $AndroidPackageName, 'rm', '-f',
-        'databases/termlink-history.db',
-        'databases/termlink-history.db-shm',
-        'databases/termlink-history.db-wal',
-        'shared_prefs/termlink_product_preferences.xml'
-    ) 'ANDROID_COLD_STATE_RESET_FAILED' `
-        'The app history database or display preferences could not be reset before launch.'
-    $script:evidence.preflight | Add-Member -NotePropertyName android_cold_state -NotePropertyValue `
-        ([pscustomobject][ordered]@{
-            history_database_removed = $true
-            display_preferences_removed = $true
-            oidc_session_preserved = $true
-            device_identity_preserved = $true
-        })
+    if ($avdStartMode -cne 'warm_existing') {
+        $null = Invoke-Adb @('install', '-r', '-t', $resolvedApk) 'ANDROID_INSTALL_FAILED' 'The Debug APK could not be installed.' 180
+    }
+    if ($FrozenLifecycleAcceptance) {
+        $installedApk = Assert-InstalledCandidateApk $candidateApk
+        if (-not $script:evidence.preflight.PSObject.Properties['installed_apk']) {
+            $script:evidence.preflight | Add-Member -NotePropertyName installed_apk -NotePropertyValue $installedApk
+        }
+        $script:evidence.preflight | Add-Member -NotePropertyName android_cold_state -NotePropertyValue `
+            ([pscustomobject][ordered]@{
+                history_database_removed = $false
+                display_preferences_removed = $false
+                oidc_session_preserved = $true
+                device_identity_preserved = $true
+            })
+    } else {
+        $null = Invoke-Adb @('shell', 'am', 'force-stop', $AndroidPackageName) 'ANDROID_COLD_START_FAILED' 'The app could not be force-stopped for a cold launch.'
+        $null = Invoke-Adb @(
+            'shell', 'run-as', $AndroidPackageName, 'rm', '-f',
+            'databases/termlink-history.db',
+            'databases/termlink-history.db-shm',
+            'databases/termlink-history.db-wal',
+            'shared_prefs/termlink_product_preferences.xml'
+        ) 'ANDROID_COLD_STATE_RESET_FAILED' `
+            'The app history database or display preferences could not be reset before launch.'
+        $script:evidence.preflight | Add-Member -NotePropertyName android_cold_state -NotePropertyValue `
+            ([pscustomobject][ordered]@{
+                history_database_removed = $true
+                display_preferences_removed = $true
+                oidc_session_preserved = $true
+                device_identity_preserved = $true
+            })
+    }
     $null = Invoke-Adb @('shell', 'am', 'start', '-W', '-n', "$AndroidPackageName/$AndroidActivity") `
-        'ANDROID_COLD_START_FAILED' 'The app could not be cold-launched.'
+        $(if ($FrozenLifecycleAcceptance) { 'ANDROID_START_FAILED' } else { 'ANDROID_COLD_START_FAILED' }) `
+        'The app could not be opened.'
 
     $script:stage = 'runtime-hook-preflight'
     $script:evidence.stage = $script:stage
@@ -1347,6 +1681,12 @@ try {
         Assert-E2E ($capabilities -ccontains $operation) 'E2E_HOOK_RUNTIME_INCOMPLETE' `
             "The runtime Debug hook lacks capability '$operation'."
     }
+    if ($FrozenGraphicsMode) {
+        foreach ($operation in @('begin_frozen_history', 'page_frozen_history', 'release_frozen_history')) {
+            Assert-E2E ($capabilities -ccontains $operation) 'E2E_HOOK_RUNTIME_INCOMPLETE' `
+                "The runtime Debug hook lacks capability '$operation'."
+        }
+    }
     Assert-E2E ($probe.account_ready -is [bool]) 'E2E_HOOK_RESPONSE_INVALID' `
         'The Debug hook probe account_ready field is not a JSON boolean.'
     Assert-E2E ([bool]$probe.account_ready) 'ANDROID_ACCOUNT_NOT_READY' `
@@ -1356,7 +1696,11 @@ try {
 
     $script:stage = 'windows-managed-session'
     $script:evidence.stage = $script:stage
-    $markerStem = ('TLTF_' + $ArtifactRunId.Replace('-', '_').Replace('.', '_'))
+    $liveMarkerDigest = [Security.Cryptography.SHA256]::HashData(
+        [Text.Encoding]::UTF8.GetBytes($ArtifactRunId))
+    $markerStem = if ($FrozenLifecycleAcceptance) {
+        'TLTF32_' + [Convert]::ToHexString($liveMarkerDigest, 0, 4).ToLowerInvariant()
+    } else { 'TLTF_' + $ArtifactRunId.Replace('-', '_').Replace('.', '_') }
     $markers = @(1..$markerCount | ForEach-Object { '{0}_{1:D4}' -f $markerStem, $_ })
     Assert-E2E (@($markers | Select-Object -Unique).Count -eq $markerCount) 'MARKER_GENERATION_FAILED' `
         'The Windows marker set is not unique.'
@@ -1366,10 +1710,16 @@ try {
     # authoritative terminal width. ConPTY is allowed to hard-wrap an echoed
     # input line, which would make a long contiguous-string assertion a false
     # negative even though every output byte reached Android.
-    $liveMarkerDigest = [Security.Cryptography.SHA256]::HashData(
-        [Text.Encoding]::UTF8.GetBytes($ArtifactRunId))
     $liveMarker = 'TLTF_LIVE_' +
         [Convert]::ToHexString($liveMarkerDigest, 0, 8).ToLowerInvariant()
+    $script:liveMarker = $liveMarker
+    $frozenWidthMarker = 'TLF_COL32_' +
+        [Convert]::ToHexString($liveMarkerDigest, 0, 4).ToLowerInvariant()
+    $frozenLiveMarker = 'TLTF_FROZEN_' +
+        [Convert]::ToHexString($liveMarkerDigest, 0, 8).ToLowerInvariant()
+    $frozenOutputTrigger = Join-Path $artifactDirectory 'frozen-live-output.trigger'
+    $frozenFixtureStatusBase64 = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($frozenFixtureStatusPath))
     $childScript = if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
         @'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -1396,14 +1746,69 @@ while ($true) {
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $stem = '__MARKER_STEM__'
-1..__MARKER_COUNT__ | ForEach-Object { [Console]::WriteLine(('{0}_{1:D4}' -f $stem, $_)) }
+$padding = ''
+if (__FROZEN_LIFECYCLE__) {
+    $fixturePath = [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String('__FIXTURE_STATUS_BASE64__'))
+    try {
+        [Console]::Write([char]27 + '[32$|')
+        [Console]::Out.Flush()
+        $resizeClock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $columns = __FROZEN_COLUMNS_SOURCE__
+            if ($columns -eq 32) { break }
+            Start-Sleep -Milliseconds 100
+        } while ($resizeClock.Elapsed.TotalSeconds -lt 15)
+        if ($columns -ne 32) { throw 'FROZEN_FIXTURE_RESIZE_FAILED' }
+        [IO.File]::WriteAllText($fixturePath, [string]$columns, [Text.UTF8Encoding]::new($false))
+        $padding = 'X' * ($columns * 20)
+    }
+    catch {
+        [IO.File]::WriteAllText($fixturePath, 'FROZEN_FIXTURE_RESIZE_FAILED',
+            [Text.UTF8Encoding]::new($false))
+        throw 'FROZEN_FIXTURE_RESIZE_FAILED'
+    }
+}
+1..__MARKER_COUNT__ | ForEach-Object {
+    $marker = '{0}_{1:D4}' -f $stem, $_
+    if (-not __FROZEN_LIFECYCLE__ -or $_ -lt __MARKER_COUNT__) { $marker += $padding }
+    [Console]::WriteLine($marker)
+}
+if (__FROZEN_LIFECYCLE__) { [Console]::WriteLine('__FROZEN_WIDTH_MARKER__') }
 while ($true) {
     $line = [Console]::ReadLine()
     if ($null -eq $line -or $line -eq '__TERMLINK_TAIL_FIRST_EXIT__') { break }
     [Console]::WriteLine($line)
 }
 '@.Replace('__MARKER_STEM__', $markerStem).
+            Replace('__FROZEN_LIFECYCLE__', $(if ($FrozenLifecycleAcceptance) { '$true' } else { '$false' })).
+            Replace('__FROZEN_COLUMNS_SOURCE__', '[Console]::WindowWidth').
+            Replace('__FIXTURE_STATUS_BASE64__', $frozenFixtureStatusBase64).
+            Replace('__FROZEN_WIDTH_MARKER__', $frozenWidthMarker).
             Replace('__MARKER_COUNT__', [string]$markerCount)
+    }
+    if ($FrozenGraphicsMode) {
+        # Only the runner's owned PowerShell child writes to its ConPTY. The
+        # native-display SessionHost does not read its redirected stdin.
+        $triggerBase64 = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($frozenOutputTrigger))
+        $frozenOutputJob = @'
+$frozenOutputTrigger = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__TRIGGER_BASE64__'))
+$null = Start-ThreadJob -ArgumentList $frozenOutputTrigger, '__FROZEN_MARKER__' -ScriptBlock {
+    param($trigger, $marker)
+    $deadline = [DateTime]::UtcNow.AddMinutes(9)
+    while (-not (Test-Path -LiteralPath $trigger) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (Test-Path -LiteralPath $trigger) {
+        [Console]::WriteLine($marker)
+        [Console]::Out.Flush()
+    }
+}
+'@.Replace('__TRIGGER_BASE64__', $triggerBase64).
+            Replace('__FROZEN_MARKER__', $frozenLiveMarker)
+        $childScript = $childScript.Replace('while ($true) {',
+            $frozenOutputJob + [Environment]::NewLine + 'while ($true) {')
     }
     $encodedChildScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
     $childCommand = '"{0}" -NoLogo -NoProfile -NonInteractive -EncodedCommand {1}' -f (Join-Path $PSHOME 'pwsh.exe'), $encodedChildScript
@@ -1418,19 +1823,37 @@ while ($true) {
     $sessionStart.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
     $sessionStart.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $sessionStart.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
-    $sessionArguments = @('--command-base64', $encodedCommand, '--managed-shell', 'powershell-7', '--timeout-ms', '600000')
+    $sessionTimeoutMs = if ($FrozenLifecycleAcceptance) { '900000' } else { '600000' }
+    $sessionArguments = @('--command-base64', $encodedCommand, '--managed-shell', 'powershell-7',
+        '--timeout-ms', $sessionTimeoutMs)
+    if ($FrozenGraphicsMode) {
+        $sessionArguments += @('--native-display', $resolvedNativeDisplay,
+            '--terminal-state', $FrozenTerminalState)
+    }
     if (-not [string]::IsNullOrWhiteSpace($AgentControlPipe)) { $sessionArguments += @('--registry-pipe', $AgentControlPipe) }
     foreach ($argument in $sessionArguments) { $sessionStart.ArgumentList.Add($argument) }
 
     $script:stage = 'tail-first-session-arm'
     $script:evidence.stage = $script:stage
-    $openSessionRequest = Start-HookOperation 'open_session' @{
+    $openSessionArguments = @{
         first_marker = $firstMarker
         last_marker = $lastMarker
         marker_count = [string]$markerCount
         minimum_tail = [string]$minimumOpenTail
         history_bootstrap_mode = $HistoryBootstrapMode
     }
+    if ($FrozenLifecycleAcceptance) {
+        # Frozen readiness depends only on last_marker. The live marker sits
+        # at the tail of live output that has frequently scrolled out of the
+        # visible viewport by the time the surface settles, so requiring it
+        # here turned r398/r407/r408/r419/r421 into SURFACE_TIMEOUT even with
+        # transport CONNECTED and subscriber ready. The receiver treats a
+        # missing live_marker as optional (frozenLifecycleOpenSessionArguments
+        # AreValid accepts both shapes).
+        $openSessionArguments.frozen_lifecycle_acceptance = 'true'
+    }
+    $openSessionRequest = Start-HookOperation 'open_session' $openSessionArguments
+    $script:openSessionRequest = $openSessionRequest
     $sessionArm = Wait-SessionArm $openSessionRequest
     $sessionArm | Add-Member -NotePropertyName session_host_started_at_utc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
     $sessionArm | Add-Member -NotePropertyName selected_session_id -NotePropertyValue $null
@@ -1453,10 +1876,358 @@ while ($true) {
     $script:evidence.session_arm.selected_session_observed_at_utc = [DateTime]::UtcNow.ToString('o')
     Add-Assertion 'selected-session-not-in-armed-baseline' 'new UUID' $initialObservation.session_id `
         ($script:evidence.session_arm.baseline_session_ids -cnotcontains $initialObservation.session_id)
-    Add-Assertion 'session-host-started-after-baseline-arm' ">=$($script:evidence.session_arm.armed_at_utc)" `
+    # Receipt precedes startup on the host; Android's wall clock can be ahead of Windows.
+    Add-Assertion 'session-host-started-after-baseline-arm' ">=$($script:evidence.session_arm.arm_received_at_utc)" `
         $script:evidence.session_arm.session_host_started_at_utc `
         ([DateTimeOffset]::Parse($script:evidence.session_arm.session_host_started_at_utc) -ge
-            [DateTimeOffset]::Parse($script:evidence.session_arm.armed_at_utc))
+            [DateTimeOffset]::Parse($script:evidence.session_arm.arm_received_at_utc))
+    if ($FrozenLifecycleAcceptance) {
+        Assert-E2E (Test-Path -LiteralPath $frozenFixtureStatusPath -PathType Leaf) `
+            'FROZEN_FIXTURE_RESIZE_FAILED' 'The ConPTY child did not record its observed terminal width.'
+        $fixtureColumns = (Get-Content -LiteralPath $frozenFixtureStatusPath -Raw).Trim()
+        Add-Assertion 'frozen-fixture-child-observed-32-columns' '32' $fixtureColumns `
+            ($fixtureColumns -ceq '32')
+        $fixtureObservation = Get-StateObservation 'frozen-fixture-width' (
+            Invoke-HookOperation 'inspect' @{ live_marker = $frozenWidthMarker })
+        Add-Assertion 'frozen-fixture-android-observed-32-columns' '32' `
+            $fixtureObservation.terminal_columns ($fixtureObservation.terminal_columns -eq 32)
+        Add-Assertion 'frozen-fixture-width-marker-visible' 'true' `
+            $fixtureObservation.live_marker_visible $fixtureObservation.live_marker_visible
+        $script:evidence.observations += $fixtureObservation
+    }
+    if ($FrozenGraphicsMode) {
+        $script:stage = 'frozen-history-begin'
+        $script:evidence.stage = $script:stage
+        $begin = Invoke-HookOperation 'begin_frozen_history' -AcceptFailure:$ExpectFrozenUnsupported
+        if ($ExpectFrozenUnsupported) {
+            Add-Assertion 'old-host-rejects-frozen-history' 'UNSUPPORTED_FORMAT' $begin.failure_code `
+                (-not $begin.ok -and $begin.failure_code -ceq 'UNSUPPORTED_FORMAT')
+            $oldHostReleased = Invoke-HookOperation 'release_frozen_history'
+            Add-Assertion 'old-host-reject-clears-frozen-state' 'false/0' `
+                "$($oldHostReleased.frozen_active)/$($oldHostReleased.frozen_page_count)" `
+                (-not $oldHostReleased.frozen_active -and $oldHostReleased.frozen_page_count -eq 0)
+            $script:evidence.observations += $oldHostReleased
+            $script:stage = 'frozen-unsupported-live-flow'
+            $script:evidence.stage = $script:stage
+            $null = Invoke-HookOperation 'show_ime'
+            $null = Invoke-Adb @('shell', 'input', 'text', $liveMarker) `
+                'FROZEN_LIVE_INPUT_FAILED' 'The Android keyboard could not enter the live marker after old Host rejection.'
+            $null = Invoke-Adb @('shell', 'input', 'keyevent', 'KEYCODE_ENTER') `
+                'FROZEN_LIVE_INPUT_FAILED' 'The Android keyboard could not submit the live marker after old Host rejection.'
+            $oldHostLiveDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+            $oldHostLive = $null
+            do {
+                $candidate = Get-StateObservation 'frozen-unsupported-live' (
+                    Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
+                if ($candidate.session_id -ceq $initialObservation.session_id -and
+                    $candidate.live_ack -gt [uint64]$oldHostReleased.live_ack -and
+                    $candidate.live_marker_visible) {
+                    $oldHostLive = $candidate
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $oldHostLiveDeadline)
+            Assert-E2E ($null -ne $oldHostLive) 'FROZEN_UNSUPPORTED_CLOSED_LIVE_CLIENT' `
+                'Windows output did not reach Android after old Host rejected frozen history.'
+            Add-Assertion 'old-host-reject-live-continues' 'ACK advanced and marker visible' `
+                "$($oldHostLive.live_ack)/$($oldHostLive.live_marker_visible)" `
+                ($oldHostLive.live_ack -gt [uint64]$oldHostReleased.live_ack -and
+                    $oldHostLive.live_marker_visible)
+            $script:evidence.observations += $oldHostLive
+            $script:evidence.screenshots += Save-Screenshot 'frozen-unsupported-live-continues.png'
+        } else {
+            Assert-JsonProperties $begin @('frozen_active', 'frozen_render_ready',
+                'frozen_capture_id', 'frozen_revision', 'frozen_snapshot_sequence_s',
+                'frozen_page_count', 'frozen_first_line_id', 'frozen_last_line_id',
+                'frozen_next_before_line_id', 'frozen_has_more_before', 'live_ack') `
+                'Frozen BEGIN product response'
+            $script:frozenCaptureActive = [bool]$begin.frozen_active
+            Add-Assertion 'frozen-begin-one-page' '1 ready page' $begin.frozen_page_count `
+                ($begin.frozen_active -and $begin.frozen_render_ready -and $begin.frozen_page_count -eq 1)
+            Add-Assertion 'frozen-begin-has-older-lines' 'true' $begin.frozen_has_more_before `
+                ([bool]$begin.frozen_has_more_before)
+            Add-Assertion 'frozen-begin-ack-unchanged' $initialObservation.live_ack $begin.live_ack `
+                ($begin.live_ack -eq $initialObservation.live_ack)
+            Add-Assertion 'frozen-begin-capture-valid' 'positive' $begin.frozen_capture_id `
+                ([uint64]$begin.frozen_capture_id -gt 0 -and
+                    [uint64]$begin.frozen_revision -eq [uint64]$begin.frozen_snapshot_sequence_s + 1)
+            if ($FrozenLifecycleAcceptance) {
+                Assert-E2E ($begin.PSObject.Properties.Name -contains 'frozen_head_truncated' -and
+                    $begin.frozen_head_truncated -is [bool]) 'FROZEN_HEAD_FLAG_INVALID' `
+                    'Frozen BEGIN did not report a JSON boolean head-truncation flag.'
+                $seenFrozenAnchors = [Collections.Generic.HashSet[uint64]]::new()
+                Assert-E2E ([uint64]$begin.frozen_next_before_line_id -gt 0 -and
+                    $seenFrozenAnchors.Add([uint64]$begin.frozen_next_before_line_id)) 'FROZEN_BEGIN_ANCHOR_INVALID' `
+                    'Frozen BEGIN did not provide a nonzero first anchor.'
+                $frozenPageCalls = 0
+            }
+            $script:evidence.observations += $begin
+            $script:evidence.screenshots += Save-Screenshot 'frozen-01-begin.png'
+            $previous = $begin
+            for ($pageNumber = 1; $pageNumber -le 2; $pageNumber++) {
+                $script:stage = "frozen-history-page-$pageNumber"
+                $script:evidence.stage = $script:stage
+                $page = Invoke-HookOperation 'page_frozen_history'
+                if ($FrozenLifecycleAcceptance) {
+                    $frozenPageCalls++
+                    Assert-E2E (Test-FrozenPageTransition $begin $previous $page $seenFrozenAnchors) `
+                        'FROZEN_PAGE_TRANSITION_INVALID' "Frozen page $pageNumber lost its capture, render, or unique anchor."
+                }
+                Add-Assertion "frozen-page-$pageNumber-retains-capture" $begin.frozen_capture_id `
+                    $page.frozen_capture_id ($page.frozen_capture_id -eq $begin.frozen_capture_id)
+                Add-Assertion "frozen-page-$pageNumber-retains-revision" $begin.frozen_revision `
+                    $page.frozen_revision ($page.frozen_revision -eq $begin.frozen_revision)
+                Add-Assertion "frozen-page-$pageNumber-retains-snapshot" $begin.frozen_snapshot_sequence_s `
+                    $page.frozen_snapshot_sequence_s `
+                    ($page.frozen_snapshot_sequence_s -eq $begin.frozen_snapshot_sequence_s)
+                Add-Assertion "frozen-page-$pageNumber-advances-anchor" 'different nonzero anchor' `
+                    $page.frozen_next_before_line_id `
+                    ($page.frozen_next_before_line_id -ne $previous.frozen_next_before_line_id -and
+                        [uint64]$page.frozen_next_before_line_id -gt 0)
+                Add-Assertion "frozen-page-$pageNumber-renders" 'ready two-page window' `
+                    $page.frozen_page_count `
+                    ($page.frozen_active -and $page.frozen_render_ready -and $page.frozen_page_count -eq 2)
+                Add-Assertion "frozen-page-$pageNumber-ack-unchanged" $begin.live_ack $page.live_ack `
+                    ($page.live_ack -eq $begin.live_ack)
+                $script:evidence.observations += $page
+                $script:evidence.screenshots += Save-Screenshot ("frozen-0{0}-page.png" -f ($pageNumber + 1))
+                $previous = $page
+            }
+            $script:stage = 'frozen-history-concurrent-live-output'
+            $script:evidence.stage = $script:stage
+            $frozenBeforeLive = Get-StateObservation 'frozen-before-live' (
+                Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
+            $script:evidence.observations += $frozenBeforeLive
+            [IO.File]::WriteAllText($frozenOutputTrigger, $frozenLiveMarker, [Text.UTF8Encoding]::new($false))
+            $frozenLiveDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+            $frozenLive = $null
+            do {
+                $candidate = Get-StateObservation 'frozen-concurrent-live' (
+                    Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
+                if ($candidate.session_id -ceq $initialObservation.session_id -and
+                    $candidate.live_ack -gt $frozenBeforeLive.live_ack -and
+                    $candidate.visible_text_sha256 -cne $frozenBeforeLive.visible_text_sha256) {
+                    $frozenLive = $candidate
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $frozenLiveDeadline)
+            Assert-E2E ($null -ne $frozenLive) 'FROZEN_LIVE_ACK_DID_NOT_ADVANCE' `
+                'Windows output did not reach Android through Relay while frozen history was open.'
+            Add-Assertion 'frozen-live-output-ack-advanced' ">$($frozenBeforeLive.live_ack)" $frozenLive.live_ack `
+                ($frozenLive.live_ack -gt $frozenBeforeLive.live_ack)
+            Add-Assertion 'frozen-live-output-changed-live-text' 'different live text hash' `
+                $frozenLive.visible_text_sha256 `
+                ($frozenLive.visible_text_sha256 -cne $frozenBeforeLive.visible_text_sha256)
+            $script:evidence.observations += $frozenLive
+            $afterLivePage = Invoke-HookOperation 'page_frozen_history'
+            if ($FrozenLifecycleAcceptance) {
+                $frozenPageCalls++
+                Assert-E2E (Test-FrozenPageTransition $begin $previous $afterLivePage $seenFrozenAnchors) `
+                    'FROZEN_PAGE_TRANSITION_INVALID' 'The concurrent-output PAGE lost its capture, render, or unique anchor.'
+            }
+            Add-Assertion 'frozen-live-output-page-still-frozen' 'active and rendered' `
+                "$($afterLivePage.frozen_active)/$($afterLivePage.frozen_render_ready)" `
+                ($afterLivePage.frozen_active -and $afterLivePage.frozen_render_ready)
+            Add-Assertion 'frozen-live-output-retains-capture' $begin.frozen_capture_id `
+                $afterLivePage.frozen_capture_id ($afterLivePage.frozen_capture_id -eq $begin.frozen_capture_id)
+            Add-Assertion 'frozen-live-output-retains-revision' $begin.frozen_revision `
+                $afterLivePage.frozen_revision ($afterLivePage.frozen_revision -eq $begin.frozen_revision)
+            Add-Assertion 'frozen-live-output-retains-snapshot' $begin.frozen_snapshot_sequence_s `
+                $afterLivePage.frozen_snapshot_sequence_s `
+                ($afterLivePage.frozen_snapshot_sequence_s -eq $begin.frozen_snapshot_sequence_s)
+            Add-Assertion 'frozen-live-output-continues-page' 'different nonzero anchor' `
+                $afterLivePage.frozen_next_before_line_id `
+                ($afterLivePage.frozen_next_before_line_id -ne $previous.frozen_next_before_line_id -and
+                    [uint64]$afterLivePage.frozen_next_before_line_id -gt 0)
+            Add-Assertion 'frozen-live-output-page-keeps-ack' ">=$($frozenLive.live_ack)" `
+                $afterLivePage.live_ack ($afterLivePage.live_ack -ge $frozenLive.live_ack)
+            $script:evidence.observations += $afterLivePage
+            $script:evidence.screenshots += Save-Screenshot 'frozen-04-page-after-live.png'
+
+            $script:stage = 'frozen-history-relay-reconnect'
+            $script:evidence.stage = $script:stage
+            try {
+                Set-AndroidAirplaneMode $true
+                $offlineDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+                $frozenOffline = $null
+                do {
+                    $candidate = Get-StateObservation 'frozen-relay-offline' (
+                        Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
+                    if ($candidate.realtime_network_lost_count -gt $frozenLive.realtime_network_lost_count -and
+                        $candidate.realtime_connected_generation -eq 0) {
+                        $frozenOffline = $candidate
+                        break
+                    }
+                    Start-Sleep -Milliseconds 250
+                } while ([DateTime]::UtcNow -lt $offlineDeadline)
+                Assert-E2E ($null -ne $frozenOffline) 'FROZEN_RELAY_DISCONNECT_NOT_OBSERVED' `
+                    'Android did not observe Relay disconnection while frozen history was open.'
+                $script:evidence.observations += $frozenOffline
+                Add-Assertion 'frozen-relay-disconnected' 'network loss and generation 0' `
+                    "$($frozenOffline.realtime_network_lost_count)/$($frozenOffline.realtime_connected_generation)" `
+                    ($frozenOffline.realtime_network_lost_count -gt $frozenLive.realtime_network_lost_count -and
+                        $frozenOffline.realtime_connected_generation -eq 0)
+            }
+            finally {
+                if ($script:airplaneModeEnabled) {
+                    Set-AndroidAirplaneMode $false
+                    $script:evidence.cleanup.android_network_restored = $true
+                }
+            }
+            $onlineDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+            $frozenOnline = $null
+            do {
+                $candidate = Get-StateObservation 'frozen-relay-online' (
+                    Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
+                if ($candidate.realtime_network_available_count -gt $frozenOffline.realtime_network_available_count -and
+                    $candidate.realtime_connected_generation -gt $frozenLive.realtime_connected_generation -and
+                    $candidate.realtime_socket_state -ceq 'CONNECTED' -and
+                    $candidate.realtime_subscriber_ready) {
+                    $frozenOnline = $candidate
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $onlineDeadline)
+            Assert-E2E ($null -ne $frozenOnline) 'FROZEN_RELAY_RECONNECT_NOT_OBSERVED' `
+                'Android did not restore its Relay subscription while frozen history was open.'
+            $script:evidence.observations += $frozenOnline
+            Add-Assertion 'frozen-relay-successor-subscribed' '>previous generation and ready' `
+                "$($frozenOnline.realtime_connected_generation)/$($frozenOnline.realtime_subscriber_ready)" `
+                ($frozenOnline.realtime_connected_generation -gt $frozenLive.realtime_connected_generation -and
+                    $frozenOnline.realtime_subscriber_ready)
+
+            if ($FrozenLifecycleAcceptance) {
+                $script:stage = 'frozen-history-page-after-reconnect'
+                $script:evidence.stage = $script:stage
+                $frozenPageCalls++
+                $reconnectedPage = Invoke-HookOperation 'page_frozen_history'
+                Assert-E2E (Test-FrozenPageTransition $begin $afterLivePage $reconnectedPage $seenFrozenAnchors) `
+                    'FROZEN_RECONNECT_PAGE_INVALID' `
+                    'The original Frozen capture did not PAGE and render after Relay reconnection.'
+                Add-Assertion 'frozen-reconnect-page-same-capture' $begin.frozen_capture_id `
+                    $reconnectedPage.frozen_capture_id `
+                    ($reconnectedPage.frozen_capture_id -eq $begin.frozen_capture_id)
+                $script:evidence.observations += $reconnectedPage
+                $previous = $reconnectedPage
+                $script:stage = 'frozen-history-oldest-boundary'
+                $script:evidence.stage = $script:stage
+                while ($previous.frozen_has_more_before -and $frozenPageCalls -lt 256) {
+                    $frozenPageCalls++
+                    $page = Invoke-HookOperation 'page_frozen_history'
+                    Assert-E2E (Test-FrozenPageTransition $begin $previous $page $seenFrozenAnchors) `
+                        'FROZEN_PAGE_TRANSITION_INVALID' `
+                        "Frozen PAGE $frozenPageCalls lost its capture, render, or unique anchor."
+                    $script:evidence.observations += $page
+                    $previous = $page
+                }
+                Add-Assertion 'frozen-oldest-boundary-reached' 'has_more=false within 256 PAGEs' `
+                    "$($previous.frozen_has_more_before)/$frozenPageCalls" `
+                    ($frozenPageCalls -le 256 -and $previous.frozen_has_more_before -is [bool] -and
+                        -not $previous.frozen_has_more_before)
+                Add-Assertion 'frozen-oldest-head-truncated' 'true' $previous.frozen_head_truncated `
+                    ($previous.frozen_head_truncated -is [bool] -and $previous.frozen_head_truncated)
+            }
+
+            $script:stage = 'frozen-history-release'
+            $script:evidence.stage = $script:stage
+            $released = Invoke-HookOperation 'release_frozen_history'
+            $script:frozenCaptureActive = $false
+            Add-Assertion 'frozen-release-clears-overlay' 'false/0' `
+                "$($released.frozen_active)/$($released.frozen_page_count)" `
+                (-not $released.frozen_active -and $released.frozen_page_count -eq 0)
+            Add-Assertion 'frozen-release-preserves-ack' ">=$($frozenLive.live_ack)" $released.live_ack `
+                ($released.live_ack -ge $frozenLive.live_ack)
+            $script:evidence.observations += $released
+            $script:evidence.screenshots += Save-Screenshot 'frozen-05-released.png'
+            if ($FrozenLifecycleAcceptance) {
+                $script:stage = 'frozen-history-ttl-begin'
+                $script:evidence.stage = $script:stage
+                $ttlBegin = Invoke-HookOperation 'begin_frozen_history'
+                $script:frozenCaptureActive = [bool]$ttlBegin.frozen_active
+                Add-Assertion 'frozen-ttl-new-capture' 'new ready capture with older pages' `
+                    $ttlBegin.frozen_capture_id `
+                    ($ttlBegin.frozen_active -and $ttlBegin.frozen_render_ready -and
+                        $ttlBegin.frozen_capture_id -ne $begin.frozen_capture_id -and
+                        $ttlBegin.frozen_has_more_before)
+                $script:evidence.observations += $ttlBegin
+                $ttlClock = [Diagnostics.Stopwatch]::StartNew()
+                Wait-FrozenCaptureAge $ttlClock 240 'Frozen TTL first PAGE'
+                $script:stage = 'frozen-history-ttl-page-before-expiry'
+                $script:evidence.stage = $script:stage
+                $ttlPage = Invoke-HookOperation 'page_frozen_history'
+                $ttlFirstPageCompletedSeconds = $ttlClock.Elapsed.TotalSeconds
+                $ttlSeenAnchors = [Collections.Generic.HashSet[uint64]]::new()
+                $null = $ttlSeenAnchors.Add([uint64]$ttlBegin.frozen_next_before_line_id)
+                Add-Assertion 'frozen-ttl-first-page-before-deadline' '<295 seconds and rendered' `
+                    $ttlFirstPageCompletedSeconds `
+                    ($ttlFirstPageCompletedSeconds -lt 295 -and
+                        (Test-FrozenPageTransition $ttlBegin $ttlBegin $ttlPage $ttlSeenAnchors))
+                $script:evidence.observations += $ttlPage
+                Wait-FrozenCaptureAge $ttlClock 305 'Frozen TTL stale PAGE'
+                $script:stage = 'frozen-history-ttl-stale'
+                $script:evidence.stage = $script:stage
+                $ttlStale = Invoke-HookOperation 'page_frozen_history' -AcceptFailure
+                Add-Assertion 'frozen-ttl-page-does-not-renew-lease' 'STALE_CAPTURE' $ttlStale.failure_code `
+                    (-not $ttlStale.ok -and $ttlStale.failure_code -ceq 'STALE_CAPTURE')
+                $script:evidence.observations += $ttlStale
+                $ttlReleased = Invoke-HookOperation 'release_frozen_history'
+                $script:frozenCaptureActive = $false
+                Add-Assertion 'frozen-ttl-release-clears-overlay' 'false/0' `
+                    "$($ttlReleased.frozen_active)/$($ttlReleased.frozen_page_count)" `
+                    (-not $ttlReleased.frozen_active -and $ttlReleased.frozen_page_count -eq 0)
+                $script:evidence.observations += $ttlReleased
+            }
+            $rebrowse = Invoke-HookOperation 'begin_frozen_history'
+            Add-Assertion 'frozen-reconnect-new-capture' 'different ready capture' $rebrowse.frozen_capture_id `
+                ($rebrowse.frozen_render_ready -and $rebrowse.frozen_capture_id -ne $begin.frozen_capture_id)
+            $script:frozenCaptureActive = [bool]$rebrowse.frozen_active
+            $script:evidence.observations += $rebrowse
+            $script:evidence.screenshots += Save-Screenshot 'frozen-06-rebrowse.png'
+            if ($FrozenLifecycleAcceptance) {
+                $rebrowsePage = Invoke-HookOperation 'page_frozen_history'
+                $rebrowseAnchors = [Collections.Generic.HashSet[uint64]]::new()
+                $null = $rebrowseAnchors.Add([uint64]$rebrowse.frozen_next_before_line_id)
+                Add-Assertion 'frozen-expired-slot-reusable' 'new capture can PAGE' `
+                    $rebrowsePage.frozen_capture_id `
+                    (Test-FrozenPageTransition $rebrowse $rebrowse $rebrowsePage $rebrowseAnchors)
+                $script:evidence.observations += $rebrowsePage
+            }
+            $rebrowseReleased = Invoke-HookOperation 'release_frozen_history'
+            $script:frozenCaptureActive = $false
+            Add-Assertion 'frozen-rebrowse-release-clears-overlay' 'false/0' `
+                "$($rebrowseReleased.frozen_active)/$($rebrowseReleased.frozen_page_count)" `
+                (-not $rebrowseReleased.frozen_active -and $rebrowseReleased.frozen_page_count -eq 0)
+            $script:evidence.observations += $rebrowseReleased
+            $script:stage = 'frozen-release-live-flow'
+            $script:evidence.stage = $script:stage
+            # Native display mode reads its window pipe, so verify the Android input path instead of unused host stdin.
+            $null = Invoke-HookOperation 'show_ime'
+            $null = Invoke-Adb @('shell', 'input', 'text', $liveMarker) `
+                'FROZEN_LIVE_INPUT_FAILED' 'The Android keyboard could not enter the live marker.'
+            $null = Invoke-Adb @('shell', 'input', 'keyevent', 'KEYCODE_ENTER') `
+                'FROZEN_LIVE_INPUT_FAILED' 'The Android keyboard could not submit the live marker.'
+            $deadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
+            $liveAfterRelease = $null
+            do {
+                $candidate = Get-StateObservation 'frozen-release-live' (
+                    Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
+                if ($candidate.session_id -ceq $initialObservation.session_id -and
+                    $candidate.live_ack -gt $rebrowseReleased.live_ack -and $candidate.live_marker_visible) {
+                    $liveAfterRelease = $candidate
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            Assert-E2E ($null -ne $liveAfterRelease) 'FROZEN_RELEASE_CLOSED_LIVE_CLIENT' `
+                'Live output and durable ACK did not continue after releasing frozen history.'
+            $script:evidence.observations += $liveAfterRelease
+            Add-Assertion 'frozen-release-live-output-continues' ">$($rebrowseReleased.live_ack) and visible marker" `
+                $liveAfterRelease.live_ack ($liveAfterRelease.live_ack -gt $rebrowseReleased.live_ack -and
+                    $liveAfterRelease.live_marker_visible)
+            $script:evidence.screenshots += Save-Screenshot 'frozen-07-live-continues.png'
+        }
+    } else {
     if ($HistoryBootstrapMode -ceq 'StreamedChunkPrefix') {
         Add-Assertion 'streamed-prefix-snapshot-count' '0' $initialObservation.snapshot_count `
             ($initialObservation.snapshot_count -eq 0)
@@ -1940,6 +2711,7 @@ while ($true) {
     Add-Assertion 'terminal-extends-to-bottom-bar' '0..1px' $terminalBarGap ($terminalBarGap -in 0, 1)
     $script:evidence.screenshots += Save-Screenshot '05-ime-layout.png'
 
+    }
     $script:evidence.status = 'passed'
     $script:evidence.stage = 'complete'
 }
@@ -1955,8 +2727,18 @@ catch {
         message = $message
         hook_failure_code = $script:hookFailureCode
     }
+    if ($FrozenLifecycleAcceptance -and $script:stage -ceq 'tail-first-open' -and
+        $null -ne $script:openSessionRequest -and $null -ne $script:liveMarker -and
+        $null -ne $script:sessionProcess -and -not $script:sessionProcess.HasExited -and
+        $script:evidence.PSObject.Properties['session_arm']) {
+        Save-FrozenOpenFailureEvidence $script:openSessionRequest $script:evidence.session_arm $script:liveMarker
+    }
 }
 finally {
+    if ($script:frozenCaptureActive -and $null -ne $script:adbPath) {
+        try { $null = Invoke-HookOperation 'release_frozen_history'; $script:frozenCaptureActive = $false }
+        catch {}
+    }
     if ($script:airplaneModeEnabled -and $null -ne $script:adbPath) {
         for ($attempt = 1; $attempt -le 3 -and $script:airplaneModeEnabled; $attempt++) {
             try {

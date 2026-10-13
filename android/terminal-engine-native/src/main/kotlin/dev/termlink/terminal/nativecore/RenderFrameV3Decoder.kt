@@ -5,12 +5,16 @@ import dev.termlink.terminal.api.TerminalRenderColorV1
 import dev.termlink.terminal.api.TerminalRenderCursorShapeV2
 import dev.termlink.terminal.api.TerminalRenderCursorV2
 import dev.termlink.terminal.api.TerminalRenderFrameV3
+import dev.termlink.terminal.api.TerminalRenderFrameV4
+import dev.termlink.terminal.api.TerminalTextFrame
+import dev.termlink.terminal.api.TerminalWidthProfile
 import dev.termlink.terminal.api.TerminalRenderGraphemeV1
 import dev.termlink.terminal.api.TerminalRenderHyperlinkV1
 import dev.termlink.terminal.api.TerminalRenderPaletteV1
 import dev.termlink.terminal.api.TerminalRenderRenditionV3
 import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
 import dev.termlink.terminal.api.TerminalRenderRowV1
+import dev.termlink.terminal.api.TerminalLineRendition
 import dev.termlink.terminal.api.TerminalRenderScreenV1
 import dev.termlink.terminal.api.TerminalSize
 import java.nio.ByteBuffer
@@ -18,41 +22,52 @@ import java.nio.ByteOrder
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 
-/** A deterministic rejection of a malformed or unsupported TermLink Render Frame V3 payload. */
+/** Versioned entry points remain strict; neither accepts another frame version. */
 class RenderFrameV3DecodeException internal constructor(message: String) :
     IllegalArgumentException("render frame v3: $message")
+class RenderFrameV4DecodeException internal constructor(message: String) :
+    IllegalArgumentException("render frame v4: $message")
 
-/** Strict, allocation-bounded decoder for the canonical TermLink Render Frame V3 wire format. */
 object RenderFrameV3Decoder {
-    fun decode(bytes: ByteArray): TerminalRenderFrameV3 {
-        try {
-            return Decoder(bytes).decode()
-        } catch (error: RenderFrameV3DecodeException) {
-            throw error
-        } catch (error: ArithmeticException) {
-            fail("integer overflow")
-        } catch (error: IndexOutOfBoundsException) {
-            fail("truncated data")
-        } catch (error: IllegalArgumentException) {
-            fail(error.message ?: "invalid value")
-        }
+    fun decode(bytes: ByteArray): TerminalRenderFrameV3 = try {
+        TextFrameDecoder.decode(bytes, 3) as TerminalRenderFrameV3
+    } catch (error: IllegalArgumentException) {
+        throw RenderFrameV3DecodeException(error.message ?: "invalid value")
+    }
+}
+object RenderFrameV4Decoder {
+    fun decode(bytes: ByteArray): TerminalRenderFrameV4 = try {
+        TextFrameDecoder.decode(bytes, 4) as TerminalRenderFrameV4
+    } catch (error: IllegalArgumentException) {
+        throw RenderFrameV4DecodeException(error.message ?: "invalid value")
+    }
+}
+
+internal object TextFrameDecoder {
+    fun decode(bytes: ByteArray, version: Int): TerminalTextFrame = try {
+        Decoder(bytes, version).decode()
+    } catch (_: ArithmeticException) {
+        fail("integer overflow")
+    } catch (_: IndexOutOfBoundsException) {
+        fail("truncated data")
     }
 
-    private class Decoder(private val bytes: ByteArray) {
+    private class Decoder(private val bytes: ByteArray, private val version: Int) {
+        private var widthProfile = TerminalWidthProfile.LEGACY_V1
         private val reader = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
 
-        fun decode(): TerminalRenderFrameV3 {
+        fun decode(): TerminalTextFrame {
             if (bytes.size < HEADER_SIZE) fail("header is truncated")
-            if (bytes.size > MAX_FRAME_BYTES) fail("frame exceeds 16 MiB")
-            if (!bytes.regionMatches(0, MAGIC, 0, MAGIC.size)) fail("bad magic")
+            if (bytes.size > (if (version == 4) 32 * 1024 * 1024 else MAX_FRAME_BYTES)) fail("frame exceeds version byte limit")
+            if (!bytes.regionMatches(0, if (version == 4) MAGIC_V4 else MAGIC, 0, MAGIC.size)) fail("bad magic")
 
-            expectU16(8, MAJOR, "major version")
+            expectU16(8, version, "major version")
             expectU16(10, MINOR, "minor version")
             expectU16(12, HEADER_SIZE, "header size")
             expectU16(14, DIRECTORY_ENTRY_SIZE, "directory entry size")
             expectU16(16, SECTION_COUNT, "section count")
             val frameFlags = u16(18)
-            if (frameFlags and FRAME_FLAGS_MASK.inv() != 0) fail("unknown frame flags")
+            if (frameFlags and (if (version == 4) 15 else FRAME_FLAGS_MASK).inv() != 0) fail("unknown frame flags")
             val total = u32(20, "total length")
             if (total != bytes.size.toLong()) fail("total length does not match input")
             val revision = u64(24, "presentation revision")
@@ -76,10 +91,14 @@ object RenderFrameV3Decoder {
             if (cursorFlags and CURSOR_FLAGS_MASK.toLong().inv() != 0L) {
                 fail("unknown cursor flags")
             }
-            if (cursorFlags and CURSOR_FLAG_WRAP != 0L && cursorColumn != columns - 1) {
+            if (version != 4 && cursorFlags and CURSOR_FLAG_WRAP != 0L && cursorColumn != columns - 1) {
                 fail("wrap-pending cursor must be in the last column")
             }
-            expectU32(60, WIDTH_PROFILE, "width profile")
+            widthProfile = when (u32(60, "width profile")) {
+                1L -> TerminalWidthProfile.LEGACY_V1
+                2L -> if (version == 4) TerminalWidthProfile.UNICODE_16 else fail("unsupported width profile")
+                else -> fail("unsupported width profile")
+            }
             expectU32(64, DIRECTORY_OFFSET, "directory offset")
             val cursorShape = when (u8(68)) {
                 0 -> TerminalRenderCursorShapeV2.BLOCK
@@ -93,7 +112,7 @@ object RenderFrameV3Decoder {
                 else -> fail("cursor blinking flag is invalid")
             }
             expectU16(70, 0, "cursor reserved field")
-            if (u64(72, "required features") != REQUIRED_FEATURES) {
+            if (u64(72, "required features") != (if (version == 4) 0x7ffL else REQUIRED_FEATURES)) {
                 fail("unsupported required features")
             }
             expectU64(80, 0, "header reserved field")
@@ -118,7 +137,34 @@ object RenderFrameV3Decoder {
             )
             val title = decodeTitle(sections[5])
 
-            return TerminalRenderFrameV3(
+            return if (version == 4) TerminalRenderFrameV4(
+                widthProfile = widthProfile,
+                presentationRevision = revision,
+                nextSourceSequence = nextSequence,
+                size = TerminalSize(columns, rowCount),
+                activeScreen = if (frameFlags and FRAME_FLAG_ALTERNATE != 0) {
+                    TerminalRenderScreenV1.ALTERNATE
+                } else {
+                    TerminalRenderScreenV1.PRIMARY
+                },
+                reverseVideo = frameFlags and FRAME_FLAG_REVERSE_VIDEO != 0,
+                cursor = TerminalRenderCursorV2(
+                    row = cursorRow,
+                    column = cursorColumn,
+                    visible = cursorFlags and CURSOR_FLAG_VISIBLE != 0L,
+                    wrapPending = cursorFlags and CURSOR_FLAG_WRAP != 0L,
+                    shape = cursorShape,
+                    blinking = cursorBlinking,
+                ),
+                graphemes = graphemes,
+                renditions = renditions,
+                palette = palette,
+                hyperlinks = hyperlinks,
+                rows = rows,
+                title = title,
+                mouseReporting = frameFlags and 4 != 0,
+                alternateScroll = frameFlags and 8 != 0,
+            ) else TerminalRenderFrameV3(
                 presentationRevision = revision,
                 nextSourceSequence = nextSequence,
                 size = TerminalSize(columns, rowCount),
@@ -198,7 +244,7 @@ object RenderFrameV3Decoder {
                         if (count !in 1..cellCount) fail("rendition count is out of range")
                     }
                     TAG_PALETTE -> {
-                        if (count != PALETTE_COUNT.toLong() || recordSize != 4L) {
+                        if (count != (if (version == 4) 264L else PALETTE_COUNT.toLong()) || recordSize != 4L) {
                             fail("palette directory metadata is invalid")
                         }
                     }
@@ -253,7 +299,7 @@ object RenderFrameV3Decoder {
                 val width = u8(record + 6)
                 val reserved = u8(record + 7)
                 if (stringOffset != expectedStringOffset) fail("grapheme strings are not contiguous")
-                if (length !in 1..MAX_GRAPHEME_BYTES) fail("grapheme UTF-8 length is out of range")
+                if (length !in 1..(if (widthProfile == TerminalWidthProfile.UNICODE_16) 48 else MAX_GRAPHEME_BYTES)) fail("grapheme UTF-8 length is out of range")
                 if (width != 1 && width != 2) fail("grapheme width is invalid")
                 if (reserved != 0) fail("grapheme reserved byte is nonzero")
                 val end = add(stringOffset, length.toLong(), "grapheme UTF-8 end")
@@ -337,14 +383,15 @@ object RenderFrameV3Decoder {
         }
 
         private fun decodePalette(section: Section): TerminalRenderPaletteV1 {
-            if (section.length != PALETTE_BYTES) fail("palette section length is invalid")
-            val values = ArrayList<Int?>(PALETTE_COUNT)
-            repeat(PALETTE_COUNT) { index ->
+            if (section.length != (if (version == 4) 264 * 4 else PALETTE_BYTES)) fail("palette section length is invalid")
+            val count = if (version == 4) 264 else PALETTE_COUNT
+            val values = ArrayList<Int?>(count)
+            repeat(count) { index ->
                 val offset = section.absolute(index.toLong() * 4L, 4)
                 val value = u32(offset, "palette value")
                 values += when {
                     value == UNSET_RGB -> null
-                    value <= MAX_RGB.toLong() -> value.toInt()
+                    value <= (if (index >= 260) 257 else MAX_RGB).toLong() && !(index >= 260 && value == (256 + index % 2).toLong()) -> value.toInt()
                     else -> fail("palette value is invalid")
                 }
             }
@@ -353,6 +400,9 @@ object RenderFrameV3Decoder {
                 defaultForegroundRgb = values[256],
                 defaultBackgroundRgb = values[257],
                 defaultCursorRgb = values[258],
+                selectionBackgroundRgb = values.getOrNull(259),
+                foregroundAlias = values.getOrNull(260), backgroundAlias = values.getOrNull(261),
+                frameForegroundAlias = values.getOrNull(262), frameBackgroundAlias = values.getOrNull(263),
             )
         }
 
@@ -429,8 +479,16 @@ object RenderFrameV3Decoder {
                 )
                 val meaningfulEnd = u32(rowOffset, "meaningful end")
                 val rowFlags = u32(rowOffset + 4, "row flags")
-                if (meaningfulEnd > columns.toLong()) fail("meaningful end is outside the row")
-                if (rowFlags and ROW_FLAGS_MASK.toLong().inv() != 0L) fail("unknown row flags")
+                if (rowFlags and (if (version == 4) 7L else ROW_FLAGS_MASK.toLong()).inv() != 0L) fail("unknown row flags")
+                val lineRendition = TerminalLineRendition.entries[((rowFlags ushr 1) and 3L).toInt()]
+                val effectiveColumns = lineRendition.columns(columns)
+                if (meaningfulEnd > effectiveColumns.toLong()) fail("meaningful end is outside the row")
+                if (rowFlags and ROW_SOFT_WRAPPED != 0L && (rowIndex == rowCount - 1 || lineRendition != TerminalLineRendition.SINGLE_WIDTH)) fail("invalid scaled or final soft-wrapped row")
+                if (lineRendition != TerminalLineRendition.SINGLE_WIDTH && rows.lastOrNull()?.softWrapped == true) fail("soft wrap crosses a scaled row")
+                if (rowIndex == u32(48, "cursor row").toInt()) {
+                    val cursorColumn = u32(52, "cursor column").toInt()
+                    if (cursorColumn >= effectiveColumns) fail("cursor is outside the effective row")
+                }
                 val cells = ArrayList<TerminalRenderCellV1>(columns)
                 repeat(columns) { column ->
                     val cellIndex = rowIndex.toLong() * columns.toLong() + column.toLong()
@@ -469,10 +527,15 @@ object RenderFrameV3Decoder {
                     )
                 }
                 validateWideCells(cells, graphemes, rowIndex)
+                for (column in effectiveColumns until columns) {
+                    val cell = cells[column]
+                    if (cell.wideContinuation || cell.isProtected || cell.hyperlinkReference != 0 || graphemes[cell.graphemeId - 1].text != " ") fail("nonblank cell outside scaled row")
+                }
                 rows += TerminalRenderRowV1(
                     meaningfulEnd = meaningfulEnd.toInt(),
                     softWrapped = rowFlags and ROW_SOFT_WRAPPED != 0L,
                     cells = cells,
+                    lineRendition = lineRendition,
                 )
             }
             if (referencedGraphemes.any { !it }) fail("grapheme table contains an unreferenced entry")
@@ -657,7 +720,7 @@ object RenderFrameV3Decoder {
         return value.toInt()
     }
 
-    private fun fail(message: String): Nothing = throw RenderFrameV3DecodeException(message)
+    private fun fail(message: String): Nothing = throw IllegalArgumentException(message)
 
     private const val HEADER_SIZE = 96
     private const val DIRECTORY_ENTRY_SIZE = 24
@@ -668,12 +731,10 @@ object RenderFrameV3Decoder {
     private const val MAX_COLUMNS = 512
     private const val MAX_ROWS = 512
     private const val MAX_CELLS = 262_144L
-    private const val MAJOR = 3
     private const val MINOR = 0
     private const val SECTION_VERSION = 1
     private const val RENDITION_SECTION_VERSION = 2
     private const val SECTION_CRITICAL = 1
-    private const val WIDTH_PROFILE = 1
     private const val REQUIRED_FEATURES = 0x7fL
     private const val FRAME_FLAG_ALTERNATE = 1
     private const val FRAME_FLAG_REVERSE_VIDEO = 2
@@ -728,6 +789,7 @@ object RenderFrameV3Decoder {
     // Reflected Castagnoli polynomial 0x82F63B78 represented as signed Int.
     private const val CRC32C_POLYNOMIAL = -2_097_792_136
 
+    private val MAGIC_V4 = "TLRFRM4\u0000".toByteArray(StandardCharsets.US_ASCII)
     private val MAGIC = byteArrayOf('T'.code.toByte(), 'L'.code.toByte(), 'R'.code.toByte(),
         'F'.code.toByte(), 'R'.code.toByte(), 'M'.code.toByte(), '3'.code.toByte(), 0)
 }

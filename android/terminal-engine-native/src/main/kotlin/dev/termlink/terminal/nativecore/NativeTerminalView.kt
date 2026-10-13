@@ -3,8 +3,10 @@ package dev.termlink.terminal.nativecore
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Bundle
@@ -29,15 +31,24 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.OverScroller
+import dev.termlink.terminal.api.TerminalCellPosition
+import dev.termlink.terminal.api.TerminalGraphicsFormat
+import dev.termlink.terminal.api.TerminalGraphicsResource
 import dev.termlink.terminal.api.TerminalInputModifiers
 import dev.termlink.terminal.api.TerminalKittyKeyEventType
+import dev.termlink.terminal.api.TerminalLineRendition
 import dev.termlink.terminal.api.TerminalMouseButton
 import dev.termlink.terminal.api.TerminalMouseButtons
 import dev.termlink.terminal.api.TerminalMouseInput
+import dev.termlink.terminal.api.TerminalMousePosition
 import dev.termlink.terminal.api.TerminalMouseWheelDirection
+import dev.termlink.terminal.api.TerminalPixelPosition
 import dev.termlink.terminal.api.TerminalRenderColorV1
 import dev.termlink.terminal.api.TerminalRenderCursorShapeV2
-import dev.termlink.terminal.api.TerminalRenderFrameV3
+import dev.termlink.terminal.api.TerminalRenderFrameV5
+import dev.termlink.terminal.api.TerminalRenderGlyphV5
+import dev.termlink.terminal.api.TerminalRenderImageV5
+import dev.termlink.terminal.api.TerminalTextFrame
 import dev.termlink.terminal.api.TerminalRenderGraphemeV1
 import dev.termlink.terminal.api.TerminalRenderRenditionV3
 import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
@@ -45,6 +56,7 @@ import dev.termlink.terminal.api.TerminalThemeV1
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalViewportMetrics
 import dev.termlink.terminal.api.TerminalTypefaceResolver
+import java.nio.ByteBuffer
 import java.util.LinkedHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -57,7 +69,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sign
 
-/** Canvas terminal surface for immutable terminal-core Render Frame V3 projections. */
+/** Canvas terminal surface for immutable terminal-core text and graphics projections. */
 internal class NativeTerminalView @JvmOverloads constructor(
     context: Context,
     private var engine: NativeTerminalEngine?,
@@ -67,12 +79,17 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private val onScrollPastBottom: (() -> Unit)? = null,
     attrs: AttributeSet? = null,
     private val transcript: NativeTranscriptViewport? = null,
+    private val frozenFrame: TerminalTextFrame? = null,
+    private var frozenTheme: TerminalThemeV1? = null,
 ) : View(context, attrs) {
     private val density = resources.displayMetrics.density
-    private val contentPadding = if (transcript == null) 8f * density else 0f
+    private val contentPadding = if (transcript == null && frozenFrame == null) 8f * density else 0f
     private var transcriptTopInset = 0f
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG)
     private val shapePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val graphicsPaint = Paint().apply { isFilterBitmap = false }
+    private val graphicsBitmaps = HashMap<Long, GraphicsBitmap>()
+    private var graphicsBitmapBytes = 0L
     private val imeEditable = SpannableStringBuilder().apply { Selection.setSelection(this, 0) }
     private var combiningAccent = 0
     private val pressedCharacterKeys = HashMap<Int, Pair<Int, Int?>>()
@@ -136,6 +153,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     private var touchDownY = 0f
     private var selectionLongPressEligible = false
     private var detached = false
+    @Volatile private var liveViewportUncovered = true
     private var baseTypeface: Typeface = Typeface.MONOSPACE
     private var boldTypeface: Typeface = Typeface.DEFAULT_BOLD
     private var italicTypeface: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.ITALIC)
@@ -377,10 +395,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     init {
-        isFocusable = transcript == null
-        isFocusableInTouchMode = transcript == null
+        isFocusable = transcript == null && frozenFrame == null
+        isFocusableInTouchMode = transcript == null && frozenFrame == null
         if (transcript != null) followCursor = false
-        isClickable = true
+        isClickable = frozenFrame == null
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
         refreshTypeface(force = true)
     }
@@ -388,7 +406,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         val owner = engine
-        detached = if (owner != null) !owner.attachView(this) else transcript?.attachView(this) != true
+        detached = if (owner != null) !owner.attachView(this) else if (frozenFrame != null) false else transcript?.attachView(this) != true
         if (!detached) onFrameChanged()
     }
 
@@ -403,6 +421,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         selectionActionMode?.finish()
         selectionActionMode = null
         clearSelectionState()
+        retainGraphicsBitmaps(null)
         engine?.detachView(this)
         super.onDetachedFromWindow()
     }
@@ -418,10 +437,18 @@ internal class NativeTerminalView @JvmOverloads constructor(
         selectionActionMode?.finish()
         selectionActionMode = null
         clearSelectionState()
+        retainGraphicsBitmaps(null)
     }
+
+    internal fun setLiveViewportUncovered(uncovered: Boolean) {
+        liveViewportUncovered = uncovered
+    }
+
+    internal fun isLiveViewportUncovered(): Boolean = liveViewportUncovered
 
     internal fun onFrameChanged() {
         if (detached) return
+        retainGraphicsBitmaps(currentFrame() as? TerminalRenderFrameV5)
         if (transcript != null) {
             updateTranscript(pendingTranscriptPresentation ?: transcriptPresentation())
             return
@@ -448,8 +475,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
             clampViewport()
             return
         }
-        val cursorLeft = contentPadding + frame.cursor.column * cellWidth
-        val cursorRight = cursorLeft + cellWidth
+        val cursorLeft = contentPadding + frame.cursor.column * cellWidth * frame.rows[frame.cursor.row].lineRendition.horizontalScale
+        val cursorRight = cursorLeft + cellWidth * frame.rows[frame.cursor.row].lineRendition.horizontalScale
         val cursorTop = contentPadding + frame.cursor.row * cellHeight
         val cursorBottom = cursorTop + cellHeight
         // Keep a small horizontal safety area around the cursor. This avoids
@@ -467,8 +494,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
                 cursorRight - width + horizontalBreathingRoom
             else -> viewportX
         }
+        // A graphics image can occupy the rows immediately above its cursor after an IME resize.
+        val verticalBreathingRoom = minOf(
+            cellHeight * CURSOR_EDGE_MARGIN_ROWS,
+            max(0f, (height - cellHeight) / 2f),
+        )
         viewportY = when {
-            cursorTop < viewportY -> cursorTop
+            cursorTop < viewportY + verticalBreathingRoom -> cursorTop - verticalBreathingRoom
             cursorBottom > viewportY + height -> cursorBottom - height
             else -> viewportY
         }
@@ -513,25 +545,37 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (detached || engine == null && transcript == null) return
+        if (detached || engine == null && transcript == null && frozenFrame == null) return
         drawFrame(canvas, currentFrame(), currentTheme())
     }
 
     internal fun drawFrame(
         canvas: Canvas,
-        frame: TerminalRenderFrameV3,
+        frame: TerminalTextFrame,
         theme: TerminalThemeV1,
     ) {
-        if (transcript != null) {
+        val graphics = frame as? TerminalRenderFrameV5
+        retainGraphicsBitmaps(graphics)
+        if (transcript != null && graphics == null) {
             drawTranscript(canvas, frame, theme)
             return
         }
         shapePaint.style = Paint.Style.FILL
         shapePaint.color = effectiveDefaultBackground(frame, theme)
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), shapePaint)
+        if (frame.palette.frameForegroundAlias != null || frame.palette.frameBackgroundAlias != null) {
+            shapePaint.style = Paint.Style.STROKE
+            shapePaint.strokeWidth = density
+            shapePaint.color = defaultAlias(frame, theme, frame.palette.frameForegroundAlias ?: 256)
+            canvas.drawRect(density / 2, density / 2, width - density / 2, height - density / 2, shapePaint)
+            shapePaint.color = defaultAlias(frame, theme, frame.palette.frameBackgroundAlias ?: 257)
+            canvas.drawRect(density * 1.5f, density * 1.5f, width - density * 1.5f, height - density * 1.5f, shapePaint)
+            shapePaint.style = Paint.Style.FILL
+        }
 
-        val firstRow = floor((viewportY - contentPadding) / cellHeight).toInt().coerceAtLeast(0)
-        val lastRow = ceil((viewportY + height - contentPadding) / cellHeight).toInt()
+        val originY = drawingOriginY()
+        val firstRow = floor((viewportY - originY) / cellHeight).toInt().coerceAtLeast(0)
+        val lastRow = ceil((viewportY + height - originY) / cellHeight).toInt()
             .coerceAtMost(frame.size.rows - 1)
         if (lastRow < firstRow) return
         val firstColumn = floor((viewportX - contentPadding) / cellWidth).toInt().coerceAtLeast(0)
@@ -541,47 +585,206 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val colorsByRendition = Array(frame.renditions.size) { index ->
             effectiveColors(frame, frame.renditions[index], theme)
         }
+        graphics?.let { drawImages(canvas, it) { image -> image.z < GRAPHICS_BELOW_BACKGROUND_Z } }
 
         for (rowIndex in firstRow..lastRow) {
             val row = frame.rows[rowIndex]
-            val top = contentPadding + rowIndex * cellHeight - viewportY
-            var runStart = firstColumn
+            val top = originY + rowIndex * cellHeight - viewportY
+            val scale = row.lineRendition.horizontalScale
+            val rowFirst = firstColumn / scale
+            val rowLast = minOf(lastColumn / scale, row.lineRendition.columns(frame.size.columns) - 1)
+            val savedCanvas = canvas.save()
+            canvas.scale(scale.toFloat(), 1f, contentPadding - viewportX, top)
+            var runStart = rowFirst
             var runColor: Int? = null
-            for (column in firstColumn..lastColumn) {
+            for (column in rowFirst..rowLast) {
                 val cell = row.cells[column]
-                val color = if (isSelected(column, rowIndex, frame)) {
-                    theme.selectionBackground.value
+                val rendition = frame.renditions[cell.renditionId]
+                val color = if (graphics == null && isSelected(column, rowIndex, frame)) {
+                    frame.palette.selectionBackgroundRgb?.let(::opaqueRgb) ?: theme.selectionBackground.value
+                } else if (graphics != null && colorsByRendition[cell.renditionId].background == effectiveDefaultBackground(frame, theme) &&
+                    (if (rendition.inverse.xor(frame.reverseVideo)) rendition.foreground else rendition.background) == TerminalRenderColorV1.Default) {
+                    null
                 } else {
                     colorsByRendition[cell.renditionId].background
                 }
-                if (runColor != null && color != runColor) {
-                    drawBackgroundRun(canvas, runStart, column, top, runColor)
+                if (column > rowFirst && color != runColor) {
+                    runColor?.let { drawBackgroundRun(canvas, runStart, column, top, it) }
                     runStart = column
                 }
                 runColor = color
             }
-            runColor?.let { drawBackgroundRun(canvas, runStart, lastColumn + 1, top, it) }
+            runColor?.let { drawBackgroundRun(canvas, runStart, rowLast + 1, top, it) }
+            canvas.restoreToCount(savedCanvas)
         }
+        graphics?.let { drawImages(canvas, it) { image -> image.z in GRAPHICS_BELOW_BACKGROUND_Z until 0 } }
 
         // Draw every cell background before drawing any text. A width-two grapheme is painted by
         // its lead cell across both columns; painting the continuation background afterwards would
         // erase the right half of CJK, full-width, and other wide glyphs.
         val firstTextColumn = (firstColumn - 1).coerceAtLeast(0)
         for (rowIndex in firstRow..lastRow) {
+            val rendition = frame.rows[rowIndex].lineRendition
+            val scale = rendition.horizontalScale
+            val top = originY + rowIndex * cellHeight - viewportY
+            val savedCanvas = canvas.save()
+            canvas.clipRect(0f, top, width.toFloat(), top + cellHeight)
+            if (rendition == TerminalLineRendition.DOUBLE_HEIGHT_BOTTOM) canvas.translate(0f, -cellHeight)
+            val scaleY = if (rendition == TerminalLineRendition.DOUBLE_HEIGHT_TOP || rendition == TerminalLineRendition.DOUBLE_HEIGHT_BOTTOM) 2f else 1f
+            canvas.scale(scale.toFloat(), scaleY, contentPadding - viewportX, top)
             drawTextRow(
                 canvas = canvas,
                 frame = frame,
                 rowIndex = rowIndex,
-                firstColumn = firstTextColumn,
-                lastColumn = lastColumn,
+                firstColumn = firstTextColumn / scale,
+                lastColumn = minOf(lastColumn / scale, rendition.columns(frame.size.columns) - 1),
                 colorsByRendition = colorsByRendition,
             )
+            canvas.restoreToCount(savedCanvas)
         }
-        drawCursor(canvas, frame, theme)
+        if (graphics != null) {
+            drawImages(canvas, graphics) { image -> image.z >= 0 }
+            drawGraphicsSelection(canvas, graphics, theme, firstRow, lastRow)
+        }
+        if (transcript == null) drawCursor(canvas, frame, theme)
         drawSelectionHandles(canvas, frame, theme)
     }
 
+    private fun drawingOriginY(): Float = if (transcript == null) contentPadding else transcriptTopInset
+
+    private fun retainGraphicsBitmaps(frame: TerminalRenderFrameV5?) {
+        val iterator = graphicsBitmaps.entries.iterator()
+        while (iterator.hasNext()) {
+            val (id, cached) = iterator.next()
+            val current = frame?.resources?.get(id)
+            if (current == null || !cached.resource.sameContent(current)) {
+                graphicsBitmapBytes -= cached.bitmap.allocationByteCount
+                // A hardware display list may still retain this bitmap until its next frame.
+                iterator.remove()
+            } else {
+                // Independent frame decodes create new immutable objects. Compare O(pixel bytes)
+                // once per resource at the frame change, then use identity within this frame.
+                cached.resource = current
+            }
+        }
+    }
+
+    private fun graphicsBitmap(resource: TerminalGraphicsResource): Bitmap {
+        graphicsBitmaps[resource.id]?.let { cached ->
+            check(cached.resource === resource) { "graphics cache was not synchronized with the current frame" }
+            return cached.bitmap
+        }
+        val config = if (resource.format == TerminalGraphicsFormat.A8) Bitmap.Config.ALPHA_8 else Bitmap.Config.ARGB_8888
+        val bitmap = Bitmap.createBitmap(resource.width, resource.height, config)
+        check(graphicsBitmaps.size < 256 && graphicsBitmapBytes + bitmap.allocationByteCount <= MAX_GRAPHICS_BITMAP_BYTES) {
+            "current graphics bitmap allocation exceeds the 64 MiB renderer budget"
+        }
+        val pixels = resource.readOnlyPixels()
+        if (resource.format == TerminalGraphicsFormat.A8) {
+            // Bitmap JNI requires accessible storage; the immutable heap view cannot expose its array.
+            val padded = ByteArray(bitmap.rowBytes * resource.height)
+            repeat(resource.height) { row -> pixels.get(padded, row * bitmap.rowBytes, resource.width) }
+            bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(padded))
+        } else {
+            // setPixels accepts straight ARGB and lets Android premultiply exactly once.
+            val row = IntArray(resource.width)
+            repeat(resource.height) { y ->
+                repeat(resource.width) { x ->
+                    val red = pixels.get().toInt() and 255
+                    val green = pixels.get().toInt() and 255
+                    val blue = pixels.get().toInt() and 255
+                    val alpha = pixels.get().toInt() and 255
+                    row[x] = (alpha shl 24) or (red shl 16) or (green shl 8) or blue
+                }
+                bitmap.setPixels(row, 0, resource.width, 0, y, resource.width, 1)
+            }
+        }
+        graphicsBitmaps[resource.id] = GraphicsBitmap(resource, bitmap)
+        graphicsBitmapBytes += bitmap.allocationByteCount
+        return bitmap
+    }
+
+    private fun drawImages(canvas: Canvas, frame: TerminalRenderFrameV5, include: (TerminalRenderImageV5) -> Boolean) {
+        val originX = contentPadding - viewportX
+        val originY = drawingOriginY() - viewportY
+        val viewportSave = canvas.save()
+        canvas.clipRect(originX, originY, originX + frame.size.columns * cellWidth, originY + frame.size.rows * cellHeight)
+        graphicsPaint.color = android.graphics.Color.WHITE
+        graphicsPaint.alpha = 255
+        for (image in frame.images) {
+            if (!include(image)) continue
+            val x = originX + image.column * cellWidth
+            val y = originY + image.row * cellHeight
+            val imageSave = canvas.save()
+            canvas.clipRect(x + image.clip.left * cellWidth, y + image.clip.top * cellHeight,
+                x + image.clip.right * cellWidth, y + image.clip.bottom * cellHeight)
+            val left = x + (image.x.numerator.toDouble() / image.x.denominator * cellWidth).toFloat()
+            val top = y + (image.y.numerator.toDouble() / image.y.denominator * cellHeight).toFloat()
+            val right = left + (image.width.numerator.toDouble() / image.width.denominator * cellWidth).toFloat()
+            val bottom = top + (image.height.numerator.toDouble() / image.height.denominator * cellHeight).toFloat()
+            val source = image.source
+            canvas.drawBitmap(graphicsBitmap(requireNotNull(frame.resources[image.resourceId])),
+                Rect(source.x, source.y, source.x + source.width, source.y + source.height),
+                RectF(left, top, right, bottom), graphicsPaint)
+            canvas.restoreToCount(imageSave)
+        }
+        canvas.restoreToCount(viewportSave)
+    }
+
+    private fun glyphAt(frame: TerminalTextFrame, column: Int, row: Int): TerminalRenderGlyphV5? {
+        if (frame !is TerminalRenderFrameV5) return null
+        val index = frame.glyphs.binarySearch { glyph ->
+            glyph.row.compareTo(row).takeIf { it != 0 } ?: glyph.column.compareTo(column)
+        }
+        return if (index < 0) null else frame.glyphs[index]
+    }
+
+    private fun drawDrcsGlyph(canvas: Canvas, frame: TerminalRenderFrameV5, glyph: TerminalRenderGlyphV5,
+        top: Float, rendition: TerminalRenderRenditionV3, colors: EffectiveColors) {
+        val left = contentPadding + glyph.column * cellWidth - viewportX
+        graphicsPaint.color = colors.foreground
+        graphicsPaint.alpha = if (rendition.faint) 166 else 255
+        val saved = canvas.save()
+        canvas.clipRect(left, top, left + cellWidth, top + cellHeight)
+        canvas.drawBitmap(graphicsBitmap(requireNotNull(frame.resources[glyph.resourceId])),
+            Rect(glyph.x, 0, glyph.x + glyph.width, glyph.height), RectF(left, top, left + cellWidth, top + cellHeight), graphicsPaint)
+        canvas.restoreToCount(saved)
+        drawDecorations(canvas, left, top, cellWidth, rendition, colors.foreground)
+    }
+
+    private fun drawGraphicsSelection(canvas: Canvas, frame: TerminalRenderFrameV5, theme: TerminalThemeV1, firstRow: Int, lastRow: Int) {
+        shapePaint.color = frame.palette.selectionBackgroundRgb?.let(::opaqueRgb) ?: theme.selectionBackground.value
+        shapePaint.alpha = minOf(shapePaint.alpha, 112)
+        for (row in firstRow..lastRow) {
+            val rowWidth = cellWidth * frame.rows[row].lineRendition.horizontalScale
+            val top = drawingOriginY() + row * cellHeight - viewportY
+            for (column in 0 until frame.rows[row].lineRendition.columns(frame.size.columns)) {
+                if (!isSelected(column, row, frame)) continue
+                val left = contentPadding + column * rowWidth - viewportX
+                canvas.drawRect(left, top, left + rowWidth, top + cellHeight, shapePaint)
+            }
+        }
+        shapePaint.alpha = 255
+    }
+
+    internal fun graphicsCacheForTest(): Pair<Int, Long> = graphicsBitmaps.size to graphicsBitmapBytes
+
+    internal fun graphicsBitmapForTest(id: Long): Bitmap? = graphicsBitmaps[id]?.bitmap
+
+    internal fun frozenCellHeight(): Float = cellHeight
+
+    internal fun updateFrozenTheme(theme: TerminalThemeV1) {
+        require(frozenFrame != null)
+        frozenTheme = theme
+        refreshTypeface()
+        invalidate()
+    }
+
+    internal fun cellGeometryForTest(): RectF = RectF(contentPadding - viewportX, drawingOriginY() - viewportY,
+        contentPadding - viewportX + cellWidth, drawingOriginY() - viewportY + cellHeight)
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (frozenFrame != null) return false
         if (detached) return false
         val owner = engine
         if (owner == null && transcript == null) return false
@@ -1006,10 +1209,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
         baselineOffset = (cellHeight - fontHeight) / 2f - metrics.ascent
     }
 
-    private fun currentFrame(): TerminalRenderFrameV3 =
-        engine?.frames?.value ?: transcript?.projection?.frame ?: error("Native terminal view is detached")
+    private fun currentFrame(): TerminalTextFrame =
+        engine?.frames?.value ?: transcript?.projection?.frame ?: frozenFrame ?: error("Native terminal view is detached")
 
-    private fun currentTheme(): TerminalThemeV1 = engine?.theme() ?: requireNotNull(transcript).theme
+    private fun currentTheme(): TerminalThemeV1 = engine?.theme() ?: transcript?.theme ?: requireNotNull(frozenTheme)
 
     private fun maxViewportX(): Float = max(
         0f,
@@ -1101,6 +1304,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     private fun handleHistoryScrollResult(result: NativeHistoryScrollResult) {
         when (result) {
+            NativeHistoryScrollResult.CAPTURE_EXPIRED,
+            NativeHistoryScrollResult.CAPTURE_LIMIT -> {
+                scroller.forceFinished(true)
+                val message = context.getString(if (result == NativeHistoryScrollResult.CAPTURE_EXPIRED)
+                    R.string.native_history_capture_expired else R.string.native_history_capture_limit)
+                android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+            }
             NativeHistoryScrollResult.MOVED,
             NativeHistoryScrollResult.UNCHANGED,
             NativeHistoryScrollResult.CANCELLED -> Unit
@@ -1326,8 +1536,8 @@ internal class NativeTerminalView @JvmOverloads constructor(
     internal fun isCursorFullyVisibleForTest(): Boolean {
         if (engine == null || width <= 0 || height <= 0) return false
         val cursor = currentFrame().cursor
-        val cursorLeft = contentPadding + cursor.column * cellWidth
-        val cursorRight = cursorLeft + cellWidth
+        val cursorLeft = contentPadding + cursor.column * cellWidth * currentFrame().rows[cursor.row].lineRendition.horizontalScale
+        val cursorRight = cursorLeft + cellWidth * currentFrame().rows[cursor.row].lineRendition.horizontalScale
         val cursorTop = contentPadding + cursor.row * cellHeight
         val cursorBottom = cursorTop + cellHeight
         return cursorLeft >= viewportX && cursorRight <= viewportX + width &&
@@ -1343,18 +1553,19 @@ internal class NativeTerminalView @JvmOverloads constructor(
         if (engine == null || width <= 0 || height <= 0) return false
         val cursor = currentFrame().cursor
         val margin = cursorHorizontalBreathingRoomForTest()
-        val cursorLeft = contentPadding + cursor.column * cellWidth
-        val cursorRight = cursorLeft + cellWidth
+        val cursorLeft = contentPadding + cursor.column * cellWidth * currentFrame().rows[cursor.row].lineRendition.horizontalScale
+        val cursorRight = cursorLeft + cellWidth * currentFrame().rows[cursor.row].lineRendition.horizontalScale
         return cursorLeft >= viewportX + margin &&
             cursorRight <= viewportX + width - margin
     }
 
     private fun cellAt(x: Float, y: Float): CellPoint {
         val frame = currentFrame()
-        val column = floor((x + viewportX - contentPadding) / cellWidth).toInt()
-            .coerceIn(0, frame.size.columns - 1)
         val row = floor((y + viewportY - contentPadding - transcriptTopInset) / cellHeight).toInt()
             .coerceIn(0, frame.size.rows - 1)
+        val rendition = frame.rows[row].lineRendition
+        val column = floor((x + viewportX - contentPadding) / (cellWidth * rendition.horizontalScale)).toInt()
+            .coerceIn(0, rendition.columns(frame.size.columns) - 1)
         return CellPoint(column, row)
     }
 
@@ -1363,9 +1574,11 @@ internal class NativeTerminalView @JvmOverloads constructor(
         val gridX = x + viewportX - contentPadding
         val gridY = y + viewportY - contentPadding - transcriptTopInset
         if (gridX < 0f || gridY < 0f) return null
-        var column = floor(gridX / cellWidth).toInt()
         val row = floor(gridY / cellHeight).toInt()
-        if (column !in 0 until frame.size.columns || row !in 0 until frame.size.rows) return null
+        if (row !in 0 until frame.size.rows) return null
+        val rendition = frame.rows[row].lineRendition
+        var column = floor(gridX / (cellWidth * rendition.horizontalScale)).toInt()
+        if (column !in 0 until rendition.columns(frame.size.columns)) return null
 
         var cell = frame.rows[row].cells[column]
         // The second half of a wide glyph is still a visible text hit. Resolve
@@ -1390,7 +1603,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         var start = cell.column
         var end = cell.column
         while (start > 0 && hasText(start - 1)) start--
-        while (end < frame.size.columns - 1 && hasText(end + 1)) end++
+        while (end < frame.rows[cell.row].lineRendition.columns(frame.size.columns) - 1 && hasText(end + 1)) end++
         return CellPoint(start, cell.row) to CellPoint(end, cell.row)
     }
 
@@ -1399,7 +1612,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
             SelectionHandle.START -> selectionAnchor
             SelectionHandle.END -> selectionExtent
         } ?: return null
-        val x = contentPadding + (if (handle == SelectionHandle.START) point.column else point.column + 1) * cellWidth - viewportX
+        val x = contentPadding + (if (handle == SelectionHandle.START) point.column else point.column + 1) * cellWidth * currentFrame().rows[point.row].lineRendition.horizontalScale - viewportX
         val y = contentPadding + (point.row + 1) * cellHeight - viewportY
         return x to y
     }
@@ -1440,7 +1653,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     private fun drawSelectionHandles(
         canvas: Canvas,
-        frame: TerminalRenderFrameV3,
+        frame: TerminalTextFrame,
         theme: TerminalThemeV1,
     ) {
         if (!hasSelectionState()) return
@@ -1481,12 +1694,14 @@ internal class NativeTerminalView @JvmOverloads constructor(
         return safeSubmit { engine?.submitMouse(TerminalMouseInput.Wheel(direction, mousePosition(x, y))) == true }
     }
 
-    private fun mousePosition(x: Float, y: Float) = cellAt(x, y).let { cell ->
-        terminalMousePosition(
-            column = cell.column,
-            row = cell.row,
-            pixelX = (x + viewportX).roundToInt().coerceAtLeast(0),
-            pixelY = (y + viewportY).roundToInt().coerceAtLeast(0),
+    private fun mousePosition(x: Float, y: Float): TerminalMousePosition {
+        val cell = cellAt(x, y)
+        return TerminalMousePosition(
+            TerminalCellPosition(cell.column, cell.row),
+            TerminalPixelPosition(
+                (x + viewportX).roundToInt().coerceAtLeast(0),
+                (y + viewportY).roundToInt().coerceAtLeast(0),
+            ),
         )
     }
 
@@ -1497,7 +1712,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
         meta = event.metaState and KeyEvent.META_META_ON != 0,
     )
 
-    private fun isSelected(column: Int, row: Int, frame: TerminalRenderFrameV3): Boolean {
+    private fun isSelected(column: Int, row: Int, frame: TerminalTextFrame): Boolean {
         val anchor = selectionAnchor ?: return false
         val extent = selectionExtent ?: return false
         val first = minOf(anchor.linear(frame), extent.linear(frame))
@@ -1516,7 +1731,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
             for (rowIndex in frame.rows.indices) {
                 val rowStart = rowIndex * frame.size.columns
                 val start = max(0, first - rowStart)
-                val end = minOf(frame.size.columns - 1, last - rowStart)
+                val end = minOf(frame.rows[rowIndex].lineRendition.columns(frame.size.columns) - 1, last - rowStart)
                 if (start > end) continue
                 val lineStart = length
                 val firstColumn = if (transcript != null && frame.rows[rowIndex].cells[start].wideContinuation) start - 1 else start
@@ -1564,7 +1779,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     /** Own history renderer; metrics/styles retain the behavior documented in ANDROID_TERMUX_REMOVAL.md. */
-    private fun drawTranscript(canvas: Canvas, frame: TerminalRenderFrameV3, theme: TerminalThemeV1) {
+    private fun drawTranscript(canvas: Canvas, frame: TerminalTextFrame, theme: TerminalThemeV1) {
         canvas.drawColor(theme.background.value)
         val first = floor(viewportY / cellHeight).toInt().coerceAtLeast(0)
         val last = minOf(frame.rows.size, first + transcriptVisibleRows())
@@ -1671,14 +1886,14 @@ internal class NativeTerminalView @JvmOverloads constructor(
 
     private fun drawTextRow(
         canvas: Canvas,
-        frame: TerminalRenderFrameV3,
+        frame: TerminalTextFrame,
         rowIndex: Int,
         firstColumn: Int,
         lastColumn: Int,
         colorsByRendition: Array<EffectiveColors>,
     ) {
         val row = frame.rows[rowIndex]
-        val top = contentPadding + rowIndex * cellHeight - viewportY
+        val top = drawingOriginY() + rowIndex * cellHeight - viewportY
         var column = firstColumn
         while (column <= lastColumn) {
             val cell = row.cells[column]
@@ -1689,6 +1904,13 @@ internal class NativeTerminalView @JvmOverloads constructor(
             }
             val rendition = frame.renditions[cell.renditionId]
             if (grapheme == null || rendition.conceal || grapheme.text.isEmpty()) {
+                column++
+                continue
+            }
+            val graphicsGlyph = glyphAt(frame, column, rowIndex)
+            if (graphicsGlyph != null) {
+                drawDrcsGlyph(canvas, frame as TerminalRenderFrameV5, graphicsGlyph, top, rendition,
+                    colorsByRendition[cell.renditionId])
                 column++
                 continue
             }
@@ -1711,7 +1933,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
             val runText = StringBuilder()
             while (column <= lastColumn) {
                 val runCell = row.cells[column]
-                if (runCell.wideContinuation || runCell.renditionId != renditionId) break
+                if (runCell.wideContinuation || runCell.renditionId != renditionId || glyphAt(frame, column, rowIndex) != null) break
                 val runGrapheme = frame.graphemes.getOrNull(runCell.graphemeId - 1) ?: break
                 if (!runGrapheme.isBatchableAscii()) break
                 runText.append(runGrapheme.text)
@@ -1802,7 +2024,7 @@ internal class NativeTerminalView @JvmOverloads constructor(
     }
 
     private fun refreshTypeface(force: Boolean = false) {
-        val hint = (engine?.theme() ?: transcript?.theme)?.fontFamilyHint
+        val hint = (engine?.theme() ?: transcript?.theme ?: frozenTheme)?.fontFamilyHint
         if (!force && fontFamilyInitialized && hint == appliedFontFamilyHint) return
         baseTypeface = TerminalTypefaceResolver.resolve(context, hint)
         appliedFontFamilyHint = hint
@@ -1863,30 +2085,33 @@ internal class NativeTerminalView @JvmOverloads constructor(
         if (rendition.overline) canvas.drawLine(left, top + density, left + width, top + density, shapePaint)
     }
 
-    private fun drawCursor(canvas: Canvas, frame: TerminalRenderFrameV3, theme: TerminalThemeV1) {
+    private fun drawCursor(canvas: Canvas, frame: TerminalTextFrame, theme: TerminalThemeV1) {
         if (!frame.cursor.visible) return
-        val left = contentPadding + frame.cursor.column * cellWidth - viewportX
+        val cursorWidth = cellWidth * frame.rows[frame.cursor.row].lineRendition.horizontalScale
+        val left = contentPadding + frame.cursor.column * cursorWidth - viewportX
         val top = contentPadding + frame.cursor.row * cellHeight - viewportY
-        if (left + cellWidth < 0 || left > width || top + cellHeight < 0 || top > height) return
+        if (left + cursorWidth < 0 || left > width || top + cellHeight < 0 || top > height) return
         shapePaint.color = frame.palette.defaultCursorRgb?.let(::opaqueRgb) ?: theme.cursor.value
         when (frame.cursor.shape) {
             TerminalRenderCursorShapeV2.BLOCK -> {
                 shapePaint.alpha = 112
-                canvas.drawRect(left, top, left + cellWidth, top + cellHeight, shapePaint)
+                canvas.drawRect(left, top, left + cursorWidth, top + cellHeight, shapePaint)
                 shapePaint.alpha = 255
             }
             TerminalRenderCursorShapeV2.UNDERLINE ->
-                canvas.drawRect(left, top + cellHeight - 2 * density, left + cellWidth, top + cellHeight, shapePaint)
+                canvas.drawRect(left, top + cellHeight - 2 * density, left + cursorWidth, top + cellHeight, shapePaint)
             TerminalRenderCursorShapeV2.BAR ->
                 canvas.drawRect(left, top, left + 2 * density, top + cellHeight, shapePaint)
         }
     }
 
     private data class CellPoint(val column: Int, val row: Int) {
-        fun linear(frame: TerminalRenderFrameV3): Int = row * frame.size.columns + column
+        fun linear(frame: TerminalTextFrame): Int = row * frame.size.columns + column
     }
 
     private data class TextMeasureKey(val text: String, val style: Int)
+
+    private data class GraphicsBitmap(var resource: TerminalGraphicsResource, val bitmap: Bitmap)
 
     private companion object {
         const val MAX_FLING_DISTANCE = 1_000_000
@@ -1895,6 +2120,10 @@ internal class NativeTerminalView @JvmOverloads constructor(
         const val TEXT_RUN_WIDTH_TOLERANCE_PX = 0.5f
         const val TEXT_RUN_WIDTH_TOLERANCE_RATIO = 0.001f
         const val CURSOR_EDGE_MARGIN_CELLS = 2f
+        const val CURSOR_EDGE_MARGIN_ROWS = 2f
+        const val GRAPHICS_BELOW_BACKGROUND_Z = -1_073_741_824
+        // Additional Android raster storage; canonical immutable resources retain their 32 MiB cap.
+        const val MAX_GRAPHICS_BITMAP_BYTES = 64L * 1024 * 1024
     }
 }
 
@@ -1906,20 +2135,20 @@ private enum class ScrollAxis { UNDECIDED, HORIZONTAL, VERTICAL }
 private data class EffectiveColors(val foreground: Int, val background: Int)
 
 private fun effectiveColors(
-    frame: TerminalRenderFrameV3,
+    frame: TerminalTextFrame,
     rendition: TerminalRenderRenditionV3,
     theme: TerminalThemeV1,
 ): EffectiveColors {
     var foreground = resolveColor(
         rendition.foreground,
-        frame.palette.defaultForegroundRgb?.let(::opaqueRgb) ?: theme.foreground.value,
+        defaultAlias(frame, theme, frame.palette.foregroundAlias ?: 256),
         frame,
         theme,
         rendition.bold,
     )
     var background = resolveColor(
         rendition.background,
-        frame.palette.defaultBackgroundRgb?.let(::opaqueRgb) ?: theme.background.value,
+        defaultAlias(frame, theme, frame.palette.backgroundAlias ?: 257),
         frame,
         theme,
         false,
@@ -1932,17 +2161,19 @@ private fun effectiveColors(
     return EffectiveColors(foreground, background)
 }
 
-private fun effectiveDefaultBackground(frame: TerminalRenderFrameV3, theme: TerminalThemeV1): Int =
-    frame.palette.defaultBackgroundRgb?.let(::opaqueRgb)?.let { background ->
-        if (frame.reverseVideo) {
-            frame.palette.defaultForegroundRgb?.let(::opaqueRgb) ?: theme.foreground.value
-        } else background
-    } ?: if (frame.reverseVideo) theme.foreground.value else theme.background.value
+private fun effectiveDefaultBackground(frame: TerminalTextFrame, theme: TerminalThemeV1): Int =
+    defaultAlias(frame, theme, if (frame.reverseVideo) frame.palette.foregroundAlias ?: 256 else frame.palette.backgroundAlias ?: 257)
+
+private fun defaultAlias(frame: TerminalTextFrame, theme: TerminalThemeV1, index: Int): Int = when (index) {
+    256 -> frame.palette.defaultForegroundRgb?.let(::opaqueRgb) ?: theme.foreground.value
+    257 -> frame.palette.defaultBackgroundRgb?.let(::opaqueRgb) ?: theme.background.value
+    else -> resolveColor(TerminalRenderColorV1.Indexed(index), theme.foreground.value, frame, theme, false)
+}
 
 private fun resolveColor(
     color: TerminalRenderColorV1,
     defaultColor: Int,
-    frame: TerminalRenderFrameV3,
+    frame: TerminalTextFrame,
     theme: TerminalThemeV1,
     bold: Boolean,
 ): Int = when (color) {

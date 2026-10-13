@@ -55,9 +55,43 @@ enum class SessionOpenFailureCode(
     HISTORY_CORE_REBUILD_FAILED("TL-H123", true, R.string.terminal_error_history_core_rebuild_failed, R.string.terminal_error_action_retry),
     GAP_RECOVERY_REQUIRED("TL-H124", true, R.string.terminal_error_gap_recovery_required, R.string.terminal_error_action_wait_history),
     HOST_HISTORY_REQUIRED("TL-H125", false, R.string.terminal_error_host_history_required, R.string.terminal_error_action_update),
+    MALFORMED_TERMINAL_SEQUENCE("TL-H126", false, R.string.terminal_error_malformed_sequence, R.string.terminal_error_action_update),
+    TERMINAL_RESOURCE_LIMIT("TL-H127", false, R.string.terminal_error_resource_limit, R.string.terminal_error_action_update),
+    TERMINAL_PROTOCOL_SERVER("TL-H128", false, R.string.terminal_error_protocol_server, R.string.terminal_error_action_update),
+    TERMINAL_PROTOCOL_HOST("TL-H129", false, R.string.terminal_error_protocol_host, R.string.terminal_error_action_update),
+    TERMINAL_PROTOCOL_CLIENT("TL-H130", false, R.string.terminal_error_protocol_client, R.string.terminal_error_action_update),
+    TERMINAL_NEGOTIATION_TIMEOUT("TL-H131", true, R.string.terminal_error_negotiation_timeout, R.string.terminal_error_action_retry),
+    TERMINAL_NEGOTIATION_INVALID("TL-H132", false, R.string.terminal_error_negotiation_invalid, R.string.terminal_error_action_update),
+    TERMINAL_LOCAL_PROTOCOL("TL-H133", false, R.string.terminal_error_local_protocol, R.string.terminal_error_action_update),
+    TERMINAL_HISTORY_PROFILE_MISSING("TL-H134", false, R.string.terminal_error_history_profile_missing, R.string.terminal_error_action_new_session),
+    TERMINAL_HISTORY_PROFILE_INVALID("TL-H135", false, R.string.terminal_error_history_profile_invalid, R.string.terminal_error_action_new_session),
+    TERMINAL_HISTORY_PROFILE_MISMATCH("TL-H136", false, R.string.terminal_error_history_profile_mismatch, R.string.terminal_error_action_new_session),
+    TERMINAL_STATE_MISMATCH("TL-H137", false, R.string.terminal_error_state_mismatch, R.string.terminal_error_action_update),
+    TERMINAL_HISTORY_MEMORY_LIMIT("TL-H138", true, R.string.terminal_error_history_memory_limit, R.string.terminal_error_action_free_memory),
     REALTIME_CONNECTION("TL-R001", true, R.string.terminal_error_realtime_connection, R.string.terminal_error_action_check_network),
     CONTROL_LEASE_HELD("TL-C001", true, R.string.terminal_error_control_lease, R.string.terminal_error_action_wait_lease),
     UNKNOWN("TL-X001", true, R.string.terminal_error_unknown, R.string.terminal_error_action_retry),
+}
+
+/**
+ * Identifies where the protocol evidence was produced.
+ *
+ * Native renderer failures are detected by the Android mirror and keep the
+ * historical mirror wording.  A diagnostic carried by a host SESSION_ENDED
+ * event is already authenticated by the relay and must be presented as host
+ * evidence instead of being labelled as a local renderer failure.
+ */
+enum class SessionProtocolDiagnosticSource {
+    ANDROID_MIRROR,
+    WINDOWS_HOST,
+}
+
+@androidx.annotation.StringRes
+internal fun sessionProtocolDiagnosticContextResource(
+    source: SessionProtocolDiagnosticSource,
+): Int = when (source) {
+    SessionProtocolDiagnosticSource.ANDROID_MIRROR -> R.string.terminal_protocol_mirror_context
+    SessionProtocolDiagnosticSource.WINDOWS_HOST -> R.string.terminal_protocol_host_context
 }
 
 data class SessionOpenFailure(
@@ -65,6 +99,10 @@ data class SessionOpenFailure(
     /** Safe transport metadata only. Never store a URL, token, key ID, or terminal text here. */
     val httpStatus: Int? = null,
     val diagnosticCode: String? = null,
+    /** Escaped/redacted native evidence, only for local error details. */
+    val protocolDiagnostic: dev.termlink.terminal.api.TerminalProtocolDiagnostic? = null,
+    /** Source of [protocolDiagnostic]; defaults to the Android mirror for old call sites. */
+    val protocolDiagnosticSource: SessionProtocolDiagnosticSource = SessionProtocolDiagnosticSource.ANDROID_MIRROR,
 ) {
     init {
         require(diagnosticCode == null || diagnosticCode.matches(Regex("[A-Z0-9_]{1,64}"))) {
@@ -96,7 +134,14 @@ internal fun sessionOpenException(
     code: SessionOpenFailureCode,
     cause: Throwable? = null,
     httpStatus: Int? = null,
-): SessionOpenException = SessionOpenException(SessionOpenFailure(code, httpStatus), cause)
+): SessionOpenException {
+    val memoryLimit = cause?.findCause<dev.termlink.model.TerminalBufferLimitException>()
+    return SessionOpenException(SessionOpenFailure(
+        code = if (memoryLimit == null) code else SessionOpenFailureCode.TERMINAL_HISTORY_MEMORY_LIMIT,
+        httpStatus = httpStatus,
+        diagnosticCode = memoryLimit?.code,
+    ), cause)
+}
 
 /** Converts implementation exceptions to a bounded public taxonomy without echoing exception text. */
 internal fun classifySessionOpenException(
@@ -104,29 +149,61 @@ internal fun classifySessionOpenException(
     stage: SessionFailureStage,
 ): SessionOpenException {
     if (error is SessionOpenException) return error
+    error.findCause<dev.termlink.model.TerminalBufferLimitException>()?.let { limit ->
+        return SessionOpenException(SessionOpenFailure(
+            SessionOpenFailureCode.TERMINAL_HISTORY_MEMORY_LIMIT,
+            diagnosticCode = limit.code,
+        ), error)
+    }
+    error.findCause<dev.termlink.network.production.TerminalCompatibilityException>()?.let { compatibility ->
+        val code = when (compatibility.code) {
+            "TERMINAL_RELAY_UPGRADE_REQUIRED" -> SessionOpenFailureCode.TERMINAL_PROTOCOL_SERVER
+            "TERMINAL_HOST_UPGRADE_REQUIRED" -> SessionOpenFailureCode.TERMINAL_PROTOCOL_HOST
+            "TERMINAL_LOCAL_PROTOCOL_MISMATCH" -> SessionOpenFailureCode.TERMINAL_LOCAL_PROTOCOL
+            "TERMINAL_HISTORY_PROFILE_MISSING" -> SessionOpenFailureCode.TERMINAL_HISTORY_PROFILE_MISSING
+            "TERMINAL_HISTORY_PROFILE_INVALID" -> SessionOpenFailureCode.TERMINAL_HISTORY_PROFILE_INVALID
+            "TERMINAL_HISTORY_PROFILE_MISMATCH" -> SessionOpenFailureCode.TERMINAL_HISTORY_PROFILE_MISMATCH
+            "TERMINAL_STATE_MISMATCH" -> SessionOpenFailureCode.TERMINAL_STATE_MISMATCH
+            "TERMINAL_CLIENT_UPGRADE_REQUIRED", "TERMINAL_STATE_UNSUPPORTED" -> SessionOpenFailureCode.TERMINAL_PROTOCOL_CLIENT
+            "TERMINAL_NEGOTIATION_TIMEOUT" -> SessionOpenFailureCode.TERMINAL_NEGOTIATION_TIMEOUT
+            else -> SessionOpenFailureCode.TERMINAL_NEGOTIATION_INVALID
+        }
+        return SessionOpenException(SessionOpenFailure(code,
+            diagnosticCode = compatibility.code.takeIf { it.matches(Regex("[A-Z0-9_]{1,64}")) }), error)
+    }
     if (error is SQLiteFullException || error.causedBy<SQLiteFullException>()) {
         return sessionOpenException(SessionOpenFailureCode.LOCAL_STORAGE_FULL, error)
     }
     val native = error.findCause<NativeTerminalException>()
     if (native != null) {
-        val code = when (native.status) {
-            NativeTerminalStatus.ABI_MISMATCH,
-            NativeTerminalStatus.BRIDGE_FAILURE,
-            NativeTerminalStatus.MALFORMED_BRIDGE_RESULT,
-            -> SessionOpenFailureCode.NATIVE_CORE_UNAVAILABLE
-            NativeTerminalStatus.FAILED_CLOSED ->
-                SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
-            NativeTerminalStatus.UNSUPPORTED,
-            NativeTerminalStatus.HOST_EFFECT_VERSION_REQUIRED,
-            -> SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY
-            NativeTerminalStatus.GAP -> SessionOpenFailureCode.GAP_RECOVERY_REQUIRED
-            else -> if (stage == SessionFailureStage.HISTORY_REPLAY) {
-                SessionOpenFailureCode.HISTORY_CORE_REBUILD_FAILED
-            } else {
-                SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
+        val code = when (native.terminalProtocolDiagnostic?.category) {
+            "malformed" -> SessionOpenFailureCode.MALFORMED_TERMINAL_SEQUENCE
+            "limit_exceeded" -> SessionOpenFailureCode.TERMINAL_RESOURCE_LIMIT
+            "unsupported" -> SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY
+            else -> when (native.status) {
+                NativeTerminalStatus.ABI_MISMATCH,
+                NativeTerminalStatus.BRIDGE_FAILURE,
+                NativeTerminalStatus.MALFORMED_BRIDGE_RESULT,
+                -> SessionOpenFailureCode.NATIVE_CORE_UNAVAILABLE
+                NativeTerminalStatus.FAILED_CLOSED ->
+                    SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
+                NativeTerminalStatus.UNSUPPORTED,
+                NativeTerminalStatus.HOST_EFFECT_VERSION_REQUIRED,
+                -> SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY
+                NativeTerminalStatus.GAP -> SessionOpenFailureCode.GAP_RECOVERY_REQUIRED
+                NativeTerminalStatus.INCOMPATIBLE_SNAPSHOT ->
+                    if (native.operation == "installCheckpoint.profile") SessionOpenFailureCode.TERMINAL_STATE_MISMATCH
+                    else SessionOpenFailureCode.SNAPSHOT_FORMAT
+                else -> if (stage == SessionFailureStage.HISTORY_REPLAY) {
+                    SessionOpenFailureCode.HISTORY_CORE_REBUILD_FAILED
+                } else {
+                    SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
+                }
             }
         }
-        return sessionOpenException(code, error)
+        return SessionOpenException(
+            SessionOpenFailure(code, protocolDiagnostic = native.terminalProtocolDiagnostic), error,
+        )
     }
     if (error.findCause<NativeTerminalContractException>() != null) {
         return sessionOpenException(SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED, error)

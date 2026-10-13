@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="terminal_protocol_mirror_context">Source: Android terminal mirror. This mirror stopped applying output; this does not establish that the Windows process or network connection ended. detected_at identifies detection, not necessarily the first invalid parameter.</string>
+    <string name="terminal_protocol_host_context">Source: Windows terminal host. Windows ended the session after a terminal protocol failure; detected_at identifies detection, not necessarily the first invalid parameter.</string>
     <string name="ai_directory_return">Back to chat</string>
     <string name="ai_directory_pc_unavailable">The computer is unavailable. Reconnect and try again.</string>
     <string name="ai_directory_upgrade">Update the Windows client to browse files.</string>
@@ -259,6 +261,10 @@
     <string name="terminal_history_loading">Loading earlier output…</string>
     <string name="terminal_history_unavailable">Earlier output could not be loaded.</string>
     <string name="terminal_history_retry">Retry</string>
+    <string name="terminal_frozen_history_open">Browse frozen history</string>
+    <string name="terminal_frozen_history_check">Check and browse frozen history</string>
+    <string name="terminal_frozen_history_close">Close frozen history</string>
+    <string name="terminal_frozen_history_error">Frozen history unavailable (%1$s)</string>
     <string name="terminal_error_message">[%1$s] %2$s%3$s\n%4$s</string>
     <string name="terminal_error_http_status"> (HTTP %1$d)</string>
     <string name="terminal_error_diagnostic_code"> (Agent diagnostic: %1$s)</string>
@@ -752,4 +758,47 @@
     <string name="ai_manage_export">Manage and export chat</string>
     <string name="ai_interrupt">Stop generating</string>
     <string name="ai_end_chat">End chat</string>
+    <string name="terminal_protocol_details">Protocol details</string>
+    <string name="terminal_error_malformed_sequence">The terminal output contains an invalid control sequence. See protocol details for the exact bytes.</string>
+    <string name="terminal_error_resource_limit">Terminal output exceeded a parser or resource limit. See protocol details.</string>
+    <string name="terminal_protocol_copy">Copy diagnostic</string>
+    <string name="terminal_error_protocol_server">The server does not support this terminal transport contract.</string>
+    <string name="terminal_error_protocol_host">Windows sent terminal data without confirming compatible state support.</string>
+    <string name="terminal_error_local_protocol">The Windows session process and Agent use different terminal protocols. Update Windows, then create a new session and try again.</string>
+    <string name="terminal_error_history_profile_missing">This history has no terminal protocol marker. The original files are preserved and replay has stopped.</string>
+    <string name="terminal_error_history_profile_invalid">The terminal protocol marker for this history failed validation. The original files are preserved and replay has stopped.</string>
+    <string name="terminal_error_history_profile_mismatch">This history uses a terminal protocol incompatible with this version. The original files are preserved and replay has stopped.</string>
+    <string name="terminal_error_action_new_session">Create a new session. This error does not require deleting the old history.</string>
+    <string name="terminal_error_protocol_client">This session requires newer Android terminal capabilities.</string>
+    <string name="terminal_error_negotiation_timeout">Windows did not confirm terminal capabilities in time. Check connectivity and the Windows client version.</string>
+    <string name="terminal_error_negotiation_invalid">The peer returned an invalid terminal capability contract.</string>
+    <string name="terminal_error_state_mismatch">The authenticated terminal profile differs from the profile bound to this session. Restoration has stopped.</string>
+    <string name="terminal_error_history_memory_limit">This terminal history exceeds the app’s current memory budget. Restoration has stopped before the next large allocation.</string>
+    <string name="terminal_error_action_free_memory">Action: close unused sessions and retry. If the history still exceeds this device’s memory budget, continue on the computer.</string>
+    <string name="shell_open_directory">Open current directory</string>
+    <string name="shell_commands">Command markers</string>
+    <string name="shell_directory_unavailable">No local Windows directory is available for this shell.</string>
+    <string name="shell_state_unavailable">Shell information is temporarily unavailable. Please try again.</string>
+    <string name="shell_commands_empty">No command markers yet. New PowerShell sessions provide markers automatically.</string>
+    <string name="shell_anchor_unavailable">This command is on another page or is no longer retained.</string>
+    <string name="shell_command_input">Awaiting input</string>
+    <string name="shell_command_running">Running</string>
+    <string name="shell_command_exit">Exit %1$d</string>
+    <string name="shell_command_finished">Finished</string>
+    <string name="shell_command_interrupted">Interrupted</string>
+    <string name="terminal_signals_device">This device · off by default</string>
+    <string name="terminal_alerts">Terminal alerts</string>
+    <string name="terminal_sounds">Terminal sounds</string>
+    <string name="terminal_attention_message">A CLI session requests your attention.</string>
+    <string name="terminal_notification_denied">Notification permission is off. In-app alerts remain available.</string>
+    <string name="cli_notification_session_unavailable">This alert expired or its session is unavailable. Open it again from Devices.</string>
+    <string name="terminal_progress_error">Error · %1$d%%</string>
+    <string name="terminal_progress_busy">Working</string>
+    <string name="terminal_progress_paused">Paused · %1$d%%</string>
+    <string name="terminal_clipboard_requests">Ask before copying terminal text</string>
+    <string name="terminal_clipboard_title">Copy terminal text?</string>
+    <string name="terminal_clipboard_message">The CLI requests replacing this phone’s clipboard (%1$d characters). Nothing will be executed.\n\n%2$s</string>
+    <string name="terminal_clipboard_accept">Copy this time</string>
+    <string name="terminal_clipboard_expired">The request expired or control changed. Nothing was copied.</string>
+    <string name="terminal_clipboard_failed">Could not update the clipboard.</string>
 </resources>

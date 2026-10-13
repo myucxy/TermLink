@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text.Json;
 using TermLink.Agent;
 using TermLink.Pc.Contracts;
 using TermLink.Platform;
@@ -157,6 +158,18 @@ try
     await client.SaveTerminalCommandsAsync(new[] { command }, CancellationToken.None);
     var commandPath = Path.Combine(localData, "TermLink", "Agent", "terminal-commands.json");
     Require(File.Exists(commandPath), "The Agent did not persist the manual terminal command in the isolated root.");
+    var enhancedCommand = new TerminalCommandCapability(
+        "powershell-7-enhanced", "PowerShell 7（增强终端）", command.Executable,
+        new[] { "-NoLogo" }, true, false);
+    await client.SaveTerminalCommandsAsync(new[] { command, enhancedCommand }, CancellationToken.None);
+    using (var commandsJson = JsonDocument.Parse(File.ReadAllText(commandPath)))
+    {
+        var enhancedProfile = commandsJson.RootElement.EnumerateArray().Single(profile =>
+            profile.GetProperty("id").GetString() == enhancedCommand.Id);
+        Require(enhancedProfile.GetProperty("managed_shell").GetString() == "powershell-7" &&
+                !enhancedProfile.GetProperty("run_as_administrator").GetBoolean(),
+            "The Windows adapter did not save the enhanced command's managed shell and current-user launch.");
+    }
 
     var parallel = await Task.WhenAll(Enumerable.Range(0, 16)
         .Select(_ => client.GetStatusAsync(false, CancellationToken.None).AsTask()));

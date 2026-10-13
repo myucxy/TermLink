@@ -1,10 +1,14 @@
 package dev.termlink.terminal.api
 
 import java.util.Collections
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /** Host-observed effect kinds currently defined by Host Effect Frame V2. */
 enum class TerminalHostEffectKindV2 {
     PTY_REPLY,
+    RESIZE_REQUEST,
+    PLATFORM_ACTION,
 }
 
 /** One immutable, source-keyed PTY reply from a Host Effect Frame V2. */
@@ -28,8 +32,12 @@ class TerminalHostEffectV2(
         require(ownedPayload.size in 1..TerminalHostEffectFrameV2.MAX_REPLY_BYTES) {
             "PTY reply payload exceeds the Host Effect Frame V2 reply bound"
         }
-        require(isCanonicalHostEffectReplyV2(ownedPayload)) {
-            "PTY reply payload is not a canonical Host Effect Frame V2 reply"
+        require(when (kind) {
+            TerminalHostEffectKindV2.PTY_REPLY -> isCanonicalHostEffectReplyV2(ownedPayload)
+            TerminalHostEffectKindV2.RESIZE_REQUEST -> isCanonicalResizeRequest(ownedPayload)
+            TerminalHostEffectKindV2.PLATFORM_ACTION -> runCatching { TerminalPlatformAction.decode(ownedPayload) }.isSuccess
+        }) {
+            "Host effect payload is not canonical for its kind"
         }
     }
 
@@ -63,6 +71,9 @@ class TerminalHostEffectFrameV2(
         }
         require(this.effects.size <= MAX_EFFECTS) {
             "Host Effect Frame V2 effect count exceeds $MAX_EFFECTS"
+        }
+        require(this.effects.count { it.kind == TerminalHostEffectKindV2.RESIZE_REQUEST } <= 64) {
+            "Resize requests exceed the capture bound"
         }
         var totalPayloadBytes = 0L
         var previousSequence: Long? = null
@@ -109,15 +120,89 @@ class TerminalHostEffectFrameV2(
     }
 }
 
+private fun isCanonicalResizeRequest(payload: ByteArray): Boolean {
+    if (payload.size != 8) return false
+    val buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+    val columns = buffer.int
+    val rows = buffer.int
+    return columns in 0..512 && rows in 0..512 && (columns == 0) != (rows == 0)
+}
+
 private fun isCanonicalHostEffectReplyV2(payload: ByteArray): Boolean {
     if (payload.isEmpty() || payload.size > TerminalHostEffectFrameV2.MAX_REPLY_BYTES) return false
+    normalizeTerminalC1Reply(payload)?.let { return isCanonicalHostEffectReplyV2(it) }
+    if (payload.contentEquals(ascii("\u001b/Z"))) return true
     return isCanonicalLegacyReply(payload) ||
         isCanonicalKittyReply(payload) ||
+        isCanonicalKittyGraphicsReply(payload) ||
         isCanonicalDecrpm(payload) ||
         isCanonicalDecrqss(payload) ||
         isCanonicalXtversion(payload) ||
         isCanonicalXtgettcap(payload) ||
-        isCanonicalOscColor(payload)
+        isCanonicalOscColor(payload) ||
+        isCanonicalTextSize(payload) || isCanonicalExtendedQuery(payload) || isTerminalStateReport(payload)
+}
+
+private fun normalizeTerminalC1Reply(payload: ByteArray): ByteArray? {
+    if (payload.size < 2) return null
+    val prefix = payload[0].toInt() and 0xff
+    if (prefix !in listOf(0x90, 0x9b, 0x9d, 0x9f)) return null
+    val string = prefix != 0x9b
+    if (string && (payload.last().toInt() and 0xff) != 0x9c) return null
+    val end = payload.size - if (string) 1 else 0
+    if ((1 until end).any { (payload[it].toInt() and 0xff) !in 0x20..0x7e }) return null
+    return byteArrayOf(0x1b, (prefix - 0x40).toByte()) + payload.copyOfRange(1, end) +
+        if (string) byteArrayOf(0x1b, 0x5c) else byteArrayOf()
+}
+
+private fun isCanonicalExtendedQuery(payload: ByteArray): Boolean {
+    strip(payload, ascii("\u001b[?"), ascii("R"))?.let { body ->
+        val fields = String(body, Charsets.US_ASCII).split(';')
+        return fields.size == 3 && fields.withIndex().all { (index, value) ->
+            val number = value.toIntOrNull()
+            number != null && number.toString() == value && number in 1..(if (index == 2) 6 else 512)
+        }
+    }
+    strip(payload, ascii("\u001b["), ascii("*{"))?.let { body ->
+        return canonicalUnsigned(body, 0, body.size)?.let { it <= 16384 } == true
+    }
+    if (payload.contentEqualsAny("\u001bP!|00000000\u001b\\",
+            "\u001b[2;1;1;128;128;1;0x", "\u001b[3;1;1;128;128;1;0x",
+            "\u001b[?997;1n", "\u001b[?997;2n",
+            "\u001b[?13n", "\u001b[?23n", "\u001b[?27;0;0;5n", "\u001b[?53n",
+            "\u001b[?57;0n", "\u001b[?70n", "\u001b[?83n")) return true
+    strip(payload, ascii("\u001b["), ascii("\"w"))?.let { body ->
+        val fields = String(body, Charsets.US_ASCII).split(';')
+        return fields.size == 5 && fields.withIndex().all { (index, value) ->
+            val number = value.toIntOrNull()
+            number != null && number.toString() == value && when (index) {
+                0, 1 -> number in 1..512; 2, 3 -> number == 1; else -> number in 1..6
+            }
+        }
+    }
+    strip(payload, ascii("\u001bP"), ascii("\u001b\\"))?.let { body ->
+        val separator = body.indexOf('!'.code.toByte())
+        if (separator < 1 || body.size != separator + 6 || body[separator + 1] != '~'.code.toByte()) return false
+        val id = canonicalUnsigned(body, 0, separator) ?: return false
+        return id <= 65534 && body.copyOfRange(separator + 2, body.size).all {
+            it in '0'.code.toByte()..'9'.code.toByte() || it in 'A'.code.toByte()..'F'.code.toByte()
+        }
+    }
+    return false
+}
+
+private fun isCanonicalTextSize(payload: ByteArray): Boolean {
+    val body = strip(payload, ascii("\u001b["), ascii("t")) ?: return false
+    val fields = body.toString(Charsets.US_ASCII).split(';')
+    if (fields.size != 3) return false
+    val maximum = when (fields[0]) {
+        "4" -> 512 * 1024; "5", "9" -> 32768; "6" -> 1024; "8" -> 512
+        else -> return false
+    }
+    return fields.drop(1).all { field ->
+        field.isNotEmpty() && field[0] != '0' && field.all { it in '0'..'9' } &&
+            field.toIntOrNull()?.let { it in 1..maximum } == true
+    }
 }
 
 private fun isCanonicalLegacyReply(payload: ByteArray): Boolean {
@@ -144,6 +229,34 @@ private fun isCanonicalKittyReply(payload: ByteArray): Boolean {
     return flags <= 31L
 }
 
+private fun isCanonicalKittyGraphicsReply(payload: ByteArray): Boolean {
+    val body = strip(payload, ascii("\u001b_G"), ascii("\u001b\\")) ?: return false
+    val separator = body.indexOf(';'.code.toByte())
+    if (separator < 1) return false
+    val message = body.copyOfRange(separator + 1, body.size)
+    if (!message.contentEquals(ascii("OK"))) {
+        if (message.size > 240 || message.any { (it.toInt() and 0xff) !in 0x20..0x7e } ||
+            listOf("EINVAL: ", "ENOTSUP: ", "ENOSPC: ").none {
+                message.size > it.length && startsWith(message, ascii(it))
+            }) return false
+    }
+    var previous = 0
+    var identity = false
+    for (field in split(body.copyOfRange(0, separator), ','.code.toByte())) {
+        if (field.size !in 3..12 || field[1] != '='.code.toByte()) return false
+        val order = when (field[0]) {
+            'i'.code.toByte() -> 1
+            'I'.code.toByte() -> 2
+            'p'.code.toByte() -> 3
+            else -> 0
+        }
+        if (order <= previous || (canonicalUnsigned(field, 2, field.size) ?: return false) == 0L) return false
+        previous = order
+        identity = identity || order <= 2
+    }
+    return identity
+}
+
 private fun isCanonicalDecrpm(payload: ByteArray): Boolean {
     val rawBody = strip(payload, ascii("\u001b["), ascii("\$y")) ?: return false
     val body = if (rawBody.firstOrNull() == '?'.code.toByte()) rawBody.copyOfRange(1, rawBody.size) else rawBody
@@ -159,7 +272,7 @@ private fun isCanonicalDecrqss(payload: ByteArray): Boolean {
     if (body.contentEquals(ascii("0\$r"))) return true
     if (!startsWith(body, ascii("1\$r"))) return false
     val status = body.copyOfRange(3, body.size)
-    return canonicalSgrStatus(status) ||
+    return canonicalColorAssignment(status) || canonicalSgrStatus(status) ||
         canonicalMarginStatus(status, 'r'.code.toByte()) ||
         canonicalMarginStatus(status, 's'.code.toByte()) ||
         status.contentEqualsAny("1 q", "2 q", "3 q", "4 q", "5 q", "6 q") ||
@@ -168,6 +281,14 @@ private fun isCanonicalDecrqss(payload: ByteArray): Boolean {
 
 private fun isCanonicalXtversion(payload: ByteArray): Boolean =
     payload.contentEquals(ascii("\u001bP>|TermLink(1)\u001b\\"))
+
+private fun canonicalColorAssignment(status: ByteArray): Boolean {
+    val body = strip(status, byteArrayOf(), ascii(",|")) ?: return false
+    val fields = split(body, ';'.code.toByte())
+    if (fields.size != 3) return false
+    val values = fields.map { canonicalUnsigned(it, 0, it.size) ?: return false }
+    return values[0] in 1..2 && values[1] <= 257 && values[2] <= 257
+}
 
 private fun canonicalSgrStatus(status: ByteArray): Boolean {
     if (status.contentEquals(ascii("0m"))) return true
@@ -247,7 +368,7 @@ private fun isCanonicalOscColor(payload: ByteArray): Boolean {
         fields.size == 3 && fields[0].contentEquals(ascii("4")) ->
             canonicalUnsigned(fields[1], 0, fields[1].size)?.let { it <= 255 } == true &&
                 canonicalRgb(fields[2])
-        fields.size == 2 && fields[0].contentEqualsAny("10", "11", "12") -> canonicalRgb(fields[1])
+        fields.size == 2 && fields[0].contentEqualsAny("10", "11", "12", "17") -> canonicalRgb(fields[1])
         else -> false
     }
 }

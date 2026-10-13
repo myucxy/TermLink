@@ -17,6 +17,50 @@ namespace TermLink.ProductionDirectTransport.Validation
             await ValidateDedupMismatchCapacityAndPeerIsolationAsync().ConfigureAwait(false);
             await ValidateFailureReconnectAndGenerationFenceAsync().ConfigureAwait(false);
             await ValidateSessionPeerAndDisposeZeroAsync().ConfigureAwait(false);
+            await ValidateAttachmentAdmissionAndSiblingProgressAsync().ConfigureAwait(false);
+        }
+
+        private static async Task ValidateAttachmentAdmissionAndSiblingProgressAsync()
+        {
+            var peer = Guid.NewGuid();
+            var waiting = Guid.NewGuid();
+            var healthy = Guid.NewGuid();
+            var admitted = new ConcurrentDictionary<Guid, bool>();
+            admitted[healthy] = true;
+            var retained = Bytes(12, 8);
+            var expected = retained.ToArray();
+            var sent = new ConcurrentQueue<Guid>();
+            await using var outbox = new ProductionRelayExactOutbox(
+                retryDelay: TimeSpan.FromMilliseconds(5),
+                canSendSession: (p, session) => p == peer && admitted.ContainsKey(session));
+            outbox.TryEnqueue(Envelope(peer, waiting, 1, retained));
+            outbox.TryEnqueue(Envelope(peer, healthy, 1, Bytes(13, 8)));
+            Task<bool> Send(ProductionRelayExactSendRequest request, CancellationToken token)
+            {
+                Require(admitted.ContainsKey(request.SessionId), "Unconfirmed session escaped admission.");
+                if (request.SessionId == waiting)
+                    Require(request.ExactEnvelope.Span.SequenceEqual(expected), "Admission changed retained ciphertext.");
+                sent.Enqueue(request.SessionId);
+                return Task.FromResult(true);
+            }
+            outbox.ObserveRelayConnected(1, Send);
+            await WaitUntilAsync(() => sent.Count == 1).ConfigureAwait(false);
+            Require(sent.Single() == healthy && outbox.Snapshot().Single().PendingFrames == 2,
+                "A waiting attachment blocked its healthy sibling or discarded durable retry ownership.");
+            admitted[waiting] = true;
+            outbox.NotifySessionAdmissionChanged();
+            await WaitUntilAsync(() => sent.Count == 2).ConfigureAwait(false);
+            admitted.TryRemove(waiting, out _);
+            outbox.ObserveRelayDisconnected(1);
+            outbox.ObserveRelayConnected(2, Send);
+            await WaitUntilAsync(() => sent.Count == 3).ConfigureAwait(false);
+            Require(sent.Last() == healthy, "Reconnect retried a rejected attachment.");
+            admitted[waiting] = true;
+            outbox.NotifySessionAdmissionChanged();
+            await WaitUntilAsync(() => sent.Count == 4).ConfigureAwait(false);
+            Require(sent.Last() == waiting && outbox.PruneDurablyAcknowledged(peer, waiting, 1) == 1 && IsZero(retained),
+                "Accepted attachment failed to resume exact replay and durable pruning.");
+            Zero(expected);
         }
 
         private static async Task ValidateOwnershipExactBytesOrderAndDurablePruneAsync()

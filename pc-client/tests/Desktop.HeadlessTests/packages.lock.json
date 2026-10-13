@@ -197,7 +197,8 @@
           "TermLink.Platform.Abstractions": "[1.0.0, )",
           "TermLink.Platform.Linux": "[1.0.0, )",
           "TermLink.Platform.MacOS": "[1.0.0, )",
-          "TermLink.Presentation": "[1.0.0, )"
+          "TermLink.Presentation": "[1.0.0, )",
+          "TermLink.TerminalCore": "[1.0.0, )"
         }
       },
       "termlink.agent.local": {
@@ -246,6 +247,9 @@
           "TermLink.Pc.Contracts": "[1.0.0, )",
           "TermLink.Platform.Abstractions": "[1.0.0, )"
         }
+      },
+      "termlink.terminalcore": {
+        "type": "Project"
       },
       "Avalonia.Desktop": {
         "type": "CentralTransitive",

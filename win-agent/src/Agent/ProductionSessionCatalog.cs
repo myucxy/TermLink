@@ -34,7 +34,8 @@ namespace TermLink.Agent
         private void ObserveCatalogFrame(LocalFrame frame)
         {
             if (frame.Type != LocalFrameType.Title && frame.Type != LocalFrameType.Resize &&
-                frame.Type != LocalFrameType.Lifecycle && frame.Type != LocalFrameType.Output) return;
+                frame.Type != LocalFrameType.Lifecycle && frame.Type != LocalFrameType.Output &&
+                frame.Type != LocalFrameType.BrokerOutput) return;
             lock (catalogSync)
             {
                 if (!catalogEntries.TryGetValue(frame.SessionId, out var metadata))
@@ -58,7 +59,7 @@ namespace TermLink.Agent
                     entry.Lifecycle = LifecycleText(LocalPayloadCodec.ParseLifecycle(frame.Payload, out _));
                     metadata.LifecycleSequence = frame.Sequence;
                 }
-                if (frame.Type == LocalFrameType.Output)
+                if (frame.Type is LocalFrameType.Output or LocalFrameType.BrokerOutput)
                     entry.LastOutputSeq = Math.Max(entry.LastOutputSeq, frame.Sequence);
             }
         }

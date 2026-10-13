@@ -297,7 +297,7 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.FlowControl, realtimewire.Gap,
 		realtimewire.InputEvent, realtimewire.InputAccepted,
 		realtimewire.InputRejected, realtimewire.ResizeRequest,
-		realtimewire.ResizeApplied, realtimewire.ResizeResponse, realtimewire.SnapshotOffer,
+		realtimewire.ResizeApplied, realtimewire.ResizeResponse, realtimewire.HostGeometry, realtimewire.HostTheme, realtimewire.HostResizeResult, realtimewire.TerminalAttachResult, realtimewire.SnapshotOffer,
 		realtimewire.SnapshotChunk, realtimewire.ResumeRequest,
 		realtimewire.LeaseRequest, realtimewire.LeaseGranted,
 		realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
@@ -322,7 +322,7 @@ func TestRealtimeMessageDirectionACLIsExhaustive(t *testing.T) {
 		realtimewire.SessionUpsert: true, realtimewire.SessionRemoved: true,
 		realtimewire.OutputChunk: true, realtimewire.Gap: true,
 		realtimewire.InputAccepted: true, realtimewire.InputRejected: true,
-		realtimewire.ResizeApplied: true, realtimewire.ResizeResponse: true, realtimewire.SnapshotOffer: true,
+		realtimewire.ResizeApplied: true, realtimewire.ResizeResponse: true, realtimewire.HostGeometry: true, realtimewire.HostTheme: true, realtimewire.HostResizeResult: true, realtimewire.TerminalAttachResult: true, realtimewire.SnapshotOffer: true,
 		realtimewire.SnapshotChunk: true, realtimewire.LeaseGranted: true,
 		realtimewire.LeaseDenied: true, realtimewire.LeaseRevoked: true,
 		realtimewire.ThemeChanged: true, realtimewire.SessionStarted: true,
@@ -455,6 +455,7 @@ func TestOutOfBandPCResponsesBypassTerminalReplaySequence(t *testing.T) {
 		{messageType: realtimewire.HostHistoryResponse, frame: []byte("opaque-host-history-response")},
 		{messageType: realtimewire.SessionTerminateResponse, frame: []byte("opaque-session-terminate-response")},
 		{messageType: realtimewire.ResizeResponse, frame: []byte("opaque-window-resize-response")},
+		{messageType: realtimewire.TerminalAttachResult, frame: []byte("opaque-terminal-attachment-result")},
 	} {
 		envelope := realtimewire.Envelope{
 			RecipientDeviceID: androidID[:],
@@ -3302,3 +3303,14 @@ func (o *subscriptionObserver) SubscriptionsChanged(delta int) {
 }
 func (*subscriptionObserver) EnvelopeRouted(string, string, string, int, time.Duration) {}
 func (*subscriptionObserver) SlowConsumerDisconnected()                                 {}
+
+func TestTerminalAttachCapabilitiesAreOptionalAndNeverInferred(t *testing.T) {
+	baseline := negotiatedCapabilities(requiredCapabilities)
+	if containsRelayCapability(baseline, "terminal_attach_v1") || containsRelayCapability(baseline, "terminal_host_geometry_v1") {
+		t.Fatal("old peer was granted new terminal capabilities")
+	}
+	modern := negotiatedCapabilities(append(append([]string(nil), requiredCapabilities...), "terminal_attach_v1", "terminal_host_geometry_v1"))
+	if !containsRelayCapability(modern, "terminal_attach_v1") || !containsRelayCapability(modern, "terminal_host_geometry_v1") {
+		t.Fatal("explicit terminal capabilities were not negotiated")
+	}
+}

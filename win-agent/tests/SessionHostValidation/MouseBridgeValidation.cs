@@ -71,16 +71,26 @@ internal static class MouseBridgeValidation
         Console.WriteLine("Mouse bridge: direct, standalone and managed nested ConPTY wheel/click/drag parity passed.");
     }
 
-    private static void RunScenario(string mode)
+    // Explicit opt-in: starts only a new CLI, never an existing user session.
+    internal static void RunClaudeStartup(string powerShellPath, string claudePath)
+    {
+        if (!File.Exists(powerShellPath) || !File.Exists(claudePath))
+            throw new FileNotFoundException("Provide installed PowerShell and Claude paths.");
+        RunScenario("managed", powerShellPath, claudePath);
+    }
+
+    private static void RunScenario(string mode, string powerShellPath = null, string claudePath = null)
     {
         var session = Guid.NewGuid();
         var token = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
         var name = "termlink-mouse-test-" + session.ToString("N");
         using var pipe = new NamedPipeServerStream(name, PipeDirection.InOut, 1,
             PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
-        var child = "\"" + Path.Combine(AppContext.BaseDirectory, "TermLink.SessionHost.Validation.exe") + "\" --mouse-probe-child";
+        var child = powerShellPath == null
+            ? "\"" + Path.Combine(AppContext.BaseDirectory, "TermLink.SessionHost.Validation.exe") + "\" --mouse-probe-child"
+            : "\"" + powerShellPath + "\" -NoLogo -NoProfile";
         var command = mode == "direct" ? child : "\"" + Path.Combine(AppContext.BaseDirectory, "TermLink.SessionHost.exe") +
-            "\" --command-base64 " + Encode(child) + " --timeout-ms 15000 --diagnostics";
+            "\" --command-base64 " + Encode(child) + " --timeout-ms " + (powerShellPath == null ? "15000" : "45000") + " --diagnostics";
         if (mode == "managed") command += " --agent-pipe " + name + " --session-id " + session + " --handshake-token " + Convert.ToBase64String(token);
         using var outer = new ConPtySessionHost(SessionHostOptions.Parse(new[] { "--command-base64", Encode(command) }));
         var type = typeof(ConPtySessionHost);
@@ -107,9 +117,9 @@ internal static class MouseBridgeValidation
             using var timeout = new CancellationTokenSource(10000);
             await pipe.WaitForConnectionAsync(timeout.Token);
             var hello = LocalFrameCodec.Read(pipe);
-            LocalPayloadCodec.ParseHello(hello.Payload, token);
+            LocalPayloadCodec.ParseTerminalHello(hello.Payload, token);
             LocalFrameCodec.Write(pipe, new LocalFrame(LocalFrameType.AgentHello, session, 0,
-                LocalPayloadCodec.Hello(Environment.ProcessId, token)));
+                LocalPayloadCodec.TerminalHello(Environment.ProcessId, token)));
             LocalFrame frame;
             while ((frame = LocalFrameCodec.Read(pipe)) != null)
             {
@@ -125,7 +135,33 @@ internal static class MouseBridgeValidation
             void Wait(string marker)
             {
                 if (!SpinWait.SpinUntil(() => Contains(marker) || agent.IsFaulted, 12000) || agent.IsFaulted)
-                    throw new Exception(mode + " mouse probe failed: " + text, agent.Exception);
+                    throw new Exception(powerShellPath == null
+                        ? mode + " mouse probe failed: " + text
+                        : "Claude startup probe timed out or its test bridge failed.", agent.Exception);
+            }
+            if (powerShellPath != null)
+            {
+                void Send(string value) { input.Write(Encoding.UTF8.GetBytes(value)); input.Flush(); }
+                Wait("PS ");
+                Send("& '" + claudePath.Replace("'", "''") + "'\r");
+                Wait("\u001b[16t");
+                Thread.Sleep(1500);
+                var cliProcess = type.GetField("processInfo", flags)!.GetValue(outer)!;
+                var cliHandle = (IntPtr)cliProcess.GetType().GetField("hProcess")!.GetValue(cliProcess)!;
+                if (WaitForSingleObject(cliHandle, 0) == 0)
+                    throw new Exception("Claude geometry query terminated the test shell.");
+                Send("\u0003");
+                Thread.Sleep(300);
+                Send("\u0003");
+                Thread.Sleep(500);
+                Send("Write-Output ('__CLAUDE_' + 'SHELL_ALIVE__')\r");
+                Wait("__CLAUDE_SHELL_ALIVE__");
+                Send("exit 0\r");
+                Wait(";authority_failed=false;input_failure=false;output_disconnected=false");
+                if (WaitForSingleObject(cliHandle, 5000) != 0 || !GetExitCodeProcess(cliHandle, out var cliExit) || cliExit != 0)
+                    throw new Exception("Claude test shell did not exit cleanly.");
+                Console.WriteLine("Claude startup: real CSI 16t observed, authority survived, shell accepted input after interrupt, exit 0.");
+                return;
             }
             Wait("__MOUSE_READY__");
             // Hover must be forwarded but cannot invalidate Android's control lease.
@@ -142,7 +178,7 @@ internal static class MouseBridgeValidation
             if (!Contains("__MOUSE_RESULT__:8,4,4,4,5__END__")) throw new Exception(mode + " mouse parity failed: " + text);
             Wait("__ORDER__:EWWPDRKEWWPDRKEWWPDRKEWWPDRK__");
             if (mode == "managed" && Volatile.Read(ref localEpochs) < 20) throw new Exception("mouse actions did not reclaim local control");
-            if (mode != "direct") Wait(";authority_failed=false;output_disconnected=false");
+            if (mode != "direct") Wait(";authority_failed=false;input_failure=false;output_disconnected=false");
             var process = type.GetField("processInfo", flags)!.GetValue(outer)!;
             var handle = (IntPtr)process.GetType().GetField("hProcess")!.GetValue(process)!;
             if (WaitForSingleObject(handle, 5000) != 0 || !GetExitCodeProcess(handle, out var exit) || exit != 0)

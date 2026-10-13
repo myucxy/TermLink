@@ -38,6 +38,29 @@
 
 core 仓库后续公开与本次许可变更分开执行。匹配的源码交付未落实时，保留本地构建验证结果并停止新的对外二进制分发。现有签名、版本与发布授权门禁仍适用，详见[授权说明](../LICENSE-STATUS.md)。
 
+客户端候选构建现在记录 `source_revision` 和 `core_revision`。生成对应源码时，使用同批
+`artifacts/release/<version>-<build>/artifact-manifest.json`，归档脚本会核对干净的双仓库 HEAD、
+五个原生库锁、发布清单及实际制品哈希；归档包括两仓库完整 tracked 源码和构建材料。
+该双仓库脚本用于包含 Android 或 Windows 客户端的批次。
+
+```powershell
+& ./release/Verify-LocalRelease.ps1 -ReleaseDirectory $releaseDirectory `
+  -ManifestPath "$releaseDirectory/artifact-manifest.json" -RequireSourceIdentity `
+  -ExpectedReleaseMode Production -AndroidSdkPath $androidSdk `
+  -ExpectedAndroidSignerSha256 $androidSigner -ExpectedWindowsSignerSha1 $windowsSigner `
+  -RequireWindowsTimestamp
+& ./scripts/New-CorrespondingSourceArchive.ps1 -ApplicationRepository . `
+  -CoreRepository ../terminal-core -Version $version -BuildNumber $build `
+  -ArtifactManifestPath "$releaseDirectory/artifact-manifest.json" `
+  -OutputPath "$releaseDirectory/TermLink-$version-$build-source.zip"
+```
+
+归档和 `.sha256.json` 均不覆盖已有文件。ZIP 内 `SOURCE-MANIFEST.json` 绑定发布清单哈希、
+应用/core revision 和各制品哈希；ZIP 自身哈希只保存在外部 sidecar。
+`README-SOURCE.md` 说明解压后重建 Git snapshot 并编译的步骤，原发布 revision 仍由源码清单保留。
+复核 `scripts/Test-CorrespondingSourceArchive.ps1` 后，还须记录接收者实际可下载的源码地址并验证下载哈希；
+生成本地 ZIP 只完成交付准备。发布说明应同时列出二进制与对应源码入口，源码的外部上传及公开范围需符合本轮授权。
+
 ## DEV 与正式发布版本规则
 
 自 2026-10-03 起执行，适用于 Android、Windows 和 Docker：

@@ -60,6 +60,7 @@ namespace TermLink.Agent
         private readonly int frameCapacityPerPeer;
         private readonly long byteCapacityPerPeer;
         private readonly TimeSpan retryDelay;
+        private readonly Func<Guid, Guid, bool> canSendSession;
         private readonly Task flushWorker;
         private Func<ProductionRelayExactSendRequest, CancellationToken, Task<bool>> relaySender;
         private CancellationTokenSource relayConnectionCancellation;
@@ -72,7 +73,8 @@ namespace TermLink.Agent
         internal ProductionRelayExactOutbox(
             int frameCapacityPerPeer = MaximumFramesPerPeer,
             long byteCapacityPerPeer = MaximumBytesPerPeer,
-            TimeSpan? retryDelay = null)
+            TimeSpan? retryDelay = null,
+            Func<Guid, Guid, bool> canSendSession = null)
         {
             if (frameCapacityPerPeer is < 1 or > MaximumFramesPerPeer)
                 throw new ArgumentOutOfRangeException(nameof(frameCapacityPerPeer));
@@ -84,6 +86,7 @@ namespace TermLink.Agent
             this.frameCapacityPerPeer = frameCapacityPerPeer;
             this.byteCapacityPerPeer = byteCapacityPerPeer;
             this.retryDelay = effectiveRetryDelay;
+            this.canSendSession = canSendSession;
             flushWorker = FlushWorkerAsync(lifetime.Token);
         }
 
@@ -469,6 +472,9 @@ namespace TermLink.Agent
                         if (entry.Removed) continue;
                         if (entry.InFlight) break;
                         if (entry.LastSentConnectionEpoch == relayConnectionEpoch) continue;
+                        // A paused terminal must not hold up sibling sessions
+                        // for the same phone, or lose its exact retry bytes.
+                        if (!CanSendSession(entry)) continue;
                         selected = entry;
                         break;
                     }
@@ -499,9 +505,16 @@ namespace TermLink.Agent
                     relayConnectionEpoch == candidate.ConnectionEpoch &&
                     relayGeneration == candidate.RelayGeneration &&
                     ReferenceEquals(relaySender, candidate.Sender) &&
+                    CanSendSession(candidate.Entry) &&
                     !candidate.ConnectionToken.IsCancellationRequested;
             }
         }
+
+        // The callback must be read-only and must never reenter this outbox.
+        private bool CanSendSession(Entry entry) =>
+            canSendSession == null || canSendSession(entry.PeerDeviceId, entry.SessionId);
+
+        internal void NotifySessionAdmissionChanged() => SignalWorker();
 
         private void CompleteSend(SendCandidate candidate, bool sent)
         {

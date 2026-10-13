@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -129,6 +130,8 @@ namespace TermLink.Agent
             new Dictionary<Guid, IRegistryManagedSession>();
         private readonly Dictionary<Guid, IRegistryManagedSession> completedSessions =
             new Dictionary<Guid, IRegistryManagedSession>();
+        // History reads profiles while holding its own lock; never reacquire registry sync there.
+        private readonly ConcurrentDictionary<Guid, IRegistryManagedSession> profileSessions = new();
         private readonly HashSet<Guid> releasedCompletedSessions = new HashSet<Guid>();
         private readonly HashSet<IRegistryManagedSession> retiring = new HashSet<IRegistryManagedSession>();
         private readonly HashSet<Guid> retainOnCompletion = new HashSet<Guid>();
@@ -146,10 +149,12 @@ namespace TermLink.Agent
         private readonly string bufferRoot;
         private readonly long maximumBufferBytes;
         private readonly Action<ManagedShellType, LocalFrame> committedFrame;
+        private readonly Action<string> completionDiagnostic;
         private readonly Action<Guid> explicitlyClosed;
         private int recoveredSessionCount;
         private bool remoteAccessEnabled = true;
         private bool preserveRegistrationsOnShutdown;
+        private bool recoveryStarted;
         private bool disposed;
 
         public SessionRegistry(
@@ -158,7 +163,10 @@ namespace TermLink.Agent
             long maximumBufferBytes,
             int maximumSessions,
             Action<ManagedShellType, LocalFrame> committedFrame = null,
-            Action<Guid> explicitlyClosed = null)
+            Action<Guid> explicitlyClosed = null,
+            Func<Guid, CancellationToken, Task<bool>> authorizeClipboard = null,
+            Func<string> brokerCaptureRootProvider = null,
+            bool deferRecovery = false)
         {
             if (string.IsNullOrWhiteSpace(bufferRoot)) throw new ArgumentException("buffer root is required", "bufferRoot");
             if (disconnectedTimeoutMilliseconds < 250 || disconnectedTimeoutMilliseconds > 300000)
@@ -182,14 +190,14 @@ namespace TermLink.Agent
                 resolvedBufferRoot,
                 disconnectedTimeoutMilliseconds,
                 maximumBufferBytes,
-                committedFrame);
+                committedFrame, authorizeClipboard, brokerCaptureRootProvider);
             retainCompletedSessions = committedFrame != null;
             registrationStore = new DpapiRegistryRegistrationStore(
                 Path.Combine(resolvedBufferRoot, "registrations.dpapi"));
             remoteAccessPolicyStore = new DpapiRemoteAccessPolicyStore(
                 Path.Combine(resolvedBufferRoot, "remote-access-policy.dpapi"));
             LoadRemoteAccessPolicy();
-            RecoverRegistrations();
+            if (!deferRecovery) RecoverRetainedSessions();
         }
 
         internal SessionRegistry(IRegistryManagedSessionFactory sessionFactory, int maximumSessions)
@@ -217,7 +225,9 @@ namespace TermLink.Agent
             IRegistryManagedSessionFactory sessionFactory,
             int maximumSessions,
             IRegistryRegistrationStore registrationStore,
-            IRemoteAccessPolicyStore remoteAccessPolicyStore)
+            IRemoteAccessPolicyStore remoteAccessPolicyStore,
+            Action<ManagedShellType, LocalFrame> committedFrame = null,
+            Action<string> completionDiagnostic = null)
         {
             if (sessionFactory == null) throw new ArgumentNullException("sessionFactory");
             if (registrationStore == null) throw new ArgumentNullException("registrationStore");
@@ -227,8 +237,11 @@ namespace TermLink.Agent
             this.registrationStore = registrationStore;
             this.remoteAccessPolicyStore = remoteAccessPolicyStore;
             this.maximumSessions = maximumSessions;
+            this.committedFrame = committedFrame;
+            this.completionDiagnostic = completionDiagnostic;
+            retainCompletedSessions = committedFrame != null;
             LoadRemoteAccessPolicy();
-            RecoverRegistrations();
+            RecoverRetainedSessions();
         }
 
         public bool RemoteAccessEnabled
@@ -369,6 +382,31 @@ namespace TermLink.Agent
                 error is CryptographicException;
         }
 
+        internal void RecoverRetainedSessions()
+        {
+            lock (sync)
+            {
+                if (disposed) throw new ObjectDisposedException(nameof(SessionRegistry));
+                if (recoveryStarted)
+                {
+                    // A later login can supply the runtime that was unavailable at startup.
+                    foreach (var recovered in completedSessions.Values.OfType<RecoveredBufferedSession>().ToArray())
+                    {
+                        if (recovered.RecoveryError.Length == 0 || deletedSessions.Contains(recovered.SessionId)) continue;
+                        try
+                        {
+                            var terminalFrame = recovered.EnsureTerminalFrame(frame => committedFrame(recovered.ShellType, frame));
+                            if (terminalFrame != null) committedFrame(recovered.ShellType, terminalFrame);
+                        }
+                        catch when (recovered.RecoveryError.Length != 0) { }
+                    }
+                    return;
+                }
+                recoveryStarted = true;
+                RecoverRegistrations();
+            }
+        }
+
         private void RecoverRegistrations()
         {
             foreach (var registration in registrationStore.Load())
@@ -377,6 +415,11 @@ namespace TermLink.Agent
                     throw new InvalidDataException("Registry registration store returned duplicate Session IDs.");
                 knownRegistrations.Add(registration.SessionId, registration);
                 if (registration.Retired) continue;
+                if (deletedSessions.Contains(registration.SessionId))
+                {
+                    RetireRegistration(registration.SessionId);
+                    continue;
+                }
                 var blockedByStoppedHost = false;
                 lock (sync)
                 {
@@ -421,14 +464,21 @@ namespace TermLink.Agent
                 maximumBufferBytes);
             try
             {
-                var terminalFrame = recovered.EnsureTerminalFrame();
                 completedSessions.Add(registration.SessionId, recovered);
-                committedFrame(registration.ShellType, terminalFrame);
+                profileSessions[registration.SessionId] = recovered;
+                var terminalFrame = recovered.EnsureTerminalFrame(frame => committedFrame(registration.ShellType, frame));
+                if (terminalFrame != null) committedFrame(registration.ShellType, terminalFrame);
+                return true;
+            }
+            catch when (recovered.RecoveryError.Length != 0)
+            {
+                // Keep one unavailable history isolated without stopping unrelated sessions.
                 return true;
             }
             catch
             {
                 completedSessions.Remove(registration.SessionId);
+                profileSessions.TryRemove(registration.SessionId, out _);
                 recovered.Dispose();
                 throw;
             }
@@ -504,6 +554,7 @@ namespace TermLink.Agent
                 registrationStore.Upsert(activeRegistration);
                 knownRegistrations[activeRegistration.SessionId] = activeRegistration;
                 sessions.Add(activeRegistration.SessionId, managed);
+                profileSessions[activeRegistration.SessionId] = managed;
             }
 
             try
@@ -521,6 +572,7 @@ namespace TermLink.Agent
                         ReferenceEquals(current, managed))
                     {
                         sessions.Remove(registration.SessionId);
+                        ForgetReleasedProfileLocked(managed);
                     }
                     var recoveryOnly = registration.AsRecoveryOnly();
                     registrationStore.Upsert(recoveryOnly);
@@ -780,6 +832,35 @@ namespace TermLink.Agent
             }
         }
 
+        internal string TerminalCompatibilityError(Guid sessionId)
+        {
+            lock (sync)
+            {
+                IRegistryManagedSession session;
+                if (!sessions.TryGetValue(sessionId, out session) && !completedSessions.TryGetValue(sessionId, out session))
+                    session = retiring.FirstOrDefault(candidate => candidate.SessionId == sessionId);
+                var managed = session as ManagedSession;
+                if (managed != null) return managed.TerminalCompatibilityError;
+                var recovered = session as RecoveredBufferedSession;
+                return recovered == null ? string.Empty : recovered.TerminalCompatibilityError;
+            }
+        }
+
+        internal TerminalSemanticProfile GetSessionProfile(Guid sessionId)
+        {
+            if (!profileSessions.TryGetValue(sessionId, out var session)) return null;
+            if (session is ManagedSession managed) return managed.BoundProfile;
+            if (session is RecoveredBufferedSession recovered) return recovered.BoundProfile;
+            return null;
+        }
+
+        private void ForgetReleasedProfileLocked(IRegistryManagedSession session)
+        {
+            if (!sessions.ContainsKey(session.SessionId) && !completedSessions.ContainsKey(session.SessionId) &&
+                !retiring.Any(candidate => candidate.SessionId == session.SessionId))
+                profileSessions.TryRemove(session.SessionId, out _);
+        }
+
         internal bool TryReadBufferedEvents(
             Guid sessionId,
             ulong resumeFromSequence,
@@ -884,8 +965,9 @@ namespace TermLink.Agent
                     }
                     return;
                 }
-                completedSessions.Remove(sessionId);
                 FinalizeRegistration(completed);
+                completedSessions.Remove(sessionId);
+                ForgetReleasedProfileLocked(completed);
             }
             DeleteBufferedEvents(completed);
             completed.Dispose();
@@ -912,7 +994,11 @@ namespace TermLink.Agent
             if (explicitlyClosed != null) explicitlyClosed(sessionId);
             if (completed)
             {
-                lock (sync) retiring.Remove(managed);
+                lock (sync)
+                {
+                    retiring.Remove(managed);
+                    ForgetReleasedProfileLocked(managed);
+                }
             }
             return new SessionStopResult
             {
@@ -1048,30 +1134,70 @@ namespace TermLink.Agent
         private void OnSessionCompleted(IRegistryManagedSession completed)
         {
             var deleteReleasedBuffer = false;
+            Exception persistenceError = null;
             lock (sync)
             {
                 IRegistryManagedSession current;
                 var wasActive = sessions.TryGetValue(completed.SessionId, out current) &&
                     ReferenceEquals(current, completed);
                 var wasRetainedStop = retainOnCompletion.Remove(completed.SessionId);
-                if (wasActive || wasRetainedStop)
+                try
                 {
-                    var alreadyReleased = releasedCompletedSessions.Remove(completed.SessionId);
-                    deleteReleasedBuffer = alreadyReleased;
-                    if (retainCompletedSessions && !alreadyReleased && !preserveRegistrationsOnShutdown)
+                    if (wasActive || wasRetainedStop)
                     {
-                        MarkRecoveryOnly(completed);
-                        completedSessions[completed.SessionId] = completed;
+                        var alreadyReleased = releasedCompletedSessions.Remove(completed.SessionId);
+                        deleteReleasedBuffer = alreadyReleased;
+                        if (retainCompletedSessions && !alreadyReleased && !preserveRegistrationsOnShutdown)
+                        {
+                            try { MarkRecoveryOnly(completed); }
+                            catch (Exception error) when (IsCompletionPersistenceError(error))
+                            { persistenceError = error; }
+                            completedSessions[completed.SessionId] = completed;
+                        }
+                        else if (!preserveRegistrationsOnShutdown)
+                        {
+                            try { FinalizeRegistration(completed); }
+                            catch (Exception error) when (IsCompletionPersistenceError(error))
+                            {
+                                deleteReleasedBuffer = false;
+                                if (retainCompletedSessions && alreadyReleased)
+                                    completedSessions[completed.SessionId] = completed;
+                                persistenceError = error;
+                            }
+                        }
                     }
-                    else if (!preserveRegistrationsOnShutdown)
-                    {
-                        FinalizeRegistration(completed);
-                    }
-                    if (wasActive) sessions.Remove(completed.SessionId);
                 }
-                retiring.Remove(completed);
+                finally
+                {
+                    if (wasActive) sessions.Remove(completed.SessionId);
+                    retiring.Remove(completed);
+                    ForgetReleasedProfileLocked(completed);
+                }
             }
+            if (persistenceError != null) ObserveCompletionPersistenceFailure(completed.SessionId, persistenceError);
             if (deleteReleasedBuffer) DeleteBufferedEvents(completed);
+        }
+
+        private static bool IsCompletionPersistenceError(Exception error) =>
+            error is IOException or UnauthorizedAccessException or CryptographicException;
+
+        private void ObserveCompletionPersistenceFailure(Guid sessionId, Exception error)
+        {
+            var line = DateTime.UtcNow.ToString("O") + " session-completion-persistence session=" +
+                sessionId.ToString("N") + " failure=" + error.GetType().Name + Environment.NewLine;
+            try
+            {
+                if (completionDiagnostic != null) { completionDiagnostic(line); return; }
+                var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "TermLink", "logs");
+                Directory.CreateDirectory(root);
+                File.AppendAllText(Path.Combine(root, "TermLink-control-runtime.log"), line, new UTF8Encoding(false));
+            }
+            catch
+            {
+                try { Console.Error.Write(line); }
+                catch { }
+            }
         }
 
         private static void DeleteBufferedEvents(IRegistryManagedSession session)
@@ -1246,7 +1372,11 @@ namespace TermLink.Agent
                 if (session.WaitForStop())
                 {
                     completed++;
-                    lock (sync) retiring.Remove(session);
+                    lock (sync)
+                    {
+                        retiring.Remove(session);
+                        ForgetReleasedProfileLocked(session);
+                    }
                 }
                 else
                 {
@@ -1273,13 +1403,19 @@ namespace TermLink.Agent
         private readonly int disconnectedTimeoutMilliseconds;
         private readonly long maximumBufferBytes;
         private readonly Action<ManagedShellType, LocalFrame> committedFrame;
+        private readonly Func<Guid, CancellationToken, Task<bool>> authorizeClipboard;
+        private readonly Func<string> brokerCaptureRootProvider;
 
-        public ManagedSessionFactory(string bufferRoot, int disconnectedTimeoutMilliseconds, long maximumBufferBytes, Action<ManagedShellType, LocalFrame> committedFrame = null)
+        public ManagedSessionFactory(string bufferRoot, int disconnectedTimeoutMilliseconds, long maximumBufferBytes, Action<ManagedShellType, LocalFrame> committedFrame = null,
+            Func<Guid, CancellationToken, Task<bool>> authorizeClipboard = null,
+            Func<string> brokerCaptureRootProvider = null)
         {
             this.bufferRoot = bufferRoot;
             this.disconnectedTimeoutMilliseconds = disconnectedTimeoutMilliseconds;
             this.maximumBufferBytes = maximumBufferBytes;
             this.committedFrame = committedFrame;
+            this.authorizeClipboard = authorizeClipboard;
+            this.brokerCaptureRootProvider = brokerCaptureRootProvider;
         }
 
         public IRegistryManagedSession Create(
@@ -1292,12 +1428,13 @@ namespace TermLink.Agent
                 disconnectedTimeoutMilliseconds,
                 maximumBufferBytes,
                 completion,
-                committedFrame);
+                committedFrame, authorizeClipboard, brokerCaptureRootProvider);
         }
     }
 
     internal sealed class RecoveredBufferedSession : IRegistryManagedSession, IRecoveryRegistrationSession, IBufferedRegistryManagedSession, IRemoteInputReplaySession
     {
+        internal TerminalSemanticProfile BoundProfile => buffer.BoundProfile;
         private readonly EncryptedEventBuffer buffer;
         private readonly string bufferDirectory;
         private readonly SessionRegistration registration;
@@ -1305,6 +1442,7 @@ namespace TermLink.Agent
         private readonly DateTime registeredAtUtc;
         private LocalLifecycleState lifecycle;
         private int exitCode;
+        internal string RecoveryError { get; private set; } = string.Empty;
 
         public RecoveredBufferedSession(
             SessionRegistration registration,
@@ -1324,11 +1462,34 @@ namespace TermLink.Agent
         public ManagedShellType ShellType { get { return shellType; } }
         public SessionRegistration Registration { get { return registration; } }
 
-        public LocalFrame EnsureTerminalFrame()
+        public LocalFrame EnsureTerminalFrame(Action<LocalFrame> verifyBrokerCapture = null)
         {
+            if (buffer.TerminalCompatibilityError.Length != 0 || !buffer.HasBoundProfile)
+            {
+                lifecycle = LocalLifecycleState.Interrupted;
+                return null;
+            }
             ulong earliest;
             ulong latest;
             var frames = buffer.ReadFrom(0, out earliest, out latest);
+            foreach (var frame in frames)
+            {
+                if (frame.Type != LocalFrameType.BrokerOutput) continue;
+                try
+                {
+                    if (verifyBrokerCapture == null)
+                        throw new InvalidOperationException("BROKER_CAPTURE_RUNTIME_UNAVAILABLE");
+                    verifyBrokerCapture(frame);
+                }
+                catch (Exception error) when (error is IOException || error is InvalidDataException ||
+                    error is UnauthorizedAccessException || error is CryptographicException ||
+                    (error is InvalidOperationException && error.Message == "BROKER_CAPTURE_RUNTIME_UNAVAILABLE"))
+                {
+                    RecoveryError = "BROKER_CAPTURE_RECOVERY_UNAVAILABLE";
+                    throw;
+                }
+            }
+            RecoveryError = string.Empty;
             LocalFrame terminalLifecycle = null;
             if (frames.Count > 0)
             {
@@ -1385,13 +1546,22 @@ namespace TermLink.Agent
 
         public void Start() { }
 
+        internal string TerminalCompatibilityError
+        {
+            get
+            {
+                var error = buffer.TerminalCompatibilityError;
+                return error.Length != 0 ? error : (!buffer.HasBoundProfile ? TerminalSessionProfile.Missing : RecoveryError);
+            }
+        }
+
         public SessionSummary GetSummary()
         {
             return new SessionSummary
             {
                 SessionId = SessionId,
                 ShellType = shellType,
-                Lifecycle = lifecycle == LocalLifecycleState.Ended
+                Lifecycle = RecoveryError.Length != 0 ? SessionAgentLifecycle.Faulted : lifecycle == LocalLifecycleState.Ended
                     ? SessionAgentLifecycle.Ended
                     : SessionAgentLifecycle.HostLost,
                 LastSequence = buffer.LastSequence,
@@ -1476,6 +1646,8 @@ namespace TermLink.Agent
 
     internal sealed class ManagedSession : IRegistryManagedSession, IInterruptibleRegistryManagedSession, IRecoveryRegistrationSession, IRemoteInputReplayDispatchSession, IBufferedRegistryManagedSession, IRemoteInputReplaySession
     {
+        internal string TerminalCompatibilityError { get { return agent.TerminalCompatibilityError; } }
+        internal TerminalSemanticProfile BoundProfile => agent.BoundProfile;
         private readonly SessionAgent agent;
         private readonly SessionRegistration registration;
         private readonly ManagedShellType shellType;
@@ -1491,7 +1663,9 @@ namespace TermLink.Agent
             int disconnectedTimeoutMilliseconds,
             long maximumBufferBytes,
             Action<IRegistryManagedSession> completion,
-            Action<ManagedShellType, LocalFrame> committedFrame = null)
+            Action<ManagedShellType, LocalFrame> committedFrame = null,
+            Func<Guid, CancellationToken, Task<bool>> authorizeClipboard = null,
+            Func<string> brokerCaptureRootProvider = null)
         {
             this.registration = registration;
             SessionId = registration.SessionId;
@@ -1506,7 +1680,8 @@ namespace TermLink.Agent
                 registration.ExpectedHostProcessId,
                 disconnectedTimeoutMilliseconds,
                 maximumBufferBytes);
-            agent = new SessionAgent(options, committedFrame == null ? (Action<LocalFrame>)null : frame => committedFrame(shellType, frame));
+            agent = new SessionAgent(options, committedFrame == null ? (Action<LocalFrame>)null : frame => committedFrame(shellType, frame),
+                authorizeClipboard, brokerCaptureRootProvider);
         }
 
         public Guid SessionId { get; private set; }
@@ -1818,15 +1993,20 @@ namespace TermLink.Agent
                     options.MaximumBufferBytes,
                     options.MaximumSessions,
                     ForwardCommittedFrame,
-                    sessionId => CurrentProductionRuntime()?.DestroySessionHistory(sessionId));
+                    sessionId => CurrentProductionRuntime()?.DestroySessionHistory(sessionId),
+                    (sessionId, token) => CurrentProductionRuntime()?.AuthorizeLocalClipboardAsync(sessionId, token) ?? Task.FromResult(false),
+                    brokerCaptureRootProvider: () => CurrentProductionRuntime()?.BrokerCaptureRootPath,
+                    deferRecovery: true);
                 if (runtime != null)
                 {
-                    runtime.Attach(registry);
                     Volatile.Write(ref productionRuntime, runtime);
+                    runtime.Attach(registry);
                 }
+                else registry.RecoverRetainedSessions();
             }
             catch
             {
+                Volatile.Write(ref productionRuntime, null);
                 if (runtime != null) runtime.Dispose();
                 if (registry != null) registry.Dispose();
                 Array.Clear(controlSecret, 0, controlSecret.Length);
@@ -2104,6 +2284,8 @@ namespace TermLink.Agent
         private void ForwardCommittedFrame(ManagedShellType shellType, LocalFrame frame)
         {
             var runtime = Volatile.Read(ref productionRuntime);
+            if (runtime == null && frame.Type == LocalFrameType.BrokerOutput)
+                throw new InvalidOperationException("BROKER_CAPTURE_RUNTIME_UNAVAILABLE");
             if (runtime != null) runtime.OnCommitted(shellType, frame);
         }
 

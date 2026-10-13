@@ -467,8 +467,28 @@ namespace TermLink.Agent
                 : ProductionIdentityStore.TryLoad(accountKey, client.OIDCIssuer, machineId);
             var reuseRetainedDevice = !selection.ReuseDeviceIdentity && retained != null;
             var reuseRetainedPc = !selection.ReusePcIdentity && retained != null;
+            var revoked = false;
+            if (selection.ReuseDeviceIdentity)
+            {
+                revoked = await IsDeviceRevokedAsync(
+                    http, serverUrl, tokens.AccessToken, selection.DeviceId,
+                    existingCredentials.Identity, CancellationToken.None).ConfigureAwait(false);
+            }
+            else if (reuseRetainedDevice)
+            {
+                revoked = await IsDeviceRevokedAsync(
+                    http, serverUrl, tokens.AccessToken, retained.DeviceId,
+                    retained.Identity, CancellationToken.None).ConfigureAwait(false);
+            }
+            if (revoked)
+            {
+                reuseRetainedDevice = false;
+                reuseRetainedPc = false;
+            }
+            var reuseExistingDevice = selection.ReuseDeviceIdentity && !revoked;
+            var reuseExistingPc = selection.ReusePcIdentity && !revoked;
             MachineResolutionResponse recovered = null;
-            if (!selection.ReusePcIdentity && !reuseRetainedPc)
+            if (!reuseExistingPc && !reuseRetainedPc)
             {
                 recovered = await ResolveMachineAsync(
                     serverUrl,
@@ -476,22 +496,26 @@ namespace TermLink.Agent
                     tokens.AccessToken,
                     http).ConfigureAwait(false);
             }
+            if (revoked && recovered == null)
+                throw new ProductionEnrollmentException(
+                    "ACCOUNT_MACHINE_IDENTITY_UNAVAILABLE",
+                    "The revoked device's PC could not be resolved safely.");
 
-            var deviceId = selection.ReuseDeviceIdentity
+            var deviceId = reuseExistingDevice
                 ? selection.DeviceId
                 : reuseRetainedDevice ? retained.DeviceId : Guid.NewGuid();
-            var resolvedPcId = selection.ReusePcIdentity
+            var resolvedPcId = reuseExistingPc
                 ? selection.PcId
                 : reuseRetainedPc ? retained.PcId
                 : recovered != null ? Guid.Parse(recovered.PcId)
                 : ProductionMachineIdentity.DeriveInitialPcId(machineId);
-            var resolvedPcName = selection.ReusePcIdentity && existingConfig != null
+            var resolvedPcName = reuseExistingPc && existingConfig != null
                 ? existingConfig.PcName
                 : reuseRetainedPc ? retained.PcName
                 : recovered != null && !string.IsNullOrWhiteSpace(recovered.PcName)
                     ? NormalizePcName(recovered.PcName)
                     : NormalizePcName(pcName);
-            var resolvedKeyEpoch = selection.ReusePcIdentity && existingConfig != null
+            var resolvedKeyEpoch = reuseExistingPc && existingConfig != null
                 ? existingConfig.KeyEpoch
                 : reuseRetainedPc ? retained.KeyEpoch
                 : recovered != null ? recovered.KeyEpoch
@@ -500,7 +524,7 @@ namespace TermLink.Agent
             var ownsIdentity = false;
             try
             {
-                if (selection.ReuseDeviceIdentity)
+                if (reuseExistingDevice)
                     identity = existingCredentials.Identity;
                 else if (reuseRetainedDevice)
                     identity = retained.Identity;
@@ -509,36 +533,95 @@ namespace TermLink.Agent
                     identity = DeviceIdentity.Generate();
                     ownsIdentity = true;
                 }
-                ProductionCredentials.SaveWithRefreshToken(
-                    deviceId,
-                    identity,
-                    accountKey,
-                    tokens.AccessToken,
-                    tokens.RefreshToken,
-                    DateTime.UtcNow.AddSeconds(tokens.ExpiresIn));
                 var config = new ProductionAgentConfig
                 {
                     ServerUrl = serverUrl,
                     PcId = resolvedPcId,
                     PcName = resolvedPcName,
                     AccountKey = accountKey,
-                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) && selection.ReusePcIdentity ? existingConfig?.AccountUsername : account.Username,
-                    AccountNickname = string.IsNullOrWhiteSpace(account.Nickname) && selection.ReusePcIdentity ? existingConfig?.AccountNickname : account.Nickname,
-                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) && selection.ReusePcIdentity ? existingConfig?.AccountEmail : account.Email,
+                    AccountUsername = string.IsNullOrWhiteSpace(account.Username) && reuseExistingPc ? existingConfig?.AccountUsername : account.Username,
+                    AccountNickname = string.IsNullOrWhiteSpace(account.Nickname) && reuseExistingPc ? existingConfig?.AccountNickname : account.Nickname,
+                    AccountEmail = string.IsNullOrWhiteSpace(account.Email) && reuseExistingPc ? existingConfig?.AccountEmail : account.Email,
                     AgentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown",
                     KeyEpoch = resolvedKeyEpoch,
                     OIDCIssuer = client.OIDCIssuer,
                     OIDCClientId = client.ClientId,
                     MachineId = machineId
                 };
-                ProductionAgentConfig.Save(config);
-                ProductionAccountStorage.SaveServerUrl(serverUrl);
-                ProductionIdentityStore.TrySave(config, deviceId, identity, accountKey);
+                lock (ProductionAccountStorage.WriteSync)
+                {
+                    ProductionCredentials.SaveWithRefreshToken(
+                        deviceId,
+                        identity,
+                        accountKey,
+                        tokens.AccessToken,
+                        tokens.RefreshToken,
+                        DateTime.UtcNow.AddSeconds(tokens.ExpiresIn));
+                    ProductionAgentConfig.Save(config);
+                    ProductionAccountStorage.SaveServerUrl(serverUrl);
+                    ProductionIdentityStore.TrySave(config, deviceId, identity, accountKey);
+                }
             }
             finally
             {
                 if (ownsIdentity) identity?.Dispose();
             }
+        }
+
+        internal static async Task<bool> IsDeviceRevokedAsync(
+            HttpClient http,
+            string serverUrl,
+            string accessToken,
+            Guid deviceId,
+            DeviceIdentity identity,
+            CancellationToken token)
+        {
+            if (http == null || string.IsNullOrWhiteSpace(serverUrl) ||
+                string.IsNullOrWhiteSpace(accessToken) || deviceId == Guid.Empty || identity == null)
+                throw new ArgumentException("The retained device status request is incomplete.");
+            const string path = "/v1/devices/self";
+            using var request = new HttpRequestMessage(HttpMethod.Get, serverUrl + path);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+            var nonceBytes = RandomNumberGenerator.GetBytes(16);
+            var nonce = Base64Url(nonceBytes);
+            var bodyHash = Convert.ToHexString(SHA256.HashData(Array.Empty<byte>())).ToLowerInvariant();
+            var canonical = string.Join("\n", "TERMLINK-DEVICE-PROOF-V1", "GET", path, timestamp, nonce, bodyHash);
+            request.Headers.TryAddWithoutValidation("X-TermLink-Device", deviceId.ToString("D"));
+            request.Headers.TryAddWithoutValidation("X-TermLink-Timestamp", timestamp);
+            request.Headers.TryAddWithoutValidation("X-TermLink-Nonce", nonce);
+            request.Headers.TryAddWithoutValidation("X-TermLink-Signature", Base64Url(identity.Sign(Encoding.UTF8.GetBytes(canonical))));
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.OK) return false;
+            if (response.StatusCode == HttpStatusCode.Unauthorized && response.Content != null)
+            {
+                await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+                var bytes = new byte[4097];
+                var count = 0;
+                while (count < bytes.Length)
+                {
+                    var read = await stream.ReadAsync(bytes.AsMemory(count), token).ConfigureAwait(false);
+                    if (read == 0) break;
+                    count += read;
+                }
+                if (count <= 4096)
+                {
+                    try
+                    {
+                        using var document = JsonDocument.Parse(bytes.AsMemory(0, count));
+                        var root = document.RootElement;
+                        if (root.ValueKind == JsonValueKind.Object &&
+                            root.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.Object &&
+                            error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String &&
+                            code.GetString() == "DEVICE_REVOKED")
+                            return true;
+                    }
+                    catch (JsonException) { }
+                }
+            }
+            throw new ProductionEnrollmentException(
+                "ACCOUNT_DEVICE_STATUS_UNAVAILABLE",
+                "The existing TermLink device status could not be verified safely.");
         }
 
         private static async Task<MachineResolutionResponse> ResolveMachineAsync(

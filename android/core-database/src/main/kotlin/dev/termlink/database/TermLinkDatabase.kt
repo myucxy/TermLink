@@ -18,8 +18,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AckCursorEntity::class,
         RendererCheckpointEntity::class,
         HistoryPreferenceEntity::class,
+        BrokerCaptureEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 abstract class TermLinkDatabase : RoomDatabase() {
@@ -32,6 +33,7 @@ abstract class TermLinkDatabase : RoomDatabase() {
     abstract fun ackCursors(): AckCursorDao
     abstract fun rendererCheckpoints(): RendererCheckpointDao
     abstract fun preferences(): HistoryPreferenceDao
+    abstract fun brokerCaptures(): BrokerCaptureDao
 
     // Conventional DAO names keep wiring readable at call sites while the short
     // names above remain convenient for generated Room code.
@@ -44,6 +46,7 @@ abstract class TermLinkDatabase : RoomDatabase() {
     fun ackCursorDao(): AckCursorDao = ackCursors()
     fun rendererCheckpointDao(): RendererCheckpointDao = rendererCheckpoints()
     fun preferenceDao(): HistoryPreferenceDao = preferences()
+    fun brokerCaptureDao(): BrokerCaptureDao = brokerCaptures()
 
     companion object {
         /**
@@ -54,7 +57,14 @@ abstract class TermLinkDatabase : RoomDatabase() {
         @JvmStatic
         fun open(context: Context, name: String = DEFAULT_NAME): TermLinkDatabase =
             Room.databaseBuilder(context.applicationContext, TermLinkDatabase::class.java, name)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .addMigrations(
+                    MIGRATION_1_2,
+                    MIGRATION_2_3,
+                    MIGRATION_3_4,
+                    MIGRATION_4_5,
+                    MIGRATION_5_6,
+                    MIGRATION_6_7,
+                )
                 .build()
 
         @JvmStatic
@@ -159,6 +169,38 @@ abstract class TermLinkDatabase : RoomDatabase() {
                 database.execSQL("ALTER TABLE pcs ADD COLUMN architecture TEXT NOT NULL DEFAULT 'unknown'")
                 database.execSQL("ALTER TABLE pcs ADD COLUMN platformVersion TEXT NOT NULL DEFAULT 'legacy'")
                 database.execSQL("ALTER TABLE pcs ADD COLUMN capabilitiesCsv TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        @JvmField
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS broker_captures (
+                        sessionId TEXT NOT NULL,
+                        captureId TEXT NOT NULL,
+                        keyEpoch INTEGER NOT NULL,
+                        sourceSequence INTEGER NOT NULL,
+                        canonicalBytes INTEGER NOT NULL,
+                        canonicalSha256 BLOB NOT NULL,
+                        keyId TEXT NOT NULL,
+                        sizeBytes INTEGER NOT NULL,
+                        ciphertextSha256 BLOB NOT NULL,
+                        ciphertext BLOB NOT NULL,
+                        createdAtEpochMillis INTEGER NOT NULL,
+                        PRIMARY KEY(sessionId, captureId, keyEpoch)
+                    )
+                    """.trimIndent(),
+                )
+                database.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS index_broker_captures_sessionId_sourceSequence_keyEpoch " +
+                        "ON broker_captures(sessionId, sourceSequence, keyEpoch)",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_broker_captures_sessionId_sourceSequence " +
+                        "ON broker_captures(sessionId, sourceSequence)",
+                )
             }
         }
     }

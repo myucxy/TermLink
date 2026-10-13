@@ -8,6 +8,21 @@ import kotlin.test.assertTrue
 
 class TerminalHostEffectFrameV2Test {
     @Test
+    fun validatesTraditionalRepliesWithoutRewritingTheirWireBytes() {
+        val valid = listOf("\u001b/Z", "\u001bP1!uB\u001b\\", "\u001bP0!u%5\u001b\\",
+            "\u0090" + "1!uB\u009c", "\u009b" + "0n", "\u009b" + "?2;2\$y")
+        valid.forEach { value ->
+            val bytes = value.toByteArray(Charsets.ISO_8859_1)
+            assertContentEquals(bytes, effect(0, 1, 0, bytes).copyPayload())
+        }
+        listOf("\u001bP1!u<\u001b\\", "\u001bP0!uBAD\u001b\\", "\u001bP01!uB\u001b\\",
+            "\u0090" + "1!uB\u001b\\", "\u0090" + "1!uB", "\u009b" + "31m").forEach { value ->
+            assertFailsWith<IllegalArgumentException> { effect(0, 1, 0, value.toByteArray(Charsets.ISO_8859_1)) }
+        }
+        assertFailsWith<IllegalArgumentException> { effect(0, 1, 0, "Лܐݝ".encodeToByteArray()) }
+    }
+
+    @Test
     fun ownsRawFramePayloadsAndEffectList() {
         val raw = ByteArray(64) { 7 }
         val payload = reply("\u001b[?31u")
@@ -43,6 +58,18 @@ class TerminalHostEffectFrameV2Test {
             "\u001b[?1;512R",
             "\u001b[?0u",
             "\u001b[?31u",
+            "\u001b[8;1;512t",
+            "\u001b[8;512;1t",
+            "\u001b[6;20;10t",
+            "\u001b[4;524288;524288t",
+            "\u001bP!|00000000\u001b\\",
+            "\u001bP1\$u1;1;1;@;@;@;0;2;L;BBAA\u001b\\",
+            "\u001bP2\$u1/9/512\u001b\\", "\u001bP2\$u\u001b\\", "\u001bP2\$s\u001b\\",
+            "\u001bP2\$s0;2;100;0;0/255;1;360;50;100\u001b\\",
+            "\u001b[2;1;1;128;128;1;0x", "\u001b[3;1;1;128;128;1;0x",
+            "\u001b[?13n", "\u001b[?23n", "\u001b[?27;0;0;5n",
+            "\u001b[?53n", "\u001b[?57;0n", "\u001b[?70n", "\u001b[?83n",
+            "\u001b[24;80;1;1;1\"w", "\u001bP42!~FE9D\u001b\\",
             "\u001b[4;2\$y",
             "\u001b[?25;1\$y",
             "\u001bP0\$r\u001b\\",
@@ -71,6 +98,18 @@ class TerminalHostEffectFrameV2Test {
     fun constructorRejectsArbitraryAndNoncanonicalReplies() {
         val invalid = listOf(
             "\u001b[31m",
+            "\u001bP!|12345678\u001b\\", "\u001b[?99n",
+            "\u001bP1\$u1;1;1;@;@;@;0;2;L;BBZZ\u001b\\",
+            "\u001bP2\$u9/9\u001b\\", "\u001bP2\$u513\u001b\\", "\u001bP2\$u9/\u001b\\",
+            "\u001bP2\$s0;2;101;0;0\u001b\\", "\u001bP2\$s0;2;1;0;0/0;2;1;0;0\u001b\\",
+            "\u001b[0;80;1;1;1\"w", "\u001b[24;513;1;1;1\"w",
+            "\u001bP00!~1234\u001b\\", "\u001bP1!~ffff\u001b\\",
+            "\u001bP1!~FFFFX\u001b\\", "\u001bP65535!~FFFF\u001b\\",
+            "\u001b[8;0;1t",
+            "\u001b[8;1;513t",
+            "\u001b[8;01;1t",
+            "\u001b[8;1;1;1t",
+            "\u001b[6;1025;10t",
             "\u001b[01;1R",
             "\u001b[513;1R",
             "\u001b[?00u",

@@ -311,10 +311,12 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                 DisplayName = command.DisplayName,
                 Executable = command.Executable,
                 Arguments = command.Arguments.Count == 0 ? string.Empty : command.Arguments[0],
-                ShellType = command.Detected ? command.Id : "custom",
+                ShellType = command.Detected
+                    ? command.Id == "powershell-7-enhanced" ? "powershell-7" : command.Id
+                    : "custom",
                 Detected = command.Detected,
                 Enabled = command.Enabled,
-                RunAsAdministrator = true
+                RunAsAdministrator = command.RunAsAdministrator
             })
             .ToList();
         await SendRequiredAsync(new RegistryRequest
@@ -717,7 +719,10 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                     remote?.ViewerCount ?? 0,
                     new DateTimeOffset(DateTime.SpecifyKind(session.LastActivityUtc, DateTimeKind.Utc)),
                     session.LastSequence,
-                    SessionDataPlaneCarrierContract.ReadFromAgentSummary(remote));
+                    SessionDataPlaneCarrierContract.ReadFromAgentSummary(remote))
+                {
+                    TerminalDiagnostic = session.Lifecycle == SessionAgentLifecycle.Connected ? null : new TerminalFailureStore().Read(session.SessionId)
+                };
             })
             .OrderByDescending(session => session.LastActivityAt)
             .ToArray();
@@ -740,7 +745,7 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
                     ? Array.Empty<string>()
                     : new[] { command.Arguments },
                 command.Detected,
-                true,
+                command.RunAsAdministrator,
                 command.Enabled))
             .Where(command => command.Enabled)
             .ToArray();

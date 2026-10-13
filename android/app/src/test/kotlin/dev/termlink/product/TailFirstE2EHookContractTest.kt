@@ -11,6 +11,35 @@ import org.junit.Test
 
 class TailFirstE2EHookContractTest {
     @Test
+    fun debugHookOpenSurfacesGetEnoughTimeForTheStressFixture() {
+        assertEquals(150_000L, tailFirstOpenSurfaceTimeoutMillis(null))
+        assertEquals(600_000L, tailFirstOpenSurfaceTimeoutMillis("true"))
+        listOf("false", "FALSE", "0").forEach {
+            assertEquals(150_000L, tailFirstOpenSurfaceTimeoutMillis(it))
+        }
+    }
+
+    @Test
+    fun openMarkerReadinessKeepsTheLiveTailFenceOptionalForOlderHooks() {
+        val last = "TLTF_run_5200"
+        val live = "TLTF_LIVE_deadbeef00112233"
+
+        assertFalse(tailFirstOpenMarkersReady("$last\n", last, live))
+        assertTrue(tailFirstOpenMarkersReady("$last\n$live", last, live))
+        assertTrue(tailFirstOpenMarkersReady(live, last, live))
+        assertTrue(tailFirstOpenMarkersReady(last, last, null))
+        assertTrue(tailFirstOpenMarkersReady("anything", null, null))
+ 
+        // A 32-column row can split a short marker; line wrapping is not marker content.
+        val wrappedLast = "TLTF\n_run\n_5200"
+        val wrappedLive = "TLTF\n_LIVE\n_deadbeef00112233"
+        assertTrue(tailFirstTextContainsMarker(wrappedLast, last))
+        assertTrue(tailFirstTextContainsMarker(wrappedLive, live))
+        assertTrue(tailFirstOpenMarkersReady("$wrappedLast\n$wrappedLive", last, live))
+        assertFalse(tailFirstTextContainsMarker("TLTF_run_520", last))
+    }
+
+    @Test
     fun receiverIsExportedOnlyByTheDebugManifestForTheExplicitAction() {
         val appRoot = locateAppRoot()
         val debugManifest = parseXml(appRoot.resolve("src/debug/AndroidManifest.xml"))

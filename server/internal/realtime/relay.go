@@ -66,10 +66,15 @@ var optionalCapabilities = []string{
 	"terminal_typed_input_v1",
 	"liveness_probe_v1",
 	"host_history_v1",
+	"terminal_broker_captures_v1",
 	"host_session_catalog_v1",
 	"ai_agent_v1",
 	"host_session_cleanup_v1",
 	"terminal_window_resize_v1",
+	"terminal_host_geometry_v1",
+	"terminal_host_theme_v1",
+	"terminal_host_resize_v1",
+	"terminal_attach_v1",
 }
 
 const (
@@ -485,6 +490,9 @@ func negotiatedCapabilities(offered []string) []string {
 		}
 	}
 	for _, capability := range optionalCapabilities {
+		if capability == "terminal_broker_captures_v1" && !slices.Contains(offered, "host_history_v1") {
+			continue
+		}
 		if slices.Contains(offered, capability) {
 			result = append(result, capability)
 		}
@@ -603,6 +611,11 @@ func (p *peer) readLoop() {
 			p.rejectApplicationFrame("host_history_capability_required", len(frame))
 			continue
 		}
+		if envelope.MessageType == realtimewire.BrokerOutput &&
+			!p.capabilities["terminal_broker_captures_v1"] {
+			p.rejectApplicationFrame("broker_capability_required", len(frame))
+			continue
+		}
 		sessionID, err := uuid.FromBytes(envelope.SessionID)
 		if err != nil {
 			p.rejectApplicationFrame("session_rejected", len(frame))
@@ -690,9 +703,9 @@ func allowedMessage(role string, messageType realtimewire.MessageType) bool {
 		switch messageType {
 		case realtimewire.Heartbeat, realtimewire.Goodbye,
 			realtimewire.SessionUpsert, realtimewire.SessionRemoved,
-			realtimewire.OutputChunk, realtimewire.Gap,
+			realtimewire.OutputChunk, realtimewire.BrokerOutput, realtimewire.Gap,
 			realtimewire.InputAccepted, realtimewire.InputRejected,
-			realtimewire.ResizeApplied, realtimewire.ResizeResponse, realtimewire.SnapshotOffer,
+			realtimewire.ResizeApplied, realtimewire.ResizeResponse, realtimewire.HostGeometry, realtimewire.HostTheme, realtimewire.HostResizeResult, realtimewire.TerminalAttachResult, realtimewire.SnapshotOffer,
 			realtimewire.SnapshotChunk, realtimewire.LeaseGranted,
 			realtimewire.LeaseDenied, realtimewire.LeaseRevoked,
 			realtimewire.ThemeChanged, realtimewire.SessionStarted,
@@ -789,7 +802,8 @@ func (p *peer) acceptPCSequence(sessionID, recipientID uuid.UUID, sequence uint6
 // opens the replay epoch that asks the Agent for the missed ordered frames.
 func (p *peer) routePCFrame(envelope realtimewire.Envelope, sessionID, recipientID uuid.UUID, frame []byte) error {
 	if envelope.MessageType == realtimewire.HostHistoryResponse ||
-		envelope.MessageType == realtimewire.SessionTerminateResponse || envelope.MessageType == realtimewire.ResizeResponse {
+		envelope.MessageType == realtimewire.SessionTerminateResponse || envelope.MessageType == realtimewire.ResizeResponse ||
+		envelope.MessageType == realtimewire.TerminalAttachResult {
 		// Host-history, termination and resize results are correlated by an E2EE
 		// request UUID. They do not consume the ordered terminal event sequence
 		// or replay window.
@@ -964,7 +978,7 @@ func (p *peer) route(envelope realtimewire.Envelope, sessionID uuid.UUID, frame 
 		// PC reconnects and replays from the recipient's durable ACK; never advance
 		// sequence state for a silently dropped frame. The cached subscription
 		// still avoids a PostgreSQL query on the terminal-output hot path.
-		return p.hub.routeToSubscriber(p, sessionID, recipient, frame)
+		return p.hub.routeToSubscriber(p, sessionID, recipient, envelope.MessageType, frame)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1697,7 +1711,7 @@ func (h *Hub) replaySubscriptionsToPC(target *peer) {
 	target.subscriptionReplayReady = true
 }
 
-func (h *Hub) routeToSubscriber(sender *peer, sessionID, recipient uuid.UUID, frame []byte) error {
+func (h *Hub) routeToSubscriber(sender *peer, sessionID, recipient uuid.UUID, messageType realtimewire.MessageType, frame []byte) error {
 	h.mu.RLock()
 	target := h.subscriptions[sessionID][recipient]
 	var cached cachedSessionRoute
@@ -1716,6 +1730,13 @@ func (h *Hub) routeToSubscriber(sender *peer, sessionID, recipient uuid.UUID, fr
 	}
 	if target.principal.UserID != sender.principal.UserID {
 		return denyRoute("subscriber_account_mismatch", store.ErrDenied)
+	}
+	if messageType == realtimewire.BrokerOutput &&
+		(!sender.capabilities["terminal_broker_captures_v1"] ||
+			!target.capabilities["terminal_broker_captures_v1"] ||
+			!sender.capabilities["host_history_v1"] ||
+			!target.capabilities["host_history_v1"]) {
+		return denyRoute("broker_capability_required", store.ErrDenied)
 	}
 	if !routePresent || cached.authorization.PCDeviceID != sender.principal.Device.ID {
 		return denyRoute("subscription_route_inactive", store.ErrDenied)

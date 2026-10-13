@@ -1,6 +1,7 @@
 package dev.termlink.terminal.nativecore
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.os.Looper
@@ -9,11 +10,23 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import dev.termlink.terminal.api.ArgbColor
+import dev.termlink.terminal.api.TerminalGraphicsFormat
+import dev.termlink.terminal.api.TerminalGraphicsResource
+import dev.termlink.terminal.api.TerminalGraphicsResources
+import dev.termlink.terminal.api.TerminalLineRendition
 import dev.termlink.terminal.api.TerminalRenderCellV1
 import dev.termlink.terminal.api.TerminalRenderColorV1
 import dev.termlink.terminal.api.TerminalRenderCursorShapeV2
 import dev.termlink.terminal.api.TerminalRenderCursorV2
 import dev.termlink.terminal.api.TerminalRenderFrameV3
+import dev.termlink.terminal.api.TerminalRenderFrameV4
+import dev.termlink.terminal.api.TerminalRenderFrameV5
+import dev.termlink.terminal.api.TerminalRenderGlyphV5
+import dev.termlink.terminal.api.TerminalRenderImageV5
+import dev.termlink.terminal.api.TerminalRenderImageProtocolV5
+import dev.termlink.terminal.api.TerminalRenderRatioV5
+import dev.termlink.terminal.api.TerminalRenderSourceV5
+import dev.termlink.terminal.api.TerminalRenderClipV5
 import dev.termlink.terminal.api.TerminalRenderGraphemeV1
 import dev.termlink.terminal.api.TerminalRenderPaletteV1
 import dev.termlink.terminal.api.TerminalRenderRenditionV3
@@ -22,6 +35,7 @@ import dev.termlink.terminal.api.TerminalRenderScreenV1
 import dev.termlink.terminal.api.TerminalRenderUnderlineStyleV3
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalThemeV1
+import dev.termlink.terminal.api.TerminalWidthProfile
 import java.nio.ByteBuffer
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
@@ -41,6 +55,232 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class NativeTerminalViewTest {
+    @Test
+    fun coveringLiveViewportRevokesVisibleDisplayUntilUncovered() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val engine = NativeTerminalEngine(bridge = FakeNativeBridge())
+        fun showTestWindow(view: View) {
+            // Robolectric attaches this Activity's View but leaves AttachInfo at GONE.
+            // Set the window state explicitly; the production visibility guard stays intact.
+            val attachInfo = requireNotNull(org.robolectric.util.ReflectionHelpers.getField<Any>(view, "mAttachInfo"))
+            org.robolectric.util.ReflectionHelpers.setField(attachInfo, "mWindowVisibility", View.VISIBLE)
+        }
+        try {
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            controller.visible()
+            view.layout(0, 0, 400, 300)
+            controller.windowFocusChanged(true)
+            assertTrue("test View must be attached before visibility is checked", view.isAttachedToWindow)
+            assertTrue("test View must be shown", view.isShown)
+            showTestWindow(view)
+            assertEquals(View.VISIBLE, view.windowVisibility)
+            engine.setLiveViewportUncovered(view, false)
+            assertFalse("the active engine must register the attached View", view.isLiveViewportUncovered())
+            engine.setLiveViewportUncovered(view, true)
+            assertTrue(engine.hasVisibleDisplay())
+
+            engine.setLiveViewportUncovered(view, false)
+            assertFalse("history overlay must reject an already pending confirmation", engine.hasVisibleDisplay())
+            engine.setLiveViewportUncovered(view, true)
+            assertTrue(engine.hasVisibleDisplay())
+
+            val replacement = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(replacement)
+            replacement.layout(0, 0, 400, 300)
+            assertTrue(replacement.isAttachedToWindow)
+            showTestWindow(replacement)
+            assertTrue(engine.hasVisibleDisplay())
+            engine.setLiveViewportUncovered(view, false)
+            assertTrue("an old View must not cover the replacement renderer", engine.hasVisibleDisplay())
+            engine.setLiveViewportUncovered(replacement, false)
+            assertFalse("frozen history must hide the live renderer even while attached", engine.hasVisibleDisplay())
+            engine.setLiveViewportUncovered(replacement, true)
+            replacement.visibility = View.INVISIBLE
+            assertFalse(engine.hasVisibleDisplay())
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun rustGraphicsFixturesReachCanvasWithTheRecordedCropClipAndMasks() = withGraphicsView { view ->
+        val path = System.getenv("TERMLINK_GRAPHICS_FIXTURES")
+        org.junit.Assume.assumeTrue("TERMLINK_GRAPHICS_FIXTURES was not supplied", path != null)
+        fun fixture(name: String) = RenderFrameV5Decoder.decode(java.io.File(requireNotNull(path), "$name.v5.bin").readBytes())
+        val theme = testTheme().copy(foreground = ArgbColor(0xff112233.toInt()), background = ArgbColor(0xff445566.toInt()))
+        val kitty = fixture("kitty-crop-scrolled")
+        var bitmap = renderGraphics(view, kitty, theme)
+        assertEquals(0xff00ff00.toInt(), cellPixel(view, bitmap, 0.5f, 0.25f))
+        assertEquals(0xffa2aab3.toInt(), cellPixel(view, bitmap, 0.5f, 0.75f))
+        val kittyBitmap = requireNotNull(view.graphicsBitmapForTest(kitty.images.single().resourceId))
+        val independentlyDecodedKitty = fixture("kitty-crop-scrolled")
+        org.junit.Assert.assertNotSame(kitty.resources[1], independentlyDecodedKitty.resources[1])
+        renderGraphics(view, independentlyDecodedKitty, theme)
+        org.junit.Assert.assertSame(kittyBitmap, view.graphicsBitmapForTest(kitty.images.single().resourceId))
+        bitmap = renderGraphics(view, fixture("sixel-region-clip"), theme)
+        assertEquals(0xff445566.toInt(), cellPixel(view, bitmap, 0.25f, 0.5f))
+        assertEquals(0xffff0000.toInt(), cellPixel(view, bitmap, 0.25f, 1.5f))
+        assertEquals(0xff445566.toInt(), cellPixel(view, bitmap, 0.75f, 1.5f))
+        bitmap = renderGraphics(view, fixture("drcs-live"), theme)
+        assertEquals(0xff112233.toInt(), cellPixel(view, bitmap, 0.5f, 0.15f))
+        assertEquals(0xff445566.toInt(), cellPixel(view, bitmap, 0.5f, 0.65f))
+        assertEquals(0xff112233.toInt(), cellPixel(view, bitmap, 3.5f, 0.09375f))
+        assertEquals(0xff445566.toInt(), cellPixel(view, bitmap, 3.5f, 0.5f))
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun graphicsLayersRespectCellBackgroundsGlyphsAndPositiveZ() = withGraphicsView { view ->
+        val red = rgbaResource(1, 255, 0, 0)
+        val green = rgbaResource(2, 0, 255, 0)
+        val mask = TerminalGraphicsResource(3, 1, 1, TerminalGraphicsFormat.A8, byteArrayOf(-1))
+        val text = graphicsText(renditions = listOf(testRendition(), testRendition().copy(background = TerminalRenderColorV1.Rgb(0x0000ff))),
+            renditionIds = listOf(0, 1))
+        val below = graphicsImage(resource = 1, z = -1_073_741_825, columns = 2)
+        var bitmap = renderGraphics(view, graphicsFrame(text, listOf(red), listOf(below)))
+        assertEquals(0xffff0000.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+        assertEquals(0xff0000ff.toInt(), cellPixel(view, bitmap, 1.5f, 0.5f))
+
+        val aboveBackground = graphicsImage(resource = 2, z = -1_073_741_824, columns = 2)
+        val glyph = TerminalRenderGlyphV5(0, 0, 3, 0, 1, 1)
+        bitmap = renderGraphics(view, graphicsFrame(text, listOf(red, green, mask), listOf(below, aboveBackground), listOf(glyph)))
+        assertEquals(0xffffffff.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+        assertEquals(0xff00ff00.toInt(), cellPixel(view, bitmap, 1.5f, 0.5f))
+
+        bitmap = renderGraphics(view, graphicsFrame(text, listOf(green, mask),
+            listOf(aboveBackground.copy(z = 0)), listOf(glyph)))
+        assertEquals(0xff00ff00.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+        val explicitDefault = graphicsText(renditions = listOf(testRendition().copy(background = TerminalRenderColorV1.Rgb(0))))
+        bitmap = renderGraphics(view, graphicsFrame(explicitDefault, listOf(red), listOf(below)))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun rgbaStraightAlphaIsPremultipliedOnceAndSourceCropIsApplied() = withGraphicsView { view ->
+        val red = rgbaResource(1, 255, 0, 0, 128)
+        val text = graphicsText(renditions = listOf(testRendition().copy(background = TerminalRenderColorV1.Rgb(0x0000ff))))
+        var bitmap = renderGraphics(view, graphicsFrame(text, listOf(red), listOf(graphicsImage(z = -1))))
+        assertEquals(0xff80007f.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+        val colors = TerminalGraphicsResource(1, 2, 1, TerminalGraphicsFormat.RGBA8888,
+            byteArrayOf(-1, 0, 0, -1, 0, -1, 0, -1))
+        val crop = graphicsImage().copy(source = TerminalRenderSourceV5(1, 0, 1, 1), width = TerminalRenderRatioV5(1, 2))
+        bitmap = renderGraphics(view, graphicsFrame(graphicsText(), listOf(colors), listOf(crop)))
+        assertEquals(0xff00ff00.toInt(), cellPixel(view, bitmap, 0.25f, 0.5f))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 0.75f, 0.5f))
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun imagesClipNegativeOriginsAndDoNotPaintOutsideTheViewport() = withGraphicsView { view ->
+        val resource = rgbaResource(1, 255, 0, 0)
+        val draw = graphicsImage(columns = 3, rows = 2).copy(column = -1, row = -1,
+            clip = TerminalRenderClipV5(2, 1, 3, 2))
+        val bitmap = renderGraphics(view, graphicsFrame(graphicsText(), listOf(resource), listOf(draw)))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+        assertEquals(0xffff0000.toInt(), cellPixel(view, bitmap, 1.5f, 0.5f))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 1.5f, 1.25f))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, -0.25f, 0.5f))
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun alphaAtlasUsesTextColorAndNeverPaintsTheFallbackCharacter() = withGraphicsView { view ->
+        val resource = TerminalGraphicsResource(1, 2, 2, TerminalGraphicsFormat.A8, byteArrayOf(-1, 0, -128, -1))
+        val glyph = TerminalRenderGlyphV5(0, 0, 1, 0, 2, 2)
+        val rendition = testRendition().copy(foreground = TerminalRenderColorV1.Rgb(0xff0000), blink = true)
+        val frame = graphicsFrame(graphicsText(fallback = "\ufffd", renditions = listOf(rendition)), listOf(resource), glyphs = listOf(glyph))
+        var bitmap = renderGraphics(view, frame)
+        assertEquals(0xffff0000.toInt(), cellPixel(view, bitmap, 0.25f, 0.25f))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 0.75f, 0.25f))
+        assertEquals(0xff800000.toInt(), cellPixel(view, bitmap, 0.25f, 0.75f))
+        assertEquals(0xffff0000.toInt(), cellPixel(view, bitmap, 0.75f, 0.75f))
+        val noFallback = renderGraphics(view, graphicsFrame(graphicsText(renditions = listOf(rendition)), listOf(resource), glyphs = listOf(glyph)))
+        val cell = view.cellGeometryForTest()
+        for (y in cell.top.toInt() + 1 until cell.bottom.toInt()) for (x in cell.left.toInt() + 1 until cell.right.toInt()) {
+            assertEquals("DRCS must replace U+FFFD at $x,$y", noFallback.getPixel(x, y), bitmap.getPixel(x, y))
+        }
+        bitmap = renderGraphics(view, graphicsFrame(graphicsText(renditions = listOf(rendition.copy(conceal = true))),
+            listOf(resource), glyphs = listOf(glyph)))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 0.25f, 0.25f))
+        bitmap = renderGraphics(view, graphicsFrame(graphicsText(renditions = listOf(rendition.copy(inverse = true,
+            background = TerminalRenderColorV1.Rgb(0x0000ff)))), listOf(resource), glyphs = listOf(glyph)))
+        assertEquals(0xff0000ff.toInt(), cellPixel(view, bitmap, 0.25f, 0.25f))
+        assertEquals(0xffff0000.toInt(), cellPixel(view, bitmap, 0.75f, 0.25f))
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun drcsDoubleHeightHalvesShareTheAtlasAndRespectRowClipping() = withGraphicsView { view ->
+        val resource = TerminalGraphicsResource(1, 2, 2, TerminalGraphicsFormat.A8, byteArrayOf(-1, 0, 0, -1))
+        val text = graphicsText(rowStyles = listOf(TerminalLineRendition.DOUBLE_HEIGHT_TOP, TerminalLineRendition.DOUBLE_HEIGHT_BOTTOM))
+        val glyphs = listOf(TerminalRenderGlyphV5(0, 0, 1, 0, 2, 2), TerminalRenderGlyphV5(0, 1, 1, 0, 2, 2))
+        val bitmap = renderGraphics(view, graphicsFrame(text, listOf(resource), glyphs = glyphs))
+        assertEquals(0xffffffff.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 1.5f, 0.5f))
+        assertEquals(0xff000000.toInt(), cellPixel(view, bitmap, 0.5f, 1.5f))
+        assertEquals(0xffffffff.toInt(), cellPixel(view, bitmap, 1.5f, 1.5f))
+        assertEquals(1, view.graphicsCacheForTest().first)
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun bitmapCacheReusesPixelsAcrossIndependentResourceDecodes() = withGraphicsView { view ->
+        val first = decodedRgbaResource(255, 0, 0)
+        val second = decodedRgbaResource(255, 0, 0)
+        org.junit.Assert.assertNotSame(first, second)
+        renderGraphics(view, graphicsFrame(graphicsText(), listOf(first), listOf(graphicsImage())))
+        val originalBitmap = requireNotNull(view.graphicsBitmapForTest(1))
+        val nextFrame = graphicsFrame(graphicsText(), listOf(second), listOf(graphicsImage()))
+        assertEquals(0xffff0000.toInt(), cellPixel(view, renderGraphics(view, nextFrame), 0.5f, 0.5f))
+        org.junit.Assert.assertSame(originalBitmap, view.graphicsBitmapForTest(1))
+        renderGraphics(view, nextFrame)
+        org.junit.Assert.assertSame(originalBitmap, view.graphicsBitmapForTest(1))
+        assertEquals(1 to 4L, view.graphicsCacheForTest())
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun bitmapCacheEvictsReusedIdsAndReleasesReferencesWhenFrameOrSessionEnds() = withGraphicsView { view ->
+        val oldResource = decodedRgbaResource(255, 0, 0)
+        val oldFrame = graphicsFrame(graphicsText(), listOf(oldResource), listOf(graphicsImage()))
+        renderGraphics(view, oldFrame)
+        val originalBitmap = requireNotNull(view.graphicsBitmapForTest(1))
+        assertEquals(1, view.graphicsCacheForTest().first)
+        val newer = graphicsFrame(graphicsText(), listOf(decodedRgbaResource(0, 0, 255)), listOf(graphicsImage()))
+        assertEquals(0xff0000ff.toInt(), cellPixel(view, renderGraphics(view, newer), 0.5f, 0.5f))
+        org.junit.Assert.assertNotSame(originalBitmap, view.graphicsBitmapForTest(1))
+        assertEquals(1, view.graphicsCacheForTest().first)
+        assertEquals(4L, view.graphicsCacheForTest().second)
+        assertEquals(0xffff0000.toInt(), cellPixel(view, renderGraphics(view, oldFrame), 0.5f, 0.5f))
+        org.junit.Assert.assertArrayEquals(byteArrayOf(-1, 0, 0, -1), oldResource.copyPixels())
+        view.drawFrame(Canvas(Bitmap.createBitmap(400, 300, Bitmap.Config.ARGB_8888)), graphicsText(), testTheme())
+        assertEquals(0 to 0L, view.graphicsCacheForTest())
+        renderGraphics(view, oldFrame)
+        view.detachEngine()
+        assertEquals(0 to 0L, view.graphicsCacheForTest())
+    }
+
+    @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun cursorRemainsAbovePositiveZImages() = withGraphicsView { view ->
+        val frame = graphicsFrame(graphicsText(cursorVisible = true), listOf(rgbaResource(1, 0, 0, 255)), listOf(graphicsImage()))
+        val bitmap = renderGraphics(view, frame)
+        assertEquals(0xff7070ff.toInt(), cellPixel(view, bitmap, 0.5f, 0.5f))
+    }
+
     @Test
     fun fingerRoutingIsExplicitAndPinnedUntilReleaseWhilePhysicalMouseStaysIndependent() = runBlocking {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
@@ -796,6 +1036,46 @@ class NativeTerminalViewTest {
     }
 
     @Test
+    @org.robolectric.annotation.GraphicsMode(org.robolectric.annotation.GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [35])
+    fun reusedImeSizedViewportShowsImageAboveReturnedCursor() = runBlocking {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val size = TerminalSize(80, 24)
+        val bridge = FakeNativeBridge().apply {
+            forcedRenderFrameV3 = cursorFrame(size, cursorRow = 23, nextSourceSequence = 1)
+        }
+        val engine = NativeTerminalEngine(initialSize = size, bridge = bridge)
+        try {
+            val view = engine.createView(controller.get()) as NativeTerminalView
+            controller.get().setContentView(view)
+            view.layout(0, 0, 400, 120)
+            assertTrue("the IME sized surface begins at the live cursor", view.viewportYForTest() > 0f)
+
+            bridge.forcedRenderFrameV3 = cursorFrame(size, cursorRow = 2, nextSourceSequence = 2)
+            engine.feed(1, ByteBuffer.wrap(byteArrayOf(1)))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val firstCell = view.cellGeometryForTest()
+            assertTrue("following the returned cursor must retain the image rows above it", firstCell.top >= 0f)
+            assertTrue(view.isCursorFullyVisibleForTest())
+            val magenta = rgbaResource(1, 255, 0, 255)
+            val frame = graphicsFrame(
+                graphicsText(rowStyles = List(3) { TerminalLineRendition.SINGLE_WIDTH }),
+                listOf(magenta),
+                listOf(graphicsImage(resource = 1, columns = 1, rows = 2)),
+            )
+            val bitmap = renderGraphics(view, frame)
+            assertEquals(0xffff00ff.toInt(), bitmap.getPixel(
+                (firstCell.left + firstCell.width() / 2f).toInt(),
+                (firstCell.top + firstCell.height() / 2f).toInt(),
+            ))
+        } finally {
+            engine.dispose()
+            controller.destroy()
+        }
+    }
+
+    @Test
     fun horizontalDragIsAxisLockedAndStartsAnInertialScroll() {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
         val size = TerminalSize(80, 24)
@@ -903,6 +1183,68 @@ class NativeTerminalViewTest {
             controller.destroy()
         }
     }
+
+    private fun withGraphicsView(block: (NativeTerminalView) -> Unit) {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val view = NativeTerminalView(controller.get(), null, 20f, 1f)
+        try {
+            view.layout(0, 0, 400, 300)
+            block(view)
+        } finally {
+            view.detachEngine()
+            controller.destroy()
+        }
+    }
+
+    private fun renderGraphics(view: NativeTerminalView, frame: TerminalRenderFrameV5, theme: TerminalThemeV1 = testTheme()): Bitmap =
+        Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
+            view.drawFrame(Canvas(it), frame, theme)
+        }
+
+    private fun cellPixel(view: NativeTerminalView, bitmap: Bitmap, column: Float, row: Float): Int {
+        val cell = view.cellGeometryForTest()
+        return bitmap.getPixel((cell.left + cell.width() * column).toInt(), (cell.top + cell.height() * row).toInt())
+    }
+
+    private fun rgbaResource(id: Long, red: Int, green: Int, blue: Int, alpha: Int = 255) =
+        TerminalGraphicsResource(id, 1, 1, TerminalGraphicsFormat.RGBA8888,
+            byteArrayOf(red.toByte(), green.toByte(), blue.toByte(), alpha.toByte()))
+
+    private fun decodedRgbaResource(red: Int, green: Int, blue: Int): TerminalGraphicsResource {
+        val bytes = ByteArray(84)
+        "TLGRS1\u0000\u0000".toByteArray(Charsets.US_ASCII).copyInto(bytes)
+        graphicsPut16(bytes, 8, 1); graphicsPut16(bytes, 10, 48); graphicsPut32(bytes, 12, bytes.size)
+        graphicsPut64(bytes, 16, 2); graphicsPut32(bytes, 24, 1); graphicsPut64(bytes, 32, 4)
+        graphicsPut64(bytes, 48, 1); graphicsPut32(bytes, 56, 1); graphicsPut32(bytes, 60, 1)
+        bytes[64] = 1
+        graphicsPut32(bytes, 68, 4)
+        byteArrayOf(red.toByte(), green.toByte(), blue.toByte(), -1).copyInto(bytes, 80)
+        graphicsPut32(bytes, 72, java.util.zip.CRC32C().apply { update(bytes, 80, 4) }.value.toInt())
+        graphicsSeal(bytes, 40)
+        return requireNotNull(GraphicsResourcesDecoder.decode(bytes)[1])
+    }
+
+    private fun graphicsImage(resource: Long = 1, z: Int = 0, columns: Int = 1, rows: Int = 1) =
+        TerminalRenderImageV5(resource, resource, 0, 0, z, resource, TerminalRenderSourceV5(0, 0, 1, 1),
+            TerminalRenderRatioV5(0, 1), TerminalRenderRatioV5(0, 1), TerminalRenderRatioV5(columns.toLong(), 1),
+            TerminalRenderRatioV5(rows.toLong(), 1), columns, rows, TerminalRenderImageProtocolV5.KITTY,
+            TerminalRenderClipV5(0, 0, columns, rows))
+
+    private fun graphicsFrame(text: TerminalRenderFrameV4, resources: List<TerminalGraphicsResource>,
+        images: List<TerminalRenderImageV5> = emptyList(), glyphs: List<TerminalRenderGlyphV5> = emptyList()) =
+        TerminalRenderFrameV5(text, TerminalGraphicsResources((resources.maxOfOrNull { it.id } ?: 0) + 1, resources.sortedBy { it.id }),
+            images.sorted(), glyphs.sorted())
+
+    private fun graphicsText(fallback: String = " ", renditions: List<TerminalRenderRenditionV3> = listOf(testRendition()),
+        renditionIds: List<Int> = listOf(0, 0), rowStyles: List<TerminalLineRendition> = listOf(TerminalLineRendition.SINGLE_WIDTH),
+        cursorVisible: Boolean = false): TerminalRenderFrameV4 = TerminalRenderFrameV4(
+        TerminalWidthProfile.UNICODE_16, 1, 1, TerminalSize(2, rowStyles.size), TerminalRenderScreenV1.PRIMARY, false,
+        TerminalRenderCursorV2(0, 0, cursorVisible, false, TerminalRenderCursorShapeV2.BLOCK, false),
+        listOf(TerminalRenderGraphemeV1(fallback, 1)), renditions,
+        TerminalRenderPaletteV1(List(256) { null }, null, null, null), emptyList(),
+        rowStyles.map { style -> TerminalRenderRowV1(style.columns(2), false,
+            List(2) { TerminalRenderCellV1(1, renditionIds[it], false, false, 0) }, style) }, "",
+    )
 
     private fun dispatchDrag(view: NativeTerminalView, fromY: Float, toY: Float) {
         val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 100f, fromY, 0)

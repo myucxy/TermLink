@@ -16,7 +16,9 @@ import dev.termlink.billing.BillingServerGateway
 import dev.termlink.billing.BillingSnapshot
 import dev.termlink.billing.PlayBillingAdapter
 import dev.termlink.crypto.DeviceKeyVault
+import dev.termlink.crypto.DeltaCrypto
 import dev.termlink.crypto.HistoryCrypto
+import dev.termlink.crypto.FrozenHistoryCrypto
 import dev.termlink.crypto.SessionCrypto
 import dev.termlink.crypto.TerminalSnapshotCrypto
 import dev.termlink.database.TermLinkDatabase
@@ -38,6 +40,7 @@ import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
+import dev.termlink.model.TerminalBufferLimitException
 import dev.termlink.model.SessionSummary
 import dev.termlink.model.TerminalCommandCapability
 import dev.termlink.network.direct.ProductionDirectAuthorizedPeer
@@ -52,15 +55,23 @@ import dev.termlink.network.production.ControlRequestSupersededException
 import dev.termlink.network.production.InputSequenceProvider
 import dev.termlink.network.production.ProductionApiClient
 import dev.termlink.network.production.ProductionHostHistoryObject
+import dev.termlink.network.production.ProductionHostHistoryTransferEvidence
+import dev.termlink.network.production.ProductionFrozenHistoryCapture
+import dev.termlink.network.production.ProductionFrozenHistoryException
+import dev.termlink.network.production.ProductionFrozenHistoryPage
 import dev.termlink.network.production.ProductionHostHistoryNotReadyException
 import dev.termlink.network.production.ProductionRealtimeMultiplexer
 import dev.termlink.network.production.ProductionRealtimeSessionClient
+import dev.termlink.network.production.ProductionStateDeltaNeedsFullSnapshotException
 import dev.termlink.network.production.ProductionRendererFatalFailure
 import dev.termlink.network.production.ProductionRealtimeSessionConfig
+import dev.termlink.network.production.ProductionTerminalProfile
+import dev.termlink.network.production.TerminalCompatibilityException
 import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.protocol.realtime.v1.GapPayload
 import dev.termlink.protocol.realtime.v1.HistoryChunkV1
 import dev.termlink.protocol.realtime.v1.HistoryEventV1
+import dev.termlink.protocol.realtime.v1.BrokerOutputPayload
 import dev.termlink.protocol.realtime.v1.HostHistoryObjectKindV1
 import dev.termlink.protocol.realtime.v1.InputResultPayload
 import dev.termlink.protocol.realtime.v1.LeasePayload
@@ -80,7 +91,10 @@ import dev.termlink.terminal.api.TerminalEngine
 import dev.termlink.terminal.api.TerminalEngineFailureDiagnostics
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
 import dev.termlink.terminal.api.TerminalViewportEngine
+import dev.termlink.terminal.api.TerminalWidthProfile
 import dev.termlink.terminal.nativecore.NativeTerminalEngine
+import dev.termlink.terminal.nativecore.NativeHistoryPage
+import dev.termlink.terminal.nativecore.NativeHistoryPageDecoder
 import java.io.IOException
 import java.io.Closeable
 import java.time.Instant
@@ -92,6 +106,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -152,6 +167,49 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import kotlin.concurrent.thread
 
+private val NativeTerminalEngine.terminalProfile: ProductionTerminalProfile
+    get() = when {
+        !graphicsProfile -> ProductionTerminalProfile.LEGACY
+        stateDeltaWidthProfile == TerminalWidthProfile.UNICODE_16 -> ProductionTerminalProfile.GRAPHICS_UNICODE16
+        else -> ProductionTerminalProfile.GRAPHICS
+    }
+
+internal fun terminalSnapshotMatchesProfile(
+    expectedProfile: ProductionTerminalProfile,
+    formatName: String?,
+    formatVersion: Int?,
+    objectBytes: Long,
+): Boolean = if (!expectedProfile.isGraphics) {
+        formatName == TerminalSnapshotCrypto.TERMINAL_CORE_SNAPSHOT_FORMAT_NAME &&
+            formatVersion == TerminalSnapshotCrypto.TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION &&
+            objectBytes in 1..TerminalSnapshotCrypto.MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES.toLong()
+    } else {
+        formatName == TerminalSnapshotCrypto.TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_NAME &&
+            formatVersion == TerminalSnapshotCrypto.TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_VERSION &&
+            objectBytes in 1..TerminalSnapshotCrypto.MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_OBJECT_BYTES.toLong()
+    }
+
+internal fun terminalCoreSnapshotKeyEpoch(
+    expectedProfile: ProductionTerminalProfile,
+    recipientDeviceId: UUID,
+    keyId: String,
+): Long? {
+    val prefix = (if (expectedProfile.isGraphics)
+        TerminalSnapshotCrypto.terminalCoreGraphicsSnapshotKeyId(recipientDeviceId, 1,
+            expectedProfile.stateContract)
+    else TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(recipientDeviceId, 1))
+        .substringBeforeLast(':') + ":"
+    if (!keyId.startsWith(prefix)) return null
+    val encoded = keyId.removePrefix(prefix)
+    if (encoded.length !in 8..19 || encoded.any { it !in '0'..'9' }) return null
+    val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
+    val canonical = if (expectedProfile.isGraphics)
+        TerminalSnapshotCrypto.terminalCoreGraphicsSnapshotKeyId(recipientDeviceId, epoch,
+            expectedProfile.stateContract)
+    else TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(recipientDeviceId, epoch)
+    return epoch.takeIf { canonical == keyId }
+}
+
 /** Thread-visible token handoff shared by every long-lived realtime client. */
 internal class RealtimeAccessTokenSource {
     private val current = AtomicReference<String?>(null)
@@ -167,6 +225,12 @@ internal class RealtimeAccessTokenSource {
     fun clear() {
         current.set(null)
     }
+}
+
+internal suspend fun <T> finishTokenRotation(action: suspend () -> T): T {
+    currentCoroutineContext().ensureActive()
+    // The issuer may consume the old refresh token before cancellation reaches its response.
+    return withContext(NonCancellable) { action() }
 }
 
 /**
@@ -419,10 +483,15 @@ private class RevokedDeviceIdentityException : Exception()
 internal fun productRealtimeOptionalCapabilities(dataPlaneEnabled: Boolean): Set<String> =
     buildSet {
         add(PcCapabilityIds.HOST_HISTORY_V1)
+        add("terminal_broker_captures_v1")
         add(PcCapabilityIds.HOST_SESSION_CATALOG_V1)
         add(PcCapabilityIds.HOST_SESSION_CLEANUP_V1)
         add("ai_agent_v1")
         add(PcCapabilityIds.TERMINAL_WINDOW_RESIZE_V1)
+        add("terminal_host_geometry_v1")
+        add("terminal_host_theme_v1")
+        add("terminal_host_resize_v1")
+        add("terminal_attach_v1")
         if (dataPlaneEnabled) {
             add(DIRECT_SESSION_CUTOVER_CAPABILITY)
             add(DIRECT_TRANSPORT_DATA_CAPABILITY)
@@ -704,6 +773,9 @@ internal data class ProductRealtimeDiagnostics(
     val socketState: String,
     val endpointCount: Int,
     val transportState: String,
+    val transportFailureReason: String? = null,
+    val terminalAcceptedGeneration: Int = 0,
+    val acceptedTerminalProfile: String? = null,
     val remoteState: String,
     val transportCollectorActive: Boolean,
     val reconnectActive: Boolean,
@@ -722,6 +794,132 @@ internal data class ProductRealtimeDiagnostics(
     val networkLostCount: Int,
     val networkReconnectCount: Int,
 )
+
+/** Local Debug evidence for one session's latest restore attempt. No object or key bytes are retained. */
+internal data class ProductRestoreDiagnostics(
+    val attempt: Long,
+    val deltaRequestCount: Int = 0,
+    val deltaInstallCount: Int = 0,
+    val deltaFallbackReason: String? = null,
+    val baseSnapshotSequence: Long? = null,
+    val baseSha256: String? = null,
+    val targetSnapshotSequence: Long? = null,
+    val targetSha256: String? = null,
+    /** Derived from the assembled sealed object size; this is not a wire ACK counter. */
+    val deltaExpectedChunkCount: Int = 0,
+    /** Present only when the completed Delta carries exact per-request network evidence. */
+    val deltaRequestId: String? = null,
+    val deltaChunksAccepted: Int = 0,
+    val deltaDuplicateChunks: Int = 0,
+    val deltaChunkAcksSent: Int = 0,
+    /** Successfully authenticated and cached Broker objects; native application is checked separately. */
+    val brokerResolvedCount: Int = 0,
+    /** Last Broker Host History request; transfer may still fail local authentication or persistence. */
+    val brokerRequestId: String? = null,
+    val brokerChunksAccepted: Int = 0,
+    val brokerDuplicateChunks: Int = 0,
+    val brokerChunkAcksSent: Int = 0,
+    /** Number of authenticated Host full snapshots installed for this attempt. */
+    val fullSnapshotInstallCount: Int = 0,
+    /** Sequence of the last successfully installed authenticated Host snapshot. */
+    val fullSnapshotSequence: Long? = null,
+    /** SHA-256 of the authenticated, decrypted native checkpoint; never the ciphertext. */
+    val fullSnapshotSha256: String? = null,
+)
+
+internal class ProductRestoreDiagnosticsLedger {
+    private val entries = ConcurrentHashMap<UUID, ProductRestoreDiagnostics>()
+    private val nextAttempt = AtomicLong()
+
+    fun begin(sessionId: UUID): Long = entries.compute(sessionId) { _, _ ->
+        ProductRestoreDiagnostics(attempt = nextAttempt.incrementAndGet())
+    }!!.attempt
+
+    fun snapshot(sessionId: UUID): ProductRestoreDiagnostics? = entries[sessionId]
+
+    fun deltaRequested(sessionId: UUID, attempt: Long, baseSequence: Long, baseHash: ByteArray) {
+        if (baseHash.size != 32) return
+        update(sessionId, attempt) { current -> current.copy(
+            deltaRequestCount = current.deltaRequestCount + 1,
+            baseSnapshotSequence = baseSequence,
+            baseSha256 = baseHash.hexDigest(),
+        ) }
+    }
+
+    fun deltaReceived(sessionId: UUID, attempt: Long, targetSequence: Long, targetHash: ByteArray,
+        sealedBytes: Int, transferEvidence: ProductionHostHistoryTransferEvidence?,
+    ) {
+        if (targetHash.size != 32 || sealedBytes <= 0) return
+        update(sessionId, attempt) { current -> current.copy(
+            targetSnapshotSequence = targetSequence,
+            targetSha256 = targetHash.hexDigest(),
+            deltaExpectedChunkCount = (sealedBytes.toLong() + 512 * 1024 - 1).div(512 * 1024).toInt(),
+            deltaRequestId = transferEvidence?.requestId?.toString(),
+            deltaChunksAccepted = transferEvidence?.newChunksAccepted ?: 0,
+            deltaDuplicateChunks = transferEvidence?.duplicateChunksAccepted ?: 0,
+            deltaChunkAcksSent = transferEvidence?.chunkAcksSent ?: 0,
+        ) }
+    }
+
+    fun deltaInstalled(sessionId: UUID, attempt: Long) = update(sessionId, attempt) { current ->
+        current.copy(deltaInstallCount = current.deltaInstallCount + 1)
+    }
+
+    fun fallback(sessionId: UUID, attempt: Long, reason: String) = update(sessionId, attempt) { current ->
+        current.copy(deltaFallbackReason = reason)
+    }
+
+    fun brokerResolved(sessionId: UUID, attempt: Long) = update(sessionId, attempt) { current ->
+        current.copy(brokerResolvedCount = current.brokerResolvedCount + 1)
+    }
+
+    fun brokerTransferred(sessionId: UUID, attempt: Long, evidence: ProductionHostHistoryTransferEvidence) =
+        update(sessionId, attempt) { current -> current.copy(
+            brokerRequestId = evidence.requestId.toString(),
+            brokerChunksAccepted = evidence.newChunksAccepted,
+            brokerDuplicateChunks = evidence.duplicateChunksAccepted,
+            brokerChunkAcksSent = evidence.chunkAcksSent,
+        ) }
+
+    /**
+     * Records one successful full Host snapshot install. The caller supplies
+     * only the SHA-256 digest of the authenticated opened checkpoint so the
+     * ledger never retains terminal state bytes.
+     */
+    fun fullSnapshotInstalled(
+        sessionId: UUID,
+        attempt: Long,
+        sequence: Long,
+        checkpoint: ByteArray,
+    ) {
+        if (sequence <= 0L || checkpoint.size != HistoryRepository.SHA256_BYTES) return
+        update(sessionId, attempt) { current -> current.copy(
+            fullSnapshotInstallCount = current.fullSnapshotInstallCount + 1,
+            fullSnapshotSequence = sequence,
+            fullSnapshotSha256 = checkpoint.hexDigest(),
+        ) }
+    }
+
+    fun remove(sessionId: UUID) { entries.remove(sessionId) }
+    fun clear() { entries.clear() }
+
+    private fun update(sessionId: UUID, attempt: Long,
+        transform: (ProductRestoreDiagnostics) -> ProductRestoreDiagnostics,
+    ) {
+        entries.computeIfPresent(sessionId) { _, current ->
+            if (current.attempt == attempt) transform(current) else current
+        }
+    }
+}
+
+private fun ByteArray.hexDigest(): String = buildString(size * 2) {
+    val digits = "0123456789abcdef"
+    for (byte in this@hexDigest) {
+        val value = byte.toInt() and 0xff
+        append(digits[value ushr 4])
+        append(digits[value and 0x0f])
+    }
+}
 
 internal enum class RealtimeNetworkObservationTransition {
     INITIAL,
@@ -1034,6 +1232,7 @@ internal class ProductionProductRepository(
     }
 
     private val liveSessions = ConcurrentHashMap<UUID, LiveProductSession>()
+    private val restoreDiagnostics = if (BuildConfig.DEBUG) ProductRestoreDiagnosticsLedger() else null
     /**
      * Final renderers restored from an online Windows host. They own no
      * realtime endpoint or control lease; Room remains only a rendering cache.
@@ -1046,6 +1245,8 @@ internal class ProductionProductRepository(
     @Volatile private var directCoordinator: ProductionDirectDeviceCoordinator? = null
     @Volatile private var directCarrierProjectionJob: Job? = null
     private val transcriptLoads = ConcurrentHashMap<TranscriptLoadKey, Deferred<Unit>>()
+    private val frozenBrowseOwners = ConcurrentHashMap<UUID, FrozenBrowseOwner>()
+    private val frozenBrowseGeneration = AtomicLong()
     private val deletedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
     private val newlyLaunchedSessionIds = ConcurrentHashMap.newKeySet<UUID>()
     private val remoteDownloadJobs = ConcurrentHashMap<UUID, Job>()
@@ -1684,6 +1885,7 @@ internal class ProductionProductRepository(
     }
 
     override suspend fun signOut() {
+        Log.w("OidcSessionStore", "Explicit sign-out requested")
         cancelRemoteDownloadsAndJoin(clearMetadata = true)
         val authenticationGeneration = beginAuthenticationTransition()
         var retiredIdentity: DeviceKeyVault.StoredIdentity? = null
@@ -1711,6 +1913,7 @@ internal class ProductionProductRepository(
         }
         retiredIdentity?.identity?.destroy()
         if (!committed) return
+        restoreDiagnostics?.clear()
     }
 
     /**
@@ -1722,6 +1925,13 @@ internal class ProductionProductRepository(
     private suspend fun beginAuthenticationTransition(): Long {
         return authenticationTransitionLock.withLock {
             authenticationRetirementBarrier.awaitQuiescence()
+            frozenBrowseOwners.keys.toList().forEach { sessionId ->
+                val released = withTimeoutOrNull(4_000L) {
+                    sessionLifecycleLanes.withLock(sessionId) { retireFrozenBrowse(sessionId) }
+                    true
+                } == true
+                if (!released) frozenBrowseOwners.remove(sessionId)?.takeIf { it.ownsClient }?.client?.close()
+            }
             val transition = authenticationStateMutationLock.withLock {
                 val generation = authenticationLifecycle.invalidate {
                     authState = null
@@ -1738,6 +1948,7 @@ internal class ProductionProductRepository(
                             sessionStates = emptyMap(),
                             sessionOpenFailures = emptyMap(),
                             sessionTitles = emptyMap(),
+                            frozenHistoryViewports = emptyMap(),
                         )
                     }
                 }
@@ -2123,7 +2334,10 @@ internal class ProductionProductRepository(
                         liveSessions.remove(sessionId, expected)
                     }
                 },
-                closeAndJoin = LiveProductSession::closeAndJoin,
+                closeAndJoin = { live ->
+                    retireFrozenBrowse(sessionId)
+                    live.closeAndJoin()
+                },
             )
             if (!retired || liveSessions.containsKey(sessionId)) return
         }
@@ -2187,20 +2401,31 @@ internal class ProductionProductRepository(
             ) { "Authentication lifecycle changed" }
             identity(authentication.accountScope)
         }
+        val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
+        realtime.multiplexer.warmConnect()
+        val terminalProfile = negotiateTerminalProfileForOpen(
+            summary, pc, pcDevice, stored, authenticationGeneration, realtime,
+        )
         val engine = NativeTerminalEngine(
             initialSize = TerminalSize(summary.columns.coerceAtLeast(1), summary.rows.coerceAtLeast(1)),
+            widthProfile = if (terminalProfile == ProductionTerminalProfile.GRAPHICS_UNICODE16)
+                TerminalWidthProfile.UNICODE_16 else TerminalWidthProfile.LEGACY_V1,
+            graphicsProfile = terminalProfile.isGraphics,
+            platformActionSink = AndroidTerminalPlatformActions(context, requireNotNull(authentication.accountScope), summary.id,
+                scope, { !closed && authState != null && accountScope == authentication.accountScope }, activityProvider,
+                clipboardPermit = { (liveSessions[summary.id]?.client?.sessionState?.value as? RemoteSessionState.Controlling)
+                    ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() }
+                    ?.let { TerminalClipboardPermit(it.leaseId, it.leaseVersion) } },
+                visible = { liveSessions[summary.id]?.engine?.hasVisibleDisplay() == true &&
+                    mutableSnapshot.value.frozenHistoryViewports[summary.id] == null }),
         )
         // One lane owns every ordered renderer mutation for this incarnation,
         // including the initial Snapshot/history replay and later realtime
         // delivery. This keeps JNI and protobuf work off Main without allowing
         // bootstrap and live frames to race each other.
         val sessionDispatcher = Dispatchers.Default.limitedParallelism(1)
-        // Start only the device-scoped handshake while the Windows host
-        // chooses and serves a checkpoint. The bounded session endpoint is
-        // still registered after bootstrap so realtime ciphertext cannot
-        // overflow an unconsumed queue.
-        val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
-        realtime.multiplexer.warmConnect()
+        // Register the live endpoint only after bootstrap, so realtime ciphertext
+        // cannot overflow an unconsumed queue while the host serves history.
         var hostHistoryClient: ProductionRealtimeSessionClient? = null
         val restoredHistory = try {
             hostHistoryClient = createHostHistoryBootstrapClient(
@@ -2283,6 +2508,7 @@ internal class ProductionProductRepository(
         }
         val directAppliedCursor = AtomicReference(restoredHistory.durableAcknowledgement)
         val liveReference = AtomicReference<LiveProductSession?>(null)
+        lateinit var brokerClient: ProductionRealtimeSessionClient
         val client = try {
             ProductionRealtimeSessionClient(
                 engine = engine,
@@ -2294,10 +2520,13 @@ internal class ProductionProductRepository(
                     sessionId = sessionId,
                     keyEpoch = pc.keyEpoch,
                     pcExchangePublicKey = pcDevice.exchangePublicKey.copyOf(),
+                    negotiateTerminalState = true,
+                    expectedTerminalState = terminalProfile.state,
                 ),
                 identity = stored.identity,
                 parentScope = scope,
                 transport = transport,
+                terminationReadinessTimeoutMillis = 120_000,
                 httpClient = http,
                 allowCleartextForLocalTest = BuildConfig.TERMLINK_ALLOW_CLEARTEXT_LOCAL_TEST,
                 authenticationRefresher = { token ->
@@ -2314,6 +2543,10 @@ internal class ProductionProductRepository(
                 },
                 initialRendererState = restoredHistory.rendererState,
                 initialObservedLocalInputEpoch = restoredHistory.localInputEpoch,
+                brokerCaptureResolver = { sequence, reference ->
+                    resolveBrokerOutputForSession(sequence, reference, summary, pc, pcDevice,
+                        stored, brokerClient)
+                },
                 acknowledgementObserver = { expectedGeneration, sequence ->
                     check(isCurrentRealtimeOwner(realtime.owner)) { "Authentication lifecycle changed" }
                     if (sessionId in deletedSessionIds) {
@@ -2399,6 +2632,7 @@ internal class ProductionProductRepository(
             }
             throw classified
         }
+        brokerClient = client
         val directRegistration = try {
             realtime.directCoordinator.registerLiveSession(pc.deviceId, sessionId, client)
         } catch (error: CancellationException) {
@@ -2644,12 +2878,20 @@ internal class ProductionProductRepository(
             }
         }.also { check(it) { "Authentication lifecycle changed" } }
 
-        val engine = NativeTerminalEngine(
-            initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
-        )
-        val sessionDispatcher = Dispatchers.Default.limitedParallelism(1)
         val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
         realtime.multiplexer.warmConnect()
+        val terminalProfile = negotiateTerminalProfileForOpen(
+            session, pc, pcDevice, stored, authenticationGeneration, realtime,
+        )
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
+            widthProfile = if (terminalProfile == ProductionTerminalProfile.GRAPHICS_UNICODE16)
+                TerminalWidthProfile.UNICODE_16 else TerminalWidthProfile.LEGACY_V1,
+            graphicsProfile = terminalProfile.isGraphics,
+            platformActionSink = AndroidTerminalPlatformActions(context, requireNotNull(authentication.accountScope), session.id,
+                scope, { !closed && authState != null && accountScope == authentication.accountScope }, activityProvider),
+        )
+        val sessionDispatcher = Dispatchers.Default.limitedParallelism(1)
         var historyClient: ProductionRealtimeSessionClient? = null
         val restored = try {
             historyClient = createHostHistoryBootstrapClient(
@@ -2771,6 +3013,33 @@ internal class ProductionProductRepository(
         }
     }
 
+    private suspend fun negotiateTerminalProfileForOpen(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        authenticationGeneration: Long,
+        realtime: RealtimeRuntimeClaim,
+    ): ProductionTerminalProfile = try {
+        // The history-only probe never feeds output into its temporary legacy engine.
+        val profile = withTemporaryHostHistoryClient(
+            session, pc, pcDevice, stored, authenticationGeneration,
+        ) { it.awaitTerminalProfile() }
+        check(isCurrentRealtimeOwner(realtime.owner)) { "Authentication lifecycle changed" }
+        profile
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Throwable) {
+        val classified = classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
+        if (!observeBootstrapFailureIfCurrent(
+                session.id, classified.failure, authenticationGeneration, realtime, stored,
+            )
+        ) {
+            throw IllegalStateException("Authentication lifecycle changed", error)
+        }
+        throw classified
+    }
+
     private fun createHostHistoryBootstrapClient(
         session: SessionSummary,
         pc: PcSummary,
@@ -2778,6 +3047,7 @@ internal class ProductionProductRepository(
         stored: DeviceKeyVault.StoredIdentity,
         engine: NativeTerminalEngine,
         realtime: RealtimeRuntimeClaim,
+        expectedProfile: ProductionTerminalProfile? = engine.terminalProfile,
         disposeEngineOnClose: Boolean = false,
         sessionDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     ): ProductionRealtimeSessionClient {
@@ -2795,6 +3065,8 @@ internal class ProductionProductRepository(
                     sessionId = session.id,
                     keyEpoch = pc.keyEpoch,
                     pcExchangePublicKey = pcDevice.exchangePublicKey.copyOf(),
+                    negotiateTerminalState = true,
+                    expectedTerminalState = expectedProfile?.state,
                 ),
                 identity = stored.identity,
                 parentScope = scope,
@@ -2832,6 +3104,7 @@ internal class ProductionProductRepository(
 
     override suspend fun closeSessionView(sessionId: UUID): Unit = sessionLifecycleLanes.withLock(sessionId) {
         check(!closed) { "Repository is closed" }
+        retireFrozenBrowse(sessionId)
         newlyLaunchedSessionIds.remove(sessionId)
         val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
         live?.closeAndJoin()
@@ -2845,6 +3118,7 @@ internal class ProductionProductRepository(
                 sessionStates = snapshot.sessionStates - sessionId,
                 sessionOpenFailures = snapshot.sessionOpenFailures - sessionId,
                 transcriptViewports = snapshot.transcriptViewports - sessionId,
+                frozenHistoryViewports = snapshot.frozenHistoryViewports - sessionId,
                 liveAcknowledgements = snapshot.liveAcknowledgements - sessionId,
                 bootstrapSources = snapshot.bootstrapSources - sessionId,
             )
@@ -2853,6 +3127,9 @@ internal class ProductionProductRepository(
 
     override fun terminalEngine(sessionId: UUID): TerminalViewportEngine? =
         liveSessions[sessionId]?.engine ?: readOnlySessionEngines[sessionId]
+
+    override fun supportsFrozenHistory(sessionId: UUID): Boolean? =
+        liveSessions[sessionId]?.client?.supportsRemoteFrozenHistory()
 
     override fun historyEngine(historyObjectId: UUID): TerminalViewportEngine? = null
 
@@ -2878,7 +3155,7 @@ internal class ProductionProductRepository(
             product.copy(
                 transcriptViewports = product.transcriptViewports + (
                     sessionId to existing.copy(
-                        nextBeforeLineId = existing.initialBeforeLineId.takeIf { it > 0u },
+                        nextBeforeLineId = externalTranscriptContinuation(existing.initialBeforeLineId),
                         nextCursor = null,
                         pages = emptyList(),
                         loadedObjectIds = emptySet(),
@@ -2893,9 +3170,322 @@ internal class ProductionProductRepository(
         }
     }
 
+    override suspend fun beginFrozenHistory(sessionId: UUID): Unit = sessionLifecycleLanes.withLock(sessionId) {
+        check(!closed) { "Repository is closed" }
+        retireFrozenBrowse(sessionId)
+        val product = mutableSnapshot.value
+        val session = product.sessions.single { it.id == sessionId }
+        val pc = product.pcs.single { it.id == session.pcId }
+        val pcDevice = product.devices.single {
+            it.id == pc.deviceId && it.type.isPcAgent() && it.trustState == DeviceTrustState.TRUSTED
+        }
+        check(pc.online && hasHostHistoryAuthority(pc.capabilities)) { "Windows history is unavailable" }
+        val displayEngine = (terminalEngine(sessionId) as? NativeTerminalEngine)
+            ?.takeIf { it.graphicsProfile }
+            ?: error("Frozen history requires a Graphics terminal")
+        var snapshotSequence = product.transcriptViewports[sessionId]?.snapshotAnchorSequence
+            ?: error("No authenticated snapshot is available for frozen history")
+        val authentication = captureAuthenticationState()
+        val stored = identity(authentication.accountScope)
+        val generation = frozenBrowseGeneration.incrementAndGet()
+        mutableSnapshot.update { it.copy(frozenHistoryViewports = it.frozenHistoryViewports +
+            (sessionId to FrozenHistoryViewportState(sessionId, snapshotSequence, generation, loading = true))) }
+
+        var engine: NativeTerminalEngine? = null
+        var client: ProductionRealtimeSessionClient? = null
+        var ownsClient = false
+        var capture: ProductionFrozenHistoryCapture? = null
+        var phase = "connect"
+        try {
+            // The multiplexer permits one endpoint per session; browsing must not replace the live owner.
+            client = liveSessions[sessionId]?.client
+            if (client == null) {
+                ownsClient = true
+                val realtime = deviceRealtimeRuntime(stored, authentication.authenticationGeneration)
+                realtime.multiplexer.warmConnect()
+                engine = NativeTerminalEngine(initialSize = TerminalSize(
+                    session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
+                    widthProfile = displayEngine.stateDeltaWidthProfile, graphicsProfile = true)
+                client = createHostHistoryBootstrapClient(session, pc, pcDevice, stored, requireNotNull(engine), realtime,
+                    expectedProfile = displayEngine.terminalProfile, disposeEngineOnClose = true)
+                requireNotNull(client).start()
+            }
+            val activeClient = requireNotNull(client)
+            phase = "profile"
+            check(activeClient.awaitTerminalProfile().isGraphics) {
+                "Windows terminal does not support frozen Graphics history"
+            }
+            if (!activeClient.supportsRemoteFrozenHistory()) {
+                throw ProductionFrozenHistoryException("UNSUPPORTED_FORMAT")
+            }
+            var maxLines = FROZEN_HISTORY_MAX_LINES
+            var snapshotRefreshes = 0
+            var first: ProductionFrozenHistoryPage? = null
+            while (first == null) {
+                try {
+                    phase = "request"
+                    first = activeClient.beginFrozenHistory(snapshotSequence,
+                        maxLines = maxLines, maxCells = FROZEN_HISTORY_MAX_CELLS,
+                        maxUtf8Bytes = FROZEN_HISTORY_MAX_UTF8_BYTES,
+                        maxObjectBytes = FROZEN_HISTORY_MAX_OBJECT_BYTES)
+                } catch (error: ProductionFrozenHistoryException) {
+                    val refreshed = if (error.code == "ANCHOR_CHANGED")
+                        nextFrozenSnapshotSequence(snapshotSequence, error.availableSnapshotSequence,
+                            snapshotRefreshes) else null
+                    if (refreshed == null && (error.code != "PAGE_LIMIT" || maxLines == 1)) throw error
+                    error.capture?.let { stale ->
+                        withTimeoutOrNull(2_000L) { runCatching { activeClient.releaseFrozenHistory(stale) } }
+                    }
+                    if (refreshed != null) {
+                        snapshotSequence = refreshed
+                        snapshotRefreshes++
+                        maxLines = FROZEN_HISTORY_MAX_LINES
+                    } else maxLines = (maxLines / 2).coerceAtLeast(1)
+                }
+            }
+            val firstPage = requireNotNull(first)
+            capture = firstPage.capture
+            phase = "decode"
+            val page = firstPage.use { decodeFrozenHistoryPage(it, session, pc, pcDevice, stored,
+                ULong.MAX_VALUE, previouslyConsumedAnchors = setOf(ULong.MAX_VALUE)) }
+            phase = "publish"
+            requireCurrentAuthentication(authentication.authenticationGeneration)
+            check(mutableSnapshot.value.frozenHistoryViewports[sessionId]?.generation == generation) {
+                "Frozen browse generation changed"
+            }
+            val owner = FrozenBrowseOwner(activeClient, ownsClient, requireNotNull(capture), session, pc, pcDevice, stored,
+                authentication.authenticationGeneration, generation)
+            val published = authenticationLifecycle.runIfCurrent(authentication.authenticationGeneration,
+                predicate = { !closed && storedIdentity === stored }) {
+                frozenBrowseOwners[sessionId] = owner
+                mutableSnapshot.update { current ->
+                    val selected = current.frozenHistoryViewports[sessionId]
+                    if (selected?.generation != generation) current else current.copy(
+                        frozenHistoryViewports = current.frozenHistoryViewports + (sessionId to selected.copy(
+                            snapshotSequence = owner.capture.snapshotSequence,
+                            captureId = owner.capture.captureId,
+                            revision = owner.capture.revision,
+                            pages = listOf(page),
+                            consumedAnchors = setOf(ULong.MAX_VALUE),
+                            nextBeforeLineId = page.nextBeforeLineId.toULong().takeIf { page.hasMoreBefore },
+                            loading = false,
+                        )),
+                    )
+                }
+            }
+            check(published) { "Authentication lifecycle changed" }
+            client = null
+            capture = null
+        } catch (error: Throwable) {
+            if (BuildConfig.DEBUG && error !is CancellationException) {
+                val origin = error.stackTrace.take(6).joinToString("|") {
+                    "${it.className}.${it.methodName}:${it.lineNumber}"
+                }
+                Log.e("TermLinkFrozenHistory", "operation=begin phase=$phase type=${error.javaClass.simpleName} origin=$origin")
+            }
+            withContext(NonCancellable) {
+                val active = client
+                if (active != null) {
+                    frozenBrowseOwners[sessionId]?.takeIf { it.client === active }?.let {
+                        frozenBrowseOwners.remove(sessionId, it)
+                    }
+                    (capture ?: (error as? ProductionFrozenHistoryException)?.capture)?.let { toRelease ->
+                        withTimeoutOrNull(2_000L) { runCatching { active.releaseFrozenHistory(toRelease) } }
+                    }
+                    if (ownsClient) {
+                        runCatching { active.closeGracefully() }
+                        active.close()
+                    }
+                } else engine?.dispose()
+            }
+            mutableSnapshot.update { current ->
+                val selected = current.frozenHistoryViewports[sessionId]
+                if (selected?.generation != generation) current else current.copy(
+                    frozenHistoryViewports = current.frozenHistoryViewports + (sessionId to selected.copy(
+                        loading = false, error = frozenHistoryErrorCode(error),
+                    )),
+                )
+            }
+            if (error is CancellationException) throw error
+        }
+    }
+
+    override suspend fun loadFrozenHistoryBefore(sessionId: UUID): Unit = sessionLifecycleLanes.withLock(sessionId) {
+        val owner = frozenBrowseOwners[sessionId] ?: return@withLock
+        val selected = mutableSnapshot.value.frozenHistoryViewports[sessionId] ?: return@withLock
+        val before = selected.nextBeforeLineId ?: return@withLock
+        if (selected.loading || selected.generation != owner.generation ||
+            selected.captureId != owner.capture.captureId || selected.revision != owner.capture.revision) return@withLock
+        if (before in selected.consumedAnchors || selected.consumedAnchors.size >= FROZEN_HISTORY_MAX_ANCHORS) {
+            mutableSnapshot.update { it.copy(frozenHistoryViewports = it.frozenHistoryViewports +
+                (sessionId to selected.copy(error = "BROWSE_LIMIT"))) }
+            return@withLock
+        }
+        mutableSnapshot.update { it.copy(frozenHistoryViewports = it.frozenHistoryViewports +
+            (sessionId to selected.copy(loading = true, error = null))) }
+        var phase = "validate"
+        try {
+            requireCurrentAuthentication(owner.authenticationGeneration)
+            val currentPc = mutableSnapshot.value.pcs.single { it.id == owner.pc.id }
+            val trusted = mutableSnapshot.value.devices.any {
+                it.id == owner.pcDevice.id && it.trustState == DeviceTrustState.TRUSTED
+            }
+            check(currentPc.online && currentPc.deviceId == owner.pcDevice.id &&
+                currentPc.keyEpoch == owner.pc.keyEpoch && trusted) { "Frozen capture is stale" }
+            var maxLines = FROZEN_HISTORY_MAX_LINES
+            lateinit var page: NativeHistoryPage
+            while (true) {
+                try {
+                    phase = "request"
+                    page = owner.client.loadFrozenHistoryPage(owner.capture, before, maxLines,
+                        FROZEN_HISTORY_MAX_CELLS, FROZEN_HISTORY_MAX_UTF8_BYTES,
+                        FROZEN_HISTORY_MAX_OBJECT_BYTES).use {
+                        phase = "decode"
+                        decodeFrozenHistoryPage(it, owner.session, owner.pc, owner.pcDevice, owner.stored,
+                            before, selected.pages.flatMapTo(hashSetOf()) { loaded -> loaded.lines.map { it.id } },
+                            selected.consumedAnchors)
+                    }
+                    break
+                } catch (error: ProductionFrozenHistoryException) {
+                    if (error.code != "PAGE_LIMIT" || maxLines == 1) throw error
+                    maxLines = (maxLines / 2).coerceAtLeast(1)
+                }
+            }
+            phase = "publish"
+            requireCurrentAuthentication(owner.authenticationGeneration)
+            mutableSnapshot.update { current ->
+                val state = current.frozenHistoryViewports[sessionId]
+                if (state?.generation != owner.generation || state.nextBeforeLineId != before ||
+                    frozenBrowseOwners[sessionId] !== owner) current else {
+                    val retained = (listOf(page) + state.pages).take(FROZEN_HISTORY_RETAINED_PAGES)
+                    current.copy(frozenHistoryViewports = current.frozenHistoryViewports + (sessionId to state.copy(
+                        pages = retained,
+                        consumedAnchors = state.consumedAnchors + before,
+                        nextBeforeLineId = page.nextBeforeLineId.toULong().takeIf { page.hasMoreBefore },
+                        loading = false,
+                    )))
+                }
+            }
+        } catch (error: Throwable) {
+            if (BuildConfig.DEBUG && error !is CancellationException) {
+                val origin = error.stackTrace.take(6).joinToString("|") {
+                    "${it.className}.${it.methodName}:${it.lineNumber}"
+                }
+                Log.e("TermLinkFrozenHistory", "operation=page phase=$phase type=${error.javaClass.simpleName} origin=$origin")
+            }
+            mutableSnapshot.update { current ->
+                val state = current.frozenHistoryViewports[sessionId]
+                if (state?.generation != owner.generation) current else current.copy(
+                    frozenHistoryViewports = current.frozenHistoryViewports + (sessionId to state.copy(
+                        loading = false, error = frozenHistoryErrorCode(error),
+                    )),
+                )
+            }
+            if (error is CancellationException) throw error
+        }
+    }
+
+    override suspend fun releaseFrozenHistory(sessionId: UUID) {
+        mutableSnapshot.update { it.copy(frozenHistoryViewports = it.frozenHistoryViewports - sessionId) }
+        sessionLifecycleLanes.withLock(sessionId) { retireFrozenBrowse(sessionId) }
+    }
+
+    private suspend fun retireFrozenBrowse(sessionId: UUID) {
+        val owner = frozenBrowseOwners.remove(sessionId) ?: return
+        mutableSnapshot.update { current ->
+            if (current.frozenHistoryViewports[sessionId]?.generation != owner.generation) current
+            else current.copy(frozenHistoryViewports = current.frozenHistoryViewports - sessionId)
+        }
+        withContext(NonCancellable) {
+            try {
+                withTimeoutOrNull(2_000L) { runCatching { owner.client.releaseFrozenHistory(owner.capture) } }
+            } finally {
+                if (owner.ownsClient) {
+                    runCatching { owner.client.closeGracefully() }
+                    owner.client.close()
+                }
+            }
+        }
+    }
+
+    private suspend fun decodeFrozenHistoryPage(
+        value: ProductionFrozenHistoryPage,
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        requestedBeforeLineId: ULong,
+        previouslyLoadedLineIds: Set<Long> = emptySet(),
+        previouslyConsumedAnchors: Set<ULong> = emptySet(),
+    ): NativeHistoryPage = withContext(Dispatchers.Default) {
+        val capture = value.capture
+        val objectData = value.objectData
+        require(capture.captureId in 1uL..Long.MAX_VALUE.toULong() &&
+            objectData.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_FROZEN_PAGE &&
+            objectData.formatName == "TERMLINK_FROZEN_HISTORY_PAGE_V2" && objectData.formatVersion == 1 &&
+            objectData.snapshotSequence == capture.snapshotSequence &&
+            objectData.requestBeforeLineId == requestedBeforeLineId &&
+            objectData.keyId == FrozenHistoryCrypto.keyId(stored.deviceId, pc.keyEpoch,
+                capture.stateContract)) {
+            "Frozen page selector does not match the authenticated capture"
+        }
+        val metadata = requireNotNull(objectData.frozenHistory) { "Frozen capture metadata is missing" }
+        require(metadata.token == capture.token && metadata.captureId.toULong() == capture.captureId &&
+            metadata.captureRevision.toULong() == capture.revision &&
+            metadata.snapshotSeq.toULong() == capture.snapshotSequence &&
+            metadata.stateContract == capture.stateContract) {
+            "Frozen capture metadata changed"
+        }
+        val pairwise = SessionCrypto.derivePairwiseKey(
+            stored.identity.exchange.privateKey, pcDevice.exchangePublicKey,
+            pc.deviceId, stored.deviceId, pc.keyEpoch,
+        )
+        val token = capture.token.toByteArray()
+        try {
+            val plaintext = FrozenHistoryCrypto.open(
+                pairwise, objectData.sealedObject, session.id, pc.deviceId, stored.deviceId,
+                pc.keyEpoch, token, capture.captureId, capture.revision, capture.snapshotSequence,
+                requestedBeforeLineId, value.maxLines, value.maxCells, value.maxUtf8Bytes,
+                FrozenHistoryCrypto.PAGE_FORMAT_V2, capture.stateContract,
+            )
+            try {
+                NativeHistoryPageDecoder.decodeV2(plaintext, capture.captureId.toLong()).also { page ->
+                    val next = validateFrozenPageCursor(requestedBeforeLineId, capture.revision,
+                        page.revision, page.requestedAnchor, page.hasMoreBefore, page.nextBeforeLineId,
+                        objectData.firstLineId, objectData.lastLineId, page.lines.map { it.id },
+                        previouslyLoadedLineIds, previouslyConsumedAnchors)
+                    require(page.hasMoreBefore == objectData.hasMoreBefore &&
+                        page.nextBeforeLineId.toULong() == objectData.nextBeforeLineId &&
+                        next == objectData.nextBeforeLineId.takeIf { objectData.hasMoreBefore } &&
+                        page.headTruncated == metadata.headTruncated &&
+                        page.columns == objectData.columns &&
+                        page.lines.sumOf { it.rowCount } == objectData.rows.toLong()) {
+                        "Frozen page body disagrees with authenticated continuation"
+                    }
+                }
+            } finally {
+                plaintext.fill(0)
+            }
+        } finally {
+            pairwise.fill(0)
+            token.fill(0)
+        }
+    }
+
+    private fun frozenHistoryErrorCode(error: Throwable): String = when (error) {
+        is ProductionFrozenHistoryException -> if (error.code == "PAGE_BUDGET") {
+            "PAGE_BUDGET cells=${error.requiredCells} utf8=${error.requiredUtf8Bytes}"
+        } else error.code
+        is TerminalBufferLimitException -> error.code
+        else -> "FROZEN_HISTORY_FAILED"
+    }
+
     /** Debug/E2E hook: returns cache counts only and never opens encrypted objects. */
     internal suspend fun debugHistoryObjectCounts(sessionId: UUID): HistoryObjectCounts =
         historyRepository.historyObjectCounts(sessionId)
+
+    internal fun debugRestoreDiagnostics(sessionId: UUID): ProductRestoreDiagnostics? =
+        if (BuildConfig.DEBUG) restoreDiagnostics?.snapshot(sessionId) else null
 
     internal fun debugRealtimeDiagnostics(sessionId: UUID): ProductRealtimeDiagnostics? {
         val realtime = liveSessions[sessionId]?.client?.diagnostics() ?: return null
@@ -2906,6 +3496,9 @@ internal class ProductionProductRepository(
             socketState = realtime.multiplexer.socket.state,
             endpointCount = realtime.multiplexer.endpointCount,
             transportState = realtime.transportState,
+            transportFailureReason = realtime.transportFailureReason,
+            terminalAcceptedGeneration = realtime.terminalAcceptedGeneration,
+            acceptedTerminalProfile = realtime.acceptedTerminalProfile,
             remoteState = realtime.remoteState,
             transportCollectorActive = realtime.transportCollectorActive,
             reconnectActive = realtime.reconnectActive,
@@ -3029,13 +3622,17 @@ internal class ProductionProductRepository(
         pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         authenticationGeneration: Long,
+        expectedProfile: ProductionTerminalProfile? = null,
         action: suspend (ProductionRealtimeSessionClient) -> T,
     ): T {
-        val engine = NativeTerminalEngine(
-            initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
-        )
         val realtime = deviceRealtimeRuntime(stored, authenticationGeneration)
         realtime.multiplexer.warmConnect()
+        val engine = NativeTerminalEngine(
+            initialSize = TerminalSize(session.columns.coerceAtLeast(1), session.rows.coerceAtLeast(1)),
+            widthProfile = if (expectedProfile == ProductionTerminalProfile.GRAPHICS_UNICODE16)
+                TerminalWidthProfile.UNICODE_16 else TerminalWidthProfile.LEGACY_V1,
+            graphicsProfile = expectedProfile?.isGraphics == true,
+        )
         var client: ProductionRealtimeSessionClient? = null
         try {
             val activeClient = createHostHistoryBootstrapClient(
@@ -3045,9 +3642,12 @@ internal class ProductionProductRepository(
                 stored = stored,
                 engine = engine,
                 realtime = realtime,
+                expectedProfile = expectedProfile,
                 disposeEngineOnClose = true,
-            ).also(ProductionRealtimeSessionClient::start)
-            client = activeClient
+            ).also {
+                client = it
+                it.start()
+            }
             return action(activeClient)
         } finally {
             withContext(NonCancellable) {
@@ -3794,11 +4394,13 @@ internal class ProductionProductRepository(
         // Room transaction. UUIDs are never reused, so the fence is permanent
         // for this repository lifetime.
         deletedSessionIds += sessionId
+        retireFrozenBrowse(sessionId)
         val live = synchronized(liveSessionLock) { liveSessions.remove(sessionId) }
         live?.closeAndJoin()
         val readOnly = synchronized(liveSessionLock) { readOnlySessionEngines.remove(sessionId) }
         readOnly?.dispose()
         historyRepository.deleteSession(sessionId)
+        restoreDiagnostics?.remove(sessionId)
         mutableSnapshot.update { snapshot -> snapshot.withoutSession(sessionId) }
     }
 
@@ -3886,6 +4488,9 @@ internal class ProductionProductRepository(
             } ?: session
         }
         val retainedSessionIds = sessions.mapTo(mutableSetOf(), SessionSummary::id)
+        frozenBrowseOwners.keys.filterNot(retainedSessionIds::contains).forEach { sessionId ->
+            sessionLifecycleLanes.withLock(sessionId) { retireFrozenBrowse(sessionId) }
+        }
         val published = authenticationLifecycle.runIfCurrent(
             authenticationGeneration,
             predicate = { !closed && authState != null },
@@ -3928,6 +4533,7 @@ internal class ProductionProductRepository(
                         historyEntries.mapTo(mutableSetOf()) { it.historyObject.id },
                     ),
                     transcriptViewports = current.transcriptViewports.filterKeys(retainedSessionIds::contains),
+                    frozenHistoryViewports = current.frozenHistoryViewports.filterKeys(retainedSessionIds::contains),
                     liveAcknowledgements = current.liveAcknowledgements.filterKeys(retainedSessionIds::contains),
                     bootstrapSources = current.bootstrapSources.filterKeys(retainedSessionIds::contains),
                     catalogPlans = catalogPlans,
@@ -4368,52 +4974,55 @@ internal class ProductionProductRepository(
             }
             val refreshToken = state.refreshToken?.takeIf { it.isNotBlank() }
                 ?: throw NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS)
-            val payload = withContext(Dispatchers.IO) { nativeOidc.refresh(configuration, refreshToken) }
-            val refreshedSubject = OidcJwtClaims.accessTokenSubject(
-                payload.accessToken,
-                configuration.issuer,
-                configuration.clientId,
-            )
-            if (expectedAccountScope != AccountScope.canonical(configuration.issuer, refreshedSubject)) {
-                throw NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS)
+            return finishTokenRotation {
+                val payload = withContext(Dispatchers.IO) { nativeOidc.refresh(configuration, refreshToken) }
+                val refreshedSubject = OidcJwtClaims.accessTokenSubject(
+                    payload.accessToken,
+                    configuration.issuer,
+                    configuration.clientId,
+                )
+                if (expectedAccountScope != AccountScope.canonical(configuration.issuer, refreshedSubject)) {
+                    throw NativeOidcException(NativeOidcFailure.INVALID_CREDENTIALS)
+                }
+                val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
+                    // Metadata only. A real refresh request here would require
+                    // duplicating the live refresh token inside TokenRequest.
+                    .setGrantType(CredentialFreeAuthState.SANITIZED_REQUEST_GRANT_TYPE)
+                    .setScope(payload.scope ?: state.scope)
+                    .build()
+                val tokenResponse = TokenResponse.Builder(request)
+                    .setTokenType(payload.tokenType)
+                    .setAccessToken(payload.accessToken)
+                    .setAccessTokenExpiresIn(payload.expiresInSeconds)
+                    .setRefreshToken(payload.refreshToken ?: refreshToken)
+                    .setIdToken(payload.idToken ?: state.idToken)
+                    .setScope(payload.scope ?: state.scope)
+                    .setAdditionalParameters(emptyMap())
+                    .build()
+                val updated = AuthState(configuration.serviceConfiguration)
+                updated.update(tokenResponse, null)
+                val clean = CredentialFreeAuthState.sanitize(updated)
+                val committed = authenticationLifecycle.runIfCurrent(
+                    captured = generation,
+                    predicate = {
+                        !closed &&
+                            authState === state &&
+                            accountScope == expectedAccountScope &&
+                            (expectedRuntimeOwner == null || realtimeMultiplexerOwner === expectedRuntimeOwner)
+                    },
+                ) {
+                    sessionStore.saveAuthState(clean)
+                    authState = clean
+                    realtimeAccessToken.publish(payload.accessToken)
+                }
+                check(committed) { "Authentication lifecycle changed" }
+                payload.accessToken
             }
-            val request = TokenRequest.Builder(configuration.serviceConfiguration, configuration.clientId)
-                // Metadata only. A real refresh request here would require
-                // duplicating the live refresh token inside TokenRequest.
-                .setGrantType(CredentialFreeAuthState.SANITIZED_REQUEST_GRANT_TYPE)
-                .setScope(payload.scope ?: state.scope)
-                .build()
-            val tokenResponse = TokenResponse.Builder(request)
-                .setTokenType(payload.tokenType)
-                .setAccessToken(payload.accessToken)
-                .setAccessTokenExpiresIn(payload.expiresInSeconds)
-                .setRefreshToken(payload.refreshToken ?: refreshToken)
-                .setIdToken(payload.idToken ?: state.idToken)
-                .setScope(payload.scope ?: state.scope)
-                .setAdditionalParameters(emptyMap())
-                .build()
-            val updated = AuthState(configuration.serviceConfiguration)
-            updated.update(tokenResponse, null)
-            val clean = CredentialFreeAuthState.sanitize(updated)
-            val committed = authenticationLifecycle.runIfCurrent(
-                captured = generation,
-                predicate = {
-                    !closed &&
-                        authState === state &&
-                        accountScope == expectedAccountScope &&
-                        (expectedRuntimeOwner == null || realtimeMultiplexerOwner === expectedRuntimeOwner)
-                },
-            ) {
-                authState = clean
-                sessionStore.saveAuthState(clean)
-                realtimeAccessToken.publish(payload.accessToken)
-            }
-            check(committed) { "Authentication lifecycle changed" }
-            return payload.accessToken
         } catch (error: Throwable) {
             if (isAuthenticationRefreshRejection(error) &&
                 isCurrentAuthentication(generation, state, expectedRuntimeOwner)
             ) {
+                Log.w("OidcSessionStore", "Invalidating authentication after refresh rejection")
                 invalidateAuthentication(
                     authenticationGeneration = generation,
                     expectedAuthState = state,
@@ -4676,6 +5285,7 @@ internal class ProductionProductRepository(
                 history = emptyList(),
                 replayedHistoryObjectIds = emptySet(),
                 transcriptViewports = emptyMap(),
+                frozenHistoryViewports = emptyMap(),
                 liveAcknowledgements = emptyMap(),
                 bootstrapSources = emptyMap(),
                 catalogPlans = emptyList(),
@@ -4829,9 +5439,10 @@ internal class ProductionProductRepository(
             liveSessionIds = liveSessions.keys,
         )
         mutableSnapshot.update { current ->
+            val failureIds = visible + catalogProtocolDiagnosticSessionIds(current)
             current.copy(
                 sessionStates = current.sessionStates.filterKeys(visible::contains),
-                sessionOpenFailures = current.sessionOpenFailures.filterKeys(visible::contains),
+                sessionOpenFailures = current.sessionOpenFailures.filterKeys(failureIds::contains),
             )
         }
     }
@@ -4853,16 +5464,22 @@ internal class ProductionProductRepository(
                             liveSessions.remove(sessionId, incarnation)
                         }
                     },
-                    closeAndJoin = LiveProductSession::closeAndJoin,
+                    closeAndJoin = { live ->
+                        retireFrozenBrowse(sessionId)
+                        live.closeAndJoin()
+                    },
                 )
             }
         }
         val visible = retained + readOnlySessionEngines.keys
-        mutableSnapshot.value = mutableSnapshot.value.copy(
-            sessionStates = mutableSnapshot.value.sessionStates.filterKeys(visible::contains),
-            sessionOpenFailures = mutableSnapshot.value.sessionOpenFailures.filterKeys(visible::contains),
-            sessionTitles = mutableSnapshot.value.sessionTitles.filterKeys(visible::contains),
-        )
+        mutableSnapshot.update { current ->
+            val failureIds = visible + catalogProtocolDiagnosticSessionIds(current)
+            current.copy(
+                sessionStates = current.sessionStates.filterKeys(visible::contains),
+                sessionOpenFailures = current.sessionOpenFailures.filterKeys(failureIds::contains),
+                sessionTitles = current.sessionTitles.filterKeys(visible::contains),
+            )
+        }
     }
 
     /**
@@ -4895,18 +5512,23 @@ internal class ProductionProductRepository(
                                 liveSessions.remove(sessionId, incarnation)
                             }
                         },
-                        closeAndJoin = LiveProductSession::closeAndJoin,
+                        closeAndJoin = { live ->
+                            retireFrozenBrowse(sessionId)
+                            live.closeAndJoin()
+                        },
                     )
                 }
                 val readOnly = synchronized(liveSessionLock) {
                     readOnlySessionEngines.remove(sessionId)
                 }
                 readOnly?.dispose()
+                retireFrozenBrowse(sessionId)
                 mutableSnapshot.update { snapshot ->
                     snapshot.copy(
                         sessionStates = snapshot.sessionStates - sessionId,
                         sessionOpenFailures = snapshot.sessionOpenFailures - sessionId,
                         sessionTitles = snapshot.sessionTitles - sessionId,
+                        frozenHistoryViewports = snapshot.frozenHistoryViewports - sessionId,
                     )
                 }
             }
@@ -4918,6 +5540,15 @@ internal class ProductionProductRepository(
         pcs: List<PcSummary>,
         sessions: List<SessionSummary>,
     ) {
+        frozenBrowseOwners.toMap().forEach { (sessionId, owner) ->
+            val currentPc = pcs.firstOrNull { it.id == owner.pc.id }
+            val currentDevice = devices.firstOrNull { it.id == owner.pcDevice.id }
+            if (currentPc?.keyEpoch != owner.pc.keyEpoch || currentPc?.deviceId != owner.pcDevice.id ||
+                currentDevice?.trustState != DeviceTrustState.TRUSTED) {
+                sessionLifecycleLanes.withLock(sessionId) { retireFrozenBrowse(sessionId) }
+                mutableSnapshot.update { it.copy(frozenHistoryViewports = it.frozenHistoryViewports - sessionId) }
+            }
+        }
         liveSessions.toMap().forEach { (sessionId, live) ->
             val session = sessions.firstOrNull { it.id == sessionId } ?: return@forEach
             val pc = pcs.firstOrNull { it.id == session.pcId } ?: return@forEach
@@ -5220,6 +5851,8 @@ internal class ProductionProductRepository(
                         pcDevice = pcDevice,
                         stored = stored,
                         authenticationGeneration = authentication.authenticationGeneration,
+                        expectedProfile = readOnlySessionEngines[key.sessionId]?.terminalProfile
+                            ?: error("The authenticated read-only renderer is unavailable"),
                     ) { client ->
                         loadHostTranscriptPage(
                             key = key,
@@ -5409,20 +6042,16 @@ internal class ProductionProductRepository(
         client: ProductionRealtimeSessionClient,
         durableLiveAcknowledgement: ULong,
     ): TranscriptAnchor? {
+        val expectedProfile = client.awaitTerminalProfile()
         val value = awaitHostHistoryReady { client.requestLatestHostSnapshot() } ?: return null
         try {
             if (value.snapshotSequence <= key.snapshotSequence ||
                 value.snapshotSequence > durableLiveAcknowledgement
             ) return null
-            val descriptor = cacheHostSnapshot(session, pc, stored, value)
-            return openTerminalTranscriptAnchor(
-                session = session,
-                pc = pc,
-                pcDevice = pcDevice,
-                stored = stored,
-                descriptor = descriptor,
-                sealedObject = value.sealedObject,
-            )
+            return cacheHostSnapshot(session, pc, pcDevice, stored, value, expectedProfile).use { verified ->
+                TranscriptAnchor(requireNotNull(verified.descriptor.metadata.snapshotSequence),
+                    verified.opened.initialTranscriptBeforeLineId)
+            }
         } finally {
             value.destroy()
         }
@@ -5449,50 +6078,6 @@ internal class ProductionProductRepository(
         this != null && sessionId == key.sessionId && snapshotAnchorSequence == key.snapshotSequence &&
             nextBeforeLineId == key.beforeLineId && nextCursor == key.cursor &&
             viewportGeneration == key.viewportGeneration
-
-    private suspend fun openTerminalTranscriptAnchor(
-        session: SessionSummary,
-        pc: PcSummary,
-        pcDevice: DeviceSummary,
-        stored: DeviceKeyVault.StoredIdentity,
-        descriptor: SnapshotDownloadDescriptor,
-        sealedObject: ByteArray,
-    ): TranscriptAnchor = withContext(Dispatchers.Default) {
-        val metadata = descriptor.metadata
-        val sequence = requireNotNull(metadata.snapshotSequence)
-        require(metadata.kind == HistoryObject.Kind.SNAPSHOT)
-        require(metadata.formatName == HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT && metadata.formatVersion == 2)
-        val keyEpoch = requireNotNull(terminalCoreSnapshotKeyEpoch(stored.deviceId, metadata.keyId))
-        require(keyEpoch <= pc.keyEpoch)
-        val pairwise = SessionCrypto.derivePairwiseKey(
-            stored.identity.exchange.privateKey,
-            pcDevice.exchangePublicKey,
-            pc.deviceId,
-            stored.deviceId,
-            keyEpoch,
-        )
-        try {
-            val opened = TerminalSnapshotCrypto.openTerminalCoreSnapshot(
-                pairwiseKey = pairwise,
-                sealedObject = sealedObject,
-                expectedSessionId = session.id,
-                expectedPcDeviceId = pc.deviceId,
-                expectedRecipientDeviceId = stored.deviceId,
-                expectedKeyEpoch = keyEpoch,
-                expectedKeyId = metadata.keyId,
-                expectedSnapshotSequence = sequence,
-                expectedColumns = descriptor.columns,
-                expectedRows = descriptor.rows,
-            )
-            try {
-                TranscriptAnchor(sequence, opened.initialTranscriptBeforeLineId)
-            } finally {
-                opened.checkpoint.fill(0)
-            }
-        } finally {
-            pairwise.fill(0)
-        }
-    }
 
     private suspend fun openTranscriptPage(
         session: SessionSummary,
@@ -5905,7 +6490,10 @@ internal class ProductionProductRepository(
                 sessionStates = emptyMap(),
                 sessionOpenFailures = emptyMap(),
                 sessionTitles = emptyMap(),
+                frozenHistoryViewports = emptyMap(),
             )
+            frozenBrowseOwners.values.toList().filter { it.ownsClient }.forEach { it.client.close() }
+            frozenBrowseOwners.clear()
             appendActivity(
                 context.getString(R.string.activity_authentication_expired),
                 message,
@@ -5945,6 +6533,7 @@ internal class ProductionProductRepository(
     override fun close() {
         if (closed) return
         closed = true
+        restoreDiagnostics?.clear()
         cancelUpdateDownload()
         aiRequestSlots.clear()
         directProductE2EBridgeRegistration?.close()
@@ -5956,6 +6545,8 @@ internal class ProductionProductRepository(
             realtimeNetworkCallbackRegistered = false
         }
         closeLiveSessions()
+        frozenBrowseOwners.values.toList().filter { it.ownsClient }.forEach { it.client.close() }
+        frozenBrowseOwners.clear()
         realtimeRuntimeScope.cancel()
         directCoordinatorRuntimeScope.cancel()
         val closingDownloadJobs = remoteDownloadJobs.values.toList()
@@ -6001,6 +6592,13 @@ internal class ProductionProductRepository(
         val columns: Int,
     )
 
+    private class VerifiedHostSnapshot(
+        val descriptor: SnapshotDownloadDescriptor,
+        val opened: TerminalSnapshotCrypto.OpenedTerminalCoreSnapshot,
+    ) : AutoCloseable {
+        override fun close() { opened.checkpoint.fill(0) }
+    }
+
     private data class TranscriptLoadKey(
         val sessionId: UUID,
         val snapshotSequence: ULong,
@@ -6012,6 +6610,18 @@ internal class ProductionProductRepository(
     private data class TranscriptAnchor(
         val snapshotSequence: ULong,
         val beforeLineId: ULong,
+    )
+
+    private data class FrozenBrowseOwner(
+        val client: ProductionRealtimeSessionClient,
+        val ownsClient: Boolean,
+        val capture: ProductionFrozenHistoryCapture,
+        val session: SessionSummary,
+        val pc: PcSummary,
+        val pcDevice: DeviceSummary,
+        val stored: DeviceKeyVault.StoredIdentity,
+        val authenticationGeneration: Long,
+        val generation: Long,
     )
 
     private class LiveProductSession(
@@ -6234,7 +6844,7 @@ internal class ProductionProductRepository(
         val terminalCommands = get("terminal_commands")?.jsonArray
             ?.map { value ->
                 val command = value.jsonObject
-                dev.termlink.model.TerminalCommandCapability(
+                TerminalCommandCapability(
                     id = command.requiredString("id").also { id ->
                         require(id.matches(Regex("[a-z][a-z0-9._-]{0,63}")))
                     },
@@ -6247,13 +6857,7 @@ internal class ProductionProductRepository(
                     source = command.requiredString("source").also { source ->
                         require(source == "detected" || source == "manual")
                     },
-                ).also { capability ->
-                    require(
-                        capability.source == "manual" && capability.shellType == "custom" ||
-                            capability.source == "detected" && capability.shellType == capability.id &&
-                            capability.id in setOf("command-prompt", "windows-powershell", "powershell-7", "wsl"),
-                    )
-                }
+                ).also(::requireValidTerminalCommandCapability)
             }
             ?.also { commands ->
                 require(commands.size <= 24 && commands.distinctBy { command -> command.id }.size == commands.size)
@@ -6366,15 +6970,16 @@ internal class ProductionProductRepository(
         rows: Int,
         columns: Int,
         sealedObject: ByteArray,
+        expectedProfile: ProductionTerminalProfile,
     ): TerminalSnapshotCrypto.OpenedTerminalCoreSnapshot = withContext(Dispatchers.Default) {
         val sequence = requireNotNull(metadata.snapshotSequence) { "Snapshot sequence is missing" }
         if (metadata.kind != HistoryObject.Kind.SNAPSHOT ||
-            metadata.formatName != HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT ||
-            metadata.formatVersion != 2
+            !terminalSnapshotMatchesProfile(expectedProfile, metadata.formatName, metadata.formatVersion, metadata.sizeBytes) ||
+            metadata.sizeBytes != sealedObject.size.toLong()
         ) {
             throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT)
         }
-        val keyEpoch = terminalCoreSnapshotKeyEpoch(stored.deviceId, metadata.keyId)
+        val keyEpoch = terminalCoreSnapshotKeyEpoch(expectedProfile, stored.deviceId, metadata.keyId)
             ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_RECIPIENT)
         if (keyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
         val pairwise = SessionCrypto.derivePairwiseKey(
@@ -6385,18 +6990,31 @@ internal class ProductionProductRepository(
             keyEpoch,
         )
         try {
-            TerminalSnapshotCrypto.openTerminalCoreSnapshot(
-                pairwiseKey = pairwise,
-                sealedObject = sealedObject,
-                expectedSessionId = session.id,
-                expectedPcDeviceId = pc.deviceId,
-                expectedRecipientDeviceId = stored.deviceId,
-                expectedKeyEpoch = keyEpoch,
-                expectedKeyId = metadata.keyId,
-                expectedSnapshotSequence = sequence,
-                expectedColumns = columns,
-                expectedRows = rows,
-            )
+            val opened = if (!expectedProfile.isGraphics) TerminalSnapshotCrypto.openTerminalCoreSnapshot(
+                    pairwiseKey = pairwise,
+                    sealedObject = sealedObject,
+                    expectedSessionId = session.id,
+                    expectedPcDeviceId = pc.deviceId,
+                    expectedRecipientDeviceId = stored.deviceId,
+                    expectedKeyEpoch = keyEpoch,
+                    expectedKeyId = metadata.keyId,
+                    expectedSnapshotSequence = sequence,
+                    expectedColumns = columns,
+                    expectedRows = rows,
+                ) else TerminalSnapshotCrypto.openTerminalCoreGraphicsSnapshot(
+                    pairwiseKey = pairwise,
+                    sealedObject = sealedObject,
+                    expectedSessionId = session.id,
+                    expectedPcDeviceId = pc.deviceId,
+                    expectedRecipientDeviceId = stored.deviceId,
+                    expectedKeyEpoch = keyEpoch,
+                    expectedKeyId = metadata.keyId,
+                    expectedSnapshotSequence = sequence,
+                    expectedColumns = columns,
+                    expectedRows = rows,
+                    expectedStateContract = expectedProfile.stateContract,
+                )
+            opened
         } catch (error: Exception) {
             throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_PREPARE)
         } finally {
@@ -6420,46 +7038,44 @@ internal class ProductionProductRepository(
         } catch (error: Exception) {
             throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
         } ?: return null
-        if (bound.snapshot.metadata.formatName != HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT ||
-            bound.snapshot.metadata.formatVersion != 2
-        ) {
-            bound.snapshot.ciphertext.fill(0)
-            return null
-        }
-        if (!snapshotCanResumeThroughDurableAcknowledgement(
-                snapshotSequence = bound.snapshotSequence,
-                durableAcknowledgement = bound.durableAcknowledgement,
-            )
-        ) {
-            bound.snapshot.ciphertext.fill(0)
-            return null
-        }
-        val outputTail = latestAuthoritativeSessionTail(session, authenticationGeneration)
-        if (outputTail == null) {
-            bound.snapshot.ciphertext.fill(0)
-            return null
-        }
-        val tail = restorableSessionEventTail(outputTail, bound.durableAcknowledgement)
-        if (!snapshotSuffixRestoreIsBounded(
-                snapshotSequence = bound.snapshotSequence,
-                durableAcknowledgement = bound.durableAcknowledgement,
-                authoritativeTail = tail,
-            )
-        ) {
-            bound.snapshot.ciphertext.fill(0)
-            return null
-        }
         return try {
-            val opened = openNativeTerminalSnapshot(
-                session,
-                pc,
-                pcDevice,
-                stored,
-                bound.snapshot.metadata,
-                bound.snapshotRows,
-                bound.snapshotColumns,
-                bound.snapshot.ciphertext,
-            )
+            if (!terminalSnapshotMatchesProfile(
+                    engine.terminalProfile, bound.snapshot.metadata.formatName,
+                    bound.snapshot.metadata.formatVersion, bound.snapshot.metadata.sizeBytes,
+                ) || terminalCoreSnapshotKeyEpoch(engine.terminalProfile, stored.deviceId,
+                    bound.snapshot.metadata.keyId) == null
+            ) {
+                return null
+            }
+            if (!snapshotCanResumeThroughDurableAcknowledgement(
+                    snapshotSequence = bound.snapshotSequence,
+                    durableAcknowledgement = bound.durableAcknowledgement,
+                )
+            ) {
+                return null
+            }
+            val outputTail = latestAuthoritativeSessionTail(session, authenticationGeneration)
+            if (outputTail == null) {
+                return null
+            }
+            val tail = restorableSessionEventTail(outputTail, bound.durableAcknowledgement)
+            if (!snapshotSuffixRestoreIsBounded(
+                    snapshotSequence = bound.snapshotSequence,
+                    durableAcknowledgement = bound.durableAcknowledgement,
+                    authoritativeTail = tail,
+                )
+            ) {
+                return null
+            }
+            val opened = try {
+                openNativeTerminalSnapshot(session, pc, pcDevice, stored,
+                    bound.snapshot.metadata, bound.snapshotRows, bound.snapshotColumns,
+                    bound.snapshot.ciphertext, engine.terminalProfile)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                return null
+            }
             try {
                 val installed = try {
                     engine.installCheckpoint(opened.checkpoint)
@@ -6579,7 +7195,7 @@ internal class ProductionProductRepository(
         } catch (error: Exception) {
             throw classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
         } finally {
-            bound.snapshot.ciphertext.fill(0)
+            bound.close()
         }
     }
 
@@ -6625,22 +7241,26 @@ internal class ProductionProductRepository(
         expectedRendererGeneration: Long,
         descriptor: SnapshotDownloadDescriptor,
         hostHistoryClient: ProductionRealtimeSessionClient,
+        sealedObject: ByteArray,
+        verifiedOpened: TerminalSnapshotCrypto.OpenedTerminalCoreSnapshot? = null,
     ): RestoredLiveHistory? {
         val restoreAttempt = HOST_HISTORY_RESTORE_ATTEMPTS.incrementAndGet()
         var restoreStage = "cache_lookup"
         val metadata = descriptor.metadata
+        if (!terminalSnapshotMatchesProfile(
+                engine.terminalProfile, metadata.formatName, metadata.formatVersion, metadata.sizeBytes,
+            )
+        ) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT)
         val sequence = requireNotNull(metadata.snapshotSequence)
         logHostSnapshotRestore(
             restoreAttempt,
             "started",
             "snapshot_seq=$sequence expected_generation=$expectedRendererGeneration host_history=true",
         )
-        val cached = requireNotNull(historyRepository.getHistoryObject(metadata.id)?.takeIf { value ->
-            value.metadata.kind == HistoryObject.Kind.SNAPSHOT &&
-                MessageDigest.isEqual(value.metadata.ciphertextSha256, metadata.ciphertextSha256)
-        }) { "Host Snapshot was not cached before installation" }
-        restoreStage = "snapshot_cache_read"
-        val sealedObject = cached.ciphertext
+        // The authenticated object is already verified and durably cached by the caller.
+        // Borrow it until restoration finishes instead of reloading a second large BLOB.
+        require(metadata.sizeBytes == sealedObject.size.toLong()) { "Host Snapshot size mismatch" }
+        restoreStage = "snapshot_cached"
         try {
             logHostSnapshotRestore(
                 restoreAttempt,
@@ -6648,7 +7268,7 @@ internal class ProductionProductRepository(
                 "snapshot_seq=$sequence cache_hit=true sealed_bytes=${sealedObject.size}",
             )
             restoreStage = "snapshot_decrypt"
-            val opened = openNativeTerminalSnapshot(
+            val opened = verifiedOpened ?: openNativeTerminalSnapshot(
                 session,
                 pc,
                 pcDevice,
@@ -6657,6 +7277,7 @@ internal class ProductionProductRepository(
                 descriptor.rows,
                 descriptor.columns,
                 sealedObject,
+                engine.terminalProfile,
             )
             logHostSnapshotRestore(
                 restoreAttempt,
@@ -6769,34 +7390,36 @@ internal class ProductionProductRepository(
                     } catch (error: Exception) {
                         throw classifySessionOpenException(error, SessionFailureStage.SNAPSHOT_CHECKPOINT)
                     }
-                    logHostSnapshotRestore(
-                        restoreAttempt,
-                        "bind_committed",
-                        "snapshot_seq=${bound.snapshotSequence} durable_ack=${bound.durableAcknowledgement} " +
-                            "renderer_generation=${bound.rendererGeneration}",
-                    )
-                    restoreStage = "complete"
-                    RestoredLiveHistory(
-                        rendererState = RendererBootstrapState.ExactCheckpoint(
-                            sequence = restoredThrough.toLong(),
-                            rendererGeneration = bound.rendererGeneration,
-                            snapshotId = metadata.id,
-                            ciphertextSha256 = metadata.ciphertextSha256,
-                            snapshotSequence = bound.snapshotSequence.toLong(),
-                        ),
-                        localInputEpoch = localInputEpoch,
-                        transcriptAnchor = TranscriptAnchor(
-                            sequence,
-                            opened.initialTranscriptBeforeLineId,
-                        ),
-                        durableAcknowledgement = bound.durableAcknowledgement,
-                        bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
-                    ).also {
+                    bound.use {
                         logHostSnapshotRestore(
                             restoreAttempt,
-                            "complete",
-                            "snapshot_seq=$sequence restored_through=$restoredThrough",
+                            "bind_committed",
+                            "snapshot_seq=${bound.snapshotSequence} durable_ack=${bound.durableAcknowledgement} " +
+                                "renderer_generation=${bound.rendererGeneration}",
                         )
+                        restoreStage = "complete"
+                        RestoredLiveHistory(
+                            rendererState = RendererBootstrapState.ExactCheckpoint(
+                                sequence = restoredThrough.toLong(),
+                                rendererGeneration = bound.rendererGeneration,
+                                snapshotId = metadata.id,
+                                ciphertextSha256 = metadata.ciphertextSha256,
+                                snapshotSequence = bound.snapshotSequence.toLong(),
+                            ),
+                            localInputEpoch = localInputEpoch,
+                            transcriptAnchor = TranscriptAnchor(
+                                sequence,
+                                opened.initialTranscriptBeforeLineId,
+                            ),
+                            durableAcknowledgement = bound.durableAcknowledgement,
+                            bootstrapSource = ProductBootstrapSource.REMOTE_SNAPSHOT,
+                        ).also {
+                            logHostSnapshotRestore(
+                                restoreAttempt,
+                                "complete",
+                                "snapshot_seq=$sequence restored_through=$restoredThrough",
+                            )
+                        }
                     }
                 }
             } finally {
@@ -6808,8 +7431,6 @@ internal class ProductionProductRepository(
         } catch (error: Exception) {
             logHostSnapshotRestore(restoreAttempt, "failed", "last_stage=$restoreStage", error)
             throw error
-        } finally {
-            sealedObject.fill(0)
         }
     }
 
@@ -6874,12 +7495,152 @@ internal class ProductionProductRepository(
 
     private class SnapshotSuffixReplayLimitExceededException : RuntimeException()
 
+    private suspend fun restoreGraphicsDeltaFromBound(
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        engine: NativeTerminalEngine,
+        authenticationGeneration: Long,
+        expectedRendererGeneration: Long,
+        hostHistoryClient: ProductionRealtimeSessionClient,
+        diagnosticAttempt: Long?,
+    ): RestoredLiveHistory? {
+        val bound = try {
+            historyRepository.rendererCheckpointState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            throw sessionOpenException(SessionOpenFailureCode.LOCAL_CHECKPOINT, error)
+        } ?: run {
+            diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "BASE_MISSING") }
+            return null
+        }
+        bound.use {
+            if (!terminalSnapshotMatchesProfile(engine.terminalProfile,
+                    bound.snapshot.metadata.formatName, bound.snapshot.metadata.formatVersion,
+                    bound.snapshot.metadata.sizeBytes) ||
+                terminalCoreSnapshotKeyEpoch(engine.terminalProfile, stored.deviceId,
+                    bound.snapshot.metadata.keyId) == null) {
+                diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "BASE_PROFILE_MISMATCH") }
+                throw RetiredGraphicsDeltaBaseException()
+            }
+            check(bound.rendererGeneration == expectedRendererGeneration) {
+                "State Delta base renderer generation changed"
+            }
+            val opened = try {
+                openNativeTerminalSnapshot(session, pc, pcDevice, stored,
+                    bound.snapshot.metadata, bound.snapshotRows, bound.snapshotColumns,
+                    bound.snapshot.ciphertext, engine.terminalProfile)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "BASE_AUTHENTICATION_FAILED") }
+                throw RetiredGraphicsDeltaBaseException()
+            }
+            try {
+                if (!isCurrentGraphicsDeltaBase(opened.checkpoint)) {
+                    throw RetiredGraphicsDeltaBaseException()
+                }
+                val baseHash = MessageDigest.getInstance("SHA-256").digest(opened.checkpoint)
+                try {
+                    diagnosticAttempt?.let { restoreDiagnostics?.deltaRequested(
+                        session.id, it, bound.snapshotSequence.toLong(), baseHash)
+                    }
+                    val deltaObject = hostHistoryClient.requestHostStateDelta(
+                        baseNextSourceSequence = bound.snapshotSequence + 1uL,
+                        baseSnapshotBytes = opened.checkpoint.size,
+                        baseSnapshotSha256 = baseHash,
+                        deltaProfile = graphicsDeltaProfile(engine.stateDeltaWidthProfile,
+                            engine.stateDeltaOutputProfile),
+                    )
+                    deltaObject.use { value ->
+                        val delta = requireNotNull(value.stateDelta) {
+                            "State Delta response omitted authenticated metadata"
+                        }
+                        diagnosticAttempt?.let { restoreDiagnostics?.deltaReceived(
+                            session.id, it, delta.targetNextSourceSequence - 1,
+                            delta.targetSnapshotSha256.toByteArray(), value.sealedObject.size,
+                            value.transferEvidence)
+                        }
+                        val pairwise = SessionCrypto.derivePairwiseKey(
+                            stored.identity.exchange.privateKey, pcDevice.exchangePublicKey,
+                            pc.deviceId, stored.deviceId, pc.keyEpoch)
+                        try {
+                            applyGraphicsStateDelta(
+                                pairwiseKey = pairwise,
+                                sealedDelta = value.sealedObject,
+                                metadata = delta,
+                                baseCheckpoint = opened.checkpoint,
+                                baseSnapshotSequence = bound.snapshotSequence,
+                                baseObservedLocalInputEpoch = opened.observedLocalInputEpoch,
+                                sessionId = session.id,
+                                pcDeviceId = pc.deviceId,
+                                recipientDeviceId = stored.deviceId,
+                                keyEpoch = pc.keyEpoch,
+                                terminalProfile = engine.terminalProfile,
+                                widthProfile = engine.stateDeltaWidthProfile,
+                                outputProfile = engine.stateDeltaOutputProfile,
+                            ).use { target ->
+                                currentCoroutineContext().ensureActive()
+                                val objectId = UUID.randomUUID()
+                                val ciphertextHash = HistoryRepository.sha256(target.sealedSnapshot)
+                                val keyId = TerminalSnapshotCrypto.terminalCoreGraphicsSnapshotKeyId(
+                                    stored.deviceId, pc.keyEpoch, engine.terminalProfile.stateContract)
+                                val objectKey = hostHistoryObjectKey(session.id, objectId)
+                                historyRepository.putSnapshot(
+                                    sessionId = session.id,
+                                    snapshotSequence = target.snapshotSequence,
+                                    rows = target.size.rows,
+                                    columns = target.size.columns,
+                                    objectKey = objectKey,
+                                    keyId = keyId,
+                                    formatName = TerminalSnapshotCrypto.TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_NAME,
+                                    formatVersion = TerminalSnapshotCrypto.TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_VERSION,
+                                    ciphertext = target.sealedSnapshot,
+                                    id = objectId,
+                                    ciphertextSha256 = ciphertextHash,
+                                )
+                                val metadata = HistoryObject(
+                                    id = objectId,
+                                    kind = HistoryObject.Kind.SNAPSHOT,
+                                    objectKey = objectKey,
+                                    keyId = keyId,
+                                    ciphertextSha256 = ciphertextHash,
+                                    sizeBytes = target.sealedSnapshot.size.toLong(),
+                                    startSequence = null,
+                                    endSequence = null,
+                                    snapshotSequence = target.snapshotSequence,
+                                    formatName = TerminalSnapshotCrypto.TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_NAME,
+                                    formatVersion = TerminalSnapshotCrypto.TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_VERSION,
+                                )
+                                logHostSnapshotRestore(HOST_HISTORY_RESTORE_ATTEMPTS.incrementAndGet(),
+                                    "delta_target_cached", "snapshot_seq=${target.snapshotSequence} " +
+                                        "target_bytes=${delta.targetSnapshotBytes}")
+                                val restored = restoreRemoteNativeTerminalSnapshot(
+                                    session, pc, pcDevice, stored, engine, authenticationGeneration,
+                                    expectedRendererGeneration,
+                                    SnapshotDownloadDescriptor(metadata, target.size.rows, target.size.columns),
+                                    hostHistoryClient, target.sealedSnapshot,
+                                ) ?: throw sessionOpenException(SessionOpenFailureCode.HISTORY_NOT_READY)
+                                diagnosticAttempt?.let { restoreDiagnostics?.deltaInstalled(session.id, it) }
+                                return restored
+                            }
+                        } finally { pairwise.fill(0) }
+                    }
+                } finally { baseHash.fill(0) }
+            } finally { opened.checkpoint.fill(0) }
+        }
+    }
+
     private suspend fun cacheHostSnapshot(
         session: SessionSummary,
         pc: PcSummary,
+        pcDevice: DeviceSummary,
         stored: DeviceKeyVault.StoredIdentity,
         value: ProductionHostHistoryObject,
-    ): SnapshotDownloadDescriptor {
+        expectedProfile: ProductionTerminalProfile,
+    ): VerifiedHostSnapshot {
         require(value.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_SNAPSHOT) {
             "Host history object is not a Snapshot"
         }
@@ -6889,31 +7650,37 @@ internal class ProductionProductRepository(
         require(value.columns in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_COLUMNS &&
             value.rows in 1..HistoryRepository.MAX_TERMINAL_SNAPSHOT_ROWS
         ) { "Host Snapshot dimensions are invalid" }
-        require(value.formatName == HistoryRepository.TERMINAL_CORE_SNAPSHOT_FORMAT && value.formatVersion == 2) {
-            "Host Snapshot format is unsupported"
-        }
-        val keyEpoch = terminalCoreSnapshotKeyEpoch(stored.deviceId, value.keyId)
+        if (!terminalSnapshotMatchesProfile(
+                expectedProfile, value.formatName, value.formatVersion, value.sealedObject.size.toLong(),
+            )
+        ) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_FORMAT)
+        val keyEpoch = terminalCoreSnapshotKeyEpoch(expectedProfile, stored.deviceId, value.keyId)
             ?: throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_RECIPIENT)
         if (keyEpoch > pc.keyEpoch) throw sessionOpenException(SessionOpenFailureCode.SNAPSHOT_KEY)
         val metadata = value.toHistoryObject(session.id)
-        historyRepository.putSnapshot(
-            sessionId = session.id,
-            snapshotSequence = value.snapshotSequence,
-            rows = value.rows,
-            columns = value.columns,
-            objectKey = metadata.objectKey,
-            keyId = value.keyId,
-            formatName = value.formatName,
-            formatVersion = value.formatVersion,
-            ciphertext = value.sealedObject,
-            id = value.objectId,
-            ciphertextSha256 = value.ciphertextSha256,
-        )
-        return SnapshotDownloadDescriptor(
-            metadata = metadata,
-            rows = value.rows,
-            columns = value.columns,
-        )
+        // Both graphics width policies share the sealed container; verify the decrypted checkpoint before caching.
+        val opened = openNativeTerminalSnapshot(session, pc, pcDevice, stored, metadata, value.rows,
+            value.columns, value.sealedObject, expectedProfile)
+        try {
+            historyRepository.putSnapshot(
+                sessionId = session.id,
+                snapshotSequence = value.snapshotSequence,
+                rows = value.rows,
+                columns = value.columns,
+                objectKey = metadata.objectKey,
+                keyId = value.keyId,
+                formatName = value.formatName,
+                formatVersion = value.formatVersion,
+                ciphertext = value.sealedObject,
+                id = value.objectId,
+                ciphertextSha256 = value.ciphertextSha256,
+            )
+            return VerifiedHostSnapshot(SnapshotDownloadDescriptor(metadata, value.rows,
+                value.columns), opened)
+        } catch (error: Throwable) {
+            opened.checkpoint.fill(0)
+            throw error
+        }
     }
 
     private suspend fun replayHostHistoryRange(
@@ -6991,7 +7758,7 @@ internal class ProductionProductRepository(
                     events = chunk.eventsList,
                     eventSequence = { it.seq.toULong() },
                     initialLocalInputEpoch = localInputEpoch,
-                    applyEvent = { event -> applyHistoryEvent(engine, event) },
+                    applyEvent = { event -> applyHistoryEvent(engine, event, client, session, pc, pcDevice, stored) },
                 )
                 restored = value.endSequence
                 diagnosticAttempt?.let { attempt ->
@@ -7081,6 +7848,11 @@ internal class ProductionProductRepository(
         allowFreshReplayFromZero: Boolean = false,
         hostHistoryClient: ProductionRealtimeSessionClient,
     ): RestoredLiveHistory {
+        val diagnosticAttempt = restoreDiagnostics?.begin(session.id)
+        val terminalProfile = hostHistoryClient.awaitTerminalProfile()
+        if (terminalProfile != engine.terminalProfile) {
+            throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+        }
         val cursor = historyRepository.ackCursorState(session.id, LIVE_OUTPUT_ACK_DIRECTION)
             ?: historyRepository.initializeAckCursor(session.id, LIVE_OUTPUT_ACK_DIRECTION)
         if (allowFreshReplayFromZero && cursor.sequence == 0uL) {
@@ -7103,12 +7875,39 @@ internal class ProductionProductRepository(
             BuildConfig.TERMLINK_TERMINAL_SNAPSHOT_RUNTIME,
             pc.capabilities,
         )
-        // Prefer terminal-core's canonical Snapshot V2 from the Windows host.
+        val deltaAvailable = terminalSnapshotNegotiated &&
+            terminalProfile.isGraphics &&
+            hostHistoryClient.supportsRemoteStateDelta()
+        if (!deltaAvailable) diagnosticAttempt?.let {
+            restoreDiagnostics?.fallback(session.id, it, "UNAVAILABLE")
+        }
+        val deltaBootstrap = restorePreferredGraphicsDelta(available = deltaAvailable) {
+            try {
+                restoreGraphicsDeltaFromBound(
+                    session, pc, pcDevice, stored, engine, authenticationGeneration,
+                    cursor.rendererGeneration, hostHistoryClient, diagnosticAttempt,
+                )
+            } catch (error: ProductionStateDeltaNeedsFullSnapshotException) {
+                diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "NEEDS_FULL_SNAPSHOT") }
+                throw error
+            } catch (error: RetiredGraphicsDeltaBaseException) {
+                diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "RETIRED_BASE") }
+                throw error
+            } catch (error: CancellationException) {
+                diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "CANCELLED") }
+                throw error
+            } catch (error: Exception) {
+                diagnosticAttempt?.let { restoreDiagnostics?.fallback(session.id, it, "FAILED") }
+                throw error
+            }
+        }
+        deltaBootstrap.restored?.let { return it }
+        // Prefer the authenticated profile's canonical Snapshot from the Windows host.
         // Host event-range replay is the only availability fallback.
         restoreReplaceableBoundOrRemoteCheckpoint(
             negotiated = terminalSnapshotNegotiated,
             restoreBound = {
-                restoreBoundNativeTerminalCheckpoint(
+                if (deltaBootstrap.requireFullSnapshot) null else restoreBoundNativeTerminalCheckpoint(
                     session,
                     pc,
                     pcDevice,
@@ -7124,23 +7923,52 @@ internal class ProductionProductRepository(
                     hostHistoryClient.requestLatestHostSnapshot()
                 } ?: return@restoreReplaceableBoundOrRemoteCheckpoint null
                 try {
-                    val descriptor = cacheHostSnapshot(
-                        session = session,
-                        pc = pc,
-                        stored = stored,
-                        value = hostSnapshot,
-                    )
-                    return@restoreReplaceableBoundOrRemoteCheckpoint restoreRemoteNativeTerminalSnapshot(
+                    val verified = cacheHostSnapshot(
                         session = session,
                         pc = pc,
                         pcDevice = pcDevice,
                         stored = stored,
-                        engine = engine,
-                        authenticationGeneration = authenticationGeneration,
-                        expectedRendererGeneration = cursor.rendererGeneration,
-                        descriptor = descriptor,
-                        hostHistoryClient = hostHistoryClient,
+                        value = hostSnapshot,
+                        expectedProfile = terminalProfile,
                     )
+                    return@restoreReplaceableBoundOrRemoteCheckpoint verified.use {
+                        // Hash the original authenticated checkpoint before the
+                        // restore function wipes it in its finally block. The
+                        // ledger is updated only after a non-null successful
+                        // restore result; failures, cancellation, and delta
+                        // restores therefore cannot appear as full restores.
+                        val checkpointSha256 = if (diagnosticAttempt != null && restoreDiagnostics != null) {
+                            HistoryRepository.sha256(verified.opened.checkpoint)
+                        } else {
+                            null
+                        }
+                        try {
+                            val restored = restoreRemoteNativeTerminalSnapshot(
+                                session = session,
+                                pc = pc,
+                                pcDevice = pcDevice,
+                                stored = stored,
+                                engine = engine,
+                                authenticationGeneration = authenticationGeneration,
+                                expectedRendererGeneration = cursor.rendererGeneration,
+                                descriptor = verified.descriptor,
+                                hostHistoryClient = hostHistoryClient,
+                                sealedObject = hostSnapshot.sealedObject,
+                                verifiedOpened = verified.opened,
+                            )
+                            if (restored != null && checkpointSha256 != null) {
+                                val sequence = requireNotNull(verified.descriptor.metadata.snapshotSequence)
+                                diagnosticAttempt?.let { attempt ->
+                                    restoreDiagnostics?.fullSnapshotInstalled(
+                                        session.id, attempt, sequence.toLong(), checkpointSha256,
+                                    )
+                                }
+                            }
+                            restored
+                        } finally {
+                            checkpointSha256?.fill(0)
+                        }
+                    }
                 } finally {
                     hostSnapshot.destroy()
                 }
@@ -7260,7 +8088,10 @@ internal class ProductionProductRepository(
                                         liveSessions.remove(sessionId, expected)
                                     }
                                 },
-                                closeAndJoin = LiveProductSession::closeAndJoin,
+                                closeAndJoin = { retiring ->
+                                    retireFrozenBrowse(sessionId)
+                                    retiring.closeAndJoin()
+                                },
                                 afterRetired = { openSessionLocked(sessionId) },
                             )
                         } catch (error: CancellationException) {
@@ -7307,13 +8138,22 @@ internal class ProductionProductRepository(
                             liveSessions.remove(sessionId, expected)
                         }
                     },
-                    closeAndJoin = LiveProductSession::closeAndJoin,
+                    closeAndJoin = { live ->
+                        retireFrozenBrowse(sessionId)
+                        live.closeAndJoin()
+                    },
                 )
                 if (!retired) return@withLock
-                val classified = sessionOpenException(
-                    SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED,
-                )
-                observeBootstrapFailure(sessionId, classified.failure)
+                val diagnostic = failure.terminalProtocolDiagnostic
+                val classified = sessionOpenException(when (diagnostic?.category) {
+                    "unsupported" -> SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY
+                    "malformed" -> SessionOpenFailureCode.MALFORMED_TERMINAL_SEQUENCE
+                    "limit_exceeded" -> SessionOpenFailureCode.TERMINAL_RESOURCE_LIMIT
+                    else -> SessionOpenFailureCode.NATIVE_RENDERER_FAILED_CLOSED
+                })
+                observeBootstrapFailure(sessionId, classified.failure.copy(
+                    protocolDiagnostic = diagnostic,
+                ))
             }
             RendererFatalIncarnationDecision.RECOVER -> {
                 try {
@@ -7324,7 +8164,10 @@ internal class ProductionProductRepository(
                                 liveSessions.remove(sessionId, expected)
                             }
                         },
-                        closeAndJoin = LiveProductSession::closeAndJoin,
+                        closeAndJoin = { live ->
+                            retireFrozenBrowse(sessionId)
+                            live.closeAndJoin()
+                        },
                         afterRetired = {
                             openSessionLocked(
                                 sessionId = sessionId,
@@ -7336,7 +8179,9 @@ internal class ProductionProductRepository(
                     throw error
                 } catch (error: Throwable) {
                     val classified = classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY)
-                    observeBootstrapFailure(sessionId, classified.failure)
+                    observeBootstrapFailure(sessionId, classified.failure.copy(
+                        protocolDiagnostic = classified.failure.protocolDiagnostic ?: failure.terminalProtocolDiagnostic,
+                    ))
                 }
             }
         }
@@ -7351,6 +8196,21 @@ internal class ProductionProductRepository(
                     val output = OutputChunkPayload.parseFrom(payload).output.toByteArray()
                     DecodedHistoryEvent(RemoteSessionEvent.Output(event.seq, output))
                 }
+                MessageType.HOST_RESIZE_RESULT -> DecodedHistoryEvent(RemoteSessionEvent.HostResizeResult(event.seq,
+                    dev.termlink.terminal.api.TerminalHostResizeResultV1.decode(
+                        dev.termlink.protocol.realtime.v1.HostResizeResultPayload.parseFrom(payload).resultV1.toByteArray(),
+                    ),
+                ))
+                MessageType.HOST_THEME -> DecodedHistoryEvent(RemoteSessionEvent.HostTheme(event.seq,
+                    dev.termlink.terminal.api.TerminalHostThemeV1.decode(
+                        dev.termlink.protocol.realtime.v1.HostThemePayload.parseFrom(payload).themeV1.toByteArray(),
+                    ),
+                ))
+                MessageType.HOST_GEOMETRY -> DecodedHistoryEvent(RemoteSessionEvent.HostGeometry(event.seq,
+                    dev.termlink.terminal.api.TerminalHostGeometryV1.decode(
+                        dev.termlink.protocol.realtime.v1.HostGeometryPayload.parseFrom(payload).geometryV1.toByteArray(),
+                    ),
+                ))
                 MessageType.RESIZE_APPLIED -> ResizePayload.parseFrom(payload).let { resize ->
                     DecodedHistoryEvent(
                         RemoteSessionEvent.Resize(
@@ -7374,6 +8234,10 @@ internal class ProductionProductRepository(
                             event.seq,
                             RemoteLifecycle.ENDED,
                             value.exitCode.takeIf { value.hasExitCode() },
+                            dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
+                                value.exitCode.takeIf { value.hasExitCode() },
+                                value.terminalProtocolDiagnostic.takeIf { value.hasTerminalProtocolDiagnostic() },
+                            ),
                         ),
                     )
                 }
@@ -7432,15 +8296,6 @@ internal class ProductionProductRepository(
         return epoch.takeIf { HistoryCrypto.keyId(recipientDeviceId, it) == keyId }
     }
 
-    private fun terminalCoreSnapshotKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
-        val prefix = "terminal-core-snapshot-v2:${recipientDeviceId.toString().replace("-", "")}:"
-        if (!keyId.startsWith(prefix)) return null
-        val encoded = keyId.removePrefix(prefix)
-        if (encoded.length != 8 || encoded.any { !it.isDigit() }) return null
-        val epoch = encoded.toLongOrNull()?.takeIf { it > 0 } ?: return null
-        return epoch.takeIf { TerminalSnapshotCrypto.terminalCoreSnapshotKeyId(recipientDeviceId, it) == keyId }
-    }
-
     private fun transcriptKeyEpoch(recipientDeviceId: UUID, keyId: String): Long? {
         val prefix = "transcript-v1:${recipientDeviceId.toString().replace("-", "")}:"
         if (!keyId.startsWith(prefix)) return null
@@ -7450,7 +8305,59 @@ internal class ProductionProductRepository(
         return epoch.takeIf { TerminalSnapshotCrypto.transcriptKeyId(recipientDeviceId, it) == keyId }
     }
 
-    private suspend fun applyHistoryEvent(engine: TerminalEngine, event: HistoryEventV1): Long {
+    private suspend fun resolveBrokerOutputForSession(
+        sequence: Long,
+        reference: ByteArray,
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+        client: ProductionRealtimeSessionClient,
+    ): RemoteSessionEvent.BrokerOutput {
+        val diagnosticAttempt = restoreDiagnostics?.snapshot(session.id)?.attempt
+        val currentPc = mutableSnapshot.value.pcs.firstOrNull { it.id == pc.id }
+        val currentDevice = mutableSnapshot.value.devices.firstOrNull { it.id == pcDevice.id }
+        check(!closed && currentPc?.deviceId == pc.deviceId && currentPc?.keyEpoch == pc.keyEpoch &&
+            currentDevice?.trustState == DeviceTrustState.TRUSTED &&
+            currentDevice?.exchangePublicKey?.contentEquals(pcDevice.exchangePublicKey) == true) {
+            "Broker capture PC identity or key epoch changed"
+        }
+        val pairwise = SessionCrypto.derivePairwiseKey(stored.identity.exchange.privateKey,
+            pcDevice.exchangePublicKey, pc.deviceId, stored.deviceId, pc.keyEpoch)
+        try {
+            val resolved = resolveBrokerOutput(sequence, reference, session.id, pc.deviceId,
+                stored.deviceId, pc.keyEpoch, pairwise, historyRepository,
+                request = { selection ->
+                    client.requestHostBrokerCapture(selection).also { remote ->
+                        remote.transferEvidence?.let { evidence ->
+                            diagnosticAttempt?.let {
+                                restoreDiagnostics?.brokerTransferred(session.id, it, evidence)
+                            }
+                        }
+                    }
+                }, stateContract = client.awaitTerminalProfile().stateContract)
+            val latestPc = mutableSnapshot.value.pcs.firstOrNull { it.id == pc.id }
+            val latestDevice = mutableSnapshot.value.devices.firstOrNull { it.id == pcDevice.id }
+            if (closed || latestPc?.deviceId != pc.deviceId || latestPc?.keyEpoch != pc.keyEpoch ||
+                latestDevice?.trustState != DeviceTrustState.TRUSTED ||
+                latestDevice?.exchangePublicKey?.contentEquals(pcDevice.exchangePublicKey) != true) {
+                resolved.close()
+                error("Broker capture PC identity or key epoch changed")
+            }
+            diagnosticAttempt?.let { restoreDiagnostics?.brokerResolved(session.id, it) }
+            return resolved
+        } finally { pairwise.fill(0) }
+    }
+
+    private suspend fun applyHistoryEvent(
+        engine: TerminalEngine,
+        event: HistoryEventV1,
+        client: ProductionRealtimeSessionClient,
+        session: SessionSummary,
+        pc: PcSummary,
+        pcDevice: DeviceSummary,
+        stored: DeviceKeyVault.StoredIdentity,
+    ): Long {
         if (event.messageType == MessageType.GAP) {
             val payload = event.payload.toByteArray()
             try {
@@ -7461,11 +8368,29 @@ internal class ProductionProductRepository(
                 payload.fill(0)
             }
         }
-        val decoded = decodeHistoryEvent(event)
+        val decoded = if (event.messageType == MessageType.BROKER_OUTPUT) {
+            val payload = event.payload.toByteArray()
+            try {
+                val reference = BrokerOutputPayload.parseFrom(payload).referenceV1.toByteArray()
+                try {
+                    DecodedHistoryEvent(resolveBrokerOutputForSession(event.seq, reference,
+                        session, pc, pcDevice, stored, client))
+                } finally { reference.fill(0) }
+            } finally { payload.fill(0) }
+        } else decodeHistoryEvent(event)
         return try {
             when (val remote = decoded.event) {
                 is RemoteSessionEvent.Output ->
                     engine.feed(remote.sequence, ByteBuffer.wrap(remote.bytes).asReadOnlyBuffer())
+                is RemoteSessionEvent.BrokerOutput -> {
+                    val output = remote.copyOutput()
+                    val captures = remote.copyCanonicalCaptures()
+                    try { engine.applyBrokerCapturedOutput(remote.sequence, output, captures) }
+                    finally { output.fill(0); captures.fill(0) }
+                }
+                is RemoteSessionEvent.HostResizeResult -> engine.advance(remote.sequence)
+                is RemoteSessionEvent.HostTheme -> engine.applyHostTheme(remote.sequence, remote.theme)
+                is RemoteSessionEvent.HostGeometry -> engine.applyHostGeometry(remote.sequence, remote.geometry)
                 is RemoteSessionEvent.Resize ->
                     engine.resize(remote.sequence, remote.size.columns, remote.size.rows)
                 is RemoteSessionEvent.Title,
@@ -7491,7 +8416,11 @@ internal class ProductionProductRepository(
             )
             throw error
         } finally {
-            if (decoded.event is RemoteSessionEvent.Output) decoded.event.bytes.fill(0)
+            when (val applied = decoded.event) {
+                is RemoteSessionEvent.Output -> applied.bytes.fill(0)
+                is RemoteSessionEvent.BrokerOutput -> applied.close()
+                else -> Unit
+            }
         }
     }
 
@@ -7513,6 +8442,12 @@ internal class ProductionProductRepository(
         private const val HISTORY_REPLAY_LOG_TAG = "TermLinkHistoryReplay"
         private const val HOST_HISTORY_RESTORE_LOG_TAG = "TermLinkHostRestore"
         private const val REMOTE_DOWNLOAD_LOG_TAG = "TermLinkFileTransfer"
+        private const val FROZEN_HISTORY_MAX_LINES = 32
+        private const val FROZEN_HISTORY_MAX_CELLS = 8_192
+        private const val FROZEN_HISTORY_MAX_UTF8_BYTES = 256 * 1024
+        private const val FROZEN_HISTORY_MAX_OBJECT_BYTES = 8 * 1024 * 1024
+        private const val FROZEN_HISTORY_RETAINED_PAGES = 2
+        private const val FROZEN_HISTORY_MAX_ANCHORS = 4_096
         private val HOST_HISTORY_RESTORE_ATTEMPTS = AtomicInteger()
         private const val MAX_HISTORY_FAILURE_CLASS_CHARS = 128
         const val UPDATE_PREFERENCES = "update_service"
@@ -7701,14 +8636,14 @@ internal fun rebaseTranscriptViewportToNewerAnchor(
     return viewport.copy(
         snapshotAnchorSequence = newSnapshotSequence,
         initialBeforeLineId = newInitialBeforeLineId,
-        nextBeforeLineId = newInitialBeforeLineId,
+        nextBeforeLineId = externalTranscriptContinuation(newInitialBeforeLineId),
         nextCursor = null,
         pages = emptyList(),
         loadedObjectIds = emptySet(),
         consumedCursors = emptySet(),
         loading = false,
         error = null,
-        hasMoreBefore = true,
+        hasMoreBefore = newInitialBeforeLineId > 1u,
         viewportGeneration = Math.addExact(viewport.viewportGeneration, 1L),
     )
 }
@@ -8198,8 +9133,18 @@ internal fun sessionFailuresAfterRuntimeState(
     failures: Map<UUID, SessionOpenFailure>,
     sessionId: UUID,
     state: RemoteSessionState,
-): Map<UUID, SessionOpenFailure> =
-    if (state is RemoteSessionState.Controlling) failures - sessionId else failures
+): Map<UUID, SessionOpenFailure> {
+    if (state is RemoteSessionState.Controlling) return failures - sessionId
+    val diagnostic = (state as? RemoteSessionState.Exited)?.protocolDiagnostic ?: return failures
+    val code = when (diagnostic.category) {
+        "unsupported" -> SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY
+        "malformed" -> SessionOpenFailureCode.MALFORMED_TERMINAL_SEQUENCE
+        "limit_exceeded" -> SessionOpenFailureCode.TERMINAL_RESOURCE_LIMIT
+        else -> return failures
+    }
+    return failures + (sessionId to SessionOpenFailure(code, protocolDiagnostic = diagnostic,
+        protocolDiagnosticSource = SessionProtocolDiagnosticSource.WINDOWS_HOST))
+}
 
 private fun retryableTransientControlFailure(error: Throwable): Boolean = when (error) {
     is IOException -> true

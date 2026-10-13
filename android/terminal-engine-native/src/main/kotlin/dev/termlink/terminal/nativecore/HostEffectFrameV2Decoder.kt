@@ -56,7 +56,8 @@ object HostEffectFrameV2Decoder {
             if (aggregatePayloadBytes > TerminalHostEffectFrameV2.MAX_PAYLOAD_BYTES) {
                 fail("aggregate payload exceeds ${TerminalHostEffectFrameV2.MAX_PAYLOAD_BYTES} bytes")
             }
-            expectU64(40, REQUIRED_FEATURES, "required features")
+            val features = u64(40, "required features")
+            if (features and 1L == 0L || features and 7L != features) fail("required features")
             expectU64(48, 0, "header reserved field")
             val payloadCrc = u32(56, "payload CRC32C")
             val headerCrc = u32(60, "header CRC32C")
@@ -69,6 +70,8 @@ object HostEffectFrameV2Decoder {
             var previousSequence: Long? = null
             var previousSourceOffset = 0L
             var previousOrdinal = 0L
+            var resizeCount = 0
+            var platformCount = 0
 
             repeat(effectCount) { index ->
                 val recordOffset = checkedInt(
@@ -79,7 +82,12 @@ object HostEffectFrameV2Decoder {
                     ),
                     "record offset",
                 )
-                expectU32(recordOffset, KIND_PTY_REPLY, "effect kind")
+                val kind = when (u32(recordOffset, "effect kind")) {
+                    KIND_PTY_REPLY -> TerminalHostEffectKindV2.PTY_REPLY
+                    2L -> TerminalHostEffectKindV2.RESIZE_REQUEST.also { if (++resizeCount > 64) fail("resize request bound") }
+                    3L -> TerminalHostEffectKindV2.PLATFORM_ACTION.also { platformCount++ }
+                    else -> fail("effect kind")
+                }
                 expectU32(recordOffset + 4, 0, "effect flags")
                 val sequence = u64(recordOffset + 8, "source sequence")
                 val sourceOffset = u32(recordOffset + 16, "source offset end")
@@ -107,7 +115,7 @@ object HostEffectFrameV2Decoder {
                 val start = checkedInt(effectPayloadOffset, "effect payload offset")
                 val end = checkedInt(payloadEnd, "effect payload end")
                 effects += TerminalHostEffectV2(
-                    kind = TerminalHostEffectKindV2.PTY_REPLY,
+                    kind = kind,
                     sourceSequence = sequence,
                     sourceOffsetEnd = checkedInt(sourceOffset, "source offset end"),
                     ordinal = ordinal,
@@ -121,6 +129,7 @@ object HostEffectFrameV2Decoder {
             if (expectedEffectPayloadOffset != bytes.size.toLong()) {
                 fail("frame has trailing or missing payload bytes")
             }
+            if (features != (REQUIRED_FEATURES or (if (resizeCount == 0) 0L else 2L) or (if (platformCount == 0) 0L else 4L))) fail("resize feature declaration")
             return TerminalHostEffectFrameV2(bytes, effects)
         }
 

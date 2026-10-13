@@ -561,10 +561,12 @@ if ($AndroidApk -or $AndroidAab) {
     }
 }
 
+$coreRevision = $null
 if ($WindowsSetup -or $WindowsMsix -or $AndroidApk -or $AndroidAab) {
     $nativePlatform = if (($WindowsSetup -or $WindowsMsix) -and ($AndroidApk -or $AndroidAab)) { 'All' }
         elseif ($WindowsSetup -or $WindowsMsix) { 'Windows' } else { 'Android' }
-    $null = & (Join-Path $repositoryRoot 'scripts\Verify-NativeArtifacts.ps1') -Platform $nativePlatform -RequireClean:$isProduction
+    $nativeInfo = & (Join-Path $repositoryRoot 'scripts\Verify-NativeArtifacts.ps1') -Platform $nativePlatform -RequireClean:$isProduction
+    $coreRevision = [string]$nativeInfo.revision
 }
 
 $allArtifactTargets = @($manifestPath, $pendingManifestPath)
@@ -577,22 +579,19 @@ if ($WindowsMsix) { $allArtifactTargets += $msixArtifactPath }
 if ($AndroidApk) { $allArtifactTargets += $apkArtifactPath }
 if ($AndroidAab) { $allArtifactTargets += $aabArtifactPath }
 
-# Resolve source identity before creating the release output directory. Otherwise a
-# previously clean tree would become dirty merely because this build created its own
-# untracked artifact directory, and a genuinely dirty source tree would be mislabeled
-# as the clean HEAD commit in the OCI image metadata.
-$serverSourceRevision = $null
+# Resolve source identity for every platform before creating any build output.
+# A production artifact must describe one clean, committed source tree.
+$gitPath = Resolve-Executable -Path 'git' -Name 'Git'
+$sourceRevision = (& $gitPath -C $repositoryRoot rev-parse HEAD).Trim()
+Assert-Condition ($LASTEXITCODE -eq 0 -and $sourceRevision -cmatch '^[0-9a-f]{40}$') `
+    'Unable to resolve the application source revision.'
+$initialSourceStatus = @(& $gitPath -C $repositoryRoot status --porcelain --untracked-files=normal)
+Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to resolve the application source worktree status.'
+Assert-Condition (-not $isProduction -or $initialSourceStatus.Count -eq 0) `
+    'Production requires a clean application source worktree.'
+if ($initialSourceStatus.Count -gt 0) { $sourceRevision = "$sourceRevision-dirty" }
 $serverSourceCreated = $null
 if ($ServerImage) {
-    $gitPath = Resolve-Executable -Path 'git' -Name 'Git'
-    $serverSourceRevision = (& $gitPath -C $repositoryRoot rev-parse HEAD).Trim()
-    Assert-Condition ($LASTEXITCODE -eq 0 -and $serverSourceRevision -match '^[0-9a-fA-F]{40}$') `
-        'Unable to resolve the source revision for the server image.'
-    $sourceStatus = @(& $gitPath -C $repositoryRoot status --porcelain --untracked-files=normal)
-    Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to resolve the source worktree status for the server image.'
-    if ($sourceStatus.Count -gt 0) {
-        $serverSourceRevision = "$serverSourceRevision-dirty"
-    }
     $serverSourceCreated = (& $gitPath -C $repositoryRoot show -s '--format=%cI' HEAD).Trim()
     Assert-Condition ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($serverSourceCreated)) `
         'Unable to resolve the source commit time for the server image.'
@@ -610,7 +609,7 @@ if ($ServerImage) {
         '--file', (Join-Path $repositoryRoot 'server\Dockerfile'),
         '--tag', "termlink-server:$Version-build.$BuildNumber",
         '--build-arg', "VERSION=$Version+$BuildNumber",
-        '--build-arg', "REVISION=$serverSourceRevision",
+        '--build-arg', "REVISION=$sourceRevision",
         '--build-arg', "CREATED=$serverSourceCreated",
         '--output', "type=oci,dest=$serverArtifactPath",
         $repositoryRoot
@@ -767,6 +766,15 @@ if ($AndroidApk -or $AndroidAab) {
     }
 }
 
+# Reject a source change made while any platform was building.
+$finalSourceHead = (& $gitPath -C $repositoryRoot rev-parse HEAD).Trim()
+Assert-Condition ($LASTEXITCODE -eq 0 -and $finalSourceHead -ceq $sourceRevision.Replace('-dirty', '')) `
+    'Application source HEAD changed during the release build.'
+$finalSourceStatus = @(& $gitPath -C $repositoryRoot status --porcelain --untracked-files=normal)
+Assert-Condition ($LASTEXITCODE -eq 0 -and
+    ($finalSourceStatus -join "`n") -ceq ($initialSourceStatus -join "`n")) `
+    'Application source worktree changed during the release build.'
+
 # Re-read and hash every artifact only after every platform build has finished. In
 # particular, a BuildKit OCI exporter can return control while Windows is still
 # making the completed tar visible through its filesystem cache. Deferring the final
@@ -779,13 +787,16 @@ $finalArtifactRecords = @(
     }
 )
 $sortedRecords = @($finalArtifactRecords | Sort-Object platform, type, path)
-$manifest = [pscustomobject][ordered]@{
+$manifestFields = [ordered]@{
     schema_version = 1
     version = $Version
     build_number = $BuildNumber
     release_mode = $ReleaseMode.ToLowerInvariant()
-    artifacts = $sortedRecords
+    source_revision = $sourceRevision
 }
+if ($null -ne $coreRevision) { $manifestFields.core_revision = $coreRevision }
+$manifestFields.artifacts = $sortedRecords
+$manifest = [pscustomobject]$manifestFields
 $manifestJson = $manifest | ConvertTo-Json -Depth 6
 if ($isProduction) {
     try {
@@ -797,6 +808,7 @@ if ($isProduction) {
             ReleaseDirectory = $resolvedOutputDirectory
             ManifestPath = $pendingManifestPath
             ExpectedReleaseMode = 'Production'
+            RequireSourceIdentity = $true
         }
         if ($AndroidApk -or $AndroidAab) {
             $verificationParameters.ExpectedAndroidSignerSha256 = $ExpectedAndroidSignerSha256

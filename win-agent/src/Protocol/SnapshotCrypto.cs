@@ -29,6 +29,14 @@ public static class SnapshotCrypto
     public const int MaxTerminalCoreSnapshotPlaintextBytes =
         MaxTerminalCoreSnapshotObjectBytes - 4 * 1024;
     public const string TerminalCoreSnapshotFormatName = "TERMLINK_TERMINAL_CORE_SNAPSHOT";
+    public const uint TerminalCoreGraphicsSnapshotContainerVersion = 3;
+    public const uint TerminalCoreGraphicsSnapshotFormatVersion = 1;
+    public const int MaxTerminalCoreGraphicsSnapshotPlaintextBytes = 128 * 1024 * 1024;
+    public const int MaxTerminalCoreGraphicsSnapshotObjectBytes =
+        MaxTerminalCoreGraphicsSnapshotPlaintextBytes + 4 * 1024;
+    public const string TerminalCoreGraphicsSnapshotFormatName = "TERMLINK_TERMINAL_CORE_GRAPHICS_SNAPSHOT";
+    public const string TerminalStateContractV1 = "terminal_state_2_22_v1";
+    public const string TerminalStateContractV2 = "terminal_state_2_22_v2";
 
     private const int MaxColumns = 512;
     private const int MaxRows = 256;
@@ -53,6 +61,14 @@ public static class SnapshotCrypto
         "TERMLINK-TERMINAL-CORE-SNAPSHOT-KEY-V2\0"u8.ToArray();
     private static readonly byte[] TerminalCoreSnapshotAadPrefix =
         "TERMLINK-TERMINAL-CORE-SNAPSHOT-OBJECT-V2\0"u8.ToArray();
+    private static readonly byte[] TerminalCoreGraphicsSnapshotKeyPrefix =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-KEY-V1\0"u8.ToArray();
+    private static readonly byte[] TerminalCoreGraphicsSnapshotAadPrefix =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-OBJECT-V1\0"u8.ToArray();
+    private static readonly byte[] TerminalCoreGraphicsSnapshotKeyPrefixV2 =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-KEY-V2\0"u8.ToArray();
+    private static readonly byte[] TerminalCoreGraphicsSnapshotAadPrefixV2 =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-OBJECT-V2\0"u8.ToArray();
 
     public static string SnapshotKeyId(Guid recipientDeviceId, long keyEpoch) =>
         KeyId("snapshot-v1:", recipientDeviceId, keyEpoch);
@@ -62,6 +78,11 @@ public static class SnapshotCrypto
 
     public static string TerminalCoreSnapshotKeyId(Guid recipientDeviceId, long keyEpoch) =>
         KeyId("terminal-core-snapshot-v2:", recipientDeviceId, keyEpoch);
+
+    public static string TerminalCoreGraphicsSnapshotKeyId(Guid recipientDeviceId, long keyEpoch,
+        string stateContract = TerminalStateContractV1) =>
+        KeyId(NormalizeGraphicsStateContract(stateContract) == TerminalStateContractV2 ? "terminal-core-graphics-snapshot-v2:" :
+            "terminal-core-graphics-snapshot-v1:", recipientDeviceId, keyEpoch);
 
     public static byte[] SealSnapshot(
         byte[] pairwiseKey,
@@ -175,7 +196,25 @@ public static class SnapshotCrypto
         ulong initialTranscriptBeforeLineId,
         ulong observedLocalInputEpoch,
         byte[] checkpoint,
-        byte[] nonce = null)
+        byte[] nonce = null) =>
+        SealNativeSnapshot(pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch,
+            snapshotSequence, columns, rows, initialTranscriptBeforeLineId, observedLocalInputEpoch,
+            checkpoint, nonce, graphics: false);
+
+    public static byte[] SealTerminalCoreGraphicsSnapshot(
+        byte[] pairwiseKey, Guid sessionId, Guid pcDeviceId, Guid recipientDeviceId, long keyEpoch,
+        ulong snapshotSequence, uint columns, uint rows, ulong initialTranscriptBeforeLineId,
+        ulong observedLocalInputEpoch, byte[] checkpoint, byte[] nonce = null,
+        string stateContract = null) =>
+        SealNativeSnapshot(pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch,
+            snapshotSequence, columns, rows, initialTranscriptBeforeLineId, observedLocalInputEpoch,
+            checkpoint, nonce, graphics: true, stateContract: stateContract);
+
+    private static byte[] SealNativeSnapshot(
+        byte[] pairwiseKey, Guid sessionId, Guid pcDeviceId, Guid recipientDeviceId, long keyEpoch,
+        ulong snapshotSequence, uint columns, uint rows, ulong initialTranscriptBeforeLineId,
+        ulong observedLocalInputEpoch, byte[] checkpoint, byte[] nonce, bool graphics,
+        string stateContract = null)
     {
         ValidatePairwiseAndIdentity(pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch);
         ValidateTerminalCoreSnapshotMetadata(
@@ -184,14 +223,16 @@ public static class SnapshotCrypto
             rows,
             initialTranscriptBeforeLineId,
             observedLocalInputEpoch,
-            checkpoint);
+            checkpoint, graphics, stateContract);
         var nonceBytes = CopyNonce(nonce);
         try
         {
-            var keyId = TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch);
+            var normalizedStateContract = graphics ? NormalizeGraphicsStateContract(stateContract) : null;
+            var keyId = graphics ? TerminalCoreGraphicsSnapshotKeyId(recipientDeviceId, keyEpoch, normalizedStateContract) :
+                TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch);
             var container = new TerminalCoreSnapshotCiphertextV2
             {
-                ContainerVersion = TerminalCoreSnapshotContainerVersion,
+                ContainerVersion = graphics ? TerminalCoreGraphicsSnapshotContainerVersion : TerminalCoreSnapshotContainerVersion,
                 SessionId = ByteString.CopyFrom(UuidBytes(sessionId)),
                 PcDeviceId = ByteString.CopyFrom(UuidBytes(pcDeviceId)),
                 RecipientDeviceId = ByteString.CopyFrom(UuidBytes(recipientDeviceId)),
@@ -200,27 +241,33 @@ public static class SnapshotCrypto
                 SnapshotSeq = snapshotSequence,
                 Columns = columns,
                 Rows = rows,
-                FormatName = TerminalCoreSnapshotFormatName,
-                FormatVersion = TerminalCoreSnapshotFormatVersion,
+                FormatName = graphics ? TerminalCoreGraphicsSnapshotFormatName : TerminalCoreSnapshotFormatName,
+                FormatVersion = graphics ? TerminalCoreGraphicsSnapshotFormatVersion : TerminalCoreSnapshotFormatVersion,
                 Compression = SnapshotCompressionV1.None,
                 UncompressedBytes = checked((ulong)checkpoint.LongLength),
                 Nonce = ByteString.CopyFrom(nonceBytes),
                 InitialTranscriptBeforeLineId = initialTranscriptBeforeLineId,
                 ObservedLocalInputEpoch = observedLocalInputEpoch
             };
-            var key = DeriveTerminalCoreSnapshotKey(
+            var maxObjectBytes = graphics ? MaxTerminalCoreGraphicsSnapshotObjectBytes : MaxTerminalCoreSnapshotObjectBytes;
+            var ciphertextLength = checked(checkpoint.Length + 16);
+            if (container.CalculateSize() + CodedOutputStream.ComputeTagSize(15) +
+                CodedOutputStream.ComputeLengthSize(ciphertextLength) + ciphertextLength > maxObjectBytes)
+                throw new InvalidDataException("Sealed terminal-core snapshot exceeds the production bound.");
+            var key = DeriveNativeSnapshotKey(
                 pairwiseKey,
                 sessionId,
                 recipientDeviceId,
                 keyEpoch,
-                keyId);
-            var aad = TerminalCoreSnapshotAssociatedData(container);
+                keyId, graphics, normalizedStateContract);
+            var aad = NativeSnapshotAssociatedData(container, graphics, normalizedStateContract);
             try
             {
-                container.Ciphertext = ByteString.CopyFrom(
-                    SessionCrypto.Encrypt(key, nonceBytes, aad, checkpoint));
+                var ciphertext = SessionCrypto.Encrypt(key, nonceBytes, aad, checkpoint);
+                try { container.Ciphertext = ByteString.CopyFrom(ciphertext); }
+                finally { CryptographicOperations.ZeroMemory(ciphertext); }
                 var result = container.ToByteArray();
-                if (result.Length > MaxTerminalCoreSnapshotObjectBytes)
+                if (result.Length > maxObjectBytes)
                     throw new InvalidDataException("Sealed terminal-core snapshot exceeds the production bound.");
                 return result;
             }
@@ -245,7 +292,29 @@ public static class SnapshotCrypto
         uint expectedColumns,
         uint expectedRows,
         ulong expectedInitialTranscriptBeforeLineId,
-        out ulong observedLocalInputEpoch)
+        out ulong observedLocalInputEpoch) =>
+        OpenNativeSnapshot(pairwiseKey, sealedObject, expectedSessionId, expectedPcDeviceId,
+            expectedRecipientDeviceId, expectedKeyEpoch, expectedKeyId, expectedSnapshotSequence,
+            expectedColumns, expectedRows, expectedInitialTranscriptBeforeLineId,
+            out observedLocalInputEpoch, graphics: false);
+
+    public static byte[] OpenTerminalCoreGraphicsSnapshot(
+        byte[] pairwiseKey, byte[] sealedObject, Guid expectedSessionId, Guid expectedPcDeviceId,
+        Guid expectedRecipientDeviceId, long expectedKeyEpoch, string expectedKeyId,
+        ulong expectedSnapshotSequence, uint expectedColumns, uint expectedRows,
+        ulong expectedInitialTranscriptBeforeLineId, out ulong observedLocalInputEpoch,
+        string expectedStateContract = null) =>
+        OpenNativeSnapshot(pairwiseKey, sealedObject, expectedSessionId, expectedPcDeviceId,
+            expectedRecipientDeviceId, expectedKeyEpoch, expectedKeyId, expectedSnapshotSequence,
+            expectedColumns, expectedRows, expectedInitialTranscriptBeforeLineId,
+            out observedLocalInputEpoch, graphics: true, expectedStateContract: expectedStateContract);
+
+    private static byte[] OpenNativeSnapshot(
+        byte[] pairwiseKey, byte[] sealedObject, Guid expectedSessionId, Guid expectedPcDeviceId,
+        Guid expectedRecipientDeviceId, long expectedKeyEpoch, string expectedKeyId,
+        ulong expectedSnapshotSequence, uint expectedColumns, uint expectedRows,
+        ulong expectedInitialTranscriptBeforeLineId, out ulong observedLocalInputEpoch, bool graphics,
+        string expectedStateContract = null)
     {
         ValidatePairwiseAndIdentity(
             pairwiseKey,
@@ -254,7 +323,7 @@ public static class SnapshotCrypto
             expectedRecipientDeviceId,
             expectedKeyEpoch);
         if (sealedObject is null || sealedObject.Length == 0 ||
-            sealedObject.Length > MaxTerminalCoreSnapshotObjectBytes)
+            sealedObject.Length > (graphics ? MaxTerminalCoreGraphicsSnapshotObjectBytes : MaxTerminalCoreSnapshotObjectBytes))
             throw new InvalidDataException("Sealed terminal-core snapshot size is invalid.");
         TerminalCoreSnapshotCiphertextV2 container;
         try { container = TerminalCoreSnapshotCiphertextV2.Parser.ParseFrom(sealedObject); }
@@ -272,14 +341,15 @@ public static class SnapshotCrypto
             expectedSnapshotSequence,
             expectedColumns,
             expectedRows,
-            expectedInitialTranscriptBeforeLineId);
-        var key = DeriveTerminalCoreSnapshotKey(
+            expectedInitialTranscriptBeforeLineId, graphics, expectedStateContract);
+        var normalizedStateContract = graphics ? NormalizeGraphicsStateContract(expectedStateContract) : null;
+        var key = DeriveNativeSnapshotKey(
             pairwiseKey,
             expectedSessionId,
             expectedRecipientDeviceId,
             expectedKeyEpoch,
-            expectedKeyId);
-        var aad = TerminalCoreSnapshotAssociatedData(container);
+            expectedKeyId, graphics, normalizedStateContract);
+        var aad = NativeSnapshotAssociatedData(container, graphics, normalizedStateContract);
         byte[] plaintext = null;
         try
         {
@@ -297,7 +367,7 @@ public static class SnapshotCrypto
                 container.Rows,
                 container.InitialTranscriptBeforeLineId,
                 container.ObservedLocalInputEpoch,
-                plaintext);
+                plaintext, graphics, expectedStateContract);
             observedLocalInputEpoch = container.ObservedLocalInputEpoch;
             var result = plaintext;
             plaintext = null;
@@ -426,14 +496,27 @@ public static class SnapshotCrypto
         Guid recipientDeviceId,
         long keyEpoch,
         string keyId) =>
+        DeriveNativeSnapshotKey(pairwiseKey, sessionId, recipientDeviceId, keyEpoch, keyId, graphics: false,
+            stateContract: null);
+
+    public static byte[] DeriveTerminalCoreGraphicsSnapshotKey(
+        byte[] pairwiseKey, Guid sessionId, Guid recipientDeviceId, long keyEpoch, string keyId) =>
+        DeriveNativeSnapshotKey(pairwiseKey, sessionId, recipientDeviceId, keyEpoch, keyId, graphics: true,
+            stateContract: null);
+
+    private static byte[] DeriveNativeSnapshotKey(
+        byte[] pairwiseKey, Guid sessionId, Guid recipientDeviceId, long keyEpoch, string keyId, bool graphics,
+        string stateContract) =>
         DeriveObjectKey(
             pairwiseKey,
             sessionId,
             recipientDeviceId,
             keyEpoch,
             keyId,
-            TerminalCoreSnapshotKeyPrefix,
-            TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch));
+            graphics && stateContract == TerminalStateContractV2 ? TerminalCoreGraphicsSnapshotKeyPrefixV2 :
+                (graphics ? TerminalCoreGraphicsSnapshotKeyPrefix : TerminalCoreSnapshotKeyPrefix),
+            graphics ? TerminalCoreGraphicsSnapshotKeyId(recipientDeviceId, keyEpoch,
+                NormalizeGraphicsStateContract(stateContract)) : TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch));
 
     public static byte[] SnapshotAssociatedData(TerminalSnapshotCiphertextV1 value)
     {
@@ -491,12 +574,23 @@ public static class SnapshotCrypto
     }
 
     public static byte[] TerminalCoreSnapshotAssociatedData(
-        TerminalCoreSnapshotCiphertextV2 value)
+        TerminalCoreSnapshotCiphertextV2 value) => NativeSnapshotAssociatedData(value, graphics: false);
+
+    public static byte[] TerminalCoreGraphicsSnapshotAssociatedData(
+        TerminalCoreSnapshotCiphertextV2 value) => NativeSnapshotAssociatedData(value, graphics: true);
+    public static byte[] TerminalCoreGraphicsSnapshotAssociatedData(
+        TerminalCoreSnapshotCiphertextV2 value, string stateContract) =>
+        NativeSnapshotAssociatedData(value, graphics: true,
+            stateContract: NormalizeGraphicsStateContract(stateContract));
+
+    private static byte[] NativeSnapshotAssociatedData(TerminalCoreSnapshotCiphertextV2 value, bool graphics,
+        string stateContract = null)
     {
         ArgumentNullException.ThrowIfNull(value);
-        ValidateTerminalCoreSnapshotCryptographicMetadata(value);
+        ValidateTerminalCoreSnapshotCryptographicMetadata(value, graphics);
         using var stream = new MemoryStream();
-        stream.Write(TerminalCoreSnapshotAadPrefix);
+        stream.Write(graphics && stateContract == TerminalStateContractV2 ? TerminalCoreGraphicsSnapshotAadPrefixV2 :
+            (graphics ? TerminalCoreGraphicsSnapshotAadPrefix : TerminalCoreSnapshotAadPrefix));
         WriteUInt32(stream, value.ContainerVersion);
         stream.Write(value.SessionId.Span);
         stream.Write(value.PcDeviceId.Span);
@@ -513,6 +607,8 @@ public static class SnapshotCrypto
         WriteUInt64(stream, value.InitialTranscriptBeforeLineId);
         WriteUInt64(stream, value.ObservedLocalInputEpoch);
         stream.Write(value.Nonce.Span);
+        if (graphics && stateContract == TerminalStateContractV2)
+            WriteString(stream, stateContract, "terminal state contract");
         return stream.ToArray();
     }
 
@@ -526,18 +622,20 @@ public static class SnapshotCrypto
         ulong sequence,
         uint columns,
         uint rows,
-        ulong initialTranscriptBeforeLineId)
+        ulong initialTranscriptBeforeLineId, bool graphics, string expectedStateContract = null)
     {
-        ValidateTerminalCoreSnapshotCryptographicMetadata(value);
+        ValidateTerminalCoreSnapshotCryptographicMetadata(value, graphics);
         if (!value.SessionId.Span.SequenceEqual(UuidBytes(sessionId)) ||
             !value.PcDeviceId.Span.SequenceEqual(UuidBytes(pcDeviceId)) ||
             !value.RecipientDeviceId.Span.SequenceEqual(UuidBytes(recipientDeviceId)) ||
             value.KeyEpoch != keyEpoch || value.KeyId != keyId ||
-            value.KeyId != TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch) ||
+            value.KeyId != (graphics ? TerminalCoreGraphicsSnapshotKeyId(recipientDeviceId, keyEpoch,
+                NormalizeGraphicsStateContract(expectedStateContract)) : TerminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch)) ||
             value.SnapshotSeq != sequence || value.Columns != columns || value.Rows != rows ||
             value.InitialTranscriptBeforeLineId != initialTranscriptBeforeLineId ||
             value.Ciphertext.Length < 16 ||
-            value.Ciphertext.Length > MaxTerminalCoreSnapshotObjectBytes)
+            value.Ciphertext.Length > (graphics ? MaxTerminalCoreGraphicsSnapshotObjectBytes : MaxTerminalCoreSnapshotObjectBytes) ||
+            graphics && (ulong)value.Ciphertext.Length != value.UncompressedBytes + 16)
         {
             throw new InvalidDataException(
                 "Terminal-core snapshot object metadata does not match the requested object.");
@@ -545,17 +643,17 @@ public static class SnapshotCrypto
     }
 
     private static void ValidateTerminalCoreSnapshotCryptographicMetadata(
-        TerminalCoreSnapshotCiphertextV2 value)
+        TerminalCoreSnapshotCiphertextV2 value, bool graphics)
     {
-        if (value.ContainerVersion != TerminalCoreSnapshotContainerVersion ||
+        if (value.ContainerVersion != (graphics ? TerminalCoreGraphicsSnapshotContainerVersion : TerminalCoreSnapshotContainerVersion) ||
             value.SessionId.Length != 16 || value.PcDeviceId.Length != 16 ||
             value.RecipientDeviceId.Length != 16 || value.KeyEpoch < 1 ||
             Utf8Length(value.KeyId, "terminal-core snapshot key ID") is < 8 or > 128 ||
             value.Nonce.Length != 12 ||
-            value.FormatVersion != TerminalCoreSnapshotFormatVersion ||
-            value.FormatName != TerminalCoreSnapshotFormatName ||
+            value.FormatVersion != (graphics ? TerminalCoreGraphicsSnapshotFormatVersion : TerminalCoreSnapshotFormatVersion) ||
+            value.FormatName != (graphics ? TerminalCoreGraphicsSnapshotFormatName : TerminalCoreSnapshotFormatName) ||
             value.Compression != SnapshotCompressionV1.None ||
-            value.UncompressedBytes is 0 or > MaxTerminalCoreSnapshotPlaintextBytes ||
+            value.UncompressedBytes == 0 || value.UncompressedBytes > (ulong)(graphics ? MaxTerminalCoreGraphicsSnapshotPlaintextBytes : MaxTerminalCoreSnapshotPlaintextBytes) ||
             value.SnapshotSeq is 0 or > MaxSupportedUInt64 ||
             value.Columns is < 1 or > MaxColumns || value.Rows is < 1 or > MaxRows ||
             value.InitialTranscriptBeforeLineId is 0 or > MaxSupportedUInt64 ||
@@ -572,18 +670,39 @@ public static class SnapshotCrypto
         uint rows,
         ulong initialTranscriptBeforeLineId,
         ulong observedLocalInputEpoch,
-        byte[] checkpoint)
+        byte[] checkpoint, bool graphics, string stateContract = null)
     {
         if (snapshotSequence is 0 or > MaxSupportedUInt64 ||
             columns is < 1 or > MaxColumns || rows is < 1 or > MaxRows ||
             initialTranscriptBeforeLineId is 0 or > MaxSupportedUInt64 ||
             observedLocalInputEpoch > MaxSupportedUInt64 || checkpoint is null ||
-            checkpoint.Length is 0 or > MaxTerminalCoreSnapshotPlaintextBytes)
+            checkpoint.Length == 0 || checkpoint.Length > (graphics ? MaxTerminalCoreGraphicsSnapshotPlaintextBytes : MaxTerminalCoreSnapshotPlaintextBytes))
         {
             throw new InvalidDataException(
                 "Terminal-core snapshot metadata is invalid or unsupported.");
         }
+        if (graphics && stateContract is not null)
+        {
+            var normalized = NormalizeGraphicsStateContract(stateContract);
+            if (normalized == TerminalStateContractV2)
+            {
+                if (checkpoint.Length < 52 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(checkpoint.AsSpan(48, 4)) != 2)
+                    throw new InvalidDataException("Graphics snapshot width profile does not match terminal state contract.");
+            }
+            else if (checkpoint.Length >= 52 &&
+                BinaryPrimitives.ReadUInt32LittleEndian(checkpoint.AsSpan(48, 4)) != 1)
+                throw new InvalidDataException("Graphics snapshot width profile does not match terminal state contract.");
+        }
     }
+
+    private static string NormalizeGraphicsStateContract(string stateContract) => stateContract switch
+    {
+        null => TerminalStateContractV1,
+        TerminalStateContractV1 => TerminalStateContractV1,
+        TerminalStateContractV2 => TerminalStateContractV2,
+        _ => throw new InvalidDataException("Terminal state contract is unsupported.")
+    };
 
     public static void ValidateSnapshot(TerminalSnapshotV1 value)
     {
@@ -935,9 +1054,9 @@ public static class SnapshotCrypto
 
     private static byte[] CopyNonce(byte[] nonce)
     {
-        var value = nonce is null ? RandomNumberGenerator.GetBytes(12) : (byte[])nonce.Clone();
-        if (value.Length != 12) throw new ArgumentException("Snapshot nonce must be 12 bytes.", nameof(nonce));
-        return value;
+        if (nonce is not null && nonce.Length != 12)
+            throw new ArgumentException("Snapshot nonce must be 12 bytes.", nameof(nonce));
+        return nonce is null ? RandomNumberGenerator.GetBytes(12) : (byte[])nonce.Clone();
     }
 
     private static int Utf8Length(string value, string label)

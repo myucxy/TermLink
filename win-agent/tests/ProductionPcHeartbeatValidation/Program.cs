@@ -33,6 +33,7 @@ internal static class Program
         internal int FailSessionResponses;
         internal bool RejectNextPCAgentRegistration;
         internal bool RejectNextGenericPCUpsert;
+        internal string RejectEnhancedErrorCode;
         internal TaskCompletionSource<bool> Entered = NewSignal();
         internal TaskCompletionSource<bool> Release = NewSignal();
 
@@ -51,6 +52,21 @@ internal static class Program
                 request.RequestUri.AbsolutePath,
                 (byte[])body.Clone(),
                 key));
+
+            if (request.Method == HttpMethod.Put && request.RequestUri.AbsolutePath.StartsWith("/v1/pcs/", StringComparison.Ordinal) &&
+                RejectEnhancedErrorCode != null)
+            {
+                using var metadata = JsonDocument.Parse(body);
+                if (metadata.RootElement.GetProperty("terminal_commands").EnumerateArray().Any(command =>
+                    command.GetProperty("id").GetString() == "powershell-7-enhanced"))
+                    return new HttpResponseMessage(HttpStatusCode.BadRequest)
+                    {
+                        Content = new ByteArrayContent(JsonSerializer.SerializeToUtf8Bytes(new
+                        {
+                            error = new { code = RejectEnhancedErrorCode }
+                        }))
+                    };
+            }
 
             if (request.Method == HttpMethod.Post && request.RequestUri.AbsolutePath == "/v1/devices/register" &&
                 RejectNextPCAgentRegistration)
@@ -263,6 +279,10 @@ internal static class Program
                     capabilities.Contains("terminal_commands_v1") &&
                     capabilities.Contains("remote_agent_update_v1"),
                     "PC upsert did not advertise the generic bounded capability set.");
+                Require(capabilities.Contains("terminal_state_2_21_v2") &&
+                    capabilities.Contains("terminal_state_2_22_v1") &&
+                    capabilities.Contains("terminal_state_2_22_v2"),
+                    "PC upsert did not advertise each supported terminal width contract.");
             }
             var machineId = Convert.ToBase64String(
                     Enumerable.Range(1, 32).Select(value => (byte)value).ToArray())
@@ -566,10 +586,82 @@ internal static class Program
                     "The fail-closed stable-machine request omitted its correlation identity.");
             }
 
+            var capabilityType = agentAssembly.GetType("TermLink.Agent.TerminalCommandCapability", true);
+            object Capability(string id, string shellType) {
+                var item = Activator.CreateInstance(capabilityType, nonPublic: true);
+                Set(item, "Id", id);
+                Set(item, "DisplayName", id);
+                Set(item, "ShellType", shellType);
+                Set(item, "Source", "detected");
+                return item;
+            }
+            var enhancedCommands = Array.CreateInstance(capabilityType, 2);
+            enhancedCommands.SetValue(Capability("command-prompt", "command-prompt"), 0);
+            enhancedCommands.SetValue(Capability("powershell-7-enhanced", "powershell-7"), 1);
+            var upsertWithCommands = Method(runtimeType, "UpsertPCWithCommandsAsync");
+            Set(config, "MachineId", machineId);
+            handler.RejectEnhancedErrorCode = "INVALID_REQUEST";
+            var beforeEnhancedFallback = PCRequests(handler, pcId).Count();
+            await InvokeTask(upsertWithCommands, runtime,
+                new object[] { new[] { "command-prompt", "powershell-7" }, enhancedCommands, CancellationToken.None });
+            var enhancedFallback = PCRequests(handler, pcId).Skip(beforeEnhancedFallback).ToArray();
+            Require(enhancedFallback.Length == 2 && enhancedFallback[0].IdempotencyKey != enhancedFallback[1].IdempotencyKey &&
+                enhancedFallback[1].IdempotencyKey == (string)pcUpsertKey.Invoke(
+                    null, new object[] { pcId, deviceId, enhancedFallback[1].Body }),
+                "An older Server did not retry the enhanced command with a distinct device-scoped body key.");
+            using (var full = JsonDocument.Parse(enhancedFallback[0].Body))
+            using (var compatible = JsonDocument.Parse(enhancedFallback[1].Body))
+            {
+                var fullCommands = full.RootElement.GetProperty("terminal_commands").EnumerateArray().ToArray();
+                var compatibleCommands = compatible.RootElement.GetProperty("terminal_commands").EnumerateArray().ToArray();
+                Require(fullCommands.Length == 2 && fullCommands[1].GetProperty("id").GetString() == "powershell-7-enhanced" &&
+                    fullCommands[1].GetProperty("shell_type").GetString() == "powershell-7" &&
+                    fullCommands[1].GetProperty("source").GetString() == "detected" &&
+                    compatibleCommands.Length == 1 && compatibleCommands[0].GetProperty("id").GetString() == "command-prompt" &&
+                    compatible.RootElement.GetProperty("machine_id").GetString() == machineId &&
+                    compatible.RootElement.GetProperty("key_epoch").GetInt64() == 7 &&
+                    compatible.RootElement.GetProperty("platform").GetString() == "windows",
+                    "The compatibility retry altered a stable PC identity or removed another terminal command.");
+            }
+            handler.RejectEnhancedErrorCode = null;
+            var beforeEnhancedAccepted = PCRequests(handler, pcId).Count();
+            await InvokeTask(upsertWithCommands, runtime,
+                new object[] { new[] { "command-prompt", "powershell-7" }, enhancedCommands, CancellationToken.None });
+            var enhancedAccepted = PCRequests(handler, pcId).Skip(beforeEnhancedAccepted).ToArray();
+            Require(enhancedAccepted.Length == 1 && enhancedAccepted[0].Body.SequenceEqual(enhancedFallback[0].Body),
+                "A newer Server did not receive the enhanced command on the first request.");
+            handler.RejectEnhancedErrorCode = "OTHER_REJECTION";
+            var beforeOtherRejection = PCRequests(handler, pcId).Count();
+            var rejectedOther = false;
+            try { await InvokeTask(upsertWithCommands, runtime,
+                new object[] { new[] { "command-prompt", "powershell-7" }, enhancedCommands, CancellationToken.None }); }
+            catch (Exception) { rejectedOther = true; }
+            Require(rejectedOther && PCRequests(handler, pcId).Count() == beforeOtherRejection + 1,
+                "A different Server error triggered an enhanced-command downgrade.");
+            handler.RejectEnhancedErrorCode = null;
+            Set(config, "MachineId", null);
+            handler.RejectEnhancedErrorCode = "INVALID_REQUEST";
+            handler.RejectNextGenericPCUpsert = true;
+            var beforeLegacyEnhanced = PCRequests(handler, pcId).Count();
+            await InvokeTask(upsertWithCommands, runtime,
+                new object[] { new[] { "command-prompt", "powershell-7" }, enhancedCommands, CancellationToken.None });
+            var legacyEnhanced = PCRequests(handler, pcId).Skip(beforeLegacyEnhanced).ToArray();
+            Require(legacyEnhanced.Length == 3 && legacyEnhanced.Select(item => item.IdempotencyKey).Distinct().Count() == 3,
+                "Enhanced-command compatibility changed the bounded legacy metadata fallback.");
+            using (var legacyCompatible = JsonDocument.Parse(legacyEnhanced[2].Body))
+            {
+                Require(!legacyCompatible.RootElement.TryGetProperty("platform", out _) &&
+                    legacyCompatible.RootElement.GetProperty("terminal_commands").EnumerateArray()
+                        .Select(command => command.GetProperty("id").GetString())
+                        .SequenceEqual(new[] { "command-prompt" }),
+                    "Legacy metadata retry restored an enhanced command unsupported by the older Server.");
+            }
+            handler.RejectEnhancedErrorCode = null;
+
             var catalogRoot = Path.Combine(Path.GetTempPath(), "termlink-catalog-heartbeat-" + Guid.NewGuid().ToString("N"));
             var registryType = agentAssembly.GetType("TermLink.Agent.SessionRegistry", true);
             var catalogRegistry = (IDisposable)Activator.CreateInstance(registryType,
-                new object[] { catalogRoot, 1200, 1024L * 1024, 20, null, null });
+                new object[] { catalogRoot, 1200, 1024L * 1024, 20, null, null, null, null, false });
             var registryField = Field(runtimeType, "registry");
             registryField.SetValue(runtime, catalogRegistry);
             try

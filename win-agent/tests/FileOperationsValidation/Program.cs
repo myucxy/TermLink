@@ -12,6 +12,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Agent;
 
+if (args.Length == 1 && args[0] == "--graphics-launcher-probe") { GraphicsLauncherValidation.Run(); return; }
 var testRoot = Path.Combine(Path.GetTempPath(), "TermLink-file-operation-validation-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(testRoot);
 try
@@ -22,6 +23,7 @@ try
     await ValidateStreamingWorkerAndCancellationAsync(testRoot);
     await ValidateLeaseCancellationAndRemoteAccessAsync(testRoot);
     await ValidateTerminalRegistrationTimeoutAsync(testRoot);
+    await ValidateTerminalCompletionResultAsync(testRoot);
     await ValidateTerminalAbortCleanupAsync(testRoot);
     await ValidateDeterministicServerRejectionsAsync(testRoot);
     await ValidateApiContractAsync();
@@ -478,6 +480,65 @@ static async Task ValidateTerminalRegistrationTimeoutAsync(string testRoot)
             result.GetProperty("cwd").GetString() == successRequestedPath &&
             successStarts.Starts.Single().WorkingDirectory == Path.GetFullPath(testRoot),
             "OPEN_TERMINAL did not preserve exact cwd while launching from its normalized directory");
+    }
+}
+
+static async Task ValidateTerminalCompletionResultAsync(string testRoot)
+{
+    var stub = Path.Combine(testRoot, "completion-stub.exe");
+    File.WriteAllBytes(stub, new byte[] { 0x4d, 0x5a });
+    var settingsPath = Path.Combine(testRoot, "completion-terminal-commands.json");
+    var previousSettingsPath = AppContext.GetData(TerminalCommandProfileStore.StoragePathAppContextKey);
+    AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, settingsPath);
+    try
+    {
+        foreach (var (commandId, expectedShellType, enhanced) in new[]
+        {
+            (ManagedTerminalLauncher.CommandPromptShellType, ManagedTerminalLauncher.CommandPromptShellType, false),
+            (ManagedTerminalLauncher.WindowsPowerShellShellType, ManagedTerminalLauncher.WindowsPowerShellShellType, false),
+            (ManagedTerminalLauncher.PowerShell7ShellType, ManagedTerminalLauncher.PowerShell7ShellType, false),
+            (ManagedTerminalLauncher.WslShellType, ManagedTerminalLauncher.WslShellType, false),
+            (ManagedTerminalLauncher.EnhancedPowerShell7CommandId, ManagedTerminalLauncher.PowerShell7ShellType, true)
+        })
+        {
+            var operationId = Guid.NewGuid();
+            var api = new ControlledOperationApi(new ClaimedFileOperation
+            {
+                Id = operationId,
+                Operation = "OPEN_TERMINAL",
+                Path = testRoot,
+                ShellType = commandId,
+                TerminalCommandId = commandId,
+                LeaseToken = "completion-lease",
+                LeaseExpiresAt = DateTimeOffset.UtcNow.AddHours(1)
+            });
+            var starts = new RecordingProcessStarter();
+            using var worker = new ProductionFileOperationWorker(
+                api,
+                new DirectoryListingService(),
+                new FileTransferPreparer(new WindowsPathService(), Path.Combine(testRoot, "completion-artifacts-" + operationId.ToString("N"))),
+                new ManagedTerminalLauncher(new WindowsPathService(), starts, () => null, stub, stub, stub, stub, stub,
+                    nativeDisplayExecutable: stub),
+                CancellationToken.None,
+                sessionVisible: _ => starts.Starts.Count > 0,
+                registrationWait: TimeSpan.FromSeconds(1));
+            worker.Start();
+            await api.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var result = api.CompletionResult!.Value;
+            Require(result.GetProperty("session_id").GetGuid() == ProductionFileOperationWorker.StableSessionId(operationId) &&
+                result.GetProperty("shell_type").GetString() == expectedShellType &&
+                result.GetProperty("cwd").GetString() == testRoot &&
+                starts.Starts.Count == 1,
+                $"OPEN_TERMINAL completion contained incorrect session data for {commandId}");
+            var hasCommandId = result.TryGetProperty("terminal_command_id", out var returnedCommandId);
+            Require(hasCommandId == enhanced && (!enhanced || returnedCommandId.GetString() == commandId) &&
+                result.EnumerateObject().Count() == (enhanced ? 4 : 3),
+                $"OPEN_TERMINAL completion used the wrong result format for {commandId}");
+        }
+    }
+    finally
+    {
+        AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, previousSettingsPath);
     }
 }
 

@@ -1,10 +1,12 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -12,6 +14,7 @@ using System.Threading.Tasks;
 using TermLink.Agent;
 using TermLink.LocalIpc;
 using TermLink.TerminalCore;
+using TermLink.NativeDisplay;
 
 namespace TermLink.SessionHost
 {
@@ -118,6 +121,8 @@ namespace TermLink.SessionHost
         public short FallbackColumns { get; private set; }
         public short FallbackRows { get; private set; }
         public bool Diagnostics { get; private set; }
+        public string NativeDisplayExecutable { get; private set; }
+        public TerminalSemanticProfile SemanticProfile { get; private init; }
         public string AgentPipeName { get; private set; }
         public Guid SessionId { get; private set; }
         public byte[] HandshakeToken { get; private set; }
@@ -127,6 +132,7 @@ namespace TermLink.SessionHost
         public ManagedShellType ShellType { get; private set; }
         public bool AutoRegister { get { return !string.IsNullOrEmpty(RegistryControlPipeName); } }
         public bool UseAgentPipe { get { return !string.IsNullOrEmpty(AgentPipeName); } }
+        internal bool EnableBrokerCapture { get; set; }
 
         public static SessionHostOptions Parse(string[] args)
         {
@@ -136,6 +142,9 @@ namespace TermLink.SessionHost
             short columns = 80;
             short rows = 25;
             var diagnostics = false;
+            string nativeDisplayExecutable = null;
+            var semanticProfile = TerminalSemanticProfile.Legacy;
+            var hasSemanticProfile = false;
             string agentPipeName = null;
             string sessionIdText = null;
             string handshakeTokenText = null;
@@ -145,11 +154,25 @@ namespace TermLink.SessionHost
             var registrationTimeout = Timeout.Infinite;
             var agentBufferBytes = 4 * 1024 * 1024;
             var hasTestAgentBuffer = false;
+            var brokerCaptures = false;
 
             for (var index = 0; index < args.Length; index++)
             {
                 switch (args[index])
                 {
+                    case "--terminal-state":
+                        if (hasSemanticProfile) throw new ArgumentException("--terminal-state cannot be repeated.");
+                        var state = RequiredValue(args, ref index, "--terminal-state");
+                        semanticProfile = state == TerminalSemanticProfile.Legacy.StateContract ? TerminalSemanticProfile.Legacy :
+                            state == TerminalSemanticProfile.Graphics.StateContract ? TerminalSemanticProfile.Graphics :
+                            state == TerminalSemanticProfile.GraphicsUnicode16.StateContract ? TerminalSemanticProfile.GraphicsUnicode16 :
+                            throw new ArgumentException("--terminal-state is not a supported immutable terminal profile.");
+                        hasSemanticProfile = true;
+                        break;
+                    case "--native-display":
+                        nativeDisplayExecutable = Path.GetFullPath(RequiredValue(args, ref index, "--native-display"));
+                        if (!File.Exists(nativeDisplayExecutable)) throw new ArgumentException("Native display executable does not exist.");
+                        break;
                     case "--command-base64":
                         encodedCommand = RequiredValue(args, ref index, "--command-base64");
                         break;
@@ -167,6 +190,10 @@ namespace TermLink.SessionHost
                         break;
                     case "--diagnostics":
                         diagnostics = true;
+                        break;
+                    case "--broker-captures":
+                        if (brokerCaptures) throw new ArgumentException("--broker-captures cannot be repeated.");
+                        brokerCaptures = true;
                         break;
                     case "--agent-pipe":
                         agentPipeName = RequiredValue(args, ref index, "--agent-pipe");
@@ -276,6 +303,7 @@ namespace TermLink.SessionHost
                     throw new ArgumentException("--managed-shell cannot be combined with explicit Agent pipe options.");
                 }
                 shellType = ParseManagedShell(managedShellText);
+                commandLine = PowerShellShellIntegration.Prepare(commandLine, shellType);
                 if (!string.IsNullOrEmpty(managedSessionIdText))
                 {
                     if (!Guid.TryParse(managedSessionIdText, out sessionId) || sessionId == Guid.Empty)
@@ -340,6 +368,12 @@ namespace TermLink.SessionHost
             {
                 throw new ArgumentException("--test-agent-buffer-bytes requires --diagnostics.");
             }
+            if (nativeDisplayExecutable != null && agentPipeName == null)
+                throw new ArgumentException("Native display requires a managed SessionHost authority.");
+            if (semanticProfile.IsGraphics && nativeDisplayExecutable == null)
+                throw new ArgumentException("The graphics terminal profile requires --native-display.");
+            if (brokerCaptures && (!semanticProfile.IsGraphics || nativeDisplayExecutable == null || agentPipeName == null))
+                throw new ArgumentException("--broker-captures requires the graphics profile, --native-display and a managed SessionHost authority.");
 
             return new SessionHostOptions
             {
@@ -349,13 +383,16 @@ namespace TermLink.SessionHost
                 FallbackColumns = columns,
                 FallbackRows = rows,
                 Diagnostics = diagnostics,
+                NativeDisplayExecutable = nativeDisplayExecutable,
+                SemanticProfile = semanticProfile,
                 AgentPipeName = agentPipeName,
                 SessionId = sessionId,
                 HandshakeToken = handshakeToken,
                 AgentBufferBytes = agentBufferBytes,
                 RegistryControlPipeName = registryControlPipeName,
                 RegistrationTimeoutMilliseconds = registrationTimeout,
-                ShellType = shellType
+                ShellType = shellType,
+                EnableBrokerCapture = brokerCaptures
             };
         }
 
@@ -403,7 +440,7 @@ namespace TermLink.SessionHost
         }
     }
 
-    internal sealed class ConPtySessionHost : IDisposable
+    internal sealed partial class ConPtySessionHost : IDisposable
     {
         private const uint ExtendedStartupInfoPresent = 0x00080000;
         private const uint CreateSuspended = 0x00000004;
@@ -439,9 +476,11 @@ namespace TermLink.SessionHost
         private const int ResizePollMilliseconds = 40;
         private const int ResizeTrailingSettleMilliseconds = 140;
         private const int ResizeMaximumWaitMilliseconds = 250;
+        private const int GraphicsStartupTimeoutMilliseconds = 15000;
 
         private readonly SessionHostOptions options;
         private readonly object inputSync = new object();
+        private readonly object childStartupSync = new object();
         private readonly object terminalWriteSync = new object();
         private readonly object resizeSync = new object();
         private readonly object outerWriteSync = new object();
@@ -471,6 +510,8 @@ namespace TermLink.SessionHost
         private long inputUnitsRead;
         private long inputBytesWritten;
         private ulong localInputEpoch;
+        private ulong clipboardControlEpoch;
+        private NativeClipboardAuthorizationGate clipboardGate;
         private uint inputEventsPending;
         private bool restoreOuterConsoleInputMode;
         private bool restoreOuterConsoleOutputMode;
@@ -480,14 +521,24 @@ namespace TermLink.SessionHost
         // from publication so the initial managed-shell name stays visible.
         private string inheritedConsoleTitle;
         private AgentPipeBridge agentPipe;
+        private BrokerCaptureCoordinator brokerCapture;
+        private KittySharedMemoryBroker sharedMemoryBroker;
         private AgentRegistryRegistration agentRegistration;
         private TerminalCoreAuthority terminalAuthority;
+        private NativeDisplayServer nativeDisplay;
+        private Process nativeDisplayProcess;
         private COORD innerSize;
+        private COORD journaledInnerSize;
         private volatile bool stopInput;
         private volatile bool stopResize;
         private volatile bool outputDisconnected;
+        private volatile Exception inputBridgeFailure;
         private volatile bool authorityFailed;
-        private bool disposed;
+        private volatile bool disposed;
+        private volatile bool graphicsChildResumed;
+        private ulong graphicsGeometrySequence;
+
+        private bool ChildInputReady => !options.SemanticProfile.IsGraphics || graphicsChildResumed;
 
         public ConPtySessionHost(SessionHostOptions options)
         {
@@ -498,6 +549,28 @@ namespace TermLink.SessionHost
         }
 
         public int Run()
+        {
+            try { return RunSession(); }
+            catch (Exception error) when (options.SemanticProfile.IsGraphics && !graphicsChildResumed)
+            {
+                Console.Error.WriteLine("TermLink graphics startup failed: " + error.Message);
+                outputDisconnected = true;
+                stopInput = true;
+                lock (childStartupSync)
+                {
+                    if (IsValid(processInfo.hProcess))
+                    {
+                        TerminateProcessTree(125);
+                        WaitForSingleObject(processInfo.hProcess, 5000);
+                    }
+                    CloseIfValid(ref processInfo.hThread);
+                }
+                CloseInput();
+                throw;
+            }
+        }
+
+        private int RunSession()
         {
             var outerInput = GetStdHandle(-10);
             var outerOutput = GetStdHandle(-11);
@@ -512,9 +585,11 @@ namespace TermLink.SessionHost
                     size.X,
                     size.Y,
                     WriteAuthorityPtyReply,
-                    outerReplySuppressor.RegisterAuthorityReply);
+                    options.NativeDisplayExecutable == null ? outerReplySuppressor.RegisterAuthorityReply : null,
+                    QueueProtocolResize,
+                    options.SemanticProfile);
             }
-            StartChildSuspended();
+            if (!options.EnableBrokerCapture) StartChildSuspended();
 
             if (options.UseAgentPipe)
             {
@@ -526,7 +601,9 @@ namespace TermLink.SessionHost
                     ApplyAgentRemoteInput,
                     options.AgentBufferBytes,
                     ApplyDurableAuthorityFrame,
-                    ApplyRemoteResize);
+                    request => ApplyRemoteResize(request),
+                    options.SemanticProfile,
+                    options.EnableBrokerCapture);
                 agentPipe.Start();
                 if (options.AutoRegister)
                 {
@@ -545,6 +622,14 @@ namespace TermLink.SessionHost
                             : null);
                     agentRegistration.Start();
                 }
+                if (options.EnableBrokerCapture)
+                {
+                    if (!options.SemanticProfile.IsGraphics)
+                        throw new InvalidOperationException("Broker capture requires the graphics terminal profile.");
+                    var root = agentPipe.WaitForBrokerCaptureRoot(options.RegistrationTimeoutMilliseconds);
+                    brokerCapture = new BrokerCaptureCoordinator(root, options.WorkingDirectory, options.SessionId);
+                    StartChildSuspended();
+                }
             }
 
             outerInput = GetStdHandle(-10);
@@ -555,8 +640,11 @@ namespace TermLink.SessionHost
             ConfigureOuterOutput(outerOutput);
 
             var outputTask = Task.Run(() => BridgeOutput(outerOutput));
-            var inputTask = Task.Run(() => BridgeInput(outerInput, inputIsConsole));
-            var resizeTask = Task.Run(() => PollResize(outerOutput, size));
+            var inputTask = options.NativeDisplayExecutable == null ? Task.Run(() => BridgeInput(outerInput, inputIsConsole)) : Task.CompletedTask;
+            var resizeTask = options.NativeDisplayExecutable == null ? Task.Run(() => PollResize(outerOutput, size)) : Task.CompletedTask;
+            if (options.SemanticProfile.IsGraphics)
+                PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
+            if (options.NativeDisplayExecutable != null) { inputThreadReady.Set(); StartNativeDisplay(); }
             if (!inputThreadReady.Wait(1000))
             {
                 throw new InvalidOperationException("Input bridge did not start.");
@@ -564,7 +652,8 @@ namespace TermLink.SessionHost
             // Publish the PC-observed dimensions before the Running lifecycle
             // so the first server upsert never invents an Android viewport or
             // a default 80x24 size.
-            PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
+            if (options.SemanticProfile.IsGraphics) WaitForGraphicsStartup();
+            else PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
             // The launching process's console title is launcher noise; remember
             // it to filter later no-op polls, and publish the managed-shell
             // name as the session's initial title instead.
@@ -587,12 +676,25 @@ namespace TermLink.SessionHost
                 {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject(child) failed.");
                 }
+                if (ShouldAbortInputBridge(inputBridgeFailure, inputTask.IsFaulted))
+                {
+                    reason = "input-failure";
+                    outputDisconnected = true;
+                    CloseInput();
+                    TerminateProcessTree(125);
+                    break;
+                }
                 if (outputDisconnected)
                 {
                     reason = "output-disconnected";
                     CloseInput();
                     TerminateProcessTree(125);
                     break;
+                }
+                if (nativeDisplay != null && (nativeDisplay.Failure != null || nativeDisplayProcess.HasExited))
+                {
+                    reason = "native-display-closed";
+                    CloseInput(); TerminateProcessTree(0); break;
                 }
                 if (options.TimeoutMilliseconds != Timeout.Infinite &&
                     stopwatch.ElapsedMilliseconds >= options.TimeoutMilliseconds)
@@ -626,6 +728,8 @@ namespace TermLink.SessionHost
                 CheckWin32(GetExitCodeProcess(processInfo.hProcess, out rawExitCode), "GetExitCodeProcess(forced)");
             }
 
+            var inputFailedBeforeShutdown = reason == "input-failure" ||
+                ShouldAbortInputBridge(inputBridgeFailure, inputTask.IsFaulted);
             CloseInput();
             if (inputIsConsole) GetNumberOfConsoleInputEvents(outerInput, out inputEventsPending);
             StopInputBridge(inputTask);
@@ -650,9 +754,12 @@ namespace TermLink.SessionHost
             }
             RestoreOuterOutputMode();
 
+            var sessionExitCode = reason == "timeout" ? 124 :
+                authorityFailed || inputFailedBeforeShutdown ? 125 : unchecked((int)rawExitCode);
+
             var endedSequence = PublishAgentFrame(
                 LocalFrameType.Lifecycle,
-                LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, unchecked((int)rawExitCode)));
+                LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, sessionExitCode));
             var removedSequence = PublishAgentFrame(
                 LocalFrameType.SessionRemoved,
                 LocalPayloadCodec.SessionRemoved());
@@ -660,6 +767,8 @@ namespace TermLink.SessionHost
             if (agentPipe != null && terminalSequence > 0) agentPipe.WaitForAck(terminalSequence, 2000);
 
             CloseChildHandles();
+            sharedMemoryBroker?.Dispose();
+            sharedMemoryBroker = null;
             CloseIfValid(ref job);
             ReleaseAttributeList();
             GC.Collect();
@@ -681,9 +790,10 @@ namespace TermLink.SessionHost
                     ";agent_ack=" + (agentPipe == null ? 0 : agentPipe.LastAcknowledgedSequence) +
                     ";durable_ack=" + (agentPipe == null ? 0 : agentPipe.LastDurablyAcknowledgedSequence) +
                     ";authority_failed=" + authorityFailed.ToString().ToLowerInvariant() +
+                        ";input_failure=" + (inputBridgeFailure == null ? "false" : "true") +
                     ";output_disconnected=" + outputDisconnected.ToString().ToLowerInvariant());
             }
-            return reason == "timeout" ? 124 : unchecked((int)rawExitCode);
+            return sessionExitCode;
         }
 
         private void ApplyDurableAuthorityFrame(LocalFrame frame)
@@ -694,6 +804,7 @@ namespace TermLink.SessionHost
             }
             catch (Exception error)
             {
+                RecordTerminalAuthorityFailure(error);
                 if (options.Diagnostics)
                 {
                     Console.Error.WriteLine(
@@ -718,10 +829,9 @@ namespace TermLink.SessionHost
                 throw new IOException("ConPTY input is closed for a terminal reply.");
             lock (terminalWriteSync)
             {
-                if (!WriteAll(destination, bytes, bytes.Length))
+                if (!WriteConPtyInput(destination, bytes, bytes.Length))
                     throw new IOException("The terminal-core PTY reply could not be written.");
             }
-            Interlocked.Add(ref inputBytesWritten, bytes.Length);
         }
 
         private void WriteExpiredRawInput(byte[] bytes)
@@ -769,6 +879,7 @@ namespace TermLink.SessionHost
                 pseudoConsoleInput, pseudoConsoleOutput, 0, out pseudoConsole), "CreatePseudoConsole");
             if (options.Diagnostics) Console.Error.WriteLine("__CONPTY_BACKEND__:" + PseudoConsoleApi.Backend);
             innerSize = size;
+            journaledInnerSize = size;
             CloseIfValid(ref pseudoConsoleInput);
             CloseIfValid(ref pseudoConsoleOutput);
 
@@ -808,6 +919,13 @@ namespace TermLink.SessionHost
                     (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))),
                 "SetInformationJobObject(KILL_ON_JOB_CLOSE)");
 
+            if (brokerCapture != null)
+            {
+                sharedMemoryBroker = new KittySharedMemoryBroker(options.SessionId, job);
+                sharedMemoryBroker.Start();
+                brokerCapture.AttachSharedMemory(sharedMemoryBroker);
+            }
+
             var startup = new STARTUPINFOEX();
             startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
             startup.StartupInfo.dwFlags = StartfUseStdHandles;
@@ -817,7 +935,8 @@ namespace TermLink.SessionHost
             startup.lpAttributeList = attributeList;
             var commandLine = new StringBuilder(options.CommandLine);
             var environmentBlock = Marshal.StringToHGlobalUni(BuildSanitizedChildEnvironmentBlock(
-                Environment.GetEnvironmentVariables()));
+                Environment.GetEnvironmentVariables(), brokerCapture?.TemporaryDirectory,
+                sharedMemoryBroker?.PipeName));
             try
             {
                 CheckWin32(
@@ -838,7 +957,18 @@ namespace TermLink.SessionHost
             {
                 Marshal.FreeHGlobal(environmentBlock);
             }
-            CheckWin32(AssignProcessToJobObject(job, processInfo.hProcess), "AssignProcessToJobObject");
+            if (!AssignProcessToJobObject(job, processInfo.hProcess))
+            {
+                var error = Marshal.GetLastWin32Error();
+                TerminateProcess(processInfo.hProcess, 125);
+                throw new Win32Exception(error, "AssignProcessToJobObject failed.");
+            }
+            if (!options.SemanticProfile.IsGraphics) ResumeChild();
+            else if (options.Diagnostics) Console.Error.WriteLine("__GRAPHICS_CHILD_SUSPENDED__:pid=" + processInfo.dwProcessId + ";");
+        }
+
+        private void ResumeChild()
+        {
             if (ResumeThread(processInfo.hThread) == uint.MaxValue)
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread failed.");
@@ -846,7 +976,40 @@ namespace TermLink.SessionHost
             CloseIfValid(ref processInfo.hThread);
         }
 
-        internal static string BuildSanitizedChildEnvironmentBlock(IDictionary environment)
+        private void WaitForGraphicsStartup()
+        {
+            var elapsed = Stopwatch.StartNew();
+            var timeout = options.TimeoutMilliseconds == Timeout.Infinite ? GraphicsStartupTimeoutMilliseconds :
+                Math.Min(options.TimeoutMilliseconds, GraphicsStartupTimeoutMilliseconds);
+            while (true)
+            {
+                lock (childStartupSync)
+                {
+                    if (disposed) throw new OperationCanceledException("Session disposed before initial display geometry.");
+                    if (authorityFailed || outputDisconnected) throw new IOException("Terminal authority failed before initial display geometry.");
+                    if (nativeDisplay.Failure != null) throw new IOException("Native display failed before initial geometry.", nativeDisplay.Failure);
+                    if (nativeDisplayProcess.HasExited) throw new IOException("Native display exited before initial geometry.");
+                    if (agentPipe.IsLocalOnly) throw new IOException("Remote access stopped before initial display geometry.");
+                    if (agentPipe.HasDisconnected) throw new IOException("Agent disconnected before initial display geometry.");
+                    if (WaitForSingleObject(processInfo.hProcess, 0) != WaitTimeout)
+                        throw new IOException("Suspended child exited before initial display geometry.");
+                    if (elapsed.ElapsedMilliseconds >= timeout || ShouldAbortUnregisteredSession(options.AutoRegister,
+                        agentPipe.IsConnected, elapsed.ElapsedMilliseconds, options.RegistrationTimeoutMilliseconds))
+                        throw new TimeoutException("Timed out waiting for durably applied native display cell geometry.");
+                    if (graphicsGeometrySequence != 0 && agentPipe.IsConnected)
+                    {
+                        ResumeChild();
+                        graphicsChildResumed = true;
+                        if (options.Diagnostics) Console.Error.WriteLine("__GRAPHICS_STARTUP_READY__:geometry=" + graphicsGeometrySequence + ";");
+                        return;
+                    }
+                }
+                Thread.Sleep(25);
+            }
+        }
+
+        internal static string BuildSanitizedChildEnvironmentBlock(IDictionary environment,
+            string temporaryDirectory = null, string sharedMemoryPipeName = null)
         {
             if (environment == null) throw new ArgumentNullException(nameof(environment));
             var variables = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -855,13 +1018,25 @@ namespace TermLink.SessionHost
                 var name = entry.Key as string;
                 if (string.IsNullOrEmpty(name)) continue;
                 var value = entry.Value as string ?? string.Empty;
+                if (string.Equals(name, KittySharedMemoryBroker.EnvironmentVariable,
+                    StringComparison.OrdinalIgnoreCase)) continue;
                 if (string.Equals(name, "NO_COLOR", StringComparison.OrdinalIgnoreCase)) continue;
                 if (string.Equals(name, "TERM", StringComparison.OrdinalIgnoreCase) &&
                     string.Equals(value.Trim(), "dumb", StringComparison.OrdinalIgnoreCase)) continue;
                 if (string.Equals(name, "COLORTERM", StringComparison.OrdinalIgnoreCase) &&
                     string.IsNullOrWhiteSpace(value)) continue;
+                if (temporaryDirectory != null &&
+                    (string.Equals(name, "TMP", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(name, "TEMP", StringComparison.OrdinalIgnoreCase))) continue;
                 variables[name] = value;
             }
+            if (temporaryDirectory != null)
+            {
+                variables["TMP"] = temporaryDirectory;
+                variables["TEMP"] = temporaryDirectory;
+            }
+            if (sharedMemoryPipeName != null)
+                variables[KittySharedMemoryBroker.EnvironmentVariable] = sharedMemoryPipeName;
 
             var block = new StringBuilder();
             foreach (var variable in variables)
@@ -940,10 +1115,41 @@ namespace TermLink.SessionHost
                 if (inputIsConsole) BridgeConsoleInput(outerInput);
                 else BridgePipeInput(outerInput);
             }
+            catch (Exception error)
+            {
+                inputBridgeFailure = error;
+                try
+                {
+                    if (error is NativeTerminalException native && native.Diagnostic != null)
+                    {
+                        try { Console.Error.WriteLine("TermLink terminal input failure / 终端输入处理失败:\n" + native.Diagnostic); } catch { }
+                        try { new TerminalFailureStore().TryWrite(options.SessionId, native.Diagnostic); } catch { }
+                    }
+                    else if (options.Diagnostics)
+                    {
+                        try
+                        {
+                            var detail = error is NativeTerminalAbiException
+                                ? ";message=" + error.Message.Replace('\r', ' ').Replace('\n', ' ')
+                                : string.Empty;
+                            Console.Error.WriteLine("__TERMINAL_INPUT_FAILURE__:type=" + error.GetType().Name + detail);
+                        }
+                        catch { }
+                    }
+                }
+                catch
+                {
+                    // Failure reporting must never turn a recorded input fault into a faulted bridge task.
+                }
+            }
             finally
             {
                 inputThreadReady.Set();
-                CloseInput();
+                // EOF of a launcher's stdin is not EOF of a managed remote
+                // session: its authority still sends query replies and the
+                // Agent can deliver input. Session shutdown owns that handle.
+                if (inputIsConsole || stopInput || !(options.AutoRegister || options.UseAgentPipe))
+                    CloseInput();
             }
         }
 
@@ -1122,9 +1328,13 @@ namespace TermLink.SessionHost
                     key.KeyDown,
                     key.ControlKeyState,
                     key.RepeatCount);
-                if (!terminalAuthority.EncodeAndWriteConsoleKey(nativeKey, bytes =>
-                    WriteLocalInput(bytes, bytes.Length)))
-                    return false;
+                try
+                {
+                    if (!WithBrokerPublicationGate(() => terminalAuthority.EncodeAndWriteConsoleKey(nativeKey, bytes =>
+                        WriteLocalInput(bytes, bytes.Length))))
+                        return false;
+                }
+                catch (NativeTerminalException error) when (IsRecoverableInput(error) && TryHandleInputDiagnostic(error)) { }
             }
             return true;
         }
@@ -1140,7 +1350,11 @@ namespace TermLink.SessionHost
                     ? WriteLocalInput(bytes, bytes.Length) : WriteInput(bytes, bytes.Length);
                 if (terminalAuthority != null)
                 {
-                    if (!terminalAuthority.EncodeAndWriteConsoleMouse(input, Write)) return false;
+                    try
+                    {
+                        if (!WithBrokerPublicationGate(() => terminalAuthority.EncodeAndWriteConsoleMouse(input, Write))) return false;
+                    }
+                    catch (NativeTerminalException error) when (IsRecoverableInput(error) && TryHandleInputDiagnostic(error)) { }
                 }
                 else
                 {
@@ -1151,6 +1365,19 @@ namespace TermLink.SessionHost
             }
             return true;
         }
+
+        private bool TryHandleInputDiagnostic(NativeTerminalException error)
+        {
+            var text = error?.Diagnostic;
+            if (text == null || text.Length > 2048 || !text.StartsWith("TL-INPUT-DIAG/1\ndirection=input_encoding\n", StringComparison.Ordinal) ||
+                !text.EndsWith("\n", StringComparison.Ordinal) || text.Any(c => c != '\n' && (c < 32 || c > 126))) return false;
+            try { new TerminalFailureStore().TryWriteInput(options.SessionId, text); } catch { }
+            if (options.Diagnostics) Console.Error.WriteLine("__TERMINAL_INPUT_REJECTED__:\n" + text);
+            return true;
+        }
+
+        private static bool IsRecoverableInput(NativeTerminalException error) =>
+            error.Status is NativeTerminalStatus.InvalidArgument or NativeTerminalStatus.LimitExceeded or NativeTerminalStatus.Unsupported;
 
         private static byte[] EncodeCompatibilityKey(KEY_EVENT_RECORD key)
         {
@@ -1249,39 +1476,62 @@ namespace TermLink.SessionHost
             }
         }
 
+        private readonly ConPtyInputTranscoder conPtyInputTranscoder = new();
+
+        // Call only while holding terminalWriteSync. All authority, local and
+        // remote input passes through this one ordered UTF-8 boundary.
+        private bool WriteConPtyInput(IntPtr destination, byte[] bytes, int length)
+        {
+            var wire = conPtyInputTranscoder.Convert(bytes, length, out var wireLength);
+            try {
+                if (!WriteAll(destination, wire, wireLength)) return false;
+                Interlocked.Add(ref inputBytesWritten, wireLength);
+                return true;
+            } finally { if (!ReferenceEquals(wire, bytes)) Array.Clear(wire, 0, wire.Length); }
+        }
+
         private bool WriteInput(byte[] buffer, int length)
         {
+            if (!ChildInputReady) return false;
             IntPtr destination;
             lock (inputSync) destination = terminalInput;
             if (!IsValid(destination)) return false;
             lock (terminalWriteSync)
             {
-                if (!WriteAll(destination, buffer, length)) return false;
+                if (!WriteConPtyInput(destination, buffer, length)) return false;
             }
-            Interlocked.Add(ref inputBytesWritten, length);
             return true;
         }
 
         private bool WriteLocalInput(byte[] buffer, int length)
         {
-            IntPtr destination;
-            lock (inputSync) destination = terminalInput;
-            if (!IsValid(destination)) return false;
-            lock (terminalWriteSync)
+            return WithBrokerPublicationGate(() =>
             {
-                localInputEpoch = checked(localInputEpoch + 1);
-                if (agentPipe != null)
+                if (!ChildInputReady) return false;
+                IntPtr destination;
+                lock (inputSync) destination = terminalInput;
+                if (!IsValid(destination)) return false;
+                lock (terminalWriteSync)
                 {
-                    agentPipe.Publish(LocalFrameType.LocalInputObserved, LocalPayloadCodec.LocalInputEpoch(localInputEpoch));
+                    localInputEpoch = checked(localInputEpoch + 1);
+                    clipboardControlEpoch = checked(clipboardControlEpoch + 1);
+                    if (agentPipe != null)
+                        agentPipe.Publish(LocalFrameType.LocalInputObserved, LocalPayloadCodec.LocalInputEpoch(localInputEpoch));
+                    return WriteConPtyInput(destination, buffer, length);
                 }
-                if (!WriteAll(destination, buffer, length)) return false;
-            }
-            Interlocked.Add(ref inputBytesWritten, length);
-            return true;
+            });
+        }
+
+        private bool WithBrokerPublicationGate(Func<bool> action)
+        {
+            var bridge = agentPipe;
+            return brokerCapture == null || bridge == null ? action() : bridge.WithPublicationGate(action);
         }
 
         private void ApplyAgentInput(Guid inputId, byte[] bytes)
         {
+            if (!ChildInputReady) throw new IOException("Session input is unavailable before initial display geometry.");
+            lock (terminalWriteSync) clipboardControlEpoch = checked(clipboardControlEpoch + 1);
             if (!WriteInput(bytes, bytes.Length))
             {
                 throw new IOException("ConPTY input pipe is closed for input " + inputId.ToString("D") + ".");
@@ -1290,6 +1540,7 @@ namespace TermLink.SessionHost
 
         private LocalRemoteInputResult ApplyAgentRemoteInput(Guid inputId, ulong expectedLocalInputEpoch, byte[] bytes)
         {
+            if (!ChildInputReady) return LocalRemoteInputResult.SessionInputUnavailable;
             IntPtr destination;
             lock (inputSync) destination = terminalInput;
             if (!IsValid(destination)) return LocalRemoteInputResult.ConPtyClosed;
@@ -1299,12 +1550,12 @@ namespace TermLink.SessionHost
                 {
                     return LocalRemoteInputResult.LocalInputSuperseded;
                 }
-                if (!WriteAll(destination, bytes, bytes.Length))
+                if (!WriteConPtyInput(destination, bytes, bytes.Length))
                 {
                     return LocalRemoteInputResult.WriteFailed;
                 }
+                clipboardControlEpoch = checked(clipboardControlEpoch + 1);
             }
-            Interlocked.Add(ref inputBytesWritten, bytes.Length);
             return LocalRemoteInputResult.Accepted;
         }
 
@@ -1315,9 +1566,14 @@ namespace TermLink.SessionHost
             {
                 if (IsValid(inputThread)) CancelSynchronousIo(inputThread);
             }
-            if (!inputTask.Wait(1000))
+            try
             {
-                throw new InvalidOperationException("Input bridge did not stop.");
+                if (!inputTask.Wait(1000))
+                    inputBridgeFailure ??= new InvalidOperationException("Input bridge did not stop.");
+            }
+            catch (AggregateException error)
+            {
+                inputBridgeFailure ??= error.GetBaseException();
             }
             lock (inputSync) CloseIfValid(ref inputThread);
         }
@@ -1381,13 +1637,33 @@ namespace TermLink.SessionHost
                 }
                 var agentBytes = new byte[total];
                 Buffer.BlockCopy(buffer, 0, agentBytes, 0, total);
-                var outputSequence = PublishAgentFrame(LocalFrameType.Output, agentBytes);
+                ulong outputSequence;
+                try
+                {
+                    outputSequence = brokerCapture == null
+                        ? PublishAgentFrame(LocalFrameType.Output, agentBytes)
+                        : agentPipe.ExecuteBrokerTransaction((sequence, publish) =>
+                            brokerCapture.Apply(terminalAuthority, sequence, agentBytes, publish),
+                            () => authorityFailed || disposed || outputDisconnected);
+                }
+                catch (Exception error)
+                {
+                    RecordTerminalAuthorityFailure(error);
+                    if (options.Diagnostics)
+                        Console.Error.WriteLine("__BROKER_OUTPUT_FAILURE__:" + error.GetType().Name +
+                            ";message=" + error.Message.Replace('\r', ' ').Replace('\n', ' '));
+                    authorityFailed = true;
+                    outputDisconnected = true;
+                    CloseInput();
+                    break;
+                }
                 if (agentPipe != null && !WaitForAuthority(outputSequence))
                 {
                     outputDisconnected = true;
                     break;
                 }
                 titleTracker.Process(agentBytes, PublishTitleIfChanged);
+                if (options.NativeDisplayExecutable != null) continue;
                 // Activate reply routing while holding the same lock that projects the query.
                 // This prevents pre-projection user input from matching a future reply. The
                 // terminal-core source coordinate selects the exact query occurrence whose
@@ -1395,11 +1671,12 @@ namespace TermLink.SessionHost
                 bool projected;
                 try
                 {
+                    var displayBytes = terminalAuthority == null ? agentBytes : terminalAuthority.TakeLegacyProjection(outputSequence);
                     projected = outerReplySuppressor.ProjectOutput(
                         agentBytes,
                         agentBytes.Length,
                         outputSequence,
-                        () => { lock (outerWriteSync) return WriteAll(outerOutput, buffer, total); });
+                        () => { lock (outerWriteSync) return displayBytes.Length == 0 || WriteAll(outerOutput, displayBytes, displayBytes.Length); });
                 }
                 catch (Exception error)
                 {
@@ -1419,6 +1696,16 @@ namespace TermLink.SessionHost
                     break;
                 }
             }
+        }
+
+        private void RecordTerminalAuthorityFailure(Exception error)
+        {
+            if (error is not NativeTerminalException nativeError || nativeError.Diagnostic == null) return;
+            // Escaped evidence stays on the outer error surface and protected local store, never in ConPTY input.
+            try { Console.Error.WriteLine("TermLink terminal protocol failure / 终端协议处理失败:\n" + nativeError.Diagnostic); }
+            catch { }
+            try { new TerminalFailureStore().TryWrite(options.SessionId, nativeError.Diagnostic); }
+            catch { }
         }
 
         private void PollResize(IntPtr outerOutput, COORD previous)
@@ -1504,13 +1791,14 @@ namespace TermLink.SessionHost
             PublishAgentFrame(LocalFrameType.Title, payload);
         }
 
-        private LocalResizeResult ApplyRemoteResize(LocalResizeRequest request)
+        private LocalResizeResult ApplyRemoteResize(LocalResizeRequest request, bool preserveDesktopFit = true)
         {
             var result = new LocalResizeResult { Id = request.Id, Error = LocalResizeError.WINDOW_RESIZE_UNSUPPORTED };
             if (Interlocked.CompareExchange(ref remoteResizeBusy, 1, 0) != 0)
             { result.Error = LocalResizeError.RESIZE_BUSY; return result; }
             try
             {
+                if (options.NativeDisplayExecutable != null) return ApplyNativeRemoteResize(request, preserveDesktopFit);
                 var outer = GetStdHandle(-11);
                 CONSOLE_SCREEN_BUFFER_INFO info;
                 if (!GetConsoleScreenBufferInfo(outer, out info)) return result;
@@ -1556,9 +1844,10 @@ namespace TermLink.SessionHost
                     lock (resizeSync)
                     {
                         if (actual.X == target.X && actual.Y == target.Y &&
-                            innerSize.X == target.X && innerSize.Y == target.Y)
+                            innerSize.X == target.X && innerSize.Y == target.Y &&
+                            journaledInnerSize.X == target.X && journaledInnerSize.Y == target.Y)
                         {
-                            if (request.Restore) { desktopSizeBeforeFit = null; lastFittedSize = null; }
+                            if (request.Restore || !preserveDesktopFit) { desktopSizeBeforeFit = null; lastFittedSize = null; }
                             else { desktopSizeBeforeFit ??= before; lastFittedSize = target; }
                             result.Error = LocalResizeError.OK;
                             return result;
@@ -1582,7 +1871,100 @@ namespace TermLink.SessionHost
                 innerSize = size;
             }
             PublishAgentFrame(LocalFrameType.Resize, LocalPayloadCodec.Resize(size.X, size.Y));
+            lock (resizeSync) journaledInnerSize = size;
             return true;
+        }
+
+        private void StartNativeDisplay()
+        {
+            clipboardGate = new NativeClipboardAuthorizationGate(
+                () => agentPipe?.RequestClipboardAuthorizationAsync() ?? Task.FromResult(false));
+            nativeDisplay = new NativeDisplayServer(RenderNativeDisplay, ApplyNativeDisplayInput,
+                (kind, payload) => {
+                    if (kind == NativeDisplayProtocol.ClipboardQuery) {
+                        lock (terminalWriteSync) return (NativeDisplayProtocol.ClipboardState,
+                            new[] { clipboardGate.Query(payload, clipboardControlEpoch, agentPipe?.IsConnected == true) });
+                    }
+                    if (kind == NativeDisplayProtocol.SignalsQuery) {
+                        NativeDisplayProtocol.RequireSize(payload, 0);
+                        return (NativeDisplayProtocol.SignalsState, terminalAuthority.PollDisplaySignals(options.SessionId));
+                    }
+                    return terminalAuthority.ShellDisplay(kind, payload);
+                }, diagnostic => new TerminalFailureStore().TryWriteInput(options.SessionId, diagnostic));
+            var start = new ProcessStartInfo(options.NativeDisplayExecutable) { UseShellExecute = false, CreateNoWindow = true };
+            start.ArgumentList.Add("--native-terminal"); start.ArgumentList.Add(nativeDisplay.PipeName);
+            start.ArgumentList.Add(Process.GetCurrentProcess().Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            nativeDisplayProcess = Process.Start(start) ?? throw new IOException("Native terminal window failed to start.");
+            nativeDisplay.Start(nativeDisplayProcess.Id);
+            if (options.Diagnostics) Console.Error.WriteLine("__NATIVE_DISPLAY_PID__:" + nativeDisplayProcess.Id + ";");
+        }
+
+        private bool ApplyNativeDisplayInput(byte kind, byte[] payload)
+        {
+            if (!ChildInputReady && kind is NativeDisplayProtocol.ConsoleKey or NativeDisplayProtocol.Text or
+                NativeDisplayProtocol.Paste or NativeDisplayProtocol.Focus or NativeDisplayProtocol.Mouse) return false;
+            bool Write(byte[] bytes) => bytes.Length == 0 || WriteLocalInput(bytes, bytes.Length);
+            switch (kind)
+            {
+                case NativeDisplayProtocol.ConsoleKey:
+                    NativeDisplayProtocol.RequireSize(payload, 26);
+                    if (payload[6] != 1 || payload[19] != 0 ||
+                        !payload.AsSpan(0, 6).SequenceEqual(payload.AsSpan(13, 6)) ||
+                        !payload.AsSpan(7, 6).SequenceEqual(payload.AsSpan(20, 6))) throw new InvalidDataException("Invalid native key pair.");
+                    NativeTerminalWin32KeyEvent KeyAt(int offset) => new NativeTerminalWin32KeyEvent(
+                            BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset)), BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset + 2)),
+                            (char)BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset + 4)), payload[offset + 6] != 0,
+                            BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(offset + 7)), BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset + 11)));
+                    return WithBrokerPublicationGate(() => terminalAuthority.EncodeAndWriteDisplayKeyPair(KeyAt(0), KeyAt(13), Write));
+                case NativeDisplayProtocol.Text:
+                case NativeDisplayProtocol.Paste:
+                    return WithBrokerPublicationGate(() => terminalAuthority.EncodeAndWriteDisplayText(
+                        NativeDisplayProtocol.Utf8.GetString(payload), kind == NativeDisplayProtocol.Paste, Write));
+                case NativeDisplayProtocol.HostTheme:
+                    NativeTerminalHostThemeV1.Decode(payload);
+                    var themeSequence = PublishAgentFrame(LocalFrameType.HostTheme, payload);
+                    return agentPipe == null || WaitForAuthority(themeSequence);
+                case NativeDisplayProtocol.HostGeometry:
+                    var geometry = NativeTerminalHostGeometryV1.Decode(payload);
+                    var geometrySequence = PublishAgentFrame(LocalFrameType.HostGeometry, payload);
+                    var geometryBridge = agentPipe;
+                    var applied = geometryBridge == null || WaitForAuthority(geometrySequence);
+                    if (applied && options.SemanticProfile.IsGraphics &&
+                        geometry.CellWidth > 0 && geometry.CellHeight > 0 && geometryBridge != null &&
+                        geometryBridge.LastDurablyAcknowledgedSequence >= geometrySequence)
+                    {
+                        lock (childStartupSync) graphicsGeometrySequence = geometrySequence;
+                    }
+                    return applied;
+                case NativeDisplayProtocol.Resize:
+                    NativeDisplayProtocol.RequireSize(payload, 4);
+                    var columns = BinaryPrimitives.ReadUInt16LittleEndian(payload); var rows = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(2));
+                    if (columns < 2 || columns > 512 || rows < 2 || rows > 512) throw new InvalidDataException("Invalid native display size.");
+                    return ApplyNativeLocalResize(new COORD { X = (short)columns, Y = (short)rows });
+                case NativeDisplayProtocol.FitResult:
+                    return CompleteNativeFit(payload);
+                case NativeDisplayProtocol.Focus:
+                    NativeDisplayProtocol.RequireSize(payload, 1);
+                    if (payload[0] > 1) throw new InvalidDataException("Invalid native display focus.");
+                    return WithBrokerPublicationGate(() => terminalAuthority.EncodeAndWriteDisplayFocus(
+                        payload[0] != 0, bytes => WriteInput(bytes, bytes.Length)));
+                case NativeDisplayProtocol.Mouse:
+                    NativeDisplayProtocol.RequireSize(payload, 20);
+                    var position = NativeTerminalMousePosition.CellAndPixel(
+                        BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(4)), BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(8)),
+                        BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(12)), BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(16)));
+                    var held = (NativeTerminalMouseButtons)payload[2]; var modifiers = (NativeTerminalModifiers)payload[3];
+                    var mouse = (NativeTerminalMouseAction)payload[0] switch {
+                        NativeTerminalMouseAction.Press => NativeTerminalMouseEvent.Press((NativeTerminalMouseButton)payload[1], held, position, modifiers),
+                        NativeTerminalMouseAction.Release => NativeTerminalMouseEvent.Release((NativeTerminalMouseButton)payload[1], held, position, modifiers),
+                        NativeTerminalMouseAction.Move when payload[1] == 0 => NativeTerminalMouseEvent.Move(held, position, modifiers),
+                        NativeTerminalMouseAction.Wheel => NativeTerminalMouseEvent.Wheel((NativeTerminalMouseWheelDirection)payload[1], held, position, modifiers),
+                        _ => throw new InvalidDataException("Invalid native mouse action."),
+                    };
+                    return WithBrokerPublicationGate(() => terminalAuthority.EncodeAndWriteConsoleMouse(mouse, bytes =>
+                        WindowsConsoleMouseInput.IsUserAction(mouse) ? Write(bytes) : WriteInput(bytes, bytes.Length)));
+                default: throw new InvalidDataException("Unsupported native display request.");
+            }
         }
 
         private ulong PublishAgentFrame(LocalFrameType type, byte[] payload)
@@ -1592,10 +1974,11 @@ namespace TermLink.SessionHost
 
         private bool WaitForAuthority(ulong sequence)
         {
-            if (sequence == 0 || agentPipe == null) return false;
+            var bridge = agentPipe;
+            if (sequence == 0 || bridge == null) return false;
             while (!authorityFailed && !disposed && !outputDisconnected)
             {
-                if (agentPipe.WaitForAck(sequence, 250)) return true;
+                if (bridge.WaitForAck(sequence, 250)) return true;
             }
             return false;
         }
@@ -1674,8 +2057,11 @@ namespace TermLink.SessionHost
 
         private void CloseChildHandles()
         {
-            CloseIfValid(ref processInfo.hThread);
-            CloseIfValid(ref processInfo.hProcess);
+            lock (childStartupSync)
+            {
+                CloseIfValid(ref processInfo.hThread);
+                CloseIfValid(ref processInfo.hProcess);
+            }
         }
 
         private void ReleaseAttributeList()
@@ -1688,8 +2074,13 @@ namespace TermLink.SessionHost
 
         public void Dispose()
         {
-            if (disposed) return;
-            disposed = true;
+            lock (childStartupSync)
+            {
+                if (disposed) return;
+                disposed = true;
+                if (options.SemanticProfile.IsGraphics && !graphicsChildResumed && IsValid(processInfo.hProcess))
+                    TerminateProcessTree(125);
+            }
             stopInput = true;
             stopResize = true;
             CloseInput();
@@ -1712,9 +2103,15 @@ namespace TermLink.SessionHost
             }
             if (terminalAuthority != null)
             {
+                nativeDisplay?.Dispose(); nativeDisplay = null;
+                nativeDisplayProcess?.Dispose(); nativeDisplayProcess = null;
                 terminalAuthority.Dispose();
                 terminalAuthority = null;
             }
+            sharedMemoryBroker?.Dispose();
+            sharedMemoryBroker = null;
+            brokerCapture?.Dispose();
+            brokerCapture = null;
             outerReplySuppressor.Dispose();
             CloseIfValid(ref pseudoConsoleInput);
             CloseIfValid(ref pseudoConsoleOutput);
@@ -1733,6 +2130,9 @@ namespace TermLink.SessionHost
         {
             return handle != IntPtr.Zero && handle != new IntPtr(-1);
         }
+
+        internal static bool ShouldAbortInputBridge(Exception failure, bool taskFaulted) =>
+            failure != null || taskFaulted;
 
         private static void CheckHandle(IntPtr handle, string label)
         {
@@ -2090,6 +2490,7 @@ namespace TermLink.SessionHost
 
     internal sealed class AgentPipeBridge : IDisposable
     {
+        private readonly object publicationSync = new object();
         private readonly string pipeName;
         private readonly Guid sessionId;
         private readonly byte[] handshakeToken;
@@ -2097,7 +2498,13 @@ namespace TermLink.SessionHost
         private readonly Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler;
         private readonly Action<LocalFrame> acknowledgedFrameHandler;
         private readonly Func<LocalResizeRequest, LocalResizeResult> resizeHandler;
+        private readonly TerminalSemanticProfile semanticProfile;
+        private readonly bool requireBrokerCaptureRoot;
         private readonly Queue<LocalFrame> controlResults = new Queue<LocalFrame>();
+        private readonly Queue<LocalFrame> commands = new Queue<LocalFrame>();
+        private readonly AutoResetEvent commandPending = new AutoResetEvent(false);
+        private TaskCompletionSource<bool> pendingClipboard;
+        private Guid pendingClipboardId;
         private readonly int maximumBufferedBytes;
         private readonly object sync = new object();
         private readonly object authorityApplySync = new object();
@@ -2105,6 +2512,9 @@ namespace TermLink.SessionHost
         private readonly AutoResetEvent sendPending = new AutoResetEvent(false);
         private NamedPipeClientStream pipe;
         private Task connectionTask;
+        private Task commandTask;
+        private BrokerTransaction brokerTransaction;
+        private string brokerCaptureRoot;
         private ulong nextSequence;
         private ulong lastAuthorityAcknowledgedSequence;
         private ulong lastDurablyAcknowledgedSequence;
@@ -2113,7 +2523,16 @@ namespace TermLink.SessionHost
         private volatile bool stop;
         private bool acknowledgedFrameHandlerFailed;
         private bool localOnly;
+        private bool hasDisconnected;
         private bool disposed;
+
+        private sealed class BrokerTransaction
+        {
+            internal BrokerTransaction(ulong sequence) { Sequence = sequence; }
+            internal ulong Sequence { get; }
+            internal bool Published { get; set; }
+            internal bool Durable { get; set; }
+        }
 
         public AgentPipeBridge(
             string pipeName,
@@ -2123,7 +2542,9 @@ namespace TermLink.SessionHost
             Func<Guid, ulong, byte[], LocalRemoteInputResult> remoteInputHandler,
             int maximumBufferedBytes,
             Action<LocalFrame> acknowledgedFrameHandler = null,
-            Func<LocalResizeRequest, LocalResizeResult> resizeHandler = null)
+            Func<LocalResizeRequest, LocalResizeResult> resizeHandler = null,
+            TerminalSemanticProfile semanticProfile = null,
+            bool requireBrokerCaptureRoot = false)
         {
             this.pipeName = pipeName;
             this.sessionId = sessionId;
@@ -2133,6 +2554,8 @@ namespace TermLink.SessionHost
             this.maximumBufferedBytes = maximumBufferedBytes;
             this.acknowledgedFrameHandler = acknowledgedFrameHandler;
             this.resizeHandler = resizeHandler;
+            this.semanticProfile = semanticProfile ?? TerminalSemanticProfile.Legacy;
+            this.requireBrokerCaptureRoot = requireBrokerCaptureRoot;
         }
 
         public ulong LastAcknowledgedSequence
@@ -2150,11 +2573,63 @@ namespace TermLink.SessionHost
             get { lock (sync) return pipe != null && pipe.IsConnected; }
         }
 
+        public bool HasDisconnected
+        {
+            get { lock (sync) return hasDisconnected; }
+        }
+
+        public bool IsLocalOnly
+        {
+            get { lock (sync) return localOnly; }
+        }
+
+        public string BrokerCaptureRoot
+        {
+            get { lock (sync) return brokerCaptureRoot; }
+        }
+
+        public string WaitForBrokerCaptureRoot(int timeoutMilliseconds)
+        {
+            var timeout = timeoutMilliseconds == Timeout.Infinite ? 10000 : Math.Min(timeoutMilliseconds, 10000);
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeout);
+            lock (sync)
+            {
+                while (brokerCaptureRoot == null && !stop && !disposed)
+                {
+                    var remaining = deadline - DateTime.UtcNow;
+                    if (remaining <= TimeSpan.Zero) break;
+                    Monitor.Wait(sync, remaining);
+                }
+                return brokerCaptureRoot ?? throw new InvalidDataException(
+                    "Authenticated Agent did not provide the graphics broker capture root.");
+            }
+        }
+
+        public async Task<bool> RequestClipboardAuthorizationAsync()
+        {
+            TaskCompletionSource<bool> completion;
+            lock (sync) {
+                if (stop || disposed || localOnly || pipe == null || !pipe.IsConnected || pendingClipboard != null || controlResults.Count >= 16)
+                    return false;
+                pendingClipboardId = Guid.NewGuid();
+                completion = pendingClipboard = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                controlResults.Enqueue(new LocalFrame(LocalFrameType.ClipboardAuthorize, sessionId, 0, pendingClipboardId.ToByteArray()));
+                sendPending.Set();
+            }
+            try {
+                return await Task.WhenAny(completion.Task, Task.Delay(3000)).ConfigureAwait(false) == completion.Task &&
+                    await completion.Task.ConfigureAwait(false);
+            } finally {
+                lock (sync) { pendingClipboard = null; pendingClipboardId = Guid.Empty; }
+            }
+        }
+
         public void Start()
         {
             lock (sync)
             {
                 if (connectionTask != null) throw new InvalidOperationException("Agent pipe bridge already started.");
+                commandTask = Task.Run((Action)ProcessCommands);
                 connectionTask = Task.Run((Action)ConnectionLoop);
             }
         }
@@ -2163,19 +2638,89 @@ namespace TermLink.SessionHost
         {
             LocalFrame frame;
             bool applyLocally;
-            lock (sync)
+            lock (publicationSync)
             {
-                if (disposed) return 0;
-                frame = new LocalFrame(type, sessionId, ++nextSequence, payload);
-                applyLocally = localOnly;
-                if (!applyLocally)
+                lock (sync)
                 {
-                    AddPending(frame);
-                    sendPending.Set();
+                    if (disposed) return 0;
+                    frame = new LocalFrame(type, sessionId, ++nextSequence, payload);
+                    applyLocally = localOnly;
+                    if (!applyLocally)
+                    {
+                        AddPending(frame);
+                        sendPending.Set();
+                    }
+                }
+                if (applyLocally) TryApplyAuthorityFrame(frame);
+            }
+            return frame.Sequence;
+        }
+
+        public T WithPublicationGate<T>(Func<T> action)
+        {
+            ArgumentNullException.ThrowIfNull(action);
+            lock (publicationSync) return action();
+        }
+
+        public ulong ExecuteBrokerTransaction(Action<ulong, Action<LocalFrameType, byte[]>> apply,
+            Func<bool> shouldAbort)
+        {
+            if (apply == null || shouldAbort == null) throw new ArgumentNullException();
+            lock (publicationSync)
+            {
+                ulong sequence;
+                lock (sync) sequence = checked(nextSequence + 1);
+                while (sequence > 1 && !WaitForAck(sequence - 1, 250))
+                    if (shouldAbort() || stop || disposed) throw new IOException("Broker Output predecessor did not apply.");
+                var transaction = new BrokerTransaction(sequence);
+                lock (sync)
+                {
+                    if (stop || disposed || localOnly || brokerTransaction != null)
+                        throw new IOException("Broker Output authority is unavailable.");
+                    brokerTransaction = transaction;
+                }
+                try
+                {
+                    apply(sequence, (type, payload) =>
+                    {
+                        if (transaction.Published || (type != LocalFrameType.Output && type != LocalFrameType.BrokerOutput))
+                            throw new InvalidDataException("Broker Output published an invalid frame.");
+                        transaction.Published = true;
+                        var published = Publish(type, payload);
+                        if (published != sequence) throw new InvalidDataException("Broker Output publication sequence changed.");
+                        while (true)
+                        {
+                            lock (sync) if (transaction.Durable) break;
+                            if (shouldAbort() || stop || disposed)
+                                throw new IOException("Broker Output was not durably acknowledged.");
+                            lock (sync) Monitor.Wait(sync, 250);
+                        }
+                    });
+                    lock (authorityApplySync)
+                    {
+                        lock (sync)
+                        {
+                            if (!transaction.Published || !transaction.Durable || brokerTransaction != transaction ||
+                                lastAuthorityAcknowledgedSequence + 1 != sequence)
+                                throw new InvalidDataException("Broker Output authority commit was not ordered.");
+                            lastAuthorityAcknowledgedSequence = sequence;
+                            brokerTransaction = null;
+                            Monitor.PulseAll(sync);
+                        }
+                    }
+                    return sequence;
+                }
+                catch
+                {
+                    lock (sync)
+                    {
+                        acknowledgedFrameHandlerFailed = true;
+                        brokerTransaction = null;
+                        Monitor.PulseAll(sync);
+                    }
+                    throw;
                 }
             }
-            if (applyLocally) TryApplyAuthorityFrame(frame);
-            return frame.Sequence;
         }
 
         public bool WaitForAck(ulong sequence, int timeoutMilliseconds)
@@ -2210,6 +2755,7 @@ namespace TermLink.SessionHost
                         if (stop) return;
                         pipe = candidate;
                     }
+                    if (requireBrokerCaptureRoot) AcceptBrokerCaptureRoot(LocalFrameCodec.Read(candidate));
                     var activePipe = candidate;
                     writer = Task.Run(() => WritePending(activePipe));
                     sendPending.Set();
@@ -2221,6 +2767,10 @@ namespace TermLink.SessionHost
                 catch (IOException)
                 {
                 }
+                catch (ObjectDisposedException)
+                {
+                    // Shutdown and buffer overflow close the active pipe to interrupt its reader.
+                }
                 catch (UnauthorizedAccessException)
                 {
                 }
@@ -2231,7 +2781,12 @@ namespace TermLink.SessionHost
                 {
                     lock (sync)
                     {
-                        if (ReferenceEquals(pipe, candidate)) pipe = null;
+                        if (candidate != null && ReferenceEquals(pipe, candidate))
+                        {
+                            hasDisconnected = true;
+                            pipe = null;
+                            pendingClipboard?.TrySetResult(false);
+                        }
                         Monitor.PulseAll(sync);
                     }
                     if (candidate != null) candidate.Dispose();
@@ -2254,14 +2809,14 @@ namespace TermLink.SessionHost
                 LocalFrameType.HostHello,
                 sessionId,
                 0,
-                LocalPayloadCodec.Hello(Process.GetCurrentProcess().Id, handshakeToken)));
+                LocalPayloadCodec.TerminalHello(Process.GetCurrentProcess().Id, handshakeToken, semanticProfile)));
             var response = LocalFrameCodec.Read(candidate);
             if (response == null || response.Type != LocalFrameType.AgentHello ||
                 response.SessionId != sessionId || response.Sequence != 0)
             {
                 throw new InvalidDataException("Invalid Agent handshake response.");
             }
-            var claimedProcessId = LocalPayloadCodec.ParseHello(response.Payload, handshakeToken);
+            var claimedProcessId = LocalPayloadCodec.ParseTerminalHello(response.Payload, handshakeToken, semanticProfile);
             if (serverProcessId != claimedProcessId)
             {
                 throw new InvalidDataException("Agent pipe server process identity mismatch.");
@@ -2289,12 +2844,38 @@ namespace TermLink.SessionHost
                     Acknowledge(frame.Sequence);
                     continue;
                 }
+                if (frame.Type == LocalFrameType.ClipboardAuthorization) {
+                    if (frame.Sequence != 0 || frame.Payload.Length != 17 || frame.Payload[16] > 1)
+                        throw new InvalidDataException("Invalid clipboard authorization response.");
+                    var id = new Guid(frame.Payload.AsSpan(0, 16));
+                    lock (sync) if (id == pendingClipboardId) pendingClipboard?.TrySetResult(frame.Payload[16] == 1);
+                    continue;
+                }
+                if (frame.Type == LocalFrameType.BrokerCaptureRoot)
+                {
+                    if (requireBrokerCaptureRoot)
+                        throw new InvalidDataException("Broker capture root was repeated after Agent authentication.");
+                    AcceptBrokerCaptureRoot(frame);
+                    continue;
+                }
                 if (frame.Sequence <= lastAgentCommandSequence)
                 {
                     if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.RemoteInputV2 ||
                         frame.Type == LocalFrameType.RemoteInputReject)
                     {
                         Array.Clear(frame.Payload, 0, frame.Payload.Length);
+                    }
+                    continue;
+                }
+                if (frame.Type == LocalFrameType.Input || frame.Type == LocalFrameType.RemoteInputV2 ||
+                    frame.Type == LocalFrameType.RemoteInputReject || frame.Type == LocalFrameType.RemoteAccessStopped)
+                {
+                    lock (sync)
+                    {
+                        if (commands.Count >= 64) throw new InvalidDataException("Agent command queue is full.");
+                        lastAgentCommandSequence = frame.Sequence;
+                        commands.Enqueue(frame);
+                        commandPending.Set();
                     }
                     continue;
                 }
@@ -2318,62 +2899,96 @@ namespace TermLink.SessionHost
                             }
                         });
                         break;
-                    case LocalFrameType.Input:
-                        byte[] bytes;
-                        var inputId = LocalPayloadCodec.ParseInput(frame.Payload, out bytes);
-                        try { inputHandler(inputId, bytes); }
-                        finally
-                        {
-                            Array.Clear(bytes, 0, bytes.Length);
-                            Array.Clear(frame.Payload, 0, frame.Payload.Length);
-                        }
-                        break;
-                    case LocalFrameType.RemoteInputV2:
-                        ulong localInputEpoch;
-                        byte[] remoteBytes;
-                        var remoteInputId = LocalPayloadCodec.ParseRemoteInput(frame.Payload, out localInputEpoch, out remoteBytes);
-                        LocalRemoteInputResult remoteResult;
-                        try { remoteResult = remoteInputHandler(remoteInputId, localInputEpoch, remoteBytes); }
-                        finally
-                        {
-                            Array.Clear(remoteBytes, 0, remoteBytes.Length);
-                            Array.Clear(frame.Payload, 0, frame.Payload.Length);
-                        }
-                        Publish(
-                            LocalFrameType.RemoteInputResult,
-                            LocalPayloadCodec.RemoteInputResult(remoteInputId, remoteResult));
-                        break;
-                    case LocalFrameType.RemoteInputReject:
-                        LocalRemoteInputResult rejectedResult;
-                        var rejectedInputId = LocalPayloadCodec.ParseRemoteInputResult(frame.Payload, out rejectedResult);
-                        Array.Clear(frame.Payload, 0, frame.Payload.Length);
-                        if (rejectedResult == LocalRemoteInputResult.Accepted)
-                        {
-                            throw new InvalidDataException("Agent cannot synthesize an accepted remote input result.");
-                        }
-                        Publish(
-                            LocalFrameType.RemoteInputResult,
-                            LocalPayloadCodec.RemoteInputResult(rejectedInputId, rejectedResult));
-                        break;
-                    case LocalFrameType.RemoteAccessStopped:
-                        LocalPayloadCodec.ParseRemoteAccessStopped(frame.Payload);
-                        EnterLocalOnly();
-                        return;
                     default:
                         throw new InvalidDataException("Agent sent an invalid command type: " + frame.Type + ".");
                 }
             }
         }
 
+        private void AcceptBrokerCaptureRoot(LocalFrame frame)
+        {
+            if (frame == null || frame.Type != LocalFrameType.BrokerCaptureRoot ||
+                frame.SessionId != sessionId || frame.Sequence != 0 || !semanticProfile.IsGraphics)
+                throw new InvalidDataException("Broker capture root is not an authenticated graphics control frame.");
+            var root = LocalPayloadCodec.ParseBrokerCaptureRoot(frame.Payload);
+            lock (sync)
+            {
+                if (brokerCaptureRoot != null && !string.Equals(brokerCaptureRoot, root,
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Broker capture root changed across Agent reconnect.");
+                brokerCaptureRoot = root;
+                Monitor.PulseAll(sync);
+            }
+        }
+
+        private void ProcessCommands()
+        {
+            while (!stop)
+            {
+                LocalFrame frame;
+                lock (sync) frame = commands.Count == 0 ? null : commands.Dequeue();
+                if (frame == null) { commandPending.WaitOne(100); continue; }
+                try
+                {
+                    switch (frame.Type)
+                    {
+                        case LocalFrameType.Input:
+                            var inputId = LocalPayloadCodec.ParseInput(frame.Payload, out var bytes);
+                            try { inputHandler(inputId, bytes); }
+                            finally { Array.Clear(bytes, 0, bytes.Length); }
+                            break;
+                        case LocalFrameType.RemoteInputV2:
+                            var remoteId = LocalPayloadCodec.ParseRemoteInput(frame.Payload,
+                                out var localInputEpoch, out var remoteBytes);
+                            LocalRemoteInputResult result;
+                            try { result = remoteInputHandler(remoteId, localInputEpoch, remoteBytes); }
+                            finally { Array.Clear(remoteBytes, 0, remoteBytes.Length); }
+                            Publish(LocalFrameType.RemoteInputResult,
+                                LocalPayloadCodec.RemoteInputResult(remoteId, result));
+                            break;
+                        case LocalFrameType.RemoteInputReject:
+                            var rejectedId = LocalPayloadCodec.ParseRemoteInputResult(frame.Payload, out var rejected);
+                            if (rejected == LocalRemoteInputResult.Accepted)
+                                throw new InvalidDataException("Agent cannot synthesize an accepted remote input result.");
+                            Publish(LocalFrameType.RemoteInputResult,
+                                LocalPayloadCodec.RemoteInputResult(rejectedId, rejected));
+                            break;
+                        case LocalFrameType.RemoteAccessStopped:
+                            LocalPayloadCodec.ParseRemoteAccessStopped(frame.Payload);
+                            EnterLocalOnly();
+                            return;
+                    }
+                }
+                catch
+                {
+                    lock (sync)
+                    {
+                        stop = true;
+                        acknowledgedFrameHandlerFailed = true;
+                        pipe?.Dispose();
+                        Monitor.PulseAll(sync);
+                    }
+                    return;
+                }
+                finally { Array.Clear(frame.Payload, 0, frame.Payload.Length); }
+            }
+        }
+
         private void Acknowledge(ulong sequence)
         {
             List<LocalFrame> acknowledged = null;
+            BrokerTransaction broker = null;
             var applyToAuthority = false;
             lock (sync)
             {
                 if (sequence > nextSequence) throw new InvalidDataException("Agent ACK exceeds published sequence.");
                 if (sequence <= lastDurablyAcknowledgedSequence) return;
                 applyToAuthority = acknowledgedFrameHandler != null && !acknowledgedFrameHandlerFailed;
+                broker = brokerTransaction;
+                if (broker != null && sequence >= broker.Sequence &&
+                    (sequence != broker.Sequence || !broker.Published || pending.Count != 1 ||
+                     pending.First.Value.Sequence != broker.Sequence))
+                    throw new InvalidDataException("Broker Output ACK did not match its exact pending frame.");
                 if (applyToAuthority)
                 {
                     acknowledged = new List<LocalFrame>();
@@ -2385,6 +3000,7 @@ namespace TermLink.SessionHost
                     }
                 }
                 lastDurablyAcknowledgedSequence = sequence;
+                if (broker != null && sequence == broker.Sequence) broker.Durable = true;
                 while (pending.First != null && pending.First.Value.Sequence <= sequence)
                 {
                     pendingBytes -= StoredBytes(pending.First.Value);
@@ -2402,6 +3018,7 @@ namespace TermLink.SessionHost
             if (!applyToAuthority) return;
             foreach (var frame in acknowledged)
             {
+                if (broker != null && frame.Sequence == broker.Sequence) continue;
                 if (!TryApplyAuthorityFrame(frame)) return;
             }
         }
@@ -2416,6 +3033,15 @@ namespace TermLink.SessionHost
                     if (localOnly) return;
                     localOnly = true;
                     stop = true;
+                    if (brokerTransaction != null)
+                    {
+                        acknowledgedFrameHandlerFailed = true;
+                        pending.Clear();
+                        pendingBytes = 0;
+                        Monitor.PulseAll(sync);
+                        sendPending.Set();
+                        return;
+                    }
                     queued = new List<LocalFrame>(pending);
                     pending.Clear();
                     pendingBytes = 0;
@@ -2500,6 +3126,12 @@ namespace TermLink.SessionHost
             pending.AddLast(frame);
             pendingBytes += StoredBytes(frame);
             if (pendingBytes <= maximumBufferedBytes) return;
+            if (brokerTransaction != null && brokerTransaction.Sequence == frame.Sequence)
+            {
+                pending.RemoveLast();
+                pendingBytes -= StoredBytes(frame);
+                throw new IOException("Broker Output exceeds the local durable transport buffer.");
+            }
 
             var gapStart = lastDurablyAcknowledgedSequence + 1;
             var gapEnd = frame.Sequence;
@@ -2514,6 +3146,7 @@ namespace TermLink.SessionHost
             pendingBytes = StoredBytes(gap);
             if (pipe != null)
             {
+                hasDisconnected = true;
                 pipe.Dispose();
                 pipe = null;
             }
@@ -2541,6 +3174,9 @@ namespace TermLink.SessionHost
                 Monitor.PulseAll(sync);
             }
             if (task != null) task.Wait(2000);
+            commandPending.Set();
+            if (commandTask != null) commandTask.Wait(2000);
+            commandPending.Dispose();
             sendPending.Dispose();
         }
 

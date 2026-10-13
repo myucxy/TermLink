@@ -4,6 +4,100 @@ using System.Text;
 
 namespace TermLink.LocalIpc
 {
+    internal sealed class TerminalLocalProtocolException : IOException
+    {
+        public TerminalLocalProtocolException() : base("TERMINAL_LOCAL_PROTOCOL_MISMATCH: SessionHost and Agent require matching terminal semantics, width and resource profiles.") { }
+    }
+
+    internal sealed class TerminalHistoryProfileException : IOException
+    {
+        public string Code { get; private set; }
+        public TerminalHistoryProfileException(string code)
+            : base(code + ": Preserved terminal history cannot be replayed with the current session profile.")
+        {
+            Code = code;
+        }
+    }
+
+    internal sealed class TerminalSemanticProfile
+    {
+        public static readonly TerminalSemanticProfile Legacy = new TerminalSemanticProfile(
+            "terminal_state_2_21_v2", "terminal_state_2_21_v2;width=1;output=0;resources=1", false, 1);
+        public static readonly TerminalSemanticProfile Graphics = new TerminalSemanticProfile(
+            "terminal_state_2_22_v1", "terminal_state_2_22_v1;width=1;output=0;resources=2", true, 1);
+        public static readonly TerminalSemanticProfile GraphicsUnicode16 = new TerminalSemanticProfile(
+            "terminal_state_2_22_v2", "terminal_state_2_22_v2;width=2;output=0;resources=2", true, 2);
+
+        private TerminalSemanticProfile(string stateContract, string descriptor, bool isGraphics, ushort widthProfile)
+        {
+            StateContract = stateContract;
+            Descriptor = descriptor;
+            IsGraphics = isGraphics;
+            WidthProfile = widthProfile;
+        }
+
+        public string StateContract { get; }
+        public string Descriptor { get; }
+        public bool IsGraphics { get; }
+        public ushort WidthProfile { get; }
+
+        internal static TerminalSemanticProfile ParseDescriptor(string descriptor)
+        {
+            if (string.Equals(descriptor, Legacy.Descriptor, StringComparison.Ordinal)) return Legacy;
+            if (string.Equals(descriptor, Graphics.Descriptor, StringComparison.Ordinal)) return Graphics;
+            if (string.Equals(descriptor, GraphicsUnicode16.Descriptor, StringComparison.Ordinal)) return GraphicsUnicode16;
+            return null;
+        }
+    }
+
+    internal static class TerminalSessionProfile
+    {
+        public const string FileName = "terminal-profile.dpapi";
+        public const int MaximumProtectedBytes = 4096;
+        public const string Missing = "TERMINAL_HISTORY_PROFILE_MISSING";
+        public const string Invalid = "TERMINAL_HISTORY_PROFILE_INVALID";
+        public const string Mismatch = "TERMINAL_HISTORY_PROFILE_MISMATCH";
+
+        public static byte[] Encode(Guid sessionId)
+        {
+            return Encode(sessionId, TerminalSemanticProfile.Legacy);
+        }
+
+        public static byte[] Encode(Guid sessionId, TerminalSemanticProfile profile)
+        {
+            if (profile == null) throw new ArgumentNullException(nameof(profile));
+            return Encoding.ASCII.GetBytes("TermLink terminal profile V1\n" +
+                sessionId.ToString("N") + "\n" + profile.Descriptor);
+        }
+
+        public static void Validate(byte[] bytes, Guid sessionId)
+        {
+            ValidateExpected(bytes, sessionId, TerminalSemanticProfile.Legacy);
+        }
+
+        public static TerminalSemanticProfile ValidateExpected(byte[] bytes, Guid sessionId, TerminalSemanticProfile expected)
+        {
+            if (expected == null) throw new ArgumentNullException(nameof(expected));
+            var actual = Read(bytes, sessionId);
+            if (actual != expected) throw new TerminalHistoryProfileException(Mismatch);
+            return actual;
+        }
+
+        public static TerminalSemanticProfile Read(byte[] bytes, Guid sessionId)
+        {
+            var prefix = Encoding.ASCII.GetBytes("TermLink terminal profile V1\n" + sessionId.ToString("N") + "\n");
+            if (bytes == null || bytes.Length <= prefix.Length || bytes.Length > 512)
+                throw new TerminalHistoryProfileException(Invalid);
+            for (var index = 0; index < prefix.Length; index++)
+                if (bytes[index] != prefix[index]) throw new TerminalHistoryProfileException(Invalid);
+            for (var index = prefix.Length; index < bytes.Length; index++)
+                if (bytes[index] < 32 || bytes[index] > 126) throw new TerminalHistoryProfileException(Invalid);
+            var profile = TerminalSemanticProfile.ParseDescriptor(
+                Encoding.ASCII.GetString(bytes, prefix.Length, bytes.Length - prefix.Length));
+            if (profile == null) throw new TerminalHistoryProfileException(Mismatch);
+            return profile;
+        }
+    }
     internal enum LocalResizeError : byte
     {
         OK, RESIZE_UNSUPPORTED, RESIZE_BUSY, LOCAL_INPUT_PRIORITY, RESIZE_EXPIRED,
@@ -28,6 +122,25 @@ namespace TermLink.LocalIpc
         public LocalResizeError Error;
     }
 
+    internal sealed class LocalHostResizeResult
+    {
+        public ulong SourceSequence;
+        public uint SourceOffsetEnd;
+        public uint Ordinal;
+        public ushort RequestedColumns;
+        public ushort RequestedRows;
+        public ushort ActualColumns;
+        public ushort ActualRows;
+        public LocalResizeError Error;
+
+        public string Describe()
+        {
+            var sequence = RequestedColumns != 0 ? "<ESC>[" + RequestedColumns + "$|" : "<ESC>[" + RequestedRows + "*|";
+            return "终端尺寸请求（规范化） / Terminal resize (normalized) " + sequence + ": " + Error +
+                "; actual=" + ActualColumns + "x" + ActualRows + "; source=" + SourceSequence + ":" + SourceOffsetEnd + ":" + Ordinal;
+        }
+    }
+
     internal enum LocalFrameType : byte
     {
         HostHello = 1,
@@ -47,7 +160,14 @@ namespace TermLink.LocalIpc
         Title = 15,
         SessionRemoved = 16,
         RemoteAccessStopped = 17,
-        ResizeResult = 18
+        ResizeResult = 18,
+        HostGeometry = 19,
+        HostTheme = 20,
+        HostResizeResult = 21,
+        ClipboardAuthorize = 22,
+        ClipboardAuthorization = 23,
+        BrokerOutput = 24,
+        BrokerCaptureRoot = 25
     }
 
     internal enum LocalRemoteInputResult : byte
@@ -230,6 +350,43 @@ namespace TermLink.LocalIpc
 
     internal static class LocalPayloadCodec
     {
+        public static byte[] BrokerCaptureRoot(string absolutePath)
+        {
+            if (string.IsNullOrWhiteSpace(absolutePath) || absolutePath.IndexOf('\0') >= 0)
+                throw new InvalidDataException("Broker capture root is empty or malformed.");
+            var bytes = new UTF8Encoding(false, true).GetBytes(absolutePath);
+            ParseBrokerCaptureRoot(bytes);
+            return bytes;
+        }
+
+        public static string ParseBrokerCaptureRoot(byte[] payload)
+        {
+            if (payload == null || payload.Length < 1 || payload.Length > 32768)
+                throw new InvalidDataException("Broker capture root payload is invalid.");
+            string path;
+            try { path = new UTF8Encoding(false, true).GetString(payload); }
+            catch (DecoderFallbackException error)
+            { throw new InvalidDataException("Broker capture root is not UTF-8.", error); }
+            if (path.Length < 3 || path[1] != ':' || path[2] != '\\' ||
+                !((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) ||
+                path.IndexOf('\0') >= 0 || path.IndexOf(':', 2) >= 0 ||
+                path.IndexOf('/') >= 0 || path.IndexOfAny(new[] { '*', '?', '"', '<', '>', '|' }) >= 0)
+                throw new InvalidDataException("Broker capture root must be an absolute local drive path.");
+            foreach (var character in path)
+                if (character < ' ')
+                    throw new InvalidDataException("Broker capture root contains a control character.");
+            if (path.Length > 3)
+                foreach (var segment in path.Substring(3).Split('\\'))
+                    if (segment.Length == 0 || segment == "." || segment == ".." ||
+                        segment.EndsWith(' ') || segment.EndsWith('.'))
+                        throw new InvalidDataException("Broker capture root contains an invalid path segment.");
+            return path;
+        }
+
+        // Immutable for this product session generation. Additive Snapshot
+        // decodability alone is insufficient when parser replay rules differ.
+        public const string TerminalStateContract = "terminal_state_2_21_v2";
+        public const string TerminalProfileDescriptor = TerminalStateContract + ";width=1;output=0;resources=1";
         public const int HandshakeTokenBytes = 32;
         public const int MaximumTitleBytes = 4096;
         private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
@@ -318,6 +475,92 @@ namespace TermLink.LocalIpc
             LocalFrameCodec.WriteUInt32(payload, 0, checked((uint)processId));
             Buffer.BlockCopy(token, 0, payload, 4, token.Length);
             return payload;
+        }
+
+        public static byte[] HostResizeResult(LocalHostResizeResult result)
+        {
+            if (result == null || result.SourceSequence == 0 || result.SourceOffsetEnd == 0 || result.SourceOffsetEnd > 1024 * 1024 ||
+                (result.RequestedColumns == 0) == (result.RequestedRows == 0) || result.RequestedColumns > 512 || result.RequestedRows > 512 ||
+                result.ActualColumns > 512 || result.ActualRows > 512 || !Enum.IsDefined(typeof(LocalResizeError), result.Error) ||
+                (result.Error == LocalResizeError.OK && (result.ActualColumns == 0 || result.ActualRows == 0 ||
+                    (result.RequestedColumns != 0 && result.RequestedColumns != result.ActualColumns) ||
+                    (result.RequestedRows != 0 && result.RequestedRows != result.ActualRows))))
+                throw new InvalidDataException("Invalid ordered host resize result.");
+            using (var stream = new MemoryStream())
+            using (var writer = new BinaryWriter(stream))
+            {
+                writer.Write((byte)1); writer.Write((byte)result.Error); writer.Write((ushort)0);
+                writer.Write(result.SourceSequence); writer.Write(result.SourceOffsetEnd); writer.Write(result.Ordinal);
+                writer.Write(result.RequestedColumns); writer.Write(result.RequestedRows);
+                writer.Write(result.ActualColumns); writer.Write(result.ActualRows);
+                return stream.ToArray();
+            }
+        }
+
+        public static LocalHostResizeResult ParseHostResizeResult(byte[] payload)
+        {
+            if (payload == null || payload.Length != 28 || payload[0] != 1 || payload[2] != 0 || payload[3] != 0)
+                throw new InvalidDataException("Invalid ordered host resize result header.");
+            using (var reader = new BinaryReader(new MemoryStream(payload)))
+            {
+                reader.ReadByte();
+                var error = (LocalResizeError)reader.ReadByte(); reader.ReadUInt16();
+                var result = new LocalHostResizeResult {
+                    Error = error, SourceSequence = reader.ReadUInt64(), SourceOffsetEnd = reader.ReadUInt32(), Ordinal = reader.ReadUInt32(),
+                    RequestedColumns = reader.ReadUInt16(), RequestedRows = reader.ReadUInt16(), ActualColumns = reader.ReadUInt16(), ActualRows = reader.ReadUInt16()
+                };
+                HostResizeResult(result);
+                return result;
+            }
+        }
+
+        public static byte[] TerminalHello(int processId, byte[] token)
+        {
+            return TerminalHello(processId, token, TerminalSemanticProfile.Legacy);
+        }
+
+        public static byte[] TerminalHello(int processId, byte[] token, TerminalSemanticProfile profile)
+        {
+            if (profile == null) throw new ArgumentNullException(nameof(profile));
+            var identity = Hello(processId, token);
+            try
+            {
+                var descriptor = Encoding.ASCII.GetBytes(profile.Descriptor);
+                var result = new byte[identity.Length + descriptor.Length];
+                Buffer.BlockCopy(identity, 0, result, 0, identity.Length);
+                Buffer.BlockCopy(descriptor, 0, result, identity.Length, descriptor.Length);
+                return result;
+            }
+            finally { Array.Clear(identity, 0, identity.Length); }
+        }
+
+        public static int ParseTerminalHello(byte[] payload, byte[] expectedToken)
+        {
+            return ParseTerminalHello(payload, expectedToken, TerminalSemanticProfile.Legacy);
+        }
+
+        public static int ParseTerminalHello(byte[] payload, byte[] expectedToken, TerminalSemanticProfile expected)
+        {
+            if (expected == null) throw new ArgumentNullException(nameof(expected));
+            var processId = ParseTerminalHello(payload, expectedToken, out TerminalSemanticProfile actual);
+            if (actual != expected) throw new TerminalLocalProtocolException();
+            return processId;
+        }
+
+        public static int ParseTerminalHello(byte[] payload, byte[] expectedToken, out TerminalSemanticProfile profile)
+        {
+            profile = null;
+            if (payload == null || payload.Length < 36 || payload.Length > 256)
+                throw new InvalidDataException("Invalid local IPC terminal hello length.");
+            var identity = new byte[36];
+            Buffer.BlockCopy(payload, 0, identity, 0, identity.Length);
+            int processId;
+            try { processId = ParseHello(identity, expectedToken); }
+            finally { Array.Clear(identity, 0, identity.Length); }
+            var actual = TerminalSemanticProfile.ParseDescriptor(Encoding.ASCII.GetString(payload, 36, payload.Length - 36));
+            if (actual == null) throw new TerminalLocalProtocolException();
+            profile = actual;
+            return processId;
         }
 
         public static int ParseHello(byte[] payload, byte[] expectedToken)

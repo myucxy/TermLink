@@ -29,6 +29,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
                 var runtimeType = Assembly.Load("TermLink.Agent").GetType(
                     "TermLink.Agent.ProductionAgentRuntime",
                     throwOnError: true);
+                TerminalStateContractValidation.Run(runtimeType);
                 ValidateFullSubscriberWindowRecoversAcrossSubscribeGeneration(runtimeType);
                 ValidateAuthorizedRecipientSigningKeyContract(runtimeType);
                 ValidateDirectPeerProviderIsolation(runtimeType);
@@ -1255,6 +1256,9 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
             SetField(runtimeType, runtime, "statusRefreshGate", new SemaphoreSlim(1, 1));
             SetField(runtimeType, runtime, "lifecycleSync", new object());
             SetField(runtimeType, runtime, "statusSync", new object());
+            var aiType = runtimeType.Assembly.GetType("TermLink.Agent.AiSessionManager", throwOnError: true);
+            SetField(runtimeType, runtime, "aiSessions", Activator.CreateInstance(aiType, InstanceFlags,
+                binder: null, args: new object[] { null, Path.GetTempPath(), null }, culture: null));
             if (tokenEndpoint != null)
                 SetField(runtimeType, runtime, "tokenEndpoint", tokenEndpoint);
             return new AuthenticationRuntimeContext(runtime, http, identity);
@@ -1697,6 +1701,7 @@ namespace TermLink.ProductionSubscriberRecovery.Validation
 
             public void Dispose()
             {
+                ((IDisposable)Runtime.GetType().GetField("aiSessions", InstanceFlags).GetValue(Runtime)).Dispose();
                 http.Dispose();
                 identity.Dispose();
             }

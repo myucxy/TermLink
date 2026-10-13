@@ -37,6 +37,13 @@ public sealed partial class App : Application
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
+            if (Program.NativeTerminalAttachment is { } attachment)
+            {
+                desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+                desktop.MainWindow = new NativeTerminalWindow(attachment.Pipe, attachment.HostPid);
+                base.OnFrameworkInitializationCompleted();
+                return;
+            }
             desktopLifetime = desktop;
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             var descriptor = CreatePlatformDescriptor();

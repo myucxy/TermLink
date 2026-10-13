@@ -17,7 +17,9 @@ namespace TermLink.TerminalCore
 
     public enum NativeTerminalHostEffectKindV2
     {
-        PtyReply = 1
+        PtyReply = 1,
+        ResizeRequest = 2,
+        PlatformAction = 3
     }
 
     /// <summary>
@@ -199,7 +201,8 @@ namespace TermLink.TerminalCore
                 if (aggregatePayloadBytes > MaximumAggregatePayloadBytes)
                     throw Error("aggregate PTY reply payload exceeds the hard limit");
 
-                ExpectUInt64(40, RequiredFeatures, "required features");
+                var features = ReadUInt64(40, "required features");
+                if ((features & 1) == 0 || (features & ~7UL) != 0) throw Error("required features");
                 ExpectUInt64(48, 0, "header reserved field");
 
                 var payloadCrc = ReadUInt32(56, "payload CRC32C");
@@ -216,6 +219,8 @@ namespace TermLink.TerminalCore
                 uint previousSourceOffset = 0;
                 uint previousOrdinal = 0;
                 var hasPrevious = false;
+                var resizeCount = 0;
+                var platformCount = 0;
 
                 for (var index = 0; index < recordCount; index++)
                 {
@@ -225,7 +230,8 @@ namespace TermLink.TerminalCore
                             Multiply((ulong)index, RecordSize, "record offset"),
                             "record offset"),
                         "record offset");
-                    ExpectUInt32(recordOffset, PtyReplyKind, "host effect kind");
+                    var kind = ReadUInt32(recordOffset, "host effect kind");
+                    if (kind != PtyReplyKind && kind != 2 && kind != 3) throw Error("host effect kind");
                     ExpectUInt32(recordOffset + 4, 0, "record flags");
                     var sequence = ReadUInt64(recordOffset + 8, "source sequence");
                     var sourceOffset = ReadUInt32(recordOffset + 16, "source offset end");
@@ -254,9 +260,17 @@ namespace TermLink.TerminalCore
                     var payload = bytes.Slice(
                         ToInt(dataOffset, "record payload offset"),
                         ToInt(dataLength, "record payload length"));
-                    ValidatePtyReply(payload);
+                    if (kind == PtyReplyKind) ValidatePtyReply(payload);
+                    else if (kind == 3) { if (!NativeTerminalPlatformAction.IsValid(payload)) throw Error("platform action payload"); platformCount++; }
+                    else
+                    {
+                        if (++resizeCount > 64 || payload.Length != 8) throw Error("resize request bound");
+                        var columns = BinaryPrimitives.ReadUInt32LittleEndian(payload);
+                        var rows = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(4));
+                        if ((columns == 0) == (rows == 0) || columns > 512 || rows > 512) throw Error("resize request dimensions");
+                    }
                     records[index] = new NativeTerminalHostEffectRecordV2(
-                        NativeTerminalHostEffectKindV2.PtyReply,
+                        (NativeTerminalHostEffectKindV2)kind,
                         sequence,
                         sourceOffset,
                         ordinal,
@@ -271,6 +285,7 @@ namespace TermLink.TerminalCore
 
                 if (expectedDataOffset != totalLength)
                     throw Error("frame has trailing or unreferenced payload bytes");
+                if (features != (RequiredFeatures | (resizeCount == 0 ? 0UL : 2UL) | (platformCount == 0 ? 0UL : 4UL))) throw Error("resize feature declaration");
                 return new NativeTerminalHostEffectFrameV2(records, bytes.ToArray());
             }
 
@@ -307,16 +322,54 @@ namespace TermLink.TerminalCore
 
             private static void ValidatePtyReply(ReadOnlySpan<byte> payload)
             {
+                var normalized = NativeTerminalTraditionalProtocol.NormalizeC1Reply(payload);
+                if (normalized != null) { ValidatePtyReply(normalized); return; }
+                if (payload.SequenceEqual(new byte[] { 0x1b, (byte)'/', (byte)'Z' })) return;
                 if (IsCanonicalV1Reply(payload) ||
+                    IsCanonicalKittyGraphicsReply(payload) ||
                     IsCanonicalDecrpm(payload) ||
                     IsCanonicalDecrqss(payload) ||
                     payload.SequenceEqual(XtVersionReply) ||
                     IsCanonicalXtgettcap(payload) ||
-                    IsCanonicalOscColor(payload))
+                    IsCanonicalOscColor(payload) ||
+                    IsCanonicalTextSize(payload) || IsCanonicalExtendedQuery(payload) || NativeTerminalStateReports.Classify(payload) != 0)
                 {
                     return;
                 }
                 throw Error("PTY reply is not a supported canonical response");
+            }
+
+            private static bool IsCanonicalKittyGraphicsReply(ReadOnlySpan<byte> payload)
+            {
+                if (!payload.StartsWith("\u001b_G"u8) || !payload.EndsWith("\u001b\\"u8)) return false;
+                var body = payload.Slice(3, payload.Length - 5);
+                var separator = body.IndexOf((byte)';');
+                if (separator < 1) return false;
+                var header = body.Slice(0, separator);
+                var message = body.Slice(separator + 1);
+                if (!message.SequenceEqual("OK"u8))
+                {
+                    if (message.Length > 240 ||
+                        !((message.StartsWith("EINVAL: "u8) && message.Length > 8) ||
+                          (message.StartsWith("ENOTSUP: "u8) && message.Length > 9) ||
+                          (message.StartsWith("ENOSPC: "u8) && message.Length > 8))) return false;
+                    foreach (var value in message) if (value < 0x20 || value > 0x7e) return false;
+                }
+                int previous = 0;
+                bool identity = false;
+                while (true)
+                {
+                    int comma = header.IndexOf((byte)',');
+                    var field = comma < 0 ? header : header.Slice(0, comma);
+                    if (field.Length < 3 || field[1] != (byte)'=') return false;
+                    int order = field[0] == (byte)'i' ? 1 : field[0] == (byte)'I' ? 2 : field[0] == (byte)'p' ? 3 : 0;
+                    if (order <= previous || field.Length > 12 ||
+                        !TryReadCanonicalUInt32(field.Slice(2), out var number) || number == 0) return false;
+                    previous = order;
+                    identity |= order <= 2;
+                    if (comma < 0) return identity;
+                    header = header.Slice(comma + 1);
+                }
             }
 
             private static bool IsCanonicalV1Reply(ReadOnlySpan<byte> payload)
@@ -350,6 +403,72 @@ namespace TermLink.TerminalCore
                     TryReadCoordinate(body.Slice(separator + 1), out _);
             }
 
+            private static bool IsCanonicalTextSize(ReadOnlySpan<byte> payload)
+            {
+                if (payload.Length < 8 || payload[0] != 0x1b || payload[1] != (byte)'[' ||
+                    payload[3] != (byte)';' || payload[payload.Length - 1] != (byte)'t') return false;
+                uint maximum = payload[2] switch {
+                    (byte)'4' => 512 * 1024, (byte)'5' or (byte)'9' => 32768,
+                    (byte)'6' => 1024, (byte)'8' => 512, _ => 0,
+                };
+                var body = payload.Slice(4, payload.Length - 5);
+                var separator = body.IndexOf((byte)';');
+                return separator > 0 && TryReadCanonicalUInt32(body.Slice(0, separator), out var height) &&
+                    TryReadCanonicalUInt32(body.Slice(separator + 1), out var width) &&
+                    height > 0 && width > 0 && height <= maximum && width <= maximum;
+            }
+
+            private static bool IsCanonicalExtendedQuery(ReadOnlySpan<byte> payload)
+            {
+                if (payload.StartsWith("\u001b[?"u8) && payload.EndsWith("R"u8)) {
+                    var body = payload.Slice(3, payload.Length - 4);
+                    for (var index = 0; index < 3; index++) {
+                        var separator = body.IndexOf((byte)';');
+                        if ((index < 2) != (separator >= 0)) return false;
+                        var field = separator < 0 ? body : body.Slice(0, separator);
+                        if (!TryReadCanonicalUInt32(field, out var value) || value < 1 || value > (index == 2 ? 6 : 512)) return false;
+                        if (separator >= 0) body = body.Slice(separator + 1);
+                    }
+                    return true;
+                }
+                if (payload.StartsWith("\u001b["u8) && payload.EndsWith("*{"u8))
+                    return TryReadCanonicalUInt32(payload.Slice(2, payload.Length - 4), out var blocks) && blocks <= 16384;
+                if (payload.SequenceEqual("\u001bP!|00000000\u001b\\"u8) ||
+                    payload.SequenceEqual("\u001b[2;1;1;128;128;1;0x"u8) ||
+                    payload.SequenceEqual("\u001b[3;1;1;128;128;1;0x"u8) ||
+                    payload.SequenceEqual("\u001b[?997;1n"u8) || payload.SequenceEqual("\u001b[?997;2n"u8) ||
+                    payload.SequenceEqual("\u001b[?13n"u8) || payload.SequenceEqual("\u001b[?23n"u8) ||
+                    payload.SequenceEqual("\u001b[?27;0;0;5n"u8) || payload.SequenceEqual("\u001b[?53n"u8) ||
+                    payload.SequenceEqual("\u001b[?57;0n"u8) || payload.SequenceEqual("\u001b[?70n"u8) ||
+                    payload.SequenceEqual("\u001b[?83n"u8)) return true;
+                if (payload.StartsWith("\u001b["u8) && payload.EndsWith("\"w"u8))
+                {
+                    var body = payload.Slice(2, payload.Length - 4);
+                    for (var index = 0; index < 5; index++) {
+                        var separator = body.IndexOf((byte)';');
+                        if ((index < 4) != (separator >= 0)) return false;
+                        var field = separator < 0 ? body : body.Slice(0, separator);
+                        if (!TryReadCanonicalUInt32(field, out var value) ||
+                            (index < 2 ? value < 1 || value > 512 : index < 4 ? value != 1 : value < 1 || value > 6)) return false;
+                        if (separator >= 0) body = body.Slice(separator + 1);
+                    }
+                    return true;
+                }
+                if (payload.StartsWith("\u001bP"u8) && payload.EndsWith("\u001b\\"u8))
+                {
+                    var body = payload.Slice(2, payload.Length - 4);
+                    var separator = body.IndexOf("!~"u8);
+                    if (separator < 1 || !TryReadCanonicalUInt32(body.Slice(0, separator), out var id) || id > 65534)
+                        return false;
+                    var hex = body.Slice(separator + 2);
+                    if (hex.Length != 4) return false;
+                    foreach (var digit in hex)
+                        if (!(digit >= '0' && digit <= '9' || digit >= 'A' && digit <= 'F')) return false;
+                    return true;
+                }
+                return false;
+            }
+
             private static bool IsCanonicalDecrpm(ReadOnlySpan<byte> payload)
             {
                 if (payload.Length < 7 || payload[0] != 0x1b || payload[1] != 0x5b ||
@@ -373,7 +492,7 @@ namespace TermLink.TerminalCore
                 if (body.Length < 4 || body[0] != 0x31 || body[1] != 0x24 || body[2] != 0x72)
                     return false;
                 var status = body.Slice(3);
-                return IsCanonicalSgrStatus(status) ||
+                return IsCanonicalColorAssignment(status) || IsCanonicalSgrStatus(status) ||
                     IsCanonicalMarginStatus(status, 0x72) ||
                     IsCanonicalMarginStatus(status, 0x73) ||
                     (status.Length == 3 && status[0] >= 0x31 && status[0] <= 0x36 &&
@@ -381,6 +500,14 @@ namespace TermLink.TerminalCore
                     (status.Length == 3 && status[0] >= 0x31 && status[0] <= 0x32 &&
                         ((status[1] == 0x22 && status[2] == 0x71) ||
                             (status[1] == 0x2a && status[2] == 0x78)));
+            }
+
+            private static bool IsCanonicalColorAssignment(ReadOnlySpan<byte> status) {
+                if (!status.EndsWith(",|"u8)) return false;
+                var body = status.Slice(0, status.Length - 2); var position = 0;
+                return TryTakeField(body, ref position, out var item) && TryReadCanonicalUInt32(item, out var id) && id >= 1 && id <= 2 &&
+                    TryTakeField(body, ref position, out var foreground) && TryReadCanonicalUInt32(foreground, out var fg) && fg <= 257 &&
+                    TryTakeField(body, ref position, out var background) && TryReadCanonicalUInt32(background, out var bg) && bg <= 257 && position == body.Length;
             }
 
             private static bool IsCanonicalSgrStatus(ReadOnlySpan<byte> status)
@@ -517,7 +644,7 @@ namespace TermLink.TerminalCore
                         index <= 255 && IsCanonicalRgb(rest.Slice(separator + 1));
                 }
                 if (body.Length > 3 && body[0] == 0x31 &&
-                    body[1] >= 0x30 && body[1] <= 0x32 && body[2] == 0x3b)
+                    (body[1] >= 0x30 && body[1] <= 0x32 || body[1] == 0x37) && body[2] == 0x3b)
                 {
                     return IsCanonicalRgb(body.Slice(3));
                 }

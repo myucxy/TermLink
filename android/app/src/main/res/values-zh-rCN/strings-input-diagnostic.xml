@@ -1,0 +1,5 @@
+<resources>
+    <string name="terminal_input_diagnostic_title">终端编码拒绝了输入</string>
+    <string name="terminal_input_diagnostic_android_title">Android 输入校验拒绝了字符</string>
+    <string name="terminal_input_diagnostic_details">输入详情</string>
+</resources>

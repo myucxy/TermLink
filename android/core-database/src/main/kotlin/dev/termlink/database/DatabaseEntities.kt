@@ -209,3 +209,33 @@ data class HistoryPreferenceEntity(
     @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val valueCiphertextSha256: ByteArray,
     val updatedAtEpochMillis: Long,
 )
+
+/**
+ * A sealed Kitty capture kept separately from terminal history objects.
+ *
+ * The key epoch is part of the identity so a rotated recipient key never
+ * overwrites a cache entry that was authenticated under an older key.  The
+ * source-sequence index additionally prevents two capture UUIDs from claiming
+ * one ordered terminal event.
+ */
+@Entity(
+    tableName = "broker_captures",
+    primaryKeys = ["sessionId", "captureId", "keyEpoch"],
+    indices = [
+        Index(value = ["sessionId", "sourceSequence", "keyEpoch"], unique = true),
+        Index(value = ["sessionId", "sourceSequence"]),
+    ],
+)
+data class BrokerCaptureEntity(
+    val sessionId: String,
+    val captureId: String,
+    val keyEpoch: Long,
+    val sourceSequence: Long,
+    val canonicalBytes: Int,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val canonicalSha256: ByteArray,
+    val keyId: String,
+    val sizeBytes: Long,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val ciphertextSha256: ByteArray,
+    @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val ciphertext: ByteArray,
+    val createdAtEpochMillis: Long,
+)

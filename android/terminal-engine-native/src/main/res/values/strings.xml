@@ -1,0 +1,4 @@
+<resources>
+    <string name="native_history_capture_expired">This history view has expired. Return to the bottom, then scroll up to refresh.</string>
+    <string name="native_history_capture_limit">History could not be captured within the memory limit. Return to the bottom and try again later.</string>
+</resources>

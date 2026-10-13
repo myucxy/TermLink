@@ -6,7 +6,7 @@ using TermLink.LocalIpc;
 namespace TermLink.SessionHost
 {
     /// <summary>
-    /// Observes OSC 0/2 window-title controls in the exact ConPTY output byte
+    /// Observes OSC 0/2/21 window-title controls in the exact ConPTY output byte
     /// stream. Bytes are never removed or changed; this is a side-band parser
     /// used only to publish ordered title metadata after the corresponding
     /// output frame has been committed.
@@ -144,7 +144,9 @@ namespace TermLink.SessionHost
 
         private static bool IsTitleCommand(IList<byte> value)
         {
-            return value.Count == 1 && (value[0] == (byte)'0' || value[0] == (byte)'2');
+            var selector = 0;
+            foreach (var digit in value) selector = selector * 10 + digit - (byte)'0';
+            return selector == 0 || selector == 2 || selector == 21;
         }
 
         private void Reset()

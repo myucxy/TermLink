@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -99,7 +100,7 @@ internal fun SessionInputMenuItems(
     val mouseToggleEnabled = touchMouseEnabled || controlling && mouseReporting
     HorizontalDivider()
     Row(
-        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+        modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp)
             .toggleable(value = touchMouseEnabled, enabled = mouseToggleEnabled,
                 role = Role.Switch, onValueChange = onTouchMouseChanged)
             .padding(horizontal = 16.dp),
@@ -110,17 +111,17 @@ internal fun SessionInputMenuItems(
                 modifier = Modifier.weight(1f, fill = false),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (mouseToggleEnabled) 1f else 0.38f))
-            IconButton(onClick = { showHelp = true }, modifier = Modifier.size(48.dp)) {
+            IconButton(onClick = { showHelp = true }, modifier = Modifier.size(40.dp)) {
                 Icon(Icons.AutoMirrored.Filled.HelpOutline,
                     contentDescription = stringResource(R.string.session_input_title),
                     modifier = Modifier.size(18.dp))
             }
         }
         Switch(checked = touchMouseEnabled, onCheckedChange = null, enabled = mouseToggleEnabled,
-            modifier = Modifier.scale(0.75f))
+            modifier = Modifier.height(40.dp).scale(0.75f))
     }
     Row(
-        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 16.dp),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp).padding(horizontal = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -136,7 +137,7 @@ internal fun SessionInputMenuItems(
                     selected = wheelOnLeft == onLeft,
                     onClick = { onWheelSideChanged(onLeft) },
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1f).widthIn(min = 52.dp).semantics { role = Role.RadioButton },
+                    modifier = Modifier.weight(1f).widthIn(min = 52.dp).height(36.dp).semantics { role = Role.RadioButton },
                     label = {
                         Text(stringResource(if (onLeft) R.string.session_wheel_left else R.string.session_wheel_right),
                             modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,

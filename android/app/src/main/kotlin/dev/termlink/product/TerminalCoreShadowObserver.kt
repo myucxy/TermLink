@@ -114,6 +114,10 @@ internal class TerminalCoreShadowObserver(
 
 private fun RemoteSessionEvent.toNativeShadowEvent(): NativeSourceEvent = when (this) {
     is RemoteSessionEvent.Output -> NativeSourceEvent.Output(sequence, bytes)
+    is RemoteSessionEvent.BrokerOutput -> error("Legacy diagnostic shadow cannot replay broker captures")
+    is RemoteSessionEvent.HostTheme -> NativeSourceEvent.HostTheme(sequence, theme)
+    is RemoteSessionEvent.HostResizeResult -> NativeSourceEvent.Advance(sequence, 0)
+    is RemoteSessionEvent.HostGeometry -> NativeSourceEvent.HostGeometry(sequence, geometry)
     is RemoteSessionEvent.Resize -> NativeSourceEvent.Resize(sequence, size)
     // A covered Gap marker is an ordered no-op. Native Gap means a real missing source range and
     // would fail-close the core, so it must never be used for an already recovered marker.

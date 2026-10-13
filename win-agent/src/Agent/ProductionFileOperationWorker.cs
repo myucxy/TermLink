@@ -954,7 +954,8 @@ namespace TermLink.Agent
                 }
                 await Task.Delay(RemoteAccessPollInterval, token).ConfigureAwait(false);
             }
-            if (ManagedTerminalLauncher.IsBuiltInShellType(commandId))
+            if (ManagedTerminalLauncher.IsBuiltInShellType(commandId) &&
+                !string.Equals(commandId, ManagedTerminalLauncher.EnhancedPowerShell7CommandId, StringComparison.Ordinal))
             {
                 return JsonSerializer.SerializeToElement(new
                 {

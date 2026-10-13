@@ -3,6 +3,8 @@ package dev.termlink.history
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import dev.termlink.database.TermLinkDatabase
+import dev.termlink.model.HeapState
+import dev.termlink.model.TerminalBufferBudget
 import java.util.UUID
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -21,6 +23,8 @@ import org.robolectric.annotation.Config
 class RendererCheckpointRepositoryTest {
     private lateinit var database: TermLinkDatabase
     private lateinit var repository: HistoryRepository
+    private val bufferBudget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+    private val opened = mutableListOf<AutoCloseable>()
 
     @Before
     fun setUp() {
@@ -28,16 +32,20 @@ class RendererCheckpointRepositoryTest {
             ApplicationProvider.getApplicationContext(),
             TermLinkDatabase::class.java,
         ).allowMainThreadQueries().build()
-        repository = HistoryRepository(database, clockMillis = { 5_000 })
+        repository = HistoryRepository(database, clockMillis = { 5_000 }, bufferBudget = bufferBudget)
     }
 
     @After
     fun tearDown() {
+        opened.forEach(AutoCloseable::close)
         database.close()
+        assertEquals(0L, bufferBudget.reservedBytes)
     }
 
+    private fun <T : AutoCloseable> T.track(): T = also { opened += it }
+
     @Test
-    fun snapshotBindingAtomicallyAdvancesAckAndFencesOldRenderer() = runBlocking {
+    fun snapshotBindingAtomicallyAdvancesAckAndFencesOldRenderer(): Unit = runBlocking {
         val sessionId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val snapshotId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val direction = "PC_TO_ANDROID"
@@ -64,11 +72,11 @@ class RendererCheckpointRepositoryTest {
                 snapshotId,
                 40u,
                 ByteArray(32),
-            )
+            ).track()
         }.exceptionOrNull()
         assertTrue(hashFailure is IllegalArgumentException)
         assertEquals(initial, repository.ackCursorState(sessionId, direction))
-        assertNull(repository.rendererCheckpointState(sessionId, direction))
+        assertNull(repository.rendererCheckpointState(sessionId, direction)?.track())
 
         val bound = repository.bindRendererCheckpoint(
             sessionId,
@@ -77,7 +85,7 @@ class RendererCheckpointRepositoryTest {
             snapshotId,
             40u,
             digest,
-        )
+        ).track()
         assertEquals(2L, bound.rendererGeneration)
         assertEquals(40uL, bound.snapshotSequence)
         assertEquals(40uL, bound.durableAcknowledgement)
@@ -101,7 +109,7 @@ class RendererCheckpointRepositoryTest {
         assertTrue(replacementFailure is IllegalArgumentException)
         assertArrayEquals(
             ciphertext,
-            repository.rendererCheckpointState(sessionId, direction)?.snapshot?.ciphertext,
+            repository.rendererCheckpointState(sessionId, direction)?.track()?.snapshot?.ciphertext,
         )
 
         val secondDirection = "ANDROID_TO_PC"
@@ -113,7 +121,7 @@ class RendererCheckpointRepositoryTest {
             snapshotId,
             40u,
             digest,
-        )
+        ).track()
         assertEquals(2L, secondBound.rendererGeneration)
 
         val staleWriterFailure = runCatching {
@@ -121,7 +129,7 @@ class RendererCheckpointRepositoryTest {
         }.exceptionOrNull()
         assertTrue(staleWriterFailure is IllegalStateException)
         assertEquals(45uL, repository.putAckCursor(sessionId, direction, bound.rendererGeneration, 45u))
-        val advanced = requireNotNull(repository.rendererCheckpointState(sessionId, direction))
+        val advanced = requireNotNull(repository.rendererCheckpointState(sessionId, direction)?.track())
         assertEquals(40uL, advanced.snapshotSequence)
         assertEquals(45uL, advanced.durableAcknowledgement)
         assertEquals(45uL, repository.ackCursorState(sessionId, direction)?.sequence)
@@ -134,7 +142,7 @@ class RendererCheckpointRepositoryTest {
                 snapshotId,
                 40u,
                 ByteArray(32),
-            )
+            ).track()
         }.exceptionOrNull()
         assertTrue(invalidReanchor is IllegalArgumentException)
         assertEquals(45uL, repository.ackCursorState(sessionId, direction)?.sequence)
@@ -147,29 +155,29 @@ class RendererCheckpointRepositoryTest {
                 snapshotId,
                 40u,
                 digest,
-            )
+            ).track()
         }.exceptionOrNull()
         assertTrue(regressionFailure is IllegalArgumentException)
         assertEquals(
             AckCursorState(sequence = 45u, rendererGeneration = bound.rendererGeneration),
             repository.ackCursorState(sessionId, direction),
         )
-        assertEquals(40uL, repository.rendererCheckpointState(sessionId, direction)?.snapshotSequence)
+        assertEquals(40uL, repository.rendererCheckpointState(sessionId, direction)?.track()?.snapshotSequence)
         assertEquals(46uL, repository.putAckCursor(sessionId, direction, bound.rendererGeneration, 46u))
     }
 
     @Test
-    fun olderHostSnapshotBindsWithoutRewindingAckWhenNoCheckpointExists() = runBlocking {
+    fun olderHostSnapshotBindsWithoutRewindingAckWhenNoCheckpointExists(): Unit = runBlocking {
         val sessionId = UUID.fromString("11223344-5566-7788-99aa-bbccddeeff")
         val snapshotId = UUID.fromString("22334455-6677-8899-aabb-ccddeeff00aa")
         val direction = "PC_TO_ANDROID"
         val ciphertext = byteArrayOf(4, 5, 6, 7)
         val initial = repository.initializeAckCursor(sessionId, direction)
         assertEquals(0uL, initial.sequence)
-        assertNull(repository.rendererCheckpointState(sessionId, direction))
+        assertNull(repository.rendererCheckpointState(sessionId, direction)?.track())
         assertEquals(46uL, repository.putAckCursor(sessionId, direction, initial.rendererGeneration, 46uL))
         assertEquals(46uL, repository.ackCursorState(sessionId, direction)?.sequence)
-        assertNull(repository.rendererCheckpointState(sessionId, direction))
+        assertNull(repository.rendererCheckpointState(sessionId, direction)?.track())
 
         repository.putSnapshot(
             sessionId = sessionId,
@@ -193,11 +201,11 @@ class RendererCheckpointRepositoryTest {
                 snapshotSequence = 45u,
                 renderedThroughSequence = 45u,
                 ciphertextSha256 = HistoryRepository.sha256(ciphertext),
-            )
+            ).track()
         }.exceptionOrNull()
         assertTrue(cursorRegression is IllegalArgumentException)
         assertEquals(46uL, repository.ackCursorState(sessionId, direction)?.sequence)
-        assertNull(repository.rendererCheckpointState(sessionId, direction))
+        assertNull(repository.rendererCheckpointState(sessionId, direction)?.track())
 
         val bound = repository.bindHostRendererCheckpoint(
             sessionId = sessionId,
@@ -207,7 +215,7 @@ class RendererCheckpointRepositoryTest {
             snapshotSequence = 45u,
             renderedThroughSequence = 46u,
             ciphertextSha256 = HistoryRepository.sha256(ciphertext),
-        )
+        ).track()
 
         assertEquals(2L, bound.rendererGeneration)
         assertEquals(45uL, bound.snapshotSequence)
@@ -216,14 +224,14 @@ class RendererCheckpointRepositoryTest {
             AckCursorState(sequence = 46uL, rendererGeneration = 2L),
             repository.ackCursorState(sessionId, direction),
         )
-        val persisted = requireNotNull(repository.rendererCheckpointState(sessionId, direction))
+        val persisted = requireNotNull(repository.rendererCheckpointState(sessionId, direction)?.track())
         assertEquals(45uL, persisted.snapshotSequence)
         assertEquals(46uL, persisted.durableAcknowledgement)
         assertEquals(2L, persisted.rendererGeneration)
     }
 
     @Test
-    fun rendererResetDeletesCheckpointInTheSameTransaction() = runBlocking {
+    fun rendererResetDeletesCheckpointInTheSameTransaction(): Unit = runBlocking {
         val sessionId = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         val snapshotId = UUID.fromString("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
         val direction = "PC_TO_ANDROID"
@@ -247,12 +255,12 @@ class RendererCheckpointRepositoryTest {
             snapshotId,
             12u,
             HistoryRepository.sha256(ciphertext),
-        )
+        ).track()
 
         val reset = repository.resetAckCursor(sessionId, direction, bound.rendererGeneration)
 
         assertEquals(3L, reset.rendererGeneration)
         assertEquals(0uL, reset.sequence)
-        assertNull(repository.rendererCheckpointState(sessionId, direction))
+        assertNull(repository.rendererCheckpointState(sessionId, direction)?.track())
     }
 }

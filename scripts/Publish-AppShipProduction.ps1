@@ -220,6 +220,7 @@ $publishPlan = [pscustomobject][ordered]@{
     manifest = $resolvedManifestPath
     release_mode = 'production'
     verification_on_publish = 'Verify-LocalRelease.ps1'
+    full_verification_performed = $false
     application_slug = $applicationSlug
     artifact_path = $artifactPath
     artifact_sha256 = $artifactSha256
@@ -273,6 +274,7 @@ $verificationParameters = @{
     ReleaseDirectory = $actualReleaseDirectory
     ManifestPath = $resolvedManifestPath
     ExpectedReleaseMode = 'Production'
+    RequireSourceIdentity = $true
 }
 if ($hasApk) {
     $verificationParameters.AndroidSdkPath = $AndroidSdkPath

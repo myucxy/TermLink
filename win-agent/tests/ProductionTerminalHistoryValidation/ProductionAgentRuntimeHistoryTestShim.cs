@@ -28,7 +28,11 @@ namespace TermLink.Agent
         private static MessageType MapMessageType(LocalFrame frame)
         {
             if (frame.Type == LocalFrameType.Output) return MessageType.OutputChunk;
+            if (frame.Type == LocalFrameType.BrokerOutput) return MessageType.BrokerOutput;
             if (frame.Type == LocalFrameType.Resize) return MessageType.ResizeApplied;
+            if (frame.Type == LocalFrameType.HostTheme) return MessageType.HostTheme;
+            if (frame.Type == LocalFrameType.HostResizeResult) return MessageType.HostResizeResult;
+            if (frame.Type == LocalFrameType.HostGeometry) return MessageType.HostGeometry;
             if (frame.Type == LocalFrameType.Title) return MessageType.SessionUpsert;
             if (frame.Type == LocalFrameType.Gap) return MessageType.Gap;
             if (frame.Type == LocalFrameType.Lifecycle)
@@ -59,6 +63,19 @@ namespace TermLink.Agent
                     SourceEventSeq = frame.Sequence,
                     PresentationRevision = frame.Sequence
                 };
+            if (frame.Type == LocalFrameType.BrokerOutput)
+            {
+                using var reference = TermLink.TerminalCore.NativeTerminalBrokerOutputReferenceV1.Decode(frame.Payload);
+                if (reference.SourceSequence != frame.Sequence)
+                    throw new InvalidDataException("BrokerOutput reference source sequence is invalid.");
+                return new BrokerOutputPayload { ReferenceV1 = ByteString.CopyFrom(frame.Payload) };
+            }
+            if (frame.Type == LocalFrameType.HostTheme)
+                return new HostThemePayload { ThemeV1 = ByteString.CopyFrom(frame.Payload) };
+            if (frame.Type == LocalFrameType.HostResizeResult)
+                return new HostResizeResultPayload { ResultV1 = ByteString.CopyFrom(frame.Payload) };
+            if (frame.Type == LocalFrameType.HostGeometry)
+                return new HostGeometryPayload { GeometryV1 = ByteString.CopyFrom(frame.Payload) };
             if (frame.Type == LocalFrameType.Resize)
             {
                 LocalPayloadCodec.ParseResize(frame.Payload, out var columns, out var rows);

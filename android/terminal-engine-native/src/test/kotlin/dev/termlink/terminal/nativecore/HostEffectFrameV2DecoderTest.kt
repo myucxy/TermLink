@@ -2,6 +2,8 @@ package dev.termlink.terminal.nativecore
 
 import dev.termlink.terminal.api.TerminalHostEffectFrameV2
 import dev.termlink.terminal.api.TerminalHostEffectKindV2
+import dev.termlink.terminal.api.TerminalHostEffectKindV1
+import dev.termlink.terminal.api.TerminalHostEffectV1
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.zip.CRC32C
@@ -12,6 +14,58 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class HostEffectFrameV2DecoderTest {
+    @Test
+    fun kittyGraphicsRepliesFollowTheCanonicalAuthorityGrammar() {
+        val accepted = listOf(
+            "i=1;OK", "I=4294967295;OK", "i=4294967295,I=9,p=2;OK", "I=2,p=3;OK",
+            "i=1;EINVAL: invalid image", "i=1;ENOTSUP: broker medium", "i=1;ENOSPC: resource budget",
+            "i=1;EINVAL: " + "x".repeat(232),
+        )
+        for (body in accepted) {
+            val sevenBit = reply("\u001b_G$body\u001b\\")
+            val eightBit = byteArrayOf(0x9f.toByte()) + sevenBit.copyOfRange(2, sevenBit.size - 2) + byteArrayOf(0x9c.toByte())
+            for (payload in listOf(sevenBit, eightBit)) {
+                val frame = buildFrame(listOf(WireEffect(7, 12, 0, payload)))
+                assertContentEquals(payload, HostEffectFrameV2Decoder.decode(frame).effects.single().copyPayload())
+                assertFailsWith<IllegalArgumentException> {
+                    TerminalHostEffectV1(TerminalHostEffectKindV1.PTY_REPLY, 7, 12, 0, payload)
+                }
+            }
+        }
+        val rejected = listOf(
+            ";OK", "p=1;OK", "i=0;OK", "I=0;OK", "i=01;OK", "i=+1;OK", "i=4294967296;OK",
+            "i=1,i=2;OK", "I=2,i=1;OK", "i=1,p=2,I=3;OK", "i=1,p=0;OK", "i=1,;OK",
+            ",i=1;OK", "i=1,,p=2;OK", "i=1,q=2;OK", "i=1;", "i=1;ok", "i=1;OK extra",
+            "i=1;ENOENT: missing", "i=1;EINVAL: ", "i=1;ENOTSUP: ", "i=1;ENOSPC: ",
+            "i=1;EINVAL: " + "x".repeat(233), "i=1;EINVAL: bad\u001b[2J", "i=1;EINVAL: bad\n",
+        )
+        for (body in rejected) {
+            val payload = reply("\u001b_G$body\u001b\\")
+            assertFailsWith<HostEffectFrameV2DecodeException> {
+                HostEffectFrameV2Decoder.decode(buildFrame(listOf(WireEffect(7, 12, 0, payload))))
+            }
+        }
+        for (payload in listOf(
+            reply("\u001b_anything\u001b\\"), reply("\u001b_Gi=1;OK\u0007"),
+            byteArrayOf(0x9f.toByte()) + reply("Gi=1;OK\u001b\\"),
+            reply("\u001b_Gi=1;OK") + byteArrayOf(0x9c.toByte()),
+            reply("\u001b_Gi=1;EINVAL: ") + byteArrayOf(0x80.toByte()) + reply("\u001b\\"),
+        )) assertFailsWith<HostEffectFrameV2DecodeException> {
+            HostEffectFrameV2Decoder.decode(buildFrame(listOf(WireEffect(7, 12, 0, payload))))
+        }
+    }
+
+    @Test
+    fun resizeEffectsRequireTheirFeatureAndCannotBecomePtyInput() {
+        val payload = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putInt(132).putInt(0).array()
+        val frame = buildFrame(listOf(WireEffect(7, 12, 0, payload))).mutateU64(40, 3).mutateU32(64, 2)
+        assertEquals(TerminalHostEffectKindV2.RESIZE_REQUEST, HostEffectFrameV2Decoder.decode(frame).effects.single().kind)
+        listOf(frame.mutateU64(40, 1), frame.mutateU32(104, 0), frame.mutateU32(104, 513),
+            frame.mutateU32(108, 24), frame.mutateU32(64, 3)).forEach {
+            assertFailsWith<HostEffectFrameV2DecodeException> { HostEffectFrameV2Decoder.decode(it) }
+        }
+    }
+
     @Test
     fun decodesEmptyCanonicalFrame() {
         val encoded = buildFrame(emptyList())
@@ -31,6 +85,10 @@ class HostEffectFrameV2DecoderTest {
             "\u001b[0n",
             "\u001b[?512;512R",
             "\u001b[?31u",
+            "\u001b[8;1;512t",
+            "\u001b[8;512;1t",
+            "\u001b[6;20;10t",
+            "\u001b[4;524288;524288t",
             "\u001b[4;2\$y",
             "\u001b[?25;1\$y",
             "\u001bP0\$r\u001b\\",
@@ -150,6 +208,11 @@ class HostEffectFrameV2DecoderTest {
     fun rejectsUppercaseNoncanonicalDecimalHexColorAndArbitraryEscapePayloads() {
         val invalid = listOf(
             "\u001b[31m",
+            "\u001b[8;0;1t",
+            "\u001b[8;1;513t",
+            "\u001b[8;01;1t",
+            "\u001b[8;1;1;1t",
+            "\u001b[6;1025;10t",
             "\u001b[01;1R",
             "\u001b[?01u",
             "\u001b[?32u",

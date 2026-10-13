@@ -1,6 +1,8 @@
 package dev.termlink.terminal.nativecore
 
 import dev.termlink.terminal.api.TerminalEngineFailureDiagnostics
+import dev.termlink.terminal.api.TerminalInputDiagnostic
+import dev.termlink.terminal.api.TerminalProtocolDiagnostic
 
 /**
  * Stable status values shared with the TermLink terminal C ABI.
@@ -24,6 +26,14 @@ enum class NativeTerminalStatus(val code: Int) {
     SNAPSHOT_NOT_ELIGIBLE(12),
     PRESENTATION_DEFERRED(13),
     HOST_EFFECT_VERSION_REQUIRED(14),
+    RENDER_FRAME_VERSION_REQUIRED(15),
+    HISTORY_STALE_CAPTURE(16),
+    HISTORY_STALE_REVISION(17),
+    HISTORY_STALE_ANCHOR(18),
+    HISTORY_PAGE_BUDGET(19),
+    MALFORMED_DELTA(20),
+    INCOMPATIBLE_DELTA(21),
+    NEEDS_FULL_SNAPSHOT(22),
     PANIC(255),
     BRIDGE_FAILURE(256),
     MALFORMED_BRIDGE_RESULT(257),
@@ -61,13 +71,17 @@ class NativeTerminalException(
         append(" (")
         append(rawStatusCode)
         append(')')
-        if (!diagnostic.isNullOrBlank()) {
+        // Structured output evidence belongs in the explicit local details UI, not crash telemetry.
+        if (!diagnostic.isNullOrBlank() && !diagnostic.startsWith("TL-DIAG/") &&
+            !diagnostic.startsWith("TL-INPUT-DIAG/")) {
             append(": ")
             append(diagnostic)
         }
     },
     cause,
 ), TerminalEngineFailureDiagnostics {
+    override val terminalProtocolDiagnostic = TerminalProtocolDiagnostic.parse(diagnostic)
+    override val terminalInputDiagnostic = TerminalInputDiagnostic.parse(diagnostic)
     override val terminalOperation: String
         get() = operation
     override val terminalStatusName: String

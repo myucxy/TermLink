@@ -2,6 +2,7 @@ package dev.termlink.session
 
 import dev.termlink.terminal.api.TerminalSize
 import dev.termlink.terminal.api.TerminalInput
+import dev.termlink.terminal.api.TerminalProtocolDiagnostic
 import java.util.UUID
 
 /**
@@ -115,6 +116,7 @@ sealed interface RemoteSessionState {
     data class Exited(
         override val lastAckedSequence: Long,
         val exitCode: Int?,
+        val protocolDiagnostic: TerminalProtocolDiagnostic? = null,
     ) : RemoteSessionState
 
     data class HistoryGap(
@@ -145,6 +147,74 @@ sealed interface RemoteSessionEvent {
             require(presentationRevision > 0) { "presentation revision must be positive" }
         }
     }
+
+    /** Already resolved, authenticated TLCAPV1 bytes; resourceLease owns its reserved cache budget. */
+    class BrokerOutput(
+        override val sequence: Long,
+        output: ByteArray,
+        canonicalCaptures: ByteArray,
+        val presentationRevision: Long = sequence,
+        resourceLease: AutoCloseable? = null,
+    ) : RemoteSessionEvent, AutoCloseable {
+        init {
+            require(sequence in 1 until Long.MAX_VALUE && presentationRevision > 0 &&
+                output.size in 1..64 * 1024 && canonicalCaptures.size in 136..32 * 1024 * 1024) {
+                "Broker Output sequence or payload size is invalid"
+            }
+            val header = java.nio.ByteBuffer.wrap(canonicalCaptures).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            require(canonicalCaptures.copyOfRange(0, 8).contentEquals("TLCAPV1\u0000".encodeToByteArray()) &&
+                header.getLong(16) == sequence) { "Broker capture identity differs from Output" }
+        }
+
+        private val ownedOutput: ByteArray
+        private val ownedCanonical: ByteArray
+        init {
+            val copiedOutput = output.copyOf()
+            try {
+                ownedCanonical = canonicalCaptures.copyOf()
+                ownedOutput = copiedOutput
+            } catch (error: Throwable) {
+                copiedOutput.fill(0)
+                throw error
+            }
+        }
+        private var lease: AutoCloseable? = resourceLease
+        private var closed = false
+        val outputByteCount: Int get() = synchronized(this) { requireOpen(); ownedOutput.size }
+        val canonicalByteCount: Int get() = synchronized(this) { requireOpen(); ownedCanonical.size }
+        fun copyOutput(): ByteArray = synchronized(this) { requireOpen(); ownedOutput.copyOf() }
+        fun copyCanonicalCaptures(): ByteArray = synchronized(this) { requireOpen(); ownedCanonical.copyOf() }
+
+        override fun close() {
+            val release = synchronized(this) {
+                if (closed) return
+                closed = true
+                ownedOutput.fill(0)
+                ownedCanonical.fill(0)
+                lease.also { lease = null }
+            }
+            release?.close()
+        }
+
+        private fun requireOpen() { check(!closed) { "Broker Output is closed" } }
+    }
+
+    data class HostTheme(
+        override val sequence: Long,
+        val theme: dev.termlink.terminal.api.TerminalHostThemeV1,
+    ) : RemoteSessionEvent
+
+    data class HostResizeResult(
+        override val sequence: Long,
+        val result: dev.termlink.terminal.api.TerminalHostResizeResultV1,
+    ) : RemoteSessionEvent {
+        init { require(result.sourceSequence < sequence) { "Host resize result precedes its request" } }
+    }
+
+    data class HostGeometry(
+        override val sequence: Long,
+        val geometry: dev.termlink.terminal.api.TerminalHostGeometryV1,
+    ) : RemoteSessionEvent
 
     data class Resize(
         override val sequence: Long,
@@ -179,6 +249,7 @@ sealed interface RemoteSessionEvent {
         override val sequence: Long,
         val state: RemoteLifecycle,
         val exitCode: Int? = null,
+        val protocolDiagnostic: TerminalProtocolDiagnostic? = null,
     ) : RemoteSessionEvent
 
     data class Gap(

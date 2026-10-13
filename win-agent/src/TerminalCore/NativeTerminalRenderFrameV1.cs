@@ -120,18 +120,25 @@ namespace TermLink.TerminalCore
             int?[] colorsRgb,
             int? defaultForegroundRgb,
             int? defaultBackgroundRgb,
-            int? defaultCursorRgb)
+            int? defaultCursorRgb, int? selectionBackgroundRgb = null, int? foregroundAlias = null, int? backgroundAlias = null, int? frameForegroundAlias = null, int? frameBackgroundAlias = null)
         {
             ColorsRgb = Array.AsReadOnly(colorsRgb);
             DefaultForegroundRgb = defaultForegroundRgb;
             DefaultBackgroundRgb = defaultBackgroundRgb;
             DefaultCursorRgb = defaultCursorRgb;
+            SelectionBackgroundRgb = selectionBackgroundRgb; ForegroundAlias = foregroundAlias; BackgroundAlias = backgroundAlias;
+            FrameForegroundAlias = frameForegroundAlias; FrameBackgroundAlias = frameBackgroundAlias;
         }
 
         public IReadOnlyList<int?> ColorsRgb { get; }
         public int? DefaultForegroundRgb { get; }
         public int? DefaultBackgroundRgb { get; }
         public int? DefaultCursorRgb { get; }
+        public int? SelectionBackgroundRgb { get; }
+        public int? ForegroundAlias { get; }
+        public int? BackgroundAlias { get; }
+        public int? FrameForegroundAlias { get; }
+        public int? FrameBackgroundAlias { get; }
     }
 
     public readonly struct NativeTerminalRenderHyperlinkV1
@@ -175,20 +182,25 @@ namespace TermLink.TerminalCore
         public int HyperlinkReference { get; }
     }
 
+    public enum NativeTerminalLineRendition { SingleWidth = 0, DoubleWidth = 1, DoubleHeightTop = 2, DoubleHeightBottom = 3 }
+
     public sealed class NativeTerminalRenderRowV1
     {
         internal NativeTerminalRenderRowV1(
             int meaningfulEnd,
             bool softWrapped,
-            NativeTerminalRenderCellV1[] cells)
+            NativeTerminalRenderCellV1[] cells,
+            NativeTerminalLineRendition lineRendition = NativeTerminalLineRendition.SingleWidth)
         {
             MeaningfulEnd = meaningfulEnd;
             SoftWrapped = softWrapped;
             Cells = Array.AsReadOnly(cells);
+            LineRendition = lineRendition;
         }
 
         public int MeaningfulEnd { get; }
         public bool SoftWrapped { get; }
+        public NativeTerminalLineRendition LineRendition { get; }
         public IReadOnlyList<NativeTerminalRenderCellV1> Cells { get; }
     }
 
@@ -262,7 +274,7 @@ namespace TermLink.TerminalCore
         {
             try
             {
-                return new Decoder(bytes).Decode();
+                return (NativeTerminalRenderFrameV1)new Decoder(bytes, 1).Decode();
             }
             catch (NativeTerminalRenderFrameV1DecodeException)
             {
@@ -280,6 +292,17 @@ namespace TermLink.TerminalCore
             {
                 throw Error("truncated data");
             }
+        }
+
+        internal static NativeTerminalRenderFrameV4 DecodeV4(ReadOnlySpan<byte> bytes)
+        {
+            try { return (NativeTerminalRenderFrameV4)new Decoder(bytes, 4).Decode(); }
+            catch (NativeTerminalRenderFrameV1DecodeException error) {
+                throw new NativeTerminalRenderFrameV4DecodeException(error.Message.Substring("render frame v1: ".Length));
+            }
+            catch (OverflowException) { throw new NativeTerminalRenderFrameV4DecodeException("integer overflow"); }
+            catch (DecoderFallbackException) { throw new NativeTerminalRenderFrameV4DecodeException("invalid UTF-8"); }
+            catch (ArgumentOutOfRangeException) { throw new NativeTerminalRenderFrameV4DecodeException("truncated data"); }
         }
 
         private static NativeTerminalRenderFrameV1DecodeException Error(string message)
@@ -351,6 +374,8 @@ namespace TermLink.TerminalCore
             private const int MaximumTitleBytes = 4_096;
             private const uint Crc32CPolynomial = 0x82f6_3b78;
 
+            private static readonly byte[] MagicV4 = Encoding.ASCII.GetBytes("TLRFRM4\0");
+
             private static readonly byte[] Magic =
             {
                 (byte)'T', (byte)'L', (byte)'R', (byte)'F',
@@ -363,24 +388,29 @@ namespace TermLink.TerminalCore
 
             private readonly ReadOnlySpan<byte> bytes;
 
-            internal Decoder(ReadOnlySpan<byte> bytes)
+            private readonly int version;
+            private uint widthProfile;
+
+            internal Decoder(ReadOnlySpan<byte> bytes, int version)
             {
                 this.bytes = bytes;
+                this.version = version;
+                this.widthProfile = 1;
             }
 
-            internal NativeTerminalRenderFrameV1 Decode()
+            internal object Decode()
             {
                 if (bytes.Length < HeaderSize) throw Error("header is truncated");
-                if (bytes.Length > MaximumFrameBytes) throw Error("frame exceeds 16 MiB");
-                if (!bytes.Slice(0, Magic.Length).SequenceEqual(Magic)) throw Error("bad magic");
+                if (bytes.Length > (version == 4 ? 32 * 1024 * 1024 : MaximumFrameBytes)) throw Error("frame exceeds version byte limit");
+                if (!bytes.Slice(0, Magic.Length).SequenceEqual(version == 4 ? MagicV4 : Magic)) throw Error("bad magic");
 
-                ExpectUInt16(8, MajorVersion, "major version");
+                ExpectUInt16(8, (ushort)version, "major version");
                 ExpectUInt16(10, MinorVersion, "minor version");
                 ExpectUInt16(12, HeaderSize, "header size");
                 ExpectUInt16(14, DirectoryEntrySize, "directory entry size");
                 ExpectUInt16(16, SectionCount, "section count");
                 var frameFlags = ReadUInt16(18, "frame flags");
-                if ((frameFlags & ~FrameFlagsMask) != 0) throw Error("unknown frame flags");
+                if ((frameFlags & ~(version == 4 ? 15 : FrameFlagsMask)) != 0) throw Error("unknown frame flags");
                 var totalLength = ReadUInt32(20, "total length");
                 if (totalLength != (uint)bytes.Length) throw Error("total length does not match input");
 
@@ -408,10 +438,14 @@ namespace TermLink.TerminalCore
 
                 var cursorFlags = ReadUInt32(56, "cursor flags");
                 if ((cursorFlags & ~CursorFlagsMask) != 0) throw Error("unknown cursor flags");
-                ExpectUInt32(60, WidthProfile, "width profile");
+                widthProfile = ReadUInt32(60, "width profile");
+                if (widthProfile != 1 && !(version == 4 && widthProfile == 2)) throw Error("unsupported width profile");
                 ExpectUInt32(64, DirectoryOffset, "directory offset");
-                ExpectUInt32(68, 0, "header reserved field");
-                ExpectUInt64(72, RequiredFeatures, "required features");
+                if (version == 4) {
+                    if (bytes[68] > 2 || bytes[69] > 1) throw Error("invalid cursor presentation");
+                    ExpectUInt16(70, 0, "cursor reserved field");
+                } else { ExpectUInt32(68, 0, "header reserved field"); }
+                ExpectUInt64(72, version == 4 ? 0x7ffUL : RequiredFeatures, "required features");
                 ExpectUInt64(80, 0, "header reserved field");
 
                 var payloadCrc = ReadUInt32(88, "payload CRC32C");
@@ -423,7 +457,8 @@ namespace TermLink.TerminalCore
 
                 var sections = DecodeDirectory(cellCount);
                 var graphemes = DecodeGraphemes(sections[0]);
-                var renditions = DecodeRenditions(sections[1]);
+                var renditions = version == 1 ? DecodeRenditions(sections[1]) : Array.Empty<NativeTerminalRenderRenditionV1>();
+                var modernRenditions = version == 4 ? DecodeModernRenditions(sections[1]) : Array.Empty<NativeTerminalRenderRenditionV3>();
                 var palette = DecodePalette(sections[2]);
                 var hyperlinks = DecodeHyperlinks(sections[3]);
                 var renderRows = DecodeRows(
@@ -432,9 +467,18 @@ namespace TermLink.TerminalCore
                     rowCount,
                     cellCount,
                     graphemes,
-                    renditions,
+                    sections[1].Count,
                     hyperlinks);
                 var title = DecodeTitle(sections[5]);
+
+                if (version == 4) return new NativeTerminalRenderFrameV4(
+                    (NativeTerminalWidthProfile)widthProfile, revision, nextSequence, columns, rowCount,
+                    (frameFlags & AlternateScreenFlag) != 0 ? NativeTerminalRenderScreenV1.Alternate : NativeTerminalRenderScreenV1.Primary,
+                    (frameFlags & ReverseVideoFlag) != 0,
+                    new NativeTerminalRenderCursorV2(new NativeTerminalRenderCursorV1(cursorRow, cursorColumn,
+                        (cursorFlags & CursorVisibleFlag) != 0, (cursorFlags & CursorWrapFlag) != 0),
+                        (NativeTerminalRenderCursorShapeV2)bytes[68], bytes[69] != 0),
+                    graphemes, modernRenditions, palette, hyperlinks, renderRows, title, (frameFlags & 4) != 0, (frameFlags & 8) != 0);
 
                 return new NativeTerminalRenderFrameV1(
                     revision,
@@ -479,7 +523,7 @@ namespace TermLink.TerminalCore
                     var expectedTag = index + 1;
                     if (ReadUInt32(entry, "section tag") != expectedTag)
                         throw Error("section tags must be exactly 1..6");
-                    ExpectUInt16(entry + 4, SectionVersion, "section version");
+                    ExpectUInt16(entry + 4, (ushort)(version == 4 && expectedTag == RenditionTag ? 2 : SectionVersion), "section version");
                     ExpectUInt16(entry + 6, CriticalSection, "section flags");
                     var offset = ReadUInt32(entry + 8, "section offset");
                     var length = ReadUInt32(entry + 12, "section length");
@@ -509,7 +553,7 @@ namespace TermLink.TerminalCore
                                 throw Error("rendition count is out of range");
                             break;
                         case PaletteTag:
-                            if (count != PaletteCount || recordSize != 4)
+                            if (count != (version == 4 ? 264 : PaletteCount) || recordSize != 4)
                                 throw Error("palette directory metadata is invalid");
                             break;
                         case HyperlinkTag:
@@ -564,7 +608,7 @@ namespace TermLink.TerminalCore
                     var reserved = ReadByte(record + 7, "grapheme reserved byte");
                     if (stringOffset != expectedStringOffset)
                         throw Error("grapheme strings are not contiguous");
-                    if (length < 1 || length > MaximumGraphemeBytes)
+                    if (length < 1 || length > (widthProfile == 2 ? 48 : MaximumGraphemeBytes))
                         throw Error("grapheme UTF-8 length is out of range");
                     if (width != 1 && width != 2) throw Error("grapheme width is invalid");
                     if (reserved != 0) throw Error("grapheme reserved byte is nonzero");
@@ -638,12 +682,35 @@ namespace TermLink.TerminalCore
                 return result;
             }
 
+            private NativeTerminalRenderRenditionV3[] DecodeModernRenditions(Section section)
+            {
+                if (Multiply((ulong)section.Count, RenditionRecordSize, "rendition bytes") != (ulong)section.Length)
+                    throw Error("rendition section length is invalid");
+                var result = new NativeTerminalRenderRenditionV3[section.Count];
+                for (var index = 0; index < result.Length; index++) {
+                    var offset = Absolute(section, Multiply((ulong)index, RenditionRecordSize, "rendition record"), RenditionRecordSize);
+                    if (index > 0 && CompareUnsigned(bytes.Slice(offset - RenditionRecordSize, RenditionRecordSize), bytes.Slice(offset, RenditionRecordSize)) >= 0)
+                        throw Error("rendition table is not strictly sorted");
+                    var flags = ReadUInt32(offset, "rendition flags");
+                    var style = (flags >> 9) & 7;
+                    if ((flags & ~0xfffU) != 0 || style > 5 || ((flags & 16) != 0) != (style != 0))
+                        throw Error("invalid extended rendition flags");
+                    result[index] = new NativeTerminalRenderRenditionV3(
+                        DecodeColor(ReadUInt32(offset + 4, "foreground")), DecodeColor(ReadUInt32(offset + 8, "background")),
+                        DecodeColor(ReadUInt32(offset + 12, "underline color")),
+                        (flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0, (flags & 8) != 0,
+                        (flags & 32) != 0, (flags & 64) != 0, (flags & 128) != 0, (flags & 256) != 0,
+                        (NativeTerminalRenderUnderlineStyleV3)style);
+                }
+                return result;
+            }
+
             private NativeTerminalRenderPaletteV1 DecodePalette(Section section)
             {
-                if (section.Length != PaletteBytes)
+                if (section.Length != (version == 4 ? 264 * 4 : PaletteBytes))
                     throw Error("palette section length is invalid");
-                var values = new int?[PaletteCount];
-                for (var index = 0; index < PaletteCount; index++)
+                var values = new int?[version == 4 ? 264 : PaletteCount];
+                for (var index = 0; index < values.Length; index++)
                 {
                     var value = ReadUInt32(
                         Absolute(section, Multiply((ulong)index, 4, "palette record"), 4),
@@ -652,7 +719,7 @@ namespace TermLink.TerminalCore
                     {
                         values[index] = null;
                     }
-                    else if (value <= MaximumRgb)
+                    else if (value <= (index >= 260 ? 257U : MaximumRgb) && !(index >= 260 && value == 256 + (index % 2)))
                     {
                         values[index] = (int)value;
                     }
@@ -668,7 +735,8 @@ namespace TermLink.TerminalCore
                     colors,
                     values[256],
                     values[257],
-                    values[258]);
+                    values[258], version == 4 ? values[259] : null, version == 4 ? values[260] : null, version == 4 ? values[261] : null,
+                    version == 4 ? values[262] : null, version == 4 ? values[263] : null);
             }
 
             private NativeTerminalRenderHyperlinkV1[] DecodeHyperlinks(Section section)
@@ -729,7 +797,7 @@ namespace TermLink.TerminalCore
                 int rowCount,
                 int cellCount,
                 NativeTerminalRenderGraphemeV1[] graphemes,
-                NativeTerminalRenderRenditionV1[] renditions,
+                int renditionCount,
                 NativeTerminalRenderHyperlinkV1[] hyperlinks)
             {
                 var rowBytes = Multiply((ulong)rowCount, RowRecordSize, "row records");
@@ -744,7 +812,7 @@ namespace TermLink.TerminalCore
                 ExpectUInt32(section.Offset + 4, CellRecordSize, "cell record size");
 
                 var referencedGraphemes = new bool[graphemes.Length];
-                var referencedRenditions = new bool[renditions.Length];
+                var referencedRenditions = new bool[renditionCount];
                 var knownLinks = new bool[MaximumHyperlinks + 1];
                 var referencedLinks = new bool[MaximumHyperlinks + 1];
                 for (var index = 0; index < hyperlinks.Length; index++)
@@ -763,9 +831,15 @@ namespace TermLink.TerminalCore
                         RowRecordSize);
                     var meaningfulEnd = ReadUInt32(rowOffset, "meaningful end");
                     var rowFlags = ReadUInt32(rowOffset + 4, "row flags");
-                    if (meaningfulEnd > (uint)columns)
+                    if ((rowFlags & ~(version == 4 ? 7U : RowFlagsMask)) != 0) throw Error("unknown row flags");
+                    var lineRendition = (NativeTerminalLineRendition)((rowFlags >> 1) & 3);
+                    var effectiveColumns = lineRendition == NativeTerminalLineRendition.SingleWidth ? columns : Math.Max(1, columns / 2);
+                    if (meaningfulEnd > (uint)effectiveColumns)
                         throw Error("meaningful end is outside the row");
-                    if ((rowFlags & ~RowFlagsMask) != 0) throw Error("unknown row flags");
+                    if ((rowFlags & RowSoftWrapped) != 0 && (rowIndex == rowCount - 1 || lineRendition != NativeTerminalLineRendition.SingleWidth)) throw Error("invalid scaled or final soft-wrapped row");
+                    if (lineRendition != NativeTerminalLineRendition.SingleWidth && rowIndex > 0 && rows[rowIndex - 1].SoftWrapped) throw Error("soft wrap crosses a scaled row");
+                    if (version == 4 && rowIndex == ReadUInt32(48, "cursor row") &&
+                        (ReadUInt32(52, "cursor column") >= effectiveColumns)) throw Error("cursor is outside the effective row");
 
                     var cells = new NativeTerminalRenderCellV1[columns];
                     for (var column = 0; column < columns; column++)
@@ -793,7 +867,7 @@ namespace TermLink.TerminalCore
                             throw Error("continuation flag and grapheme ID disagree");
                         if (graphemeIdValue > (uint)graphemes.Length)
                             throw Error("cell has a dangling grapheme ID");
-                        if (renditionIdValue >= (uint)renditions.Length)
+                        if (renditionIdValue >= (uint)renditionCount)
                             throw Error("cell has a dangling rendition ID");
                         if (hyperlinkReference != 0)
                         {
@@ -815,10 +889,14 @@ namespace TermLink.TerminalCore
                     }
 
                     ValidateWideCells(cells, graphemes, rowIndex);
+                    for (var column = effectiveColumns; column < columns; column++) {
+                        var cell = cells[column];
+                        if (cell.WideContinuation || cell.IsProtected || cell.HyperlinkReference != 0 || graphemes[cell.GraphemeId - 1].Text != " ") throw Error("nonblank cell outside scaled row");
+                    }
                     rows[rowIndex] = new NativeTerminalRenderRowV1(
                         (int)meaningfulEnd,
                         (rowFlags & RowSoftWrapped) != 0,
-                        cells);
+                        cells, lineRendition);
                 }
 
                 if (HasFalse(referencedGraphemes))

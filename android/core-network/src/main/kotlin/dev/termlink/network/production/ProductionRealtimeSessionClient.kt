@@ -1,12 +1,24 @@
 package dev.termlink.network.production
 
 import android.util.Log
+import android.os.SystemClock
 import com.google.protobuf.ByteString
 import dev.termlink.crypto.CryptoDirection
 import dev.termlink.crypto.DeviceIdentity
+import dev.termlink.crypto.DeltaCrypto
+import dev.termlink.crypto.BrokerCaptureCrypto
+import dev.termlink.crypto.FrozenHistoryCrypto
 import dev.termlink.crypto.SessionCrypto
+import dev.termlink.model.TerminalBufferBudget
+import dev.termlink.model.TerminalBufferLimitException
 import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.FlowControlPayload
+import dev.termlink.protocol.realtime.v1.FrozenHistoryMetadata
+import dev.termlink.protocol.realtime.v1.FrozenHistoryRequest
+import dev.termlink.protocol.realtime.v1.StateDeltaMetadataV1
+import dev.termlink.protocol.realtime.v1.StateDeltaRequestV1
+import dev.termlink.protocol.realtime.v1.BrokerCaptureSelectionV1
+import dev.termlink.protocol.realtime.v1.BrokerOutputPayload
 import dev.termlink.protocol.realtime.v1.GapPayload
 import dev.termlink.protocol.realtime.v1.HostHistoryControlActionV1
 import dev.termlink.protocol.realtime.v1.HostHistoryControlPayload
@@ -55,11 +67,13 @@ import java.io.Closeable
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
+import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -84,6 +98,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
@@ -105,6 +120,10 @@ data class ProductionRealtimeSessionConfig(
     val noncePrefix: ByteArray = ByteArray(4).also(SecureRandom()::nextBytes),
     /** Emergency compatibility rollback; legacy input bytes remain valid. */
     val typedInputEnabled: Boolean = true,
+    /** Product native-core sessions require explicit state acceptance before opening the receive window. */
+    val negotiateTerminalState: Boolean = false,
+    /** Pins the authenticated host profile to the engine created for this client. */
+    val expectedTerminalState: String? = null,
 ) {
     init {
         require(keyEpoch > 0) { "keyEpoch must be positive" }
@@ -112,6 +131,10 @@ data class ProductionRealtimeSessionConfig(
         require(pcExchangePublicKey.any { it.toInt() != 0 }) { "PC exchange public key is empty" }
         require(keyId.isNotEmpty() && keyId.size <= 128) { "keyId must be 1..128 bytes" }
         require(noncePrefix.size == 4) { "noncePrefix must be 4 bytes" }
+        require(expectedTerminalState == null || expectedTerminalState in ProductionTerminalStateContract.SUPPORTED_STATES) {
+            "expected terminal state is unsupported"
+        }
+        require(expectedTerminalState == null || negotiateTerminalState) { "expected terminal state requires negotiation" }
     }
 }
 
@@ -161,9 +184,46 @@ private class InMemoryInputSequenceProvider : InputSequenceProvider {
 }
 
 private const val TERMINATION_REASON_USER_REQUESTED = "USER_REQUESTED"
-private const val HOST_HISTORY_RESPONSE_CHUNK_BYTES = 512 * 1024
-private const val MAX_HOST_HISTORY_OBJECT_BYTES = 64 * 1024 * 1024
 private const val HOST_HISTORY_REQUEST_TIMEOUT_MILLIS = 30_000L
+private const val HOST_HISTORY_CANCEL_TIMEOUT_MILLIS = 1_000L
+private const val GRAPHICS_HOST_HISTORY_TOTAL_TIMEOUT_MILLIS = 5 * 60_000L
+private const val FROZEN_HISTORY_CAPABILITY = "host_history_frozen_v1"
+private const val STATE_DELTA_CAPABILITY = "state_delta_v1"
+private const val BROKER_CAPTURE_CAPABILITY = "terminal_broker_captures_v1"
+private const val BROKER_CAPTURE_FORMAT_NAME = "TERMLINK_BROKER_CAPTURE_V1"
+private const val HOST_HISTORY_RELAY_CAPABILITY = "host_history_v1"
+private val TERMINAL_SUBSCRIBER_CAPABILITIES = ProductionTerminalStateContract.SUPPORTED_STATES +
+    listOf(HOST_HISTORY_RELAY_CAPABILITY, BROKER_CAPTURE_CAPABILITY)
+private const val FROZEN_HISTORY_V2_CAPABILITY = "tlhp_v2"
+private const val FROZEN_HISTORY_V2_FORMAT_NAME = "TERMLINK_FROZEN_HISTORY_PAGE_V2"
+private const val FROZEN_HISTORY_RELEASE_TIMEOUT_MILLIS = 3_000L
+private const val HOST_HISTORY_RESPONSE_CHUNK_BYTES = 512 * 1024
+private const val MAX_BROKER_PENDING_EVENTS = 32
+private const val MAX_BROKER_PENDING_BYTES = 3 * 1024 * 1024
+internal fun supportsFrozenHistory(profile: ProductionTerminalProfile, capabilities: List<String>): Boolean =
+    profile.isGraphics && capabilities.size <= 16 &&
+        capabilities.all { it.length in 1..64 } &&
+        FROZEN_HISTORY_CAPABILITY in capabilities && FROZEN_HISTORY_V2_CAPABILITY in capabilities
+
+internal fun supportsStateDelta(profile: ProductionTerminalProfile, capabilities: List<String>): Boolean =
+    profile.isGraphics && capabilities.size <= 16 &&
+        capabilities.all { it.length in 1..64 } && STATE_DELTA_CAPABILITY in capabilities
+
+internal fun supportsBrokerCapture(profile: ProductionTerminalProfile, capabilities: List<String>): Boolean =
+    profile.isGraphics && capabilities.size <= 16 &&
+        capabilities.all { it.length in 1..64 } && BROKER_CAPTURE_CAPABILITY in capabilities
+
+internal fun frozenHistoryChunkCount(objectBytes: Long): Int {
+    require(objectBytes in 1L..(FrozenHistoryCrypto.MAX_PAGE_V2_BYTES +
+        FrozenHistoryCrypto.OBJECT_OVERHEAD_BYTES).toLong()) { "Frozen history object size is invalid" }
+    return ((objectBytes + HOST_HISTORY_RESPONSE_CHUNK_BYTES - 1) / HOST_HISTORY_RESPONSE_CHUNK_BYTES).toInt()
+}
+
+internal fun isCurrentFrozenBrowse(
+    request: FrozenHistoryRequestContext,
+    browseGeneration: Long,
+    keyEpoch: Long,
+): Boolean = request.browseGeneration == browseGeneration && request.keyEpoch == keyEpoch
 private const val MAX_SEMANTIC_INPUT_OUTBOX_ENTRIES = 128
 private const val MAX_SEMANTIC_INPUT_OUTBOX_BYTES = 8 * 1024 * 1024
 
@@ -314,7 +374,7 @@ internal interface SemanticInputRelayReplay {
     ): Boolean
 }
 
-data class ProductionHostHistoryObject(
+class ProductionHostHistoryObject internal constructor(
     val kind: HostHistoryObjectKindV1,
     val objectId: UUID,
     val snapshotSequence: ULong,
@@ -334,18 +394,229 @@ data class ProductionHostHistoryObject(
     val formatVersion: Int,
     val ciphertextSha256: ByteArray,
     val sealedObject: ByteArray,
-) {
+    private var reservation: TerminalBufferBudget.Reservation?,
+    val frozenHistory: FrozenHistoryMetadata? = null,
+    val stateDelta: StateDeltaMetadataV1? = null,
+    val brokerCapture: BrokerCaptureSelectionV1? = null,
+) : AutoCloseable {
+    private val destroyed = AtomicBoolean(false)
+    /** One request's verified receive/send evidence; transport ACK is not a durable renderer commit. */
+    @Volatile var transferEvidence: ProductionHostHistoryTransferEvidence? = null
+        internal set
+
+    @Synchronized
+    fun takeReservation(): TerminalBufferBudget.Reservation {
+        check(!destroyed.get()) { "Host history object is destroyed" }
+        return requireNotNull(reservation) { "Host history reservation was already transferred" }.also {
+            reservation = null
+        }
+    }
+
+    @Synchronized
     fun destroy() {
+        if (!destroyed.compareAndSet(false, true)) return
         ciphertextSha256.fill(0)
         sealedObject.fill(0)
+        reservation?.close()
+        reservation = null
     }
+
+    override fun close() = destroy()
 }
+
+data class ProductionHostHistoryTransferEvidence(
+    val requestId: UUID,
+    val newChunksAccepted: Int,
+    val duplicateChunksAccepted: Int,
+    val chunkAcksSent: Int,
+)
 
 class ProductionHostHistoryGapException(message: String) : IllegalStateException(message)
 class ProductionHostHistoryNotReadyException(message: String) : IllegalStateException(message)
 
+class ProductionFrozenHistoryException(
+    val code: String,
+    val requiredCells: ULong = 0uL,
+    val requiredUtf8Bytes: ULong = 0uL,
+    val capture: ProductionFrozenHistoryCapture? = null,
+    val availableSnapshotSequence: ULong? = null,
+    internal val metadata: FrozenHistoryMetadata? = null,
+) : IllegalStateException("Frozen history request failed: $code")
+
+class ProductionStateDeltaNeedsFullSnapshotException : IllegalStateException("NEEDS_FULL_SNAPSHOT")
+
+internal class StateDeltaRequestContext(
+    val snapshotSequence: ULong,
+    val contextId: ByteString,
+    val profile: Int,
+    val baseNextSequence: ULong,
+    val baseSnapshotBytes: ULong,
+    val baseSha256: ByteString,
+    val keyEpoch: Long,
+    val keyId: String,
+) {
+    fun validate(response: HostHistoryResponsePayload) {
+        require(response.hasStateDelta() && !response.hasFrozenHistory()) { "State Delta metadata is missing" }
+        val delta = response.stateDelta
+        require(response.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_STATE_DELTA &&
+            response.snapshotSeq in 1 until Long.MAX_VALUE &&
+            (snapshotSequence == 0uL || response.snapshotSeq.toULong() == snapshotSequence) &&
+            delta.contextId == contextId && delta.profile == profile &&
+            delta.baseNextSourceSequence.toULong() == baseNextSequence &&
+            delta.baseSnapshotBytes.toULong() == baseSnapshotBytes &&
+            delta.baseSnapshotSha256 == baseSha256 &&
+            delta.targetNextSourceSequence.toULong() == response.snapshotSeq.toULong() + 1uL &&
+            delta.targetNextSourceSequence.toULong() > baseNextSequence &&
+            delta.targetSnapshotBytes in 104L..(128L * 1024 * 1024) &&
+            delta.targetSnapshotSha256.size() == 32 &&
+            response.keyId == keyId && response.formatName == DeltaCrypto.FORMAT_NAME &&
+            response.formatVersion == DeltaCrypto.FORMAT_VERSION && response.errorCode.isEmpty() &&
+            response.columns == 0 && response.rows == 0 && response.initialTranscriptBeforeLineId == 0L &&
+            response.requestBeforeLineId == 0L && response.firstLineId == 0L && response.lastLineId == 0L &&
+            !response.hasMoreBefore && response.nextBeforeLineId == 0L &&
+            response.startSeq == 0L && response.endSeq == 0L && !response.hasMoreEvents
+        ) { "State Delta response does not match the requested transition" }
+    }
+
+    fun validateNeedsFullSnapshot(response: HostHistoryResponsePayload) {
+        require(response.status == HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_REJECTED &&
+            response.errorCode == "NEEDS_FULL_SNAPSHOT" && !response.hasStateDelta() &&
+            !response.hasFrozenHistory() && response.snapshotSeq in 0 until Long.MAX_VALUE) {
+            "State Delta fallback response is invalid"
+        }
+    }
+}
+
+internal class BrokerCaptureRequestContext(
+    val selection: BrokerCaptureSelectionV1,
+    val keyEpoch: Long,
+    val keyId: String,
+    val stateContract: String,
+) {
+    init {
+        require(ProductionTerminalProfile.entries.any { it.isGraphics && it.stateContract == stateContract }) {
+            "Broker capture terminal state is unsupported"
+        }
+        require(selection.objectId.size() == 16 && selection.objectId.toByteArray().any { it != 0.toByte() } &&
+            selection.sourceEventSeq in 1 until Long.MAX_VALUE &&
+            selection.canonicalBytes in 136..BrokerCaptureCrypto.MAXIMUM_CANONICAL_BYTES &&
+            selection.canonicalSha256.size() == 32) { "Broker capture selection is invalid" }
+    }
+
+    fun validate(response: HostHistoryResponsePayload) {
+        require(response.hasBrokerCapture() && !response.hasFrozenHistory() && !response.hasStateDelta() &&
+            response.brokerCapture == selection &&
+            response.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_BROKER_CAPTURE &&
+            response.objectId == selection.objectId &&
+            response.startSeq == selection.sourceEventSeq && response.endSeq == selection.sourceEventSeq &&
+            response.snapshotSeq == 0L && response.columns == 0 && response.rows == 0 &&
+            response.initialTranscriptBeforeLineId == 0L && response.requestBeforeLineId == 0L &&
+            response.firstLineId == 0L && response.lastLineId == 0L &&
+            !response.hasMoreBefore && response.nextBeforeLineId == 0L && !response.hasMoreEvents &&
+            response.keyId == keyId && response.formatName == BROKER_CAPTURE_FORMAT_NAME &&
+            response.formatVersion == 1 && response.errorCode.isEmpty() &&
+            response.objectBytes == selection.canonicalBytes.toLong() +
+                BrokerCaptureCrypto.HEADER_BYTES + 16L) {
+            "Broker capture response does not match the ordered reference"
+        }
+    }
+}
+
+/** Token and capture identity are valid only for this session and key epoch. */
+class ProductionFrozenHistoryCapture internal constructor(
+    val token: ByteString,
+    val captureId: ULong,
+    val revision: ULong,
+    val snapshotSequence: ULong,
+    val browseGeneration: Long,
+    internal val ownerSessionId: UUID,
+    val keyEpoch: Long,
+    val stateContract: String,
+)
+
+/** Encrypted page ownership follows [objectData]; callers must close it after decrypting. */
+class ProductionFrozenHistoryPage internal constructor(
+    val capture: ProductionFrozenHistoryCapture,
+    val objectData: ProductionHostHistoryObject,
+    val maxLines: Int,
+    val maxCells: Int,
+    val maxUtf8Bytes: Int,
+) : AutoCloseable {
+    override fun close() = objectData.close()
+}
+
+internal data class FrozenHistoryRequestContext(
+    val kind: HostHistoryRequestKindV1,
+    val snapshotSequence: ULong,
+    val beforeLineId: ULong,
+    val token: ByteString,
+    val captureId: ULong,
+    val revision: ULong,
+    val maxLines: Int,
+    val maxCells: Int,
+    val maxUtf8Bytes: Int,
+    val maxObjectBytes: Int,
+    val browseGeneration: Long,
+    val keyEpoch: Long,
+    val keyId: String,
+    val stateContract: String,
+) {
+    fun validate(response: HostHistoryResponsePayload) {
+        require(response.hasFrozenHistory()) { "Frozen history metadata is missing" }
+        val frozen = response.frozenHistory
+        require(response.snapshotSeq.toULong() == snapshotSequence &&
+            response.requestBeforeLineId.toULong() == beforeLineId &&
+            frozen.token.size() == 32 && frozen.captureId != 0L &&
+            frozen.captureRevision.toULong() == snapshotSequence + 1uL &&
+            frozen.snapshotSeq.toULong() == snapshotSequence &&
+            frozen.leaseRemainingMs > 0L && frozen.stateContract == stateContract &&
+            frozen.requiredCells == 0L && frozen.requiredUtf8Bytes == 0L &&
+            (kind == HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_BEGIN ||
+                (frozen.token == token && frozen.captureId.toULong() == captureId &&
+                    frozen.captureRevision.toULong() == revision)) &&
+            response.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_FROZEN_PAGE &&
+            response.formatName == FROZEN_HISTORY_V2_FORMAT_NAME && response.formatVersion == 1 &&
+            response.keyId == keyId && response.startSeq == 0L && response.endSeq == 0L &&
+            !response.hasMoreEvents && response.errorCode.isEmpty()
+        ) { "Frozen history response does not match the request" }
+    }
+
+    fun validateError(response: HostHistoryResponsePayload): ULong? {
+        val availableSnapshotSequence = if (kind == HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_BEGIN &&
+            response.errorCode == "ANCHOR_CHANGED" && response.snapshotSeq > 0L
+        ) {
+            require(response.snapshotSeq.toULong() > snapshotSequence) {
+                "Frozen history available snapshot must advance the requested anchor"
+            }
+            response.snapshotSeq.toULong()
+        } else {
+            require(response.snapshotSeq == 0L) { "Frozen history error contains an unexpected snapshot" }
+            null
+        }
+        if (!response.hasFrozenHistory()) {
+            require(response.errorCode != "PAGE_BUDGET") { "Frozen history budget metadata is missing" }
+            return availableSnapshotSequence
+        }
+        val frozen = response.frozenHistory
+        require(frozen.token.size() == 32 && frozen.captureId != 0L &&
+            frozen.captureRevision.toULong() == snapshotSequence + 1uL &&
+            frozen.stateContract == stateContract &&
+            (kind == HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_BEGIN ||
+            (frozen.token == token && frozen.captureId.toULong() == captureId &&
+                frozen.captureRevision.toULong() == revision)) &&
+            frozen.snapshotSeq.toULong() == snapshotSequence &&
+            (response.errorCode != "PAGE_BUDGET" ||
+                frozen.requiredCells > 0L || frozen.requiredUtf8Bytes > 0L)
+        ) { "Frozen history budget metadata does not match the request" }
+        return availableSnapshotSequence
+    }
+}
+
 data class ProductionRealtimeSessionDiagnostics(
+    val terminalAcceptedGeneration: Int = 0,
+    val acceptedTerminalProfile: String? = null,
     val transportState: String,
+    val transportFailureReason: String? = null,
     val remoteState: String,
     val transportCollectorActive: Boolean,
     val reconnectActive: Boolean,
@@ -364,10 +635,16 @@ data class ProductionRealtimeSessionDiagnostics(
     val historyGapCount: Long = 0,
     /** Highest durable acknowledgement currently exposed by the reducer. */
     val durableAck: Long = 0,
+    /** Valid new Host History chunks accepted by this client; no storage commit implied. */
+    val hostHistoryChunkReceivedCount: Long = 0,
+    /** Byte-identical repeats of previously accepted chunks. */
+    val hostHistoryChunkDuplicateCount: Long = 0,
+    /** CHUNK_ACK envelopes accepted by the local encrypted transport send. */
+    val hostHistoryChunkAckSentCount: Long = 0,
     val multiplexer: ProductionRealtimeMultiplexerDiagnostics,
 )
 
-/** Non-sensitive identity of one failed session-processing incarnation. */
+/** Identity and optional local-only evidence of a failed session-processing incarnation. */
 data class ProductionRendererFatalFailure(
     val sessionId: UUID,
     val sequence: Long,
@@ -378,6 +655,8 @@ data class ProductionRendererFatalFailure(
     val terminalOperation: String?,
     val terminalStatusName: String?,
     val terminalStatusCode: Int?,
+    /** Local observer only; excluded from transport logs and telemetry. */
+    val terminalProtocolDiagnostic: dev.termlink.terminal.api.TerminalProtocolDiagnostic? = null,
 )
 
 /**
@@ -410,6 +689,7 @@ class ProductionRealtimeSessionClient(
     private val subscriberRefreshIntervalMillis: Long = 15_000,
     private val terminationReadinessTimeoutMillis: Long = 15_000,
     private val hostHistoryRequestTimeoutMillis: Long = HOST_HISTORY_REQUEST_TIMEOUT_MILLIS,
+    private val graphicsHostHistoryTotalTimeoutMillis: Long = GRAPHICS_HOST_HISTORY_TOTAL_TIMEOUT_MILLIS,
     private val holdLiveReplayForHostHistory: Boolean = false,
     private val hostHistoryOnlyMode: Boolean = false,
     leaseRenewalIntervalMillis: Long = 10_000,
@@ -417,10 +697,13 @@ class ProductionRealtimeSessionClient(
     orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
     orderedEventObserverCapacity: Int = 64,
     private val rendererFatalObserver: (ProductionRendererFatalFailure) -> Unit = {},
+    private val brokerCaptureResolver: (suspend (seq: Long, referenceV1: ByteArray) -> RemoteSessionEvent.BrokerOutput)? = null,
     private val sessionDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     private val controlDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
+    private val cleanupDispatcher: CoroutineDispatcher = Dispatchers.Default,
     authenticationRefresher: ((rejectedToken: String) -> String)? = null,
     onAuthenticationRejected: (rejectedToken: String) -> Unit = {},
+    private val terminalBufferBudget: TerminalBufferBudget = TerminalBufferBudget.global,
 ) : RemoteSessionOutbound, Closeable, SemanticInputRelayReplay {
     private val scopeJob = SupervisorJob(parentScope.coroutineContext[Job])
     // JNI parsing/rendering and long replay are serialized per session away
@@ -433,18 +716,30 @@ class ProductionRealtimeSessionClient(
     private val controlScope = CoroutineScope(
         parentScope.coroutineContext + scopeJob + controlDispatcher,
     )
-    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
     private val closed = AtomicBoolean(false)
     private val closing = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
     private val metadataRefreshInFlight = AtomicBoolean(false)
     private val historyRecoveryInProgress = AtomicBoolean(false)
     private val rendererFatal = AtomicBoolean(false)
+    private data class PendingTerminalAttachment(val generation: Int, val result: CompletableDeferred<ProductionTerminalProfile>)
+    private val pendingTerminalAttachments = ConcurrentHashMap<UUID, PendingTerminalAttachment>()
+    private data class HostClockSample(val generation: Int, val keyEpoch: Long, val hostMillis: Long, val elapsedMillis: Long)
+    private val hostClockSample = AtomicReference<HostClockSample?>()
+    private val terminalAcceptedGeneration = AtomicInteger(0)
+    private val acceptedTerminalProfile = AtomicReference<ProductionTerminalProfile?>()
+    private val terminalCompatibilityFailure = AtomicReference<TerminalCompatibilityException?>()
     private val nextMetadataRefreshAtMillis = AtomicLong(0)
     private val sendMutex = Mutex()
     private val directSequenceReservationLock = Any()
     private var directSequenceReservation: ProductionDirectSequenceReservation? = null
     private val incomingProcessingMutex = Mutex()
+    private val brokerQueue = ArrayDeque<QueuedIncoming>()
+    private var brokerPendingCount = 0
+    private var brokerPendingBytes = 0
+    private var brokerDrainJob: Job? = null
+    private var brokerDrainToken = 0L
     private val controlRequestMutex = Mutex()
     private val controlArbitrationMutex = Mutex()
     private val materialLock = Any()
@@ -455,6 +750,12 @@ class ProductionRealtimeSessionClient(
     private val pendingResizes = ConcurrentHashMap<UUID, CompletableDeferred<TerminalSize>>()
     private val resizeInProgress = AtomicBoolean(false)
     private val pendingHostHistory = ConcurrentHashMap<UUID, HostHistoryAccumulator>()
+    private val pendingHostHistoryLock = Any()
+    private val frozenBrowseGeneration = AtomicLong(0)
+    private val frozenSupportedGeneration = AtomicInteger(0)
+    private val deltaSupportedGeneration = AtomicInteger(0)
+    private val brokerSupportedGeneration = AtomicInteger(0)
+    private fun currentFrozenEpoch(): Long = synchronized(materialLock) { currentMaterial.epoch }
     private val reconnectMutex = Mutex()
     private var reconnectJob: Job? = null
     private var reconnectStabilityJob: Job? = null
@@ -470,6 +771,7 @@ class ProductionRealtimeSessionClient(
     private var controlGeneration = 0L
     private var restoreControlAfterReconnect = false
     private val mutableTransportState = MutableStateFlow<ProductionTransportState>(ProductionTransportState.Connecting)
+    private val lastTransportFailureReason = AtomicReference<String?>(null)
     private val noncePrefix = config.noncePrefix.copyOf()
     private var currentMaterial = SessionKeyMaterial(
         epoch = config.keyEpoch,
@@ -512,6 +814,9 @@ class ProductionRealtimeSessionClient(
     private val contiguousAppliedSequence = AtomicLong(0)
     private val duplicateEventCount = AtomicLong(0)
     private val historyGapCount = AtomicLong(0)
+    private val hostHistoryChunkReceivedCount = AtomicLong(0)
+    private val hostHistoryChunkDuplicateCount = AtomicLong(0)
+    private val hostHistoryChunkAckSentCount = AtomicLong(0)
     private val rejectedThroughGeneration = AtomicInteger(0)
     private val transportTransitionGeneration = AtomicLong(0)
     /** Guarded by [incomingProcessingMutex]. */
@@ -521,18 +826,27 @@ class ProductionRealtimeSessionClient(
     private var lastFlowControlGeneration = Int.MIN_VALUE
     private var lastFlowControlPaused: Boolean? = null
 
-    private sealed interface HostHistoryRequestResult {
+    internal sealed interface HostHistoryRequestResult {
         data class Ready(val value: ProductionHostHistoryObject) : HostHistoryRequestResult
         data object Missing : HostHistoryRequestResult
+        data object Released : HostHistoryRequestResult
     }
 
-    private data class HostHistoryChunkAcceptance(
+    internal data class HostHistoryChunkAcceptance(
         val objectId: ByteString,
         val chunkIndex: Int,
         val completed: ProductionHostHistoryObject?,
+        val newlyAccepted: Boolean,
     )
 
-    private class HostHistoryAccumulator {
+    internal class HostHistoryAccumulator(
+        private val profile: ProductionTerminalProfile,
+        private val bufferBudget: TerminalBufferBudget,
+        val generation: Int,
+        val frozen: FrozenHistoryRequestContext? = null,
+        val delta: StateDeltaRequestContext? = null,
+        val broker: BrokerCaptureRequestContext? = null,
+    ) {
         val results = Channel<HostHistoryRequestResult>(
             capacity = 1,
             onUndeliveredElement = { result ->
@@ -544,9 +858,30 @@ class ProductionRealtimeSessionClient(
         private var assembled: ByteArray? = null
         private var received: BooleanArray? = null
         private var receivedCount = 0
+        private var newChunksAccepted = 0
+        private var duplicateChunksAccepted = 0
+        private var chunkAcksSent = 0
+        private var accepting = true
+        private var reservation: TerminalBufferBudget.Reservation? = null
+        private var completedForDelivery: ProductionHostHistoryObject? = null
+        private val lastProgressNanos = AtomicLong(System.nanoTime())
+
+        suspend fun awaitResult(idleTimeoutMillis: Long): HostHistoryRequestResult {
+            // Only newly admitted chunks move this deadline. Duplicates and invalid
+            // metadata cannot keep an incomplete object alive indefinitely.
+            while (true) {
+                val elapsedMillis = (System.nanoTime() - lastProgressNanos.get()) / 1_000_000
+                val remainingMillis = idleTimeoutMillis - elapsedMillis
+                if (remainingMillis <= 0) throw ProductionTransportException("host history request timed out")
+                withTimeoutOrNull(remainingMillis) { results.receive() }?.let { return it }
+            }
+        }
 
         @Synchronized
-        fun accept(response: HostHistoryResponsePayload): HostHistoryChunkAcceptance {
+        fun accept(response: HostHistoryResponsePayload): HostHistoryChunkAcceptance? {
+            // A timeout/close can race a response whose request was already looked up.
+            // Never allocate again after cancellation or after the final chunk.
+            if (!accepting) return null
             require(response.status == HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK) {
                 "Host history response is not successful"
             }
@@ -556,16 +891,52 @@ class ProductionRealtimeSessionClient(
             require(response.kind != HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_UNSPECIFIED) {
                 "Host history object kind is missing"
             }
-            require(response.objectBytes in 1..MAX_HOST_HISTORY_OBJECT_BYTES.toLong()) {
-                "Host history object size is invalid"
+            require(frozen != null || (!response.hasFrozenHistory() &&
+                response.kind != HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_FROZEN_PAGE)) {
+                "Frozen history page was not requested"
             }
-            require(response.chunkCount in 1..128 && response.chunkIndex < response.chunkCount) {
+            require(delta != null || (!response.hasStateDelta() &&
+                response.kind != HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_STATE_DELTA)) {
+                "State Delta was not requested"
+            }
+            require(broker != null || (!response.hasBrokerCapture() &&
+                response.kind != HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_BROKER_CAPTURE)) {
+                "Broker capture was not requested"
+            }
+            val expectedChunkCount = when {
+                broker != null -> {
+                    broker.validate(response)
+                    require(response.objectBytes in (BrokerCaptureCrypto.HEADER_BYTES + 136 + 16).toLong()..
+                        BrokerCaptureCrypto.MAXIMUM_OBJECT_BYTES.toLong()) { "Broker capture size is invalid" }
+                    ((response.objectBytes + HOST_HISTORY_RESPONSE_CHUNK_BYTES - 1) /
+                        HOST_HISTORY_RESPONSE_CHUNK_BYTES).toInt()
+                }
+                delta != null -> {
+                    delta.validate(response)
+                    require(response.objectBytes in (DeltaCrypto.HEADER_BYTES + 256 + 16).toLong()..
+                        DeltaCrypto.MAXIMUM_OBJECT_BYTES.toLong()) { "State Delta object size is invalid" }
+                    ((response.objectBytes + HOST_HISTORY_RESPONSE_CHUNK_BYTES - 1) /
+                        HOST_HISTORY_RESPONSE_CHUNK_BYTES).toInt()
+                }
+                frozen != null -> {
+                    frozen.validate(response)
+                    if (response.objectBytes > frozen.maxObjectBytes.toLong()) {
+                        throw ProductionFrozenHistoryException("PAGE_LIMIT", metadata = response.frozenHistory)
+                    }
+                    frozenHistoryChunkCount(response.objectBytes)
+                }
+                else -> profile.hostHistoryChunkCount(response.objectBytes)
+            }
+            val maximumChunks = when {
+                broker != null -> 65
+                delta != null -> 16
+                frozen != null -> 129
+                else -> profile.maxHostHistoryChunks
+            }
+            require(response.chunkCount in 1..maximumChunks &&
+                response.chunkIndex in 0 until response.chunkCount) {
                 "Host history chunk index is invalid"
             }
-            val expectedChunkCount = (
-                (response.objectBytes + HOST_HISTORY_RESPONSE_CHUNK_BYTES - 1) /
-                    HOST_HISTORY_RESPONSE_CHUNK_BYTES
-                ).toInt()
             require(response.chunkCount == expectedChunkCount) {
                 "Host history chunk count does not match object length"
             }
@@ -584,10 +955,18 @@ class ProductionRealtimeSessionClient(
             val normalizedHeader = normalizedMetadata.toByteArray()
             val existingHeader = header
             if (existingHeader == null) {
-                header = normalizedHeader
-                metadata = normalizedMetadata
-                assembled = ByteArray(response.objectBytes.toInt())
-                received = BooleanArray(response.chunkCount)
+                try {
+                    reservation = bufferBudget.reserve(response.objectBytes)
+                    header = normalizedHeader
+                    metadata = normalizedMetadata
+                    assembled = ByteArray(response.objectBytes.toInt())
+                    received = BooleanArray(response.chunkCount)
+                } catch (error: Throwable) {
+                    normalizedHeader.fill(0)
+                    accepting = false
+                    clearAssembly()
+                    throw error
+                }
             } else {
                 try {
                     require(MessageDigest.isEqual(existingHeader, normalizedHeader)) {
@@ -600,7 +979,8 @@ class ProductionRealtimeSessionClient(
             val target = requireNotNull(assembled)
             val admitted = requireNotNull(received)
             val index = response.chunkIndex
-            if (admitted[index]) {
+            val isNewChunk = !admitted[index]
+            if (!isNewChunk) {
                 var difference = 0
                 for (chunkOffset in 0 until expectedChunkBytes) {
                     difference = difference or (
@@ -615,7 +995,9 @@ class ProductionRealtimeSessionClient(
                 receivedCount++
             }
             if (receivedCount != admitted.size) {
-                return HostHistoryChunkAcceptance(response.objectId, index, null)
+                if (isNewChunk) lastProgressNanos.set(System.nanoTime())
+                recordAcceptedChunk(isNewChunk)
+                return HostHistoryChunkAcceptance(response.objectId, index, null, isNewChunk)
             }
             val digest = MessageDigest.getInstance("SHA-256").digest(target)
             val expectedDigest = response.objectSha256.toByteArray()
@@ -653,28 +1035,96 @@ class ProductionRealtimeSessionClient(
                 formatVersion = value.formatVersion,
                 ciphertextSha256 = value.objectSha256.toByteArray(),
                 sealedObject = target,
+                reservation = requireNotNull(reservation),
+                frozenHistory = if (frozen == null) null else value.frozenHistory,
+                stateDelta = if (delta == null) null else value.stateDelta,
+                brokerCapture = if (broker == null) null else value.brokerCapture,
             )
+            reservation = null // Ownership now follows the returned object until destroy().
             assembled = null
             clearAssembly()
-            return HostHistoryChunkAcceptance(response.objectId, index, completed)
+            accepting = false
+            completedForDelivery = completed
+            if (isNewChunk) lastProgressNanos.set(System.nanoTime())
+            recordAcceptedChunk(isNewChunk)
+            return HostHistoryChunkAcceptance(response.objectId, index, completed, isNewChunk)
+        }
+
+        @Synchronized
+        fun markChunkAckSent() { chunkAcksSent++ }
+
+        @Synchronized
+        fun transferEvidence(requestId: UUID): ProductionHostHistoryTransferEvidence =
+            ProductionHostHistoryTransferEvidence(requestId, newChunksAccepted,
+                duplicateChunksAccepted, chunkAcksSent)
+
+        private fun recordAcceptedChunk(newlyAccepted: Boolean) {
+            if (newlyAccepted) newChunksAccepted++ else duplicateChunksAccepted++
         }
 
         @Synchronized
         fun deliver(result: HostHistoryRequestResult) {
+            accepting = false
             if (results.trySend(result).isFailure && result is HostHistoryRequestResult.Ready) {
                 result.value.destroy()
             }
         }
 
         @Synchronized
+        fun acceptRelease(response: HostHistoryResponsePayload): Boolean {
+            if (!accepting) return false
+            require(frozen?.kind == HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE) {
+                "Only frozen release may return empty OK"
+            }
+            require(response.status == HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK &&
+                response.hasFrozenHistory() && response.errorCode.isEmpty()) {
+                "Frozen release response is invalid"
+            }
+            val metadata = response.frozenHistory
+            require(metadata.token == frozen.token && metadata.captureId.toULong() == frozen.captureId &&
+                metadata.captureRevision.toULong() == frozen.revision &&
+                metadata.snapshotSeq.toULong() == frozen.snapshotSequence &&
+                frozen.revision == frozen.snapshotSequence + 1uL &&
+                metadata.stateContract == frozen.stateContract &&
+                response.snapshotSeq == 0L && response.requestBeforeLineId == 0L &&
+                metadata.requiredCells == 0L && metadata.requiredUtf8Bytes == 0L) {
+                "Frozen release identity does not match the request"
+            }
+            require(response.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_UNSPECIFIED &&
+                response.objectId.isEmpty && response.objectSha256.isEmpty && response.objectBytes == 0L &&
+                response.chunkIndex == 0 && response.chunkCount == 0 && response.objectChunk.isEmpty &&
+                response.formatName.isEmpty() && response.formatVersion == 0) {
+                "Frozen release response must be empty"
+            }
+            accepting = false
+            return true
+        }
+
+        @Synchronized
+        fun takeCompleted(value: ProductionHostHistoryObject): ProductionHostHistoryObject {
+            check(completedForDelivery === value) { "host history request is no longer active" }
+            completedForDelivery = null
+            return value
+        }
+
+        @Synchronized
         fun fail(error: Throwable) {
+            accepting = false
             clearAssembly()
+            completedForDelivery?.destroy()
+            completedForDelivery = null
             results.close(error)
+            // close preserves queued values; a failed request must relinquish those too.
+            val buffered = results.tryReceive().getOrNull()
+            if (buffered is HostHistoryRequestResult.Ready) buffered.value.destroy()
         }
 
         @Synchronized
         fun destroy() {
+            accepting = false
             clearAssembly()
+            completedForDelivery?.destroy()
+            completedForDelivery = null
             results.cancel()
         }
 
@@ -686,6 +1136,8 @@ class ProductionRealtimeSessionClient(
             received = null
             receivedCount = 0
             metadata = null
+            reservation?.close()
+            reservation = null
         }
     }
 
@@ -703,6 +1155,9 @@ class ProductionRealtimeSessionClient(
         require(subscriberRefreshIntervalMillis > 0) { "subscriber refresh interval must be positive" }
         require(terminationReadinessTimeoutMillis > 0) { "termination readiness timeout must be positive" }
         require(hostHistoryRequestTimeoutMillis > 0) { "host history request timeout must be positive" }
+        require(graphicsHostHistoryTotalTimeoutMillis in 1..GRAPHICS_HOST_HISTORY_TOTAL_TIMEOUT_MILLIS) {
+            "graphics host history total timeout must be at most five minutes"
+        }
         require(!hostHistoryOnlyMode || holdLiveReplayForHostHistory) {
             "host history-only mode requires a permanent zero replay window"
         }
@@ -737,7 +1192,10 @@ class ProductionRealtimeSessionClient(
                             )
                             return@withLock null
                         }
-                        if (generation > activeIncomingGeneration) activeIncomingGeneration = generation
+                        if (generation > activeIncomingGeneration) {
+                            clearBrokerQueueLocked()
+                            activeIncomingGeneration = generation
+                        }
 
                         val context = IncomingProcessingContext(generation, envelope)
                         try {
@@ -747,6 +1205,7 @@ class ProductionRealtimeSessionClient(
                             throw error
                         } catch (error: Exception) {
                             rejectedThroughGeneration.accumulateAndGet(generation, ::maxOf)
+                            clearBrokerQueueLocked()
                             IncomingFailure(context, error)
                         }
                     }
@@ -785,8 +1244,17 @@ class ProductionRealtimeSessionClient(
         get() = session.title
     val transportState: StateFlow<ProductionTransportState> = mutableTransportState.asStateFlow()
 
-    fun diagnostics(): ProductionRealtimeSessionDiagnostics = ProductionRealtimeSessionDiagnostics(
-        transportState = mutableTransportState.value.diagnosticName(),
+    fun diagnostics(): ProductionRealtimeSessionDiagnostics {
+        val state = mutableTransportState.value
+        if (state is ProductionTransportState.Failed && lastTransportFailureReason.get().isNullOrBlank()) {
+            lastTransportFailureReason.set(state.reason.ifBlank { "TRANSPORT_FAILED_WITHOUT_REASON" })
+            Log.w("TermLinkRealtime", "transport failed without reason; normalized")
+        }
+        return ProductionRealtimeSessionDiagnostics(
+            terminalAcceptedGeneration = terminalAcceptedGeneration.get(),
+            acceptedTerminalProfile = acceptedTerminalProfile.get()?.state,
+            transportState = state.diagnosticName(),
+            transportFailureReason = lastTransportFailureReason.get(),
         remoteState = session.state.value.diagnosticName(),
         transportCollectorActive = transportStateJob?.isActive == true,
         reconnectActive = reconnectJob?.isActive == true ||
@@ -803,8 +1271,12 @@ class ProductionRealtimeSessionClient(
         duplicateEventCount = duplicateEventCount.get(),
         historyGapCount = historyGapCount.get(),
         durableAck = session.state.value.lastAckedSequence,
+        hostHistoryChunkReceivedCount = hostHistoryChunkReceivedCount.get(),
+        hostHistoryChunkDuplicateCount = hostHistoryChunkDuplicateCount.get(),
+        hostHistoryChunkAckSentCount = hostHistoryChunkAckSentCount.get(),
         multiplexer = transport.diagnostics(),
-    )
+        )
+    }
 
     fun start() {
         check(!closed.get()) { "production session client is closed" }
@@ -823,6 +1295,28 @@ class ProductionRealtimeSessionClient(
         check(!hostHistoryOnlyMode) { "host history-only client cannot request control" }
         check(!closed.get()) { "production session client is closed" }
         val requestGeneration = controlArbitrationMutex.withLock { controlGeneration }
+        if (started.get()) {
+            // Opening a session may request control before the first socket is
+            // connected. Wait for that physical generation before asking REST
+            // for a lease, while still allowing its first session projection
+            // to finish after the REST response.
+            try {
+                withTimeout(terminationReadinessTimeoutMillis) {
+                    mutableTransportState.first { state ->
+                        if (closed.get() || state is ProductionTransportState.Closed) {
+                            throw ProductionTransportException("production session client is closed")
+                        }
+                        if (state is ProductionTransportState.Failed) {
+                            throw ProductionTransportException(state.reason)
+                        }
+                        state is ProductionTransportState.Connected && transport.currentConnectedGeneration() > 0
+                    }
+                }
+            } catch (_: TimeoutCancellationException) {
+                throw ProductionTransportException("control transport was not ready")
+            }
+        }
+        val requestConnectedGeneration = transport.currentConnectedGeneration()
         val lease = withContext(Dispatchers.IO) {
             parseLease(
                 api.post(
@@ -831,8 +1325,14 @@ class ProductionRealtimeSessionClient(
                 ).jsonObject,
             )
         }
+        var releaseSupersededLease = false
         val granted = controlArbitrationMutex.withLock {
-            if (controlGeneration != requestGeneration) {
+            if (requestConnectedGeneration <= 0 ||
+                transport.currentConnectedGeneration() != requestConnectedGeneration
+            ) {
+                false
+            } else if (controlGeneration != requestGeneration) {
+                releaseSupersededLease = true
                 false
             } else {
                 val previous = session.state.value as? RemoteSessionState.Controlling
@@ -845,18 +1345,38 @@ class ProductionRealtimeSessionClient(
                     semanticInputOutbox.clear()
                 }
                 session.grantControl(lease.leaseId, lease.expiresAtEpochMillis, lease.version)
-                restoreControlAfterReconnect = true
-                true
+                if (transport.currentConnectedGeneration() != requestConnectedGeneration) {
+                    // grantControl suspends on the session mutex. A socket replacement
+                    // during that call must not leave the old lease writable.
+                    val active = session.state.value as? RemoteSessionState.Controlling
+                    if (active?.leaseId == lease.leaseId && active.leaseVersion == lease.version) {
+                        session.revokeControl("control request transport changed")
+                    }
+                    false
+                } else {
+                    restoreControlAfterReconnect = true
+                    true
+                }
             }
         }
         if (!granted) {
-            // A newer local-input/revocation fence won while the REST request
-            // was in flight. Release the stale server lease instead of
-            // reopening Android input.
-            withContext(Dispatchers.IO) {
-                runCatching { api.delete("/v1/sessions/${config.sessionId}/lease/${lease.leaseId}") }
+            if (releaseSupersededLease) {
+                // A local-input/revocation fence may need to release the stale
+                // REST lease. Never delete a lease now used by a newer local
+                // grant, or one whose physical socket has already changed.
+                controlArbitrationMutex.withLock {
+                    val active = session.state.value as? RemoteSessionState.Controlling
+                    if (transport.currentConnectedGeneration() == requestConnectedGeneration &&
+                        active?.leaseId != lease.leaseId
+                    ) {
+                        withContext(Dispatchers.IO) {
+                            runCatching { api.delete("/v1/sessions/${config.sessionId}/lease/${lease.leaseId}") }
+                        }
+                    }
+                }
             }
-            throw ControlRequestSupersededException()
+            if (releaseSupersededLease) throw ControlRequestSupersededException()
+            throw java.io.IOException("control request was superseded by a transport generation change")
         }
     }
 
@@ -871,6 +1391,7 @@ class ProductionRealtimeSessionClient(
         try {
             withTimeout(terminationReadinessTimeoutMillis) {
                 combine(mutableTransportState, subscriberReady) { transportState, readyGeneration ->
+                    if (transportState is ProductionTransportState.Failed) throw terminalCompatibilityFailure.get() ?: ProductionTransportException(transportState.reason)
                     transportState is ProductionTransportState.Connected && readyGeneration > 0
                 }.first { it }
             }
@@ -940,6 +1461,232 @@ class ProductionRealtimeSessionClient(
         )
     }
 
+    /** Returns a sealed Delta only; the caller verifies and installs it before advancing live ACK. */
+    suspend fun requestHostStateDelta(
+        baseNextSourceSequence: ULong,
+        baseSnapshotBytes: Int,
+        baseSnapshotSha256: ByteArray,
+        deltaProfile: Int,
+        snapshotSequence: ULong = 0uL,
+    ): ProductionHostHistoryObject {
+        require(baseNextSourceSequence in 1uL..Long.MAX_VALUE.toULong() &&
+            baseSnapshotBytes in 104..(128 * 1024 * 1024) && baseSnapshotSha256.size == 32 &&
+            deltaProfile in 1..4 && snapshotSequence < Long.MAX_VALUE.toULong()) {
+            "State Delta base checkpoint is invalid"
+        }
+        val profile = awaitTerminalProfile()
+        if (!profile.isGraphics) throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+        val contextBytes = DeltaCrypto.deriveContextId(config.sessionId, config.pcDeviceId,
+            profile.stateContract)
+        val epoch = currentFrozenEpoch()
+        val context = StateDeltaRequestContext(snapshotSequence, ByteString.copyFrom(contextBytes),
+            deltaProfile, baseNextSourceSequence, baseSnapshotBytes.toULong(),
+            ByteString.copyFrom(baseSnapshotSha256), epoch,
+            DeltaCrypto.keyId(config.androidDeviceId, epoch, profile.stateContract))
+        contextBytes.fill(0)
+        return requireNotNull(requestHostHistory(
+            HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_STATE_DELTA,
+            snapshotSequence = snapshotSequence, delta = context,
+        )) { "State Delta response contained no object" }
+    }
+
+    /** Fetches only the sealed object named by an already authenticated ordered reference. */
+    suspend fun requestHostBrokerCapture(selection: BrokerCaptureSelectionV1): ProductionHostHistoryObject {
+        val profile = awaitTerminalProfile()
+        if (!profile.isGraphics) throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+        val epoch = currentFrozenEpoch()
+        val context = BrokerCaptureRequestContext(selection.toBuilder().build(), epoch,
+            BrokerCaptureCrypto.keyId(config.androidDeviceId, epoch, profile.stateContract),
+            profile.stateContract)
+        return requireNotNull(requestHostHistory(
+            HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_BROKER_CAPTURE,
+            broker = context,
+        )) { "Broker capture response contained no object" }
+    }
+
+    suspend fun beginFrozenHistory(
+        snapshotSequence: ULong,
+        maxLines: Int = 128,
+        maxCells: Int = 65_536,
+        maxUtf8Bytes: Int = 4 * 1024 * 1024,
+        maxObjectBytes: Int = FrozenHistoryCrypto.MAX_PAGE_V2_BYTES + FrozenHistoryCrypto.OBJECT_OVERHEAD_BYTES,
+    ): ProductionFrozenHistoryPage {
+        require(snapshotSequence > 0uL && snapshotSequence < Long.MAX_VALUE.toULong()) {
+            "Frozen snapshot sequence is invalid"
+        }
+        validateFrozenBudgets(maxLines, maxCells, maxUtf8Bytes)
+        validateFrozenObjectBudget(maxObjectBytes)
+        val profile = awaitTerminalProfile()
+        if (!profile.isGraphics) throw ProductionFrozenHistoryException("UNSUPPORTED_FORMAT")
+        val keyEpoch = currentFrozenEpoch()
+        val browseGeneration = synchronized(pendingHostHistoryLock) {
+            val next = frozenBrowseGeneration.incrementAndGet()
+            pendingHostHistory.entries.forEach { (requestId, pending) ->
+                if (pending.frozen != null &&
+                    pending.frozen.kind != HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE &&
+                    pendingHostHistory.remove(requestId, pending)) {
+                    pending.fail(ProductionFrozenHistoryException("STALE_CAPTURE"))
+                }
+            }
+            next
+        }
+        val context = FrozenHistoryRequestContext(
+            HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_BEGIN,
+            snapshotSequence, ULong.MAX_VALUE, ByteString.EMPTY, 0uL, 0uL,
+            maxLines, maxCells, maxUtf8Bytes, maxObjectBytes, browseGeneration,
+            keyEpoch, FrozenHistoryCrypto.keyId(config.androidDeviceId, keyEpoch, profile.stateContract),
+            profile.stateContract,
+        )
+        val value = try {
+            requireNotNull(requestHostHistory(context.kind, snapshotSequence = snapshotSequence,
+                beforeLineId = ULong.MAX_VALUE, frozen = context)) { "Frozen begin returned no page" }
+        } catch (error: ProductionFrozenHistoryException) {
+            val metadata = error.metadata
+            if (metadata == null) throw error
+            val capture = ProductionFrozenHistoryCapture(metadata.token, metadata.captureId.toULong(),
+                metadata.captureRevision.toULong(), snapshotSequence, browseGeneration, config.sessionId,
+                keyEpoch, profile.stateContract)
+            withContext(NonCancellable) {
+                withTimeoutOrNull(FROZEN_HISTORY_RELEASE_TIMEOUT_MILLIS) {
+                    try { releaseFrozenHistory(capture) } catch (_: Exception) { /* Host lease expires if release fails. */ }
+                }
+            }
+            throw ProductionFrozenHistoryException(error.code, error.requiredCells,
+                error.requiredUtf8Bytes, capture, error.availableSnapshotSequence)
+        }
+        val metadata = requireNotNull(value.frozenHistory)
+        val capture = ProductionFrozenHistoryCapture(metadata.token, metadata.captureId.toULong(),
+            metadata.captureRevision.toULong(), snapshotSequence, browseGeneration, config.sessionId,
+            keyEpoch, profile.stateContract)
+        return ProductionFrozenHistoryPage(capture, value, maxLines, maxCells, maxUtf8Bytes)
+    }
+
+    suspend fun loadFrozenHistoryPage(
+        capture: ProductionFrozenHistoryCapture,
+        beforeLineId: ULong,
+        maxLines: Int = 128,
+        maxCells: Int = 65_536,
+        maxUtf8Bytes: Int = 4 * 1024 * 1024,
+        maxObjectBytes: Int = FrozenHistoryCrypto.MAX_PAGE_V2_BYTES + FrozenHistoryCrypto.OBJECT_OVERHEAD_BYTES,
+    ): ProductionFrozenHistoryPage {
+        validateFrozenCapture(capture)
+        require(beforeLineId != 0uL) { "Frozen page anchor is invalid" }
+        validateFrozenBudgets(maxLines, maxCells, maxUtf8Bytes)
+        validateFrozenObjectBudget(maxObjectBytes)
+        val context = FrozenHistoryRequestContext(
+            HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_PAGE,
+            capture.snapshotSequence, beforeLineId, capture.token, capture.captureId, capture.revision,
+            maxLines, maxCells, maxUtf8Bytes, maxObjectBytes, capture.browseGeneration,
+            capture.keyEpoch,
+            FrozenHistoryCrypto.keyId(config.androidDeviceId, capture.keyEpoch, capture.stateContract),
+            capture.stateContract,
+        )
+        val value = requireNotNull(requestHostHistory(context.kind, snapshotSequence = capture.snapshotSequence,
+            beforeLineId = beforeLineId, frozen = context)) { "Frozen page returned no page" }
+        return ProductionFrozenHistoryPage(capture, value, maxLines, maxCells, maxUtf8Bytes)
+    }
+
+    suspend fun releaseFrozenHistory(capture: ProductionFrozenHistoryCapture) {
+        require(capture.ownerSessionId == config.sessionId && capture.keyEpoch == currentFrozenEpoch() &&
+            capture.token.size() == 32 && capture.captureId != 0uL &&
+            capture.revision == capture.snapshotSequence + 1uL) { "Frozen capture identity is invalid" }
+        synchronized(pendingHostHistoryLock) {
+            if (frozenBrowseGeneration.compareAndSet(capture.browseGeneration, capture.browseGeneration + 1)) {
+                pendingHostHistory.entries.forEach { (requestId, pending) ->
+                    if (pending.frozen?.browseGeneration == capture.browseGeneration &&
+                        pendingHostHistory.remove(requestId, pending)) {
+                        pending.fail(ProductionFrozenHistoryException("STALE_CAPTURE"))
+                    }
+                }
+            }
+        }
+        val context = FrozenHistoryRequestContext(
+            HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE,
+            capture.snapshotSequence, 0uL, capture.token, capture.captureId, capture.revision,
+            0, 0, 0, 0, capture.browseGeneration,
+            capture.keyEpoch,
+            FrozenHistoryCrypto.keyId(config.androidDeviceId, capture.keyEpoch, capture.stateContract),
+            capture.stateContract,
+        )
+        requestHostHistory(context.kind, snapshotSequence = capture.snapshotSequence, frozen = context)
+    }
+
+    private fun validateFrozenCapture(capture: ProductionFrozenHistoryCapture) {
+        require(capture.ownerSessionId == config.sessionId && capture.keyEpoch == currentFrozenEpoch() &&
+            capture.token.size() == 32 && capture.captureId != 0uL &&
+            capture.revision == capture.snapshotSequence + 1uL) { "Frozen capture identity is invalid" }
+        if (capture.browseGeneration != frozenBrowseGeneration.get()) {
+            throw ProductionFrozenHistoryException("STALE_CAPTURE")
+        }
+    }
+
+    private fun validateFrozenBudgets(maxLines: Int, maxCells: Int, maxUtf8Bytes: Int) {
+        require(maxLines in 1..128 && maxCells in 1..65_536 && maxUtf8Bytes in 1..4 * 1024 * 1024) {
+            "Frozen history page budgets are invalid"
+        }
+    }
+
+    private fun validateFrozenObjectBudget(maxObjectBytes: Int) {
+        require(maxObjectBytes in 1..(FrozenHistoryCrypto.MAX_PAGE_V2_BYTES +
+            FrozenHistoryCrypto.OBJECT_OVERHEAD_BYTES)) { "Frozen history object budget is invalid" }
+    }
+
+    /** Waits for the current subscriber's authenticated profile, including history-only bootstraps. */
+    fun supportsRemoteFrozenHistory(): Boolean {
+        val generation = transport.currentConnectedGeneration()
+        return !closed.get() && !closing.get() && generation > 0 && subscriberReady.value == generation &&
+            terminalAttachmentAccepted(generation) && frozenSupportedGeneration.get() == generation &&
+            acceptedTerminalProfile.get()?.isGraphics == true
+    }
+
+    fun supportsRemoteStateDelta(): Boolean {
+        val generation = transport.currentConnectedGeneration()
+        val relay = transport.negotiatedCapabilities.value
+        return !closed.get() && !closing.get() && generation > 0 && subscriberReady.value == generation &&
+            terminalAttachmentAccepted(generation) && acceptedTerminalProfile.get()?.isGraphics == true &&
+            deltaSupportedGeneration.get() == generation && relay.generation == generation &&
+            HOST_HISTORY_RELAY_CAPABILITY in relay.capabilities
+    }
+
+    fun supportsRemoteBrokerCapture(): Boolean {
+        val generation = transport.currentConnectedGeneration()
+        val relay = transport.negotiatedCapabilities.value
+        return !closed.get() && !closing.get() && generation > 0 && subscriberReady.value == generation &&
+            terminalAttachmentAccepted(generation) && acceptedTerminalProfile.get()?.isGraphics == true &&
+            brokerSupportedGeneration.get() == generation && relay.generation == generation &&
+            BROKER_CAPTURE_CAPABILITY in relay.capabilities &&
+            HOST_HISTORY_RELAY_CAPABILITY in relay.capabilities
+    }
+
+    suspend fun awaitTerminalProfile(): ProductionTerminalProfile {
+        check(started.get()) { "production session client is not started" }
+        check(!closed.get()) { "production session client is closed" }
+        // withTimeoutOrNull returns null only for this wait's own deadline.
+        // An ancestor timeout must remain cancellation, not become TL-H131.
+        val profile = withTimeoutOrNull(terminationReadinessTimeoutMillis) {
+            combine(mutableTransportState, subscriberReady) { transportState, readyGeneration ->
+                if (transportState is ProductionTransportState.Failed) {
+                    throw terminalCompatibilityFailure.get() ?: ProductionTransportException(transportState.reason)
+                }
+                if (transportState is ProductionTransportState.Closed) throw ProductionTransportException("production session client is closed")
+                if (transportState is ProductionTransportState.Connected && readyGeneration > 0 &&
+                    transport.currentConnectedGeneration() == readyGeneration && terminalAttachmentAccepted(readyGeneration)
+                ) {
+                    if (config.negotiateTerminalState) acceptedTerminalProfile.get() else ProductionTerminalProfile.LEGACY
+                } else null
+            }.first { it != null }!!
+        }
+        if (profile != null) return profile
+        Log.w(REALTIME_LOG_TAG,
+            "terminal_profile_wait_timeout connected_generation=${transport.currentConnectedGeneration()} " +
+                "ready_generation=${subscriberReady.value} accepted_generation=${terminalAcceptedGeneration.get()} " +
+                "transport_state=${mutableTransportState.value.diagnosticName()} " +
+                "subscribe_count=${subscribeSendCount.get()} reconcile_active=${sessionReconcileJob?.isActive == true} " +
+                "pending_attachments=${pendingTerminalAttachments.size} history_only=$hostHistoryOnlyMode")
+        throw if (config.negotiateTerminalState) TerminalCompatibilityException("TERMINAL_NEGOTIATION_TIMEOUT")
+            else ProductionTransportException("host history transport was not ready")
+    }
+
     private suspend fun requestHostHistory(
         kind: HostHistoryRequestKindV1,
         snapshotSequence: ULong = 0u,
@@ -947,60 +1694,151 @@ class ProductionRealtimeSessionClient(
         afterSequence: ULong = 0u,
         throughSequence: ULong = 0u,
         maxEvents: Int = 0,
+        frozen: FrozenHistoryRequestContext? = null,
+        delta: StateDeltaRequestContext? = null,
+        broker: BrokerCaptureRequestContext? = null,
     ): ProductionHostHistoryObject? {
-        check(started.get()) { "production session client is not started" }
-        check(!closed.get()) { "production session client is closed" }
-        try {
-            withTimeout(terminationReadinessTimeoutMillis) {
-                combine(mutableTransportState, subscriberReady) { transportState, readyGeneration ->
-                    transportState is ProductionTransportState.Connected && readyGeneration > 0
-                }.first { it }
-            }
-        } catch (_: TimeoutCancellationException) {
-            throw ProductionTransportException("host history transport was not ready")
+        val profile = awaitTerminalProfile()
+        if (frozen != null && (!profile.isGraphics || frozen.stateContract != profile.stateContract)) {
+            throw ProductionFrozenHistoryException("UNSUPPORTED_FORMAT")
+        }
+        if ((delta != null || broker != null) && !profile.isGraphics) {
+            throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+        }
+        if (broker != null && (broker.stateContract != profile.stateContract ||
+            broker.keyId != BrokerCaptureCrypto.keyId(config.androidDeviceId, broker.keyEpoch,
+                profile.stateContract))) {
+            throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
         }
 
         val requestId = UUID.randomUUID()
-        val pending = HostHistoryAccumulator()
-        check(pendingHostHistory.putIfAbsent(requestId, pending) == null) {
-            "Host history request ID collision"
+        val generation = transport.currentConnectedGeneration()
+        val pending = HostHistoryAccumulator(profile, terminalBufferBudget, generation, frozen, delta, broker)
+        synchronized(pendingHostHistoryLock) {
+            check(!closed.get() && !closing.get()) { "production session client is closed" }
+            if (generation <= 0 || subscriberReady.value != generation ||
+                transport.currentConnectedGeneration() != generation || !terminalAttachmentAccepted(generation)
+            ) throw ProductionTransportException("host history transport was not ready")
+            if (frozen != null) {
+                if (frozen.keyEpoch != currentFrozenEpoch()) throw ProductionFrozenHistoryException("STALE_CAPTURE")
+                if (frozenSupportedGeneration.get() != generation) throw ProductionFrozenHistoryException("UNSUPPORTED_FORMAT")
+                if (frozen.kind != HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE &&
+                    !isCurrentFrozenBrowse(frozen, frozenBrowseGeneration.get(), currentFrozenEpoch())) {
+                    throw ProductionFrozenHistoryException("STALE_CAPTURE")
+                }
+            }
+            if (delta != null) {
+                val relay = transport.negotiatedCapabilities.value
+                if (delta.keyEpoch != currentFrozenEpoch() || deltaSupportedGeneration.get() != generation ||
+                    relay.generation != generation || HOST_HISTORY_RELAY_CAPABILITY !in relay.capabilities) {
+                    throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+                }
+                if (pendingHostHistory.values.any { it.delta != null }) {
+                    throw IllegalStateException("A State Delta request is already pending")
+                }
+            }
+            if (broker != null) {
+                val relay = transport.negotiatedCapabilities.value
+                if (broker.keyEpoch != currentFrozenEpoch() || brokerSupportedGeneration.get() != generation ||
+                    relay.generation != generation || BROKER_CAPTURE_CAPABILITY !in relay.capabilities ||
+                    HOST_HISTORY_RELAY_CAPABILITY !in relay.capabilities) {
+                    throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+                }
+                if (pendingHostHistory.values.any { it.broker != null }) {
+                    throw IllegalStateException("A broker capture request is already pending")
+                }
+            }
+            if (pendingHostHistory.size >= 4) throw TerminalBufferLimitException()
+            check(pendingHostHistory.putIfAbsent(requestId, pending) == null) {
+                "Host history request ID collision"
+            }
         }
-        val payload = HostHistoryRequestPayload.newBuilder()
-            .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
-            .setKind(kind)
-            .setSnapshotSeq(snapshotSequence.toLong())
-            .setBeforeLineId(beforeLineId.toLong())
-            .setAfterSeq(afterSequence.toLong())
-            .setThroughSeq(throughSequence.toLong())
-            .setMaxEvents(maxEvents)
-            .build()
-            .toByteArray()
+
         var requestSent = false
         var requestCompleted = false
         try {
-            sendEncrypted(MessageType.HOST_HISTORY_REQUEST, payload)
+            val payload = HostHistoryRequestPayload.newBuilder()
+                .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
+                .setKind(kind)
+                .setSnapshotSeq(snapshotSequence.toLong())
+                .setBeforeLineId(beforeLineId.toLong())
+                .setAfterSeq(afterSequence.toLong())
+                .setThroughSeq(throughSequence.toLong())
+                .setMaxEvents(maxEvents)
+                .addAllSubscriberCapabilities(
+                    (if (config.negotiateTerminalState) TERMINAL_SUBSCRIBER_CAPABILITIES else emptyList()) +
+                        (if (frozen != null) listOf(FROZEN_HISTORY_CAPABILITY, FROZEN_HISTORY_V2_CAPABILITY) else emptyList())
+                        + (if (delta != null) listOf(STATE_DELTA_CAPABILITY) else emptyList())
+                )
+                .apply {
+                    if (frozen != null) setFrozenHistory(FrozenHistoryRequest.newBuilder()
+                        .setToken(frozen.token)
+                        .setCaptureId(frozen.captureId.toLong())
+                        .setCaptureRevision(frozen.revision.toLong())
+                        .setMaxLines(frozen.maxLines)
+                        .setMaxCells(frozen.maxCells)
+                        .setMaxUtf8Bytes(frozen.maxUtf8Bytes)
+                        .setPageFormatVersion(FrozenHistoryCrypto.PAGE_FORMAT_V2))
+                    if (delta != null) setStateDelta(StateDeltaRequestV1.newBuilder()
+                        .setContextId(delta.contextId)
+                        .setProfile(delta.profile)
+                        .setBaseNextSourceSequence(delta.baseNextSequence.toLong())
+                        .setBaseSnapshotBytes(delta.baseSnapshotBytes.toLong())
+                        .setBaseSnapshotSha256(delta.baseSha256))
+                    if (broker != null) setBrokerCapture(broker.selection)
+                }
+                .build()
+                .toByteArray()
+            sendEncrypted(MessageType.HOST_HISTORY_REQUEST, payload, expectedConnectedGeneration = generation)
             requestSent = true
             return try {
-                val result = withTimeout(hostHistoryRequestTimeoutMillis) {
-                    pending.results.receive()
+                val result = when {
+                    !config.negotiateTerminalState -> withTimeout(hostHistoryRequestTimeoutMillis) { pending.results.receive() }
+                    profile.isGraphics -> withTimeout(graphicsHostHistoryTotalTimeoutMillis) {
+                        pending.awaitResult(hostHistoryRequestTimeoutMillis)
+                    }
+                    else -> pending.awaitResult(hostHistoryRequestTimeoutMillis)
+                }
+                val value = when (result) {
+                    is HostHistoryRequestResult.Ready -> pending.takeCompleted(result.value)
+                    HostHistoryRequestResult.Missing -> null
+                    HostHistoryRequestResult.Released -> null
+                }
+                if (frozen != null && frozen.kind != HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE &&
+                    !isCurrentFrozenBrowse(frozen, frozenBrowseGeneration.get(), currentFrozenEpoch())) {
+                    value?.destroy()
+                    throw ProductionFrozenHistoryException("STALE_CAPTURE")
+                }
+                if (delta != null && (delta.keyEpoch != currentFrozenEpoch() ||
+                    deltaSupportedGeneration.get() != generation || transport.currentConnectedGeneration() != generation)) {
+                    value?.destroy()
+                    throw ProductionTransportException("State Delta request generation changed")
+                }
+                if (broker != null && (broker.keyEpoch != currentFrozenEpoch() ||
+                    brokerSupportedGeneration.get() != generation || transport.currentConnectedGeneration() != generation)) {
+                    value?.destroy()
+                    throw ProductionTransportException("Broker capture request generation changed")
                 }
                 requestCompleted = true
-                when (result) {
-                    is HostHistoryRequestResult.Ready -> result.value
-                    HostHistoryRequestResult.Missing -> null
-                }
+                value
             } catch (_: TimeoutCancellationException) {
                 throw ProductionTransportException("host history request timed out")
             }
         } finally {
-            if (pendingHostHistory.remove(requestId, pending)) {
-                pending.destroy()
-                if (requestSent && !requestCompleted && !closed.get()) {
-                    withContext(NonCancellable) {
+            pendingHostHistory.remove(requestId, pending)
+            pending.destroy()
+            // A response failure may already have removed the accumulator. The
+            // requester still owns cancelling its host task, once, on this generation.
+            if (requestSent && !requestCompleted && !closed.get() &&
+                transport.currentConnectedGeneration() == generation
+            ) {
+                withContext(NonCancellable) {
+                    withTimeoutOrNull(HOST_HISTORY_CANCEL_TIMEOUT_MILLIS) {
                         runCatching {
                             sendHostHistoryControl(
                                 requestId = requestId,
                                 action = HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL,
+                                expectedConnectedGeneration = generation,
                             )
                         }
                     }
@@ -1014,6 +1852,7 @@ class ProductionRealtimeSessionClient(
         action: HostHistoryControlActionV1,
         objectId: ByteString = ByteString.EMPTY,
         chunkIndex: Int = 0,
+        expectedConnectedGeneration: Int? = null,
     ) {
         val payload = HostHistoryControlPayload.newBuilder()
             .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
@@ -1022,7 +1861,7 @@ class ProductionRealtimeSessionClient(
             .setChunkIndex(chunkIndex)
             .build()
             .toByteArray()
-        sendEncrypted(MessageType.HOST_HISTORY_CONTROL, payload)
+        sendEncrypted(MessageType.HOST_HISTORY_CONTROL, payload, expectedConnectedGeneration = expectedConnectedGeneration)
     }
 
     suspend fun releaseControl(reason: String = "control released") {
@@ -1081,8 +1920,9 @@ class ProductionRealtimeSessionClient(
             refreshJob?.cancelAndJoin()
             if (subscriberRefreshJob === refreshJob) subscriberRefreshJob = null
             check(!closed.get()) { "production session client is closed" }
-            incomingProcessingMutex.withLock {
+            val recovered = incomingProcessingMutex.withLock {
                 check(!closed.get()) { "production session client is closed" }
+                clearBrokerQueueLocked()
                 observedLocalInputEpoch.accumulateAndGet(recoveredLocalInputEpoch, ::maxOf)
                 session.recoverFromHistory(
                     events,
@@ -1092,18 +1932,13 @@ class ProductionRealtimeSessionClient(
                             persistAcknowledgement(expectedGeneration, recovered)
                         }
                     },
-                    publish = { recovered ->
-                        sendAcknowledgement(recovered)
-                        val connectedGeneration = transport.currentConnectedGeneration()
-                        check(connectedGeneration > 0) { "realtime socket is not connected" }
-                        establishSubscriptionHeldThenOpen(
-                            lastAckedSequence = recovered,
-                            connectedGeneration = connectedGeneration,
-                            releaseHistoryHold = true,
-                        )
-                    },
+                    publish = { recovered -> sendAcknowledgement(recovered) },
                 )
             }
+            val connectedGeneration = transport.currentConnectedGeneration()
+            check(connectedGeneration > 0) { "realtime socket is not connected" }
+            establishSubscriptionHeldThenOpen(recovered, connectedGeneration, releaseHistoryHold = true)
+            recovered
         } finally {
             historyRecoveryInProgress.set(false)
             if (!closed.get() && mutableTransportState.value is ProductionTransportState.Connected) {
@@ -1164,6 +1999,7 @@ class ProductionRealtimeSessionClient(
                         return false
                     }
                     require(keyEpoch > current.epoch) { "key epoch must not regress" }
+                    clearBrokerQueueLocked()
                     require(current.exchangePublicKey.contentEquals(pcExchangePublicKey)) {
                         "PC exchange key changed without a new device identity"
                     }
@@ -1205,11 +2041,15 @@ class ProductionRealtimeSessionClient(
                     // safely replayed after an authoritative key fence.
                     failPendingInputs("session key material changed")
                     semanticInputOutbox.clear()
+                    frozenBrowseGeneration.incrementAndGet()
+                    deltaSupportedGeneration.set(0)
+                    brokerSupportedGeneration.set(0)
+                    failPendingHostHistory(ProductionFrozenHistoryException("STALE_CAPTURE"))
                 }
-                if (mutableTransportState.value is ProductionTransportState.Connected) {
-                    resume(session.state.value.lastAckedSequence)
-                    sendFlowControl(force = true)
-                }
+            }
+            if (mutableTransportState.value is ProductionTransportState.Connected) {
+                resume(session.state.value.lastAckedSequence)
+                sendFlowControl(force = true)
             }
             return true
         } finally {
@@ -1227,19 +2067,64 @@ class ProductionRealtimeSessionClient(
     private suspend fun resumeForGeneration(lastAckedSequence: Long, connectedGeneration: Int) {
         require(lastAckedSequence >= 0)
         require(connectedGeneration > 0)
+        val requestId = UUID.randomUUID()
+        val accepted = CompletableDeferred<ProductionTerminalProfile>()
+        if (config.negotiateTerminalState) {
+            try {
+                ProductionTerminalStateContract.requireRelay(transport.negotiatedCapabilities.value, connectedGeneration)
+            } catch (error: TerminalCompatibilityException) {
+                failTerminalCompatibility(error)
+                throw error
+            }
+            pendingTerminalAttachments[requestId] = PendingTerminalAttachment(connectedGeneration, accepted)
+        }
         val payload = SubscribePayload.newBuilder()
             .setResumeFromSeq(lastAckedSequence)
             .setSubscriberExchangePublicKey(ByteString.copyFrom(identity.exchange.publicKey))
+            .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(requestId)))
+            .addAllSubscriberCapabilities(if (config.negotiateTerminalState) TERMINAL_SUBSCRIBER_CAPABILITIES else emptyList())
             .build()
             .toByteArray()
-        sendEncrypted(
-            MessageType.SUBSCRIBE,
-            payload,
-            acknowledgement = lastAckedSequence,
-            expectedConnectedGeneration = connectedGeneration,
-        )
-        lastSubscribeCursor.set(lastAckedSequence)
-        subscribeSendCount.incrementAndGet()
+        try {
+            sendEncrypted(
+                MessageType.SUBSCRIBE,
+                payload,
+                acknowledgement = lastAckedSequence,
+                expectedConnectedGeneration = connectedGeneration,
+            )
+            lastSubscribeCursor.set(lastAckedSequence)
+            subscribeSendCount.incrementAndGet()
+            if (config.negotiateTerminalState) {
+                val confirmed = withTimeoutOrNull(terminationReadinessTimeoutMillis) { accepted.await(); true } ?: false
+                check(transport.currentConnectedGeneration() == connectedGeneration) { "Terminal attachment generation changed" }
+                if (!confirmed) throw TerminalCompatibilityException("TERMINAL_NEGOTIATION_TIMEOUT")
+            }
+        } catch (error: TerminalCompatibilityException) {
+            failTerminalCompatibility(error)
+            throw error
+        } finally {
+            pendingTerminalAttachments.remove(requestId)
+        }
+    }
+
+    private fun failTerminalCompatibility(error: TerminalCompatibilityException) {
+        if (!rendererFatal.compareAndSet(false, true)) return
+        terminalCompatibilityFailure.set(error)
+        clearBrokerQueueAfterFailure()
+        cancelSessionReconcile()
+        subscriberReady.value = 0
+        frozenSupportedGeneration.set(0)
+        deltaSupportedGeneration.set(0)
+        brokerSupportedGeneration.set(0)
+        failPendingHostHistory(error)
+        subscriberRefreshJob?.cancel()
+        subscriberRefreshJob = null
+        failPendingInputs(error.message.orEmpty())
+        semanticInputOutbox.clear()
+        lastTransportFailureReason.set(error.message.orEmpty())
+        mutableTransportState.value = ProductionTransportState.Failed(error.message.orEmpty())
+        notifySessionDisconnected(error.message)
+        controlScope.launch { retireRendererEndpoint() }
     }
 
     /**
@@ -1336,6 +2221,8 @@ class ProductionRealtimeSessionClient(
      */
     internal fun sendRelayExactFromDirect(exactEnvelopeBytes: ByteArray): Boolean {
         if (closed.get() || closing.get() || exactEnvelopeBytes.isEmpty()) return false
+        val generation = transport.currentConnectedGeneration()
+        if (!terminalAttachmentAccepted(generation)) return false
         val envelope = runCatching { Envelope.parseFrom(exactEnvelopeBytes) }.getOrNull()
             ?: return false
         if (envelope.messageType != MessageType.INPUT_EVENT ||
@@ -1350,7 +2237,7 @@ class ProductionRealtimeSessionClient(
                 ProductionRealtimeClient.uuidBytes(config.pcDeviceId),
             )
         ) return false
-        return transport.sendRelayExact(envelope, exactEnvelopeBytes)
+        return transport.sendRelayExactForConnectedGeneration(envelope, exactEnvelopeBytes, generation)
     }
 
     override suspend fun resetAcknowledgement(expectedRendererGeneration: Long): DurableAckCommit =
@@ -1374,6 +2261,9 @@ class ProductionRealtimeSessionClient(
 
     override suspend fun sendInput(input: RemoteInput) {
         require(input.bytes.isNotEmpty()) { "input must not be empty" }
+        if (!terminalAttachmentAccepted(transport.currentConnectedGeneration())) {
+            throw RemoteInputRejectedException("Terminal attachment is not ready; retry after reconnection")
+        }
         val typedInput = if (config.typedInputEnabled) {
             input.typedInput ?: TerminalInput.RawBytes(input.bytes)
         } else {
@@ -1516,11 +2406,13 @@ class ProductionRealtimeSessionClient(
             "semantic replay Envelope recipient mismatch"
         }
         if (closed.get() || closing.get()) return false
-        return if (expectedConnectedGeneration != null) {
+        val generation = expectedConnectedGeneration ?: transport.currentConnectedGeneration()
+        if (!terminalAttachmentAccepted(generation)) return false
+        return if (expectedConnectedGeneration != null || config.negotiateTerminalState) {
             transport.sendRelayExactForConnectedGeneration(
                 envelope,
                 exactEnvelopeBytes,
-                expectedConnectedGeneration,
+                generation,
             )
         } else {
             transport.sendRelayExact(envelope, exactEnvelopeBytes)
@@ -1614,25 +2506,32 @@ class ProductionRealtimeSessionClient(
         }
         val id = UUID.randomUUID()
         val pending = CompletableDeferred<TerminalSize>()
-        val payload = ResizePayload.newBuilder()
+        val builder = ResizePayload.newBuilder()
             .setRequestId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(id)))
             .setLeaseId(ByteString.copyFrom(leaseIdBytes(controlling.leaseId)))
             .setLeaseVersion(controlling.leaseVersion)
             .setObservedLocalInputEpoch(observedLocalInputEpoch.get())
-            .setExpiresAtMs(System.currentTimeMillis() + 10_000)
             .setRestore(metrics == null)
             .setColumns(metrics?.size?.columns ?: 0).setRows(metrics?.size?.rows ?: 0)
             .setCellWidthPx(metrics?.cellWidthPx?.toInt()?.coerceAtLeast(1) ?: 0)
             .setCellHeightPx(metrics?.cellHeightPx?.toInt()?.coerceAtLeast(1) ?: 0)
-            .build().toByteArray()
         check(resizeInProgress.compareAndSet(false, true)) { "RESIZE_BUSY" }
         try {
             pendingResizes[id] = pending
             controlArbitrationMutex.withLock {
                 check(session.state.value == controlling) { "CONTROL_LEASE_REJECTED" }
                 check(started.get() && !closed.get() && subscriberReady.value > 0) { "SESSION_UNAVAILABLE" }
-                sendEncrypted(MessageType.RESIZE_REQUEST, payload,
-                    expectedConnectedGeneration = transport.currentConnectedGeneration())
+                val generation = transport.currentConnectedGeneration()
+                val clock = hostClockSample.get()?.takeIf {
+                    it.generation == generation && it.keyEpoch == currentFrozenEpoch()
+                }
+                // The correlated, authenticated attach reply supplies the PC clock; elapsed time includes device sleep.
+                val now = clock?.let { it.hostMillis + (SystemClock.elapsedRealtime() - it.elapsedMillis).coerceAtLeast(0) }
+                    ?: System.currentTimeMillis()
+                val payload = builder.setExpiresAtMs(now + 10_000).build().toByteArray()
+                try {
+                    sendEncrypted(MessageType.RESIZE_REQUEST, payload, expectedConnectedGeneration = generation)
+                } finally { payload.fill(0) }
             }
             return withTimeout(12_000) { pending.await() }
         } catch (_: TimeoutCancellationException) {
@@ -1640,7 +2539,6 @@ class ProductionRealtimeSessionClient(
         } finally {
             pendingResizes.remove(id)
             resizeInProgress.set(false)
-            payload.fill(0)
         }
     }
 
@@ -1738,13 +2636,11 @@ class ProductionRealtimeSessionClient(
             )
         }
         pendingTerminations.clear()
-        pendingHostHistory.entries.forEach { (requestId, pending) ->
-            if (pendingHostHistory.remove(requestId, pending)) {
-                pending.fail(
-                    ProductionTransportException("production session closed during host history request"),
-                )
-            }
-        }
+        failPendingHostHistory(ProductionTransportException("production session closed during host history request"))
+        frozenSupportedGeneration.set(0)
+        deltaSupportedGeneration.set(0)
+        brokerSupportedGeneration.set(0)
+        frozenBrowseGeneration.incrementAndGet()
         if (!transportAlreadyClosed) transport.close()
         api.close()
         incomingJob.cancel()
@@ -1761,6 +2657,7 @@ class ProductionRealtimeSessionClient(
         }
         if (incomingProcessingMutex.tryLock()) {
             try {
+                clearBrokerQueueLocked()
                 session.close()
             } finally {
                 incomingProcessingMutex.unlock()
@@ -1769,7 +2666,10 @@ class ProductionRealtimeSessionClient(
         } else {
             cleanupScope.launch {
                 try {
-                    incomingProcessingMutex.withLock { session.close() }
+                    incomingProcessingMutex.withLock {
+                        clearBrokerQueueLocked()
+                        session.close()
+                    }
                 } finally {
                     cleanupScope.cancel()
                 }
@@ -1862,6 +2762,10 @@ class ProductionRealtimeSessionClient(
                 check(!closed.get() && (allowWhileClosing || !closing.get())) {
                     "production session client is closed"
                 }
+                val sendGeneration = expectedConnectedGeneration ?: transport.currentConnectedGeneration()
+                if ((messageType == MessageType.INPUT_EVENT || messageType == MessageType.RESIZE_REQUEST) &&
+                    !terminalAttachmentAccepted(sendGeneration)
+                ) throw RemoteInputRejectedException("Terminal attachment is not ready; retry after reconnection")
                 // A cutover proposal must be visible on the independent
                 // signalling lane before the sequence named by its barrier can
                 // be used. Waiting while holding the session send mutex keeps
@@ -1948,6 +2852,10 @@ class ProductionRealtimeSessionClient(
     private fun handleIncomingFailure(failure: IncomingFailure) {
         val context = failure.context
         val error = failure.error
+        if (error is TerminalCompatibilityException) {
+            failTerminalCompatibility(error)
+            return
+        }
         val engineDiagnostics = error as? TerminalEngineFailureDiagnostics
         Log.e(
             REALTIME_LOG_TAG,
@@ -1992,8 +2900,10 @@ class ProductionRealtimeSessionClient(
     ) {
         if (!rendererFatal.compareAndSet(false, true)) return
         val reason = "terminal renderer incarnation failed"
+        clearBrokerQueueAfterFailure()
         cancelSessionReconcile()
         subscriberReady.value = 0
+        failPendingHostHistory(ProductionTransportException(reason))
         subscriberRefreshJob?.cancel()
         subscriberRefreshJob = null
         controlScope.launch {
@@ -2006,6 +2916,7 @@ class ProductionRealtimeSessionClient(
         }
         failPendingInputs(reason)
         semanticInputOutbox.clear()
+        lastTransportFailureReason.set(reason)
         mutableTransportState.value = ProductionTransportState.Failed(reason)
         // This transport is a session-scoped endpoint over a device-wide
         // WebSocket. The product owner retires this endpoint and rebuilds the
@@ -2025,6 +2936,7 @@ class ProductionRealtimeSessionClient(
                     terminalOperation = diagnostics?.terminalOperation?.take(MAX_FAILURE_CLASS_CHARS),
                     terminalStatusName = diagnostics?.terminalStatusName?.take(MAX_FAILURE_CLASS_CHARS),
                     terminalStatusCode = diagnostics?.terminalStatusCode,
+                    terminalProtocolDiagnostic = diagnostics?.terminalProtocolDiagnostic,
                 ),
             )
         }.onFailure { observerError ->
@@ -2038,8 +2950,8 @@ class ProductionRealtimeSessionClient(
 
     private suspend fun retireRendererEndpoint() {
         try {
-            if (!closed.get() && started.get() &&
-                mutableTransportState.value is ProductionTransportState.Connected
+            if (!closed.get() && started.get() && subscribeSendCount.get() > 0 &&
+                transport.currentConnectedGeneration() > 0
             ) {
                 withTimeout(GRACEFUL_UNSUBSCRIBE_TIMEOUT_MILLIS) {
                     sendEncrypted(
@@ -2065,6 +2977,10 @@ class ProductionRealtimeSessionClient(
         return parse().also { context.stage = IncomingFailureStage.SEMANTIC }
     }
 
+    private fun terminalAttachmentAccepted(generation: Int): Boolean =
+        !config.negotiateTerminalState ||
+            (generation > 0 && terminalAcceptedGeneration.get() == generation && !rendererFatal.get())
+
     private suspend fun handleIncoming(context: IncomingProcessingContext) {
         val envelope = context.envelope
         check(!closed.get()) { "production session client is closed" }
@@ -2073,6 +2989,7 @@ class ProductionRealtimeSessionClient(
         validateEnvelope(envelope)
         context.stage = IncomingFailureStage.KEY_LOOKUP
         val incomingKeyId = envelope.keyId.toByteArray()
+        var keyEpoch = 0L
         val (key, usedCurrentMaterial) = try {
             synchronized(materialLock) {
                 val material = when {
@@ -2080,6 +2997,7 @@ class ProductionRealtimeSessionClient(
                     previousMaterial?.keyId?.contentEquals(incomingKeyId) == true -> previousMaterial
                     else -> null
                 } ?: throw UnknownKeyMaterialException("Envelope key ID mismatch")
+                keyEpoch = material.epoch
                 SessionCrypto.deriveSessionKey(
                     material.pairwiseKey,
                     config.sessionId,
@@ -2109,9 +3027,196 @@ class ProductionRealtimeSessionClient(
                 previousMaterialGeneration++
             }
         }
+        var queued = false
         try {
-            context.stage = IncomingFailureStage.SEMANTIC
+            queued = queueBehindBrokerLocked(context, plaintext, usedCurrentMaterial, keyEpoch)
+            if (!queued) handleAuthenticatedIncoming(context, plaintext, usedCurrentMaterial)
+        } finally {
+            if (!queued) plaintext.fill(0)
+        }
+    }
+
+    /** Called only under incomingProcessingMutex; correlated control replies must bypass this queue. */
+    private fun queueBehindBrokerLocked(
+        context: IncomingProcessingContext,
+        plaintext: ByteArray,
+        usedCurrentMaterial: Boolean,
+        keyEpoch: Long,
+    ): Boolean {
+        val type = context.envelope.messageType
+        if (brokerDrainJob == null && type != MessageType.BROKER_OUTPUT) return false
+        if (hostHistoryOnlyMode || type == MessageType.TERMINAL_ATTACH_RESULT ||
+            type == MessageType.HOST_HISTORY_RESPONSE || type == MessageType.RESIZE_RESPONSE ||
+            type == MessageType.SESSION_TERMINATE_RESPONSE) return false
+        if (config.negotiateTerminalState && !terminalAttachmentAccepted(context.generation)) return false
+        if (type == MessageType.BROKER_OUTPUT) {
+            check(brokerCaptureResolver != null && supportsRemoteBrokerCapture() &&
+                keyEpoch == currentFrozenEpoch()) { "Broker Output is not negotiated for this session" }
+        }
+        check(brokerPendingCount < MAX_BROKER_PENDING_EVENTS &&
+            plaintext.size <= MAX_BROKER_PENDING_BYTES - brokerPendingBytes) {
+            "Broker Output receive queue overflow"
+        }
+        val reservation = terminalBufferBudget.reserve(maxOf(plaintext.size, 1).toLong())
+        try {
+            brokerQueue.addLast(QueuedIncoming(context, plaintext, usedCurrentMaterial, keyEpoch,
+                session.currentRendererGeneration, reservation))
+            brokerPendingCount++
+            brokerPendingBytes += plaintext.size
+            if (brokerDrainJob == null) {
+                val token = ++brokerDrainToken
+                brokerDrainJob = sessionScope.launch { drainBrokerQueue(token) }
+            }
+        } catch (error: Throwable) {
+            reservation.close()
+            throw error
+        }
+        return true
+    }
+
+    /** Invalidates queued plaintext without touching an in-flight resolver's owned frame. */
+    private fun clearBrokerQueueLocked() {
+        brokerDrainToken++
+        brokerDrainJob?.cancel()
+        brokerDrainJob = null
+        while (brokerQueue.isNotEmpty()) {
+            val item = brokerQueue.removeFirst()
+            brokerPendingCount--
+            brokerPendingBytes -= item.plaintext.size
+            item.close()
+        }
+    }
+
+    private fun clearBrokerQueueAfterFailure() {
+        if (incomingProcessingMutex.tryLock()) {
+            try { clearBrokerQueueLocked() } finally { incomingProcessingMutex.unlock() }
+        } else {
+            cleanupScope.launch { incomingProcessingMutex.withLock { clearBrokerQueueLocked() } }
+        }
+    }
+
+    private fun clearBrokerQueueForFailedGeneration(generation: Int, transition: Long) {
+        if (generation <= 0) return
+        val clearIfStillFailed = {
+            if (transportTransitionGeneration.get() == transition &&
+                activeIncomingGeneration == generation && subscriberReady.value != generation
+            ) clearBrokerQueueLocked()
+        }
+        if (incomingProcessingMutex.tryLock()) {
+            try { clearIfStillFailed() } finally { incomingProcessingMutex.unlock() }
+        } else {
+            cleanupScope.launch { incomingProcessingMutex.withLock { clearIfStillFailed() } }
+        }
+    }
+
+    private fun clearBrokerQueueForTransportTransition(
+        transition: Long,
+        state: RealtimeState,
+        connectedGeneration: Int,
+    ) {
+        val clearIfRetired = {
+            if (transportTransitionGeneration.get() == transition &&
+                (state != RealtimeState.Connected || connectedGeneration != activeIncomingGeneration)
+            ) clearBrokerQueueLocked()
+        }
+        if (incomingProcessingMutex.tryLock()) {
+            try { clearIfRetired() } finally { incomingProcessingMutex.unlock() }
+        } else {
+            cleanupScope.launch { incomingProcessingMutex.withLock { clearIfRetired() } }
+        }
+    }
+
+    private fun queuedFrameIsCurrent(item: QueuedIncoming, token: Long): Boolean =
+        token == brokerDrainToken && !closed.get() && !closing.get() && !rendererFatal.get() &&
+            item.context.generation == activeIncomingGeneration &&
+            transport.currentConnectedGeneration() == item.context.generation &&
+            subscriberReady.value == item.context.generation &&
+            item.keyEpoch == currentFrozenEpoch() &&
+            session.currentRendererGeneration == item.rendererGeneration &&
+            terminalAttachmentAccepted(item.context.generation)
+
+    private suspend fun drainBrokerQueue(token: Long) {
+        while (true) {
+            val item = incomingProcessingMutex.withLock {
+                if (token != brokerDrainToken) return@withLock null
+                if (brokerQueue.isEmpty()) {
+                    brokerDrainJob = null
+                    return@withLock null
+                }
+                brokerQueue.removeFirst()
+            } ?: return
+            var resolved: RemoteSessionEvent.BrokerOutput? = null
+            try {
+                if (item.context.envelope.messageType == MessageType.BROKER_OUTPUT) {
+                    val reference = parseIncomingPayload(item.context) {
+                        BrokerOutputPayload.parseFrom(item.plaintext).referenceV1.toByteArray()
+                    }
+                    try {
+                        resolved = requireNotNull(brokerCaptureResolver)(item.context.envelope.seq, reference)
+                    } finally {
+                        reference.fill(0)
+                    }
+                }
+                incomingProcessingMutex.withLock {
+                    if (!queuedFrameIsCurrent(item, token)) {
+                        if (token == brokerDrainToken) clearBrokerQueueLocked()
+                        return@withLock
+                    }
+                    val event = resolved
+                    if (event != null) {
+                        require(event.sequence == item.context.envelope.seq) {
+                            "Broker Output resolver returned another sequence"
+                        }
+                        item.context.stage = IncomingFailureStage.ENGINE_ACCEPT
+                        requireApplied(acceptOrdered(item.context, item.context.envelope, event,
+                            item.rendererGeneration))
+                        lastHandledSequence.accumulateAndGet(event.sequence, ::maxOf)
+                    } else {
+                        handleAuthenticatedIncoming(item.context, item.plaintext, item.usedCurrentMaterial)
+                    }
+                }
+            } catch (error: Exception) {
+                val failure = withContext(NonCancellable) {
+                    incomingProcessingMutex.withLock {
+                        if (token != brokerDrainToken || closed.get()) return@withLock null
+                        rejectedThroughGeneration.accumulateAndGet(item.context.generation, ::maxOf)
+                        clearBrokerQueueLocked()
+                        IncomingFailure(item.context, error)
+                    }
+                }
+                if (failure != null) handleIncomingFailure(failure)
+                return
+            } finally {
+                resolved?.close()
+                item.close()
+                withContext(NonCancellable) {
+                    incomingProcessingMutex.withLock {
+                        brokerPendingCount--
+                        brokerPendingBytes -= item.plaintext.size
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun handleAuthenticatedIncoming(
+        context: IncomingProcessingContext,
+        plaintext: ByteArray,
+        usedCurrentMaterial: Boolean,
+    ) {
+        val envelope = context.envelope
+        context.stage = IncomingFailureStage.SEMANTIC
+            if (config.negotiateTerminalState && terminalAcceptedGeneration.get() != context.generation &&
+                envelope.messageType !in setOf(MessageType.TERMINAL_ATTACH_RESULT, MessageType.HOST_HISTORY_RESPONSE,
+                    MessageType.SESSION_TERMINATE_RESPONSE)
+            ) {
+                // The PC may retry retained ciphertext before it sees our new
+                // SUBSCRIBE. Never parse/apply/ACK it until attachment is confirmed;
+                // the unchanged durable cursor asks for the same data again.
+                return
+            }
             if (hostHistoryOnlyMode &&
+                envelope.messageType != MessageType.TERMINAL_ATTACH_RESULT &&
                 envelope.messageType != MessageType.HOST_HISTORY_RESPONSE &&
                 envelope.messageType != MessageType.SESSION_TERMINATE_RESPONSE
             ) {
@@ -2122,6 +3227,40 @@ class ProductionRealtimeSessionClient(
                 return
             }
             when (envelope.messageType) {
+                MessageType.TERMINAL_ATTACH_RESULT -> {
+                    val result = parseIncomingPayload(context) {
+                        dev.termlink.protocol.realtime.v1.TerminalAttachResultPayload.parseFrom(plaintext)
+                    }
+                    val requestId = ProductionRealtimeClient.uuidFromBytes(result.requestId.toByteArray()) ?: return
+                    val pending = pendingTerminalAttachments[requestId] ?: return
+                    if (!usedCurrentMaterial || pending.generation != context.generation ||
+                        transport.currentConnectedGeneration() != context.generation) return
+                    if (!pendingTerminalAttachments.remove(requestId, pending)) return
+                    try {
+                        val profile = ProductionTerminalStateContract.requireAccepted(result)
+                        if (config.expectedTerminalState != null && profile.state != config.expectedTerminalState) {
+                            throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+                        }
+                        acceptedTerminalProfile.compareAndSet(null, profile)
+                        if (acceptedTerminalProfile.get() != profile) throw TerminalCompatibilityException("TERMINAL_STATE_MISMATCH")
+                        frozenSupportedGeneration.set(if (supportsFrozenHistory(profile, result.hostCapabilitiesList))
+                            context.generation else 0)
+                        deltaSupportedGeneration.set(if (supportsStateDelta(profile, result.hostCapabilitiesList))
+                            context.generation else 0)
+                        brokerSupportedGeneration.set(if (supportsBrokerCapture(profile, result.hostCapabilitiesList))
+                            context.generation else 0)
+                        terminalAcceptedGeneration.set(context.generation)
+                        if (envelope.sentAtMs in 1..(Long.MAX_VALUE - 15_000)) {
+                            hostClockSample.set(HostClockSample(context.generation, currentFrozenEpoch(),
+                                envelope.sentAtMs, SystemClock.elapsedRealtime()))
+                        }
+                        pending.result.complete(profile)
+                    } catch (error: TerminalCompatibilityException) {
+                        failTerminalCompatibility(error)
+                        pending.result.completeExceptionally(error)
+                    }
+                    return // Correlated result never advances terminal sequence/ACK.
+                }
                 MessageType.RESIZE_RESPONSE -> {
                     val response = parseIncomingPayload(context) { ResizeResponsePayload.parseFrom(plaintext) }
                     val id = ProductionRealtimeClient.uuidFromBytes(response.requestId.toByteArray())
@@ -2158,6 +3297,30 @@ class ProductionRealtimeSessionClient(
                             ),
                         ),
                     )
+                }
+                MessageType.HOST_RESIZE_RESULT -> {
+                    val result = parseIncomingPayload(context) {
+                        dev.termlink.terminal.api.TerminalHostResizeResultV1.decode(
+                            dev.termlink.protocol.realtime.v1.HostResizeResultPayload.parseFrom(plaintext).resultV1.toByteArray(),
+                        )
+                    }
+                    requireApplied(acceptOrdered(context, envelope, RemoteSessionEvent.HostResizeResult(envelope.seq, result)))
+                }
+                MessageType.HOST_THEME -> {
+                    val theme = parseIncomingPayload(context) {
+                        dev.termlink.terminal.api.TerminalHostThemeV1.decode(
+                            dev.termlink.protocol.realtime.v1.HostThemePayload.parseFrom(plaintext).themeV1.toByteArray(),
+                        )
+                    }
+                    requireApplied(acceptOrdered(context, envelope, RemoteSessionEvent.HostTheme(envelope.seq, theme)))
+                }
+                MessageType.HOST_GEOMETRY -> {
+                    val geometry = parseIncomingPayload(context) {
+                        dev.termlink.terminal.api.TerminalHostGeometryV1.decode(
+                            dev.termlink.protocol.realtime.v1.HostGeometryPayload.parseFrom(plaintext).geometryV1.toByteArray(),
+                        )
+                    }
+                    requireApplied(acceptOrdered(context, envelope, RemoteSessionEvent.HostGeometry(envelope.seq, geometry)))
                 }
                 MessageType.RESIZE_APPLIED -> {
                     val payload = parseIncomingPayload(context) { ResizePayload.parseFrom(plaintext) }
@@ -2221,6 +3384,10 @@ class ProductionRealtimeSessionClient(
                                 envelope.seq,
                                 RemoteLifecycle.ENDED,
                                 payload.exitCode.takeIf { payload.hasExitCode() },
+                                dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
+                                    payload.exitCode.takeIf { payload.hasExitCode() },
+                                    payload.terminalProtocolDiagnostic.takeIf { payload.hasTerminalProtocolDiagnostic() },
+                                ),
                             ),
                         ),
                     )
@@ -2327,6 +3494,7 @@ class ProductionRealtimeSessionClient(
                 }
                 MessageType.HEARTBEAT -> error("PC-to-Android heartbeat is unsupported")
                 MessageType.OUTPUT_ACK -> error("PC-to-Android output acknowledgement is unsupported")
+                MessageType.BROKER_OUTPUT -> error("Broker Output was not resolved before ordered dispatch")
                 else -> error("unsupported production message type ${envelope.messageType}")
             }
             if (envelope.seq > 0L) lastHandledSequence.accumulateAndGet(envelope.seq, ::maxOf)
@@ -2345,9 +3513,6 @@ class ProductionRealtimeSessionClient(
                 subscriberRefreshJob = null
                 cancelSessionReconcile()
             }
-        } finally {
-            plaintext.fill(0)
-        }
     }
 
     private suspend fun handleHostHistoryResponse(
@@ -2361,22 +3526,37 @@ class ProductionRealtimeSessionClient(
             return
         }
         val pending = pendingHostHistory[requestId] ?: return
+        if (pending.generation != context.generation) return
+        if (pending.delta != null && pending.delta.keyEpoch != currentFrozenEpoch()) return
+        if (pending.broker != null && pending.broker.keyEpoch != currentFrozenEpoch()) return
+        if (pending.frozen != null && pending.frozen.kind != HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE &&
+            !isCurrentFrozenBrowse(pending.frozen, frozenBrowseGeneration.get(), currentFrozenEpoch())) return
         try {
             when (response.status) {
                 HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK -> {
-                    val accepted = pending.accept(response)
+                    if (pending.frozen?.kind == HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_RELEASE) {
+                        if (pending.acceptRelease(response)) pending.deliver(HostHistoryRequestResult.Released)
+                        return
+                    }
+                    val accepted = pending.accept(response) ?: return
+                    if (accepted.newlyAccepted) hostHistoryChunkReceivedCount.incrementAndGet()
+                    else hostHistoryChunkDuplicateCount.incrementAndGet()
                     try {
                         sendHostHistoryControl(
                             requestId = requestId,
                             action = HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CHUNK_ACK,
                             objectId = accepted.objectId,
                             chunkIndex = accepted.chunkIndex,
+                            expectedConnectedGeneration = context.generation,
                         )
+                        hostHistoryChunkAckSentCount.incrementAndGet()
+                        pending.markChunkAckSent()
                     } catch (error: Throwable) {
                         accepted.completed?.destroy()
                         throw error
                     }
                     val completed = accepted.completed ?: return
+                    completed.transferEvidence = pending.transferEvidence(requestId)
                     // Keep ownership registered until the requester has taken
                     // the value. If cancellation wins after this delivery,
                     // requestHostHistory removes and cancels the Channel, whose
@@ -2395,6 +3575,20 @@ class ProductionRealtimeSessionClient(
                 }
                 HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_NOT_FOUND -> {
                     validateEmptyHostHistoryResponse(response)
+                    if (pending.delta != null) {
+                        failHostHistoryRequest(requestId, pending,
+                            IllegalStateException("State Delta request was unexpectedly not found"))
+                        return
+                    }
+                    if (pending.broker != null) {
+                        failHostHistoryRequest(requestId, pending,
+                            IllegalStateException("Broker capture is missing"))
+                        return
+                    }
+                    if (pending.frozen != null) {
+                        failHostHistoryRequest(requestId, pending, ProductionFrozenHistoryException("STALE_CAPTURE"))
+                        return
+                    }
                     if (pendingHostHistory.remove(requestId, pending)) {
                         pending.deliver(HostHistoryRequestResult.Missing)
                     }
@@ -2410,19 +3604,57 @@ class ProductionRealtimeSessionClient(
                     )
                 }
                 HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_REJECTED -> {
-                    validateEmptyHostHistoryResponse(response)
+                    validateEmptyHostHistoryResponse(response,
+                        allowSnapshotSequence = pending.frozen?.kind ==
+                            HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_FROZEN_BEGIN &&
+                            response.errorCode == "ANCHOR_CHANGED" ||
+                            pending.delta != null && response.errorCode == "NEEDS_FULL_SNAPSHOT")
+                    pending.broker?.let {
+                        require(!response.hasBrokerCapture() && !response.hasStateDelta() &&
+                            !response.hasFrozenHistory() && response.snapshotSeq == 0L) {
+                            "Broker capture rejection contains unexpected metadata"
+                        }
+                        failHostHistoryRequest(requestId, pending,
+                            IllegalStateException(response.errorCode.ifBlank { "Broker capture request was rejected" }))
+                        return
+                    }
+                    pending.delta?.let { delta ->
+                        if (response.errorCode == "NEEDS_FULL_SNAPSHOT") {
+                            delta.validateNeedsFullSnapshot(response)
+                            failHostHistoryRequest(requestId, pending,
+                                ProductionStateDeltaNeedsFullSnapshotException())
+                        } else {
+                            require(!response.hasStateDelta() && !response.hasFrozenHistory() &&
+                                response.snapshotSeq == 0L) { "State Delta rejection contains unexpected metadata" }
+                            failHostHistoryRequest(requestId, pending,
+                                IllegalStateException(response.errorCode.ifBlank { "State Delta request was rejected" }))
+                        }
+                        return
+                    }
+                    pending.frozen?.let { frozen ->
+                        val availableSnapshotSequence = frozen.validateError(response)
+                        val metadata = response.frozenHistory
+                        failHostHistoryRequest(requestId, pending, ProductionFrozenHistoryException(
+                            response.errorCode.ifBlank { "UNSUPPORTED_FORMAT" },
+                            if (response.hasFrozenHistory()) metadata.requiredCells.toULong() else 0uL,
+                            if (response.hasFrozenHistory()) metadata.requiredUtf8Bytes.toULong() else 0uL,
+                            availableSnapshotSequence = availableSnapshotSequence,
+                            metadata = if (response.hasFrozenHistory()) metadata else null,
+                        ))
+                        return
+                    }
                     failHostHistoryRequest(
                         requestId,
                         pending,
-                        IllegalStateException(
-                            response.errorCode.ifBlank { "Host history request was rejected" },
-                        ),
+                        if (response.errorCode.startsWith("TERMINAL_")) TerminalCompatibilityException(response.errorCode)
+                        else IllegalStateException(response.errorCode.ifBlank { "Host history request was rejected" }),
                     )
                 }
                 else -> error("Host history response status is invalid")
             }
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             failHostHistoryRequest(requestId, pending, error)
+            if (error !is Exception) throw error
         }
     }
 
@@ -2441,10 +3673,14 @@ class ProductionRealtimeSessionClient(
         }
     }
 
-    private fun validateEmptyHostHistoryResponse(response: HostHistoryResponsePayload) {
+    private fun validateEmptyHostHistoryResponse(
+        response: HostHistoryResponsePayload,
+        allowSnapshotSequence: Boolean = false,
+    ) {
         require(response.errorCode.length <= 128) { "Host history error code is too long" }
         require(
             response.kind == HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_UNSPECIFIED &&
+                (allowSnapshotSequence || response.snapshotSeq == 0L) &&
                 response.objectId.isEmpty &&
                 response.objectSha256.isEmpty &&
                 response.objectBytes == 0L &&
@@ -2464,14 +3700,26 @@ class ProductionRealtimeSessionClient(
         }
     }
 
+    private fun failPendingHostHistory(error: Throwable, exceptGeneration: Int? = null) {
+        synchronized(pendingHostHistoryLock) {
+            pendingHostHistory.entries.forEach { (requestId, pending) ->
+                if (pending.generation != exceptGeneration && pendingHostHistory.remove(requestId, pending)) {
+                    pending.fail(error)
+                }
+            }
+        }
+    }
+
     private suspend fun acceptOrdered(
         context: IncomingProcessingContext,
         envelope: Envelope,
         event: RemoteSessionEvent,
+        expectedRendererGeneration: Long? = null,
     ): EventAcceptance {
         context.stage = IncomingFailureStage.ENGINE_ACCEPT
         val stateBefore = session.state.value
-        val acceptance = session.accept(event)
+        val acceptance = if (expectedRendererGeneration == null) session.accept(event)
+            else session.accept(event, expectedRendererGeneration)
         when (acceptance) {
             is EventAcceptance.Applied ->
                 contiguousAppliedSequence.accumulateAndGet(acceptance.sequence, ::maxOf)
@@ -2522,6 +3770,10 @@ class ProductionRealtimeSessionClient(
                     sequence,
                     RemoteLifecycle.ENDED,
                     payload.exitCode.takeIf { payload.hasExitCode() },
+                    dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
+                        payload.exitCode.takeIf { payload.hasExitCode() },
+                        payload.terminalProtocolDiagnostic.takeIf { payload.hasTerminalProtocolDiagnostic() },
+                    ),
                 )
                 else -> error("unknown session lifecycle")
             }
@@ -2587,6 +3839,14 @@ class ProductionRealtimeSessionClient(
         cancelSessionReconcile()
         val transition = transportTransitionGeneration.incrementAndGet()
         val state = event.state
+        if (state != RealtimeState.Connected) subscriberReady.value = 0
+        clearBrokerQueueForTransportTransition(transition, state, event.connectedGeneration)
+        if (state != RealtimeState.Connected) {
+            failPendingHostHistory(ProductionTransportException("host history transport disconnected"))
+            frozenSupportedGeneration.set(0)
+            deltaSupportedGeneration.set(0)
+            brokerSupportedGeneration.set(0)
+        }
         when (state) {
             RealtimeState.Connecting -> {
                 // A device-scoped foreground/network reconcile or warm connect
@@ -2607,9 +3867,9 @@ class ProductionRealtimeSessionClient(
                     // event for the still-current generation may publish SUBSCRIBE.
                     return
                 }
+                failPendingHostHistory(ProductionTransportException("host history transport generation changed"), connectedGeneration)
                 cancelPendingReconnect()
                 mutableTransportState.value = ProductionTransportState.Connected
-                resendPendingSemanticInputsOverRelay(connectedGeneration)
                 // Wire subscription and its receive window are control-plane
                 // work. They must be published for the successor generation
                 // even while JNI/replay still occupies the renderer lane. The
@@ -2622,6 +3882,7 @@ class ProductionRealtimeSessionClient(
                             sessionState.lastAckedSequence,
                             connectedGeneration,
                         )
+                        resendPendingSemanticInputsOverRelay(connectedGeneration)
                         if (!isCurrentTransportTransition(transition, connectedGeneration)) return
                         startSubscriberRefresh()
                         scheduleReconnectAttemptReset()
@@ -2641,12 +3902,13 @@ class ProductionRealtimeSessionClient(
                 scheduleConnectedSessionProjection(transition, connectedGeneration)
             }
             is RealtimeState.Failed -> {
+                lastTransportFailureReason.set(state.reason)
                 cancelReconnectAttemptReset()
                 subscriberRefreshJob?.cancel()
                 subscriberRefreshJob = null
                 subscriberReady.value = 0
                 failPendingInputs(state.reason)
-                scheduleReconnect(state.reason)
+                scheduleReconnect(state.reason, transition)
                 notifySessionDisconnected(state.reason)
             }
             is RealtimeState.AuthenticationRejected -> {
@@ -2665,6 +3927,7 @@ class ProductionRealtimeSessionClient(
                 subscriberReady.value = 0
                 failPendingInputs(state.reason)
                 notifySessionDisconnected(state.reason)
+                lastTransportFailureReason.set(state.reason)
                 mutableTransportState.value = ProductionTransportState.Failed(state.reason)
             }
             is RealtimeState.Reconnecting -> {
@@ -2795,8 +4058,10 @@ class ProductionRealtimeSessionClient(
      * generation can cancel this work without accepting a stale SUBSCRIBE.
      */
     private fun scheduleSessionReconcile(reason: String, connectedGeneration: Int) {
+        Log.w(REALTIME_LOG_TAG, "session_reconcile_scheduled reason=$reason generation=$connectedGeneration renderer_fatal=${rendererFatal.get()} accepted_generation=${terminalAcceptedGeneration.get()} pending_attachments=${pendingTerminalAttachments.size}")
         if (!isEligibleSessionReconcile(connectedGeneration)) return
         subscriberReady.compareAndSet(connectedGeneration, 0)
+        clearBrokerQueueForFailedGeneration(connectedGeneration, transportTransitionGeneration.get())
         subscriberRefreshJob?.cancel()
         subscriberRefreshJob = null
         failPendingInputs(reason)
@@ -2905,7 +4170,8 @@ class ProductionRealtimeSessionClient(
                 return
             } catch (error: CancellationException) {
                 throw error
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                Log.w(REALTIME_LOG_TAG, "session_reconcile_attempt_failed attempt=$attempt exception=${error::class.java.simpleName} message=${error.message}")
                 subscriberReady.compareAndSet(connectedGeneration, 0)
                 if (!isCurrentSessionReconcile(reconcileEpoch, connectedGeneration)) return
             }
@@ -2943,7 +4209,7 @@ class ProductionRealtimeSessionClient(
         } else if (transport.currentConnectedGeneration() <= 0) {
             // The physical transport already disappeared; preserve the existing
             // socket-level reconnect fallback for that distinct failure class.
-            failTransport(reason)
+            failTransport(reason, connectedGeneration)
         }
     }
 
@@ -2974,10 +4240,12 @@ class ProductionRealtimeSessionClient(
         }
     }
 
-    private suspend fun scheduleReconnect(reason: String?) {
+    private suspend fun scheduleReconnect(reason: String?, expectedTransition: Long) {
         reconnectMutex.withLock {
             if (closed.get() || closing.get() || rendererFatal.get() ||
-                session.state.value is RemoteSessionState.Exited
+                session.state.value is RemoteSessionState.Exited ||
+                transportTransitionGeneration.get() != expectedTransition ||
+                transport.currentConnectedGeneration() > 0
             ) return
             if (reconnectJob?.isActive == true) return
             reconnectAttempt++
@@ -2991,7 +4259,10 @@ class ProductionRealtimeSessionClient(
                 // scheduleReconnect discard the next retry.
                 reconnectMutex.withLock {
                     reconnectJob = null
-                    if (!closed.get() && !closing.get() && !rendererFatal.get()) transport.connect()
+                    if (!closed.get() && !closing.get() && !rendererFatal.get() &&
+                        transportTransitionGeneration.get() == expectedTransition &&
+                        transport.currentConnectedGeneration() <= 0
+                    ) transport.connect()
                 }
             }
         }
@@ -3037,17 +4308,27 @@ class ProductionRealtimeSessionClient(
         pendingInputs.clear()
     }
 
-    private fun failTransport(reason: String) {
+    private fun failTransport(reason: String, failedGeneration: Int) {
         if (closed.get()) return
-        transport.disconnect(reason)
-        publishTransportFailure(reason)
+        val transition = transportTransitionGeneration.get()
+        // The socket was already lost when this fallback was selected. A successor
+        // may connect before we reach this callback; never disconnect that socket.
+        if (transport.currentConnectedGeneration() > 0) return
+        publishTransportFailure(reason, failedGeneration, transition)
     }
 
-    private fun publishTransportFailure(reason: String) {
-        if (rendererFatal.get()) return
+    private fun publishTransportFailure(reason: String, failedGeneration: Int, transition: Long) {
+        lastTransportFailureReason.set(reason)
+        if (rendererFatal.get() || transportTransitionGeneration.get() != transition ||
+            transport.currentConnectedGeneration() > 0) return
+        subscriberReady.compareAndSet(failedGeneration, 0)
+        clearBrokerQueueForFailedGeneration(failedGeneration, transition)
+        failPendingHostHistory(ProductionTransportException("host history transport disconnected"))
+        if (transportTransitionGeneration.get() != transition ||
+            transport.currentConnectedGeneration() > 0) return
         mutableTransportState.value = ProductionTransportState.Failed(reason)
         failPendingInputs(reason)
-        controlScope.launch { scheduleReconnect(reason) }
+        controlScope.launch { scheduleReconnect(reason, transition) }
         notifySessionDisconnected(reason)
     }
 
@@ -3098,6 +4379,20 @@ class ProductionRealtimeSessionClient(
         val context: IncomingProcessingContext,
         val error: Exception,
     )
+
+    private class QueuedIncoming(
+        val context: IncomingProcessingContext,
+        val plaintext: ByteArray,
+        val usedCurrentMaterial: Boolean,
+        val keyEpoch: Long,
+        val rendererGeneration: Long,
+        private val reservation: TerminalBufferBudget.Reservation,
+    ) : AutoCloseable {
+        override fun close() {
+            plaintext.fill(0)
+            reservation.close()
+        }
+    }
 
     private class SessionKeyMaterial(
         val epoch: Long,

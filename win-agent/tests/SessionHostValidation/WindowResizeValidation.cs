@@ -87,9 +87,9 @@ internal static class WindowResizeValidation
             pipe.WaitForConnectionAsync(timeout.Token).GetAwaiter().GetResult();
             var hello = LocalFrameCodec.Read(pipe);
             Require(hello.Type == LocalFrameType.HostHello && hello.SessionId == session, "host handshake");
-            LocalPayloadCodec.ParseHello(hello.Payload, token);
+            LocalPayloadCodec.ParseTerminalHello(hello.Payload, token);
             LocalFrameCodec.Write(pipe, new LocalFrame(LocalFrameType.AgentHello, session, 0,
-                LocalPayloadCodec.Hello(Environment.ProcessId, token)));
+                LocalPayloadCodec.TerminalHello(Environment.ProcessId, token)));
             var sync = new object();
             ulong sequence = 0;
             void Send(LocalFrameType kind, byte[] payload) {

@@ -1,0 +1,5 @@
+<resources>
+    <string name="terminal_input_diagnostic_title">Terminal encoding rejected input</string>
+    <string name="terminal_input_diagnostic_android_title">Android input validation rejected a character</string>
+    <string name="terminal_input_diagnostic_details">Input details</string>
+</resources>

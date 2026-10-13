@@ -52,6 +52,7 @@ internal class ProductionDeviceConnectionSupervisor(
     private val lock = Any()
     private var phase = Phase.IDLE
     private var activeConnectOwner: ConnectOwner? = null
+    private var abandonedConnectGeneration = 0
     private var nextOwnerId = 0L
     private var suppressReplacementFailure = false
     private var authenticationRecoveryUsed = false
@@ -99,7 +100,13 @@ internal class ProductionDeviceConnectionSupervisor(
     fun onEndpointDemandRemoved() {
         synchronized(lock) {
             if (closed.get() || hasEndpointDemand()) return
-            if (activeConnectOwner?.requiresEndpoint == true) activeConnectOwner = null
+            if (activeConnectOwner?.requiresEndpoint == true) {
+                activeConnectOwner = null
+                if (phase == Phase.CONNECTING) {
+                    abandonedConnectGeneration = maxOf(abandonedConnectGeneration, socket.diagnostics().generation)
+                    phase = Phase.IDLE
+                }
+            }
             cancelLivenessProbeLocked()
             retryJob?.cancel()
             retryJob = null
@@ -406,10 +413,20 @@ internal class ProductionDeviceConnectionSupervisor(
             if (closed.get()) return@synchronized
             when (state) {
                 RealtimeState.Connecting -> {
+                    if (abandonedConnectGeneration > 0 && activeConnectOwner == null &&
+                        socket.diagnostics().generation <= abandonedConnectGeneration
+                    ) return@synchronized
                     phase = Phase.CONNECTING
                     publishStateLocked(state)
                 }
                 RealtimeState.Connected -> {
+                    val diagnostics = socket.diagnostics()
+                    if (abandonedConnectGeneration > 0 &&
+                        (diagnostics.connectedGeneration <= abandonedConnectGeneration ||
+                            diagnostics.connectedGeneration != diagnostics.generation ||
+                            diagnostics.state != "CONNECTED")
+                    ) return@synchronized
+                    abandonedConnectGeneration = 0
                     authenticationRecoveryUsed = false
                     activeConnectOwner = null
                     suppressReplacementFailure = false
@@ -420,6 +437,9 @@ internal class ProductionDeviceConnectionSupervisor(
                     scheduleStabilityResetLocked()
                 }
                 is RealtimeState.Reconnecting -> {
+                    if (abandonedConnectGeneration > 0 && activeConnectOwner == null &&
+                        socket.diagnostics().generation <= abandonedConnectGeneration
+                    ) return@synchronized
                     phase = Phase.CONNECTING
                     publishStateLocked(state)
                 }
@@ -428,6 +448,12 @@ internal class ProductionDeviceConnectionSupervisor(
                     publishStateLocked(state)
                 }
                 is RealtimeState.Failed -> {
+                    if (abandonedConnectGeneration > 0 &&
+                        (socket.diagnostics().generation <= abandonedConnectGeneration &&
+                            activeConnectOwner == null ||
+                            socket.diagnostics().generation > abandonedConnectGeneration &&
+                            socket.diagnostics().state != "FAILED")
+                    ) return@synchronized
                     cancelLivenessProbeLocked()
                     if (activeConnectOwner != null && suppressReplacementFailure) {
                         suppressReplacementFailure = false

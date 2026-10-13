@@ -3,9 +3,11 @@ package dev.termlink.product
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.util.Log
 import java.security.KeyStore
 import java.util.Base64
 import java.util.UUID
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -13,6 +15,7 @@ import javax.crypto.spec.GCMParameterSpec
 import net.openid.appauth.AuthState
 import net.openid.appauth.TokenRequest
 import net.openid.appauth.TokenResponse
+import org.json.JSONException
 
 internal fun interface AuthStateCipher {
     fun transform(input: ByteArray, encrypt: Boolean): ByteArray
@@ -23,6 +26,8 @@ internal fun interface AuthStateCipher {
  * cipher; JVM tests can supply a deterministic fake without ever changing production crypto.
  */
 internal object AuthStateEnvelope {
+    class InvalidEnvelope(cause: Throwable? = null) : IllegalArgumentException("Stored OIDC session is invalid", cause)
+
     fun seal(plaintext: ByteArray, cipher: AuthStateCipher): String {
         val input = plaintext.copyOf()
         val encrypted = try {
@@ -41,9 +46,9 @@ internal object AuthStateEnvelope {
         val encrypted = try {
             Base64.getDecoder().decode(encoded)
         } catch (error: IllegalArgumentException) {
-            throw IllegalArgumentException("Stored OIDC session is invalid", error)
+            throw InvalidEnvelope(error)
         }
-        require(encrypted.size > IV_BYTES) { "Stored OIDC session is invalid" }
+        if (encrypted.size <= IV_BYTES) throw InvalidEnvelope()
         return try {
             cipher.transform(encrypted, false)
         } finally {
@@ -81,7 +86,7 @@ internal object CredentialFreeAuthState {
             .setAccessToken(response.accessToken)
             .setAccessTokenExpirationTime(response.accessTokenExpirationTime)
             .setIdToken(response.idToken)
-            .setRefreshToken(response.refreshToken)
+            .setRefreshToken(state.refreshToken)
             .setScope(response.scope)
             // Additional parameters are not needed for refresh and may carry
             // provider-specific credential-like values, so drop them all.
@@ -96,7 +101,10 @@ internal object CredentialFreeAuthState {
     internal const val SANITIZED_REQUEST_GRANT_TYPE = "urn:termlink:auth-state:credential-free"
 }
 
-internal class OidcSessionStore(context: Context) {
+internal class OidcSessionStore(
+    context: Context,
+    private val cipher: AuthStateCipher = AndroidKeystoreCipher(),
+) {
     internal fun sealAiOperation(scope: String, value: String): String {
         val bytes = ("TermLink AI Operation V1\n$scope\n" + value).encodeToByteArray()
         return try { AuthStateEnvelope.seal(bytes, cipher) } finally { bytes.fill(0) }
@@ -112,7 +120,6 @@ internal class OidcSessionStore(context: Context) {
         } finally { bytes.fill(0) }
     }
     private val preferences = context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-    private val cipher = AndroidKeystoreCipher()
 
     var serverUrl: String?
         get() = preferences.getString(KEY_SERVER_URL, null)
@@ -124,30 +131,48 @@ internal class OidcSessionStore(context: Context) {
 
     fun loadAuthState(): AuthState? {
         val encoded = preferences.getString(KEY_AUTH_STATE, null) ?: return null
-        return try {
-            val plaintext = AuthStateEnvelope.open(encoded, cipher)
-            val restored = try {
-                AuthState.jsonDeserialize(String(plaintext, Charsets.UTF_8))
-            } finally {
-                plaintext.fill(0)
+        val plaintext = try {
+            AuthStateEnvelope.open(encoded, cipher)
+        } catch (error: Exception) {
+            if (error is AuthStateEnvelope.InvalidEnvelope || error is AEADBadTagException) {
+                discardInvalidAuthState()
+            } else {
+                Log.w("OidcSessionStore", "Stored OIDC session could not be decrypted; preserving it for retry")
             }
+            return null
+        }
+        val sanitized = try {
+            val restored = AuthState.jsonDeserialize(String(plaintext, Charsets.UTF_8))
             // Migrate sessions written by older builds immediately.  Do not wait
             // for token expiry: an old AuthorizationResponse may still contain an
             // authorization code and PKCE verifier inside the encrypted envelope.
-            val sanitized = CredentialFreeAuthState.sanitize(restored)
-            saveAuthState(sanitized)
-            sanitized
-        } catch (_: Exception) {
-            // Android Keystore keys are deleted with the app.  A restored or
-            // stale preference can therefore be undecryptable after reinstall;
-            // treat it as a signed-out session instead of crashing at startup.
-            preferences.edit()
-                .remove(KEY_AUTH_STATE)
-                .remove(KEY_ACCOUNT_SCOPE)
-                .remove(KEY_ACCOUNT_LOGIN)
-                .apply()
-            null
+            CredentialFreeAuthState.sanitize(restored)
+        } catch (error: Exception) {
+            if (error is JSONException || error is IllegalArgumentException) {
+                discardInvalidAuthState()
+            } else {
+                Log.w("OidcSessionStore", "Stored OIDC session could not be restored; preserving it for retry")
+            }
+            return null
+        } finally {
+            plaintext.fill(0)
         }
+        try {
+            saveAuthState(sanitized)
+        } catch (_: Exception) {
+            // The old envelope remains encrypted; retry its migration on the next load.
+            Log.w("OidcSessionStore", "Stored OIDC session migration could not be saved; preserving the previous session")
+        }
+        return sanitized
+    }
+
+    private fun discardInvalidAuthState() {
+        Log.w("OidcSessionStore", "Discarding invalid stored OIDC session")
+        preferences.edit()
+            .remove(KEY_AUTH_STATE)
+            .remove(KEY_ACCOUNT_SCOPE)
+            .remove(KEY_ACCOUNT_LOGIN)
+            .apply()
     }
 
     var accountScope: String?
@@ -229,7 +254,7 @@ internal class OidcSessionStore(context: Context) {
         return start..end
     }
 
-    private inner class AndroidKeystoreCipher : AuthStateCipher {
+    private class AndroidKeystoreCipher : AuthStateCipher {
         override fun transform(input: ByteArray, encrypt: Boolean): ByteArray {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             return if (encrypt) {

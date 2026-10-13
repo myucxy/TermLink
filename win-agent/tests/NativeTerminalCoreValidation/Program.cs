@@ -10,15 +10,90 @@ namespace TermLink.NativeTerminalCore.Validation
 {
     internal static class Program
     {
-        private static int Main()
+        private static void ValidateFailureDiagnostic()
+        {
+            using var terminal = NativeTerminalCoreV2.Create(80, 24);
+            terminal.ApplyOutputWithHostEffectsV2(1, Encoding.ASCII.GetBytes("x\u001b[?"));
+            string diagnostic = null;
+            try
+            {
+                terminal.ApplyOutputWithHostEffectsV2(2, Encoding.ASCII.GetBytes("9999h"));
+                throw new InvalidOperationException("Unsupported mode was accepted.");
+            }
+            catch (NativeTerminalException error)
+            {
+                diagnostic = error.Diagnostic;
+                Require(error.Status == NativeTerminalStatus.Unsupported && diagnostic != null,
+                    "Missing native protocol diagnostic.");
+                Require(!error.ToString().Contains("9999"), "Output evidence leaked into generic exception telemetry.");
+                Require(diagnostic.Contains("sequence=<ESC>[?9999h\n") &&
+                    diagnostic.Contains("start=1:1\nend=2:5\n"), "Incorrect original sequence coordinates.");
+                Require(diagnostic.StartsWith("TL-DIAG/2\n", StringComparison.Ordinal) &&
+                    diagnostic.Contains("detected_at=2:4\nlast_byte=68\nlast_codepoint=U+0068\n") &&
+                    diagnostic.Contains("core_impact=failed_closed\n"), "Missing V2 detection/impact metadata.");
+            }
+            try { terminal.ApplyOutput(2, Encoding.ASCII.GetBytes("retry")); }
+            catch (NativeTerminalException error)
+            {
+                Require(error.Diagnostic == diagnostic, "FailedClosed lost the root diagnostic.");
+                return;
+            }
+            throw new InvalidOperationException("Failed terminal accepted another output.");
+        }
+
+        private static void ValidateLegacyProjection()
+        {
+            using var terminal = NativeTerminalCoreV2.Create(80, 24);
+            var first = terminal.ApplyOutputWithLegacyProjection(1, Encoding.UTF8.GetBytes("中\a\x1b[7;1;1,~\x1b]2;title"));
+            Require(Encoding.UTF8.GetString(first.Projection) == "中" && first.Effects.Records.Count == 2, "Unsafe actions reached the legacy projection.");
+            var next = terminal.ApplyOutputWithLegacyProjection(2, Encoding.UTF8.GetBytes("\aend"));
+            Require(Encoding.UTF8.GetString(next.Projection) == "\x1b]2;title\x1b\\end" && next.Effects.Records.Count == 0, "Split title or its BEL terminator changed.");
+            var clipboard = terminal.ApplyOutputWithLegacyProjection(3, Encoding.UTF8.GetBytes("\x1b]52;c;5Lit5paHCg==\x1b\\"));
+            Require(clipboard.Projection.Length == 0 && clipboard.Effects.Records.Count == 1 &&
+                NativeTerminalPlatformAction.Decode(clipboard.Effects.Records[0].Payload.ToArray()).Text == "中文\n", "Clipboard projection or typed payload escaped its boundary.");
+            string diagnostic = null;
+            try { terminal.ApplyOutputWithLegacyProjection(4, Encoding.ASCII.GetBytes("\x1b[?9999h")); }
+            catch (NativeTerminalException error) { diagnostic = error.Diagnostic; Require(error.Status == NativeTerminalStatus.Unsupported, "Wrong projection failure classification."); }
+            Require(diagnostic != null && diagnostic.Contains("<ESC>[?9999h"), "Projection lost accurate protocol diagnostics.");
+        }
+
+        private static int Main(string[] args)
         {
             try
             {
+                if (args.Length == 1 && args[0] == "--delta")
+                {
+                    DeltaValidation.Run();
+                    return 0;
+                }
+                if (args.Length == 1 && args[0] == "--frozen-capture-budget")
+                {
+                    HistoryPageValidation.RunFrozenCaptureBudget();
+                    return 0;
+                }
+                if (args.Length != 0)
+                    throw new ArgumentException("Unknown validation argument.", nameof(args));
                 HostEffectFrameV1Validation.Run();
+                ValidateFailureDiagnostic();
+                ValidateLegacyProjection();
+                Require(NativeTerminalPlatformAction.Decode(new byte[] { 3,0,0,0,1,0,0,0,65 }).Text == "A" &&
+                    !NativeTerminalPlatformAction.IsValid(new byte[] { 3,0,0,0,1,0,0,0,0 }) &&
+                    !NativeTerminalPlatformAction.IsValid(new byte[] { 3,0,0,0,1,0,0,0,255 }), "Clipboard codec accepted invalid UTF-8/NUL.");
+                TraditionalProtocolValidation.Run();
+                PageProtocolValidation.Run();
+                HostGeometryValidation.Run();
+                ValidateRejectedColorToken();
+                ValidateHorizontalEditing();
+                ValidateRenditionStack();
                 HostEffectFrameV2Validation.Run();
+                BrokerValidation.Run();
+                BrokerReferenceValidation.Run();
                 RenderFrameV1Validation.Run();
                 RenderFrameV2Validation.Run();
                 RenderFrameV3Validation.Run();
+                RenderFrameV4Validation.Run();
+                HistoryPageValidation.Run();
+                ShellIntegrationValidation.Run();
                 ValidateAbiAndSequenceOne();
                 ValidateHostEffectApplication();
                 ValidateHostEffectV2Application();
@@ -29,6 +104,7 @@ namespace TermLink.NativeTerminalCore.Validation
                 ValidateAtomicBatchBounds();
                 ValidateRenderFrameExport();
                 ValidateInputEncoding();
+                InputDiagnosticValidation.Run();
                 ValidateKittyInputEncoding();
                 ValidateWin32InputEncoding();
                 ValidateMouseInputEncoding();
@@ -49,6 +125,50 @@ namespace TermLink.NativeTerminalCore.Validation
                 Console.Error.WriteLine(error);
                 return 1;
             }
+        }
+
+        private static void ValidateHorizontalEditing()
+        {
+            using var terminal = NativeTerminalCoreV2.Create(16, 2);
+            terminal.ApplyOutputWithHostEffectsV2(1, Encoding.ASCII.GetBytes("ABCDEFGHIJKLMNOQ\u001b[2;1Habcdefghijklmnoq\u001b[1;1H\u001b6\u001b[2;16H\u001b9\u001b[3g\u001b[?5W\r\t"));
+            using var checkpoint = terminal.CaptureCheckpoint();
+            var frame = NativeTerminalRenderFrameV3Decoder.Decode(checkpoint.ExportRenderFrameV3());
+            string Row(int index) => string.Concat(frame.RenderRows[index].Cells.Select(cell =>
+                cell.WideContinuation ? "" : frame.Graphemes[cell.GraphemeId - 1].Text));
+            Require(Row(0) == "ABCDEFGHIJKLMNO " && Row(1) == "abcdefghijklmno ",
+                "Horizontal index did not shift both rows at the screen edges.");
+            Require(frame.Cursor.Column == 8, "Default tab stops were not restored through the DLL.");
+        }
+
+        private static void ValidateRejectedColorToken()
+        {
+            using var terminal = NativeTerminalCoreV2.Create(16, 4);
+            try {
+                terminal.ApplyOutput(1, Encoding.ASCII.GetBytes("\u001b[1;58:2::255:00256:1m"));
+                throw new InvalidOperationException("Invalid RGB component was accepted");
+            } catch (NativeTerminalException error) {
+                Require(error.Diagnostic?.Contains("rejected_parameter_index=5\nrejected_parameter=00256\n") == true,
+                    "Diagnostic must identify the actual RGB component, preserving its original spelling");
+            }
+        }
+
+        private static void ValidateRenditionStack()
+        {
+            using var terminal = NativeTerminalCoreV2.Create(16, 2);
+            terminal.ApplyOutputWithHostEffectsV2(1, Encoding.ASCII.GetBytes("\u001b[2;4:3;31m\u001b[#{\u001b[0m"));
+            using var checkpoint = terminal.CaptureCheckpoint();
+            var snapshot = checkpoint.ExportSnapshot();
+            Require(BinaryPrimitives.ReadUInt16LittleEndian(snapshot.AsSpan(10, 2)) == 11, "SGR stack requires Snapshot V2.11.");
+            using var restored = NativeTerminalCoreV2.ImportSnapshot(snapshot);
+            foreach (var value in new[] { terminal, restored })
+                value.ApplyOutputWithHostEffectsV2(2, Encoding.ASCII.GetBytes("\u001b[#qX"));
+            using var expected = terminal.CaptureCheckpoint();
+            using var actual = restored.CaptureCheckpoint();
+            Equal(expected.ExportSnapshot(), actual.ExportSnapshot(), "SGR stack checkpoint suffix mismatch.");
+            var frame = NativeTerminalRenderFrameV3Decoder.Decode(actual.ExportRenderFrameV3());
+            var rendition = frame.Renditions[frame.RenderRows[0].Cells[0].RenditionId];
+            Require(rendition.Faint && rendition.UnderlineStyle == NativeTerminalRenderUnderlineStyleV3.Curly,
+                "Saved rendition was lost across DLL/checkpoint.");
         }
 
         private static void ValidateAbiAndSequenceOne()

@@ -60,9 +60,7 @@ class ProductionDirectSignalDispatcherTest {
         assertTrue(discovery.start())
         assertTrue(fixture.dispatcher.start())
         assertTrue(discovery.start())
-        withTimeout(2_000) {
-            while (fixture.client.collectionStarts.get() != 1) delay(1)
-        }
+        awaitReader(fixture)
         listOf(1, 6, 5, 10, 11, 9, 14).forEachIndexed { index, type ->
             fixture.client.emit(signal(type, index + 1))
         }
@@ -206,6 +204,7 @@ class ProductionDirectSignalDispatcherTest {
         assertNull(fixture.dispatcher.acquireDiscoveryLane())
         assertNull(fixture.dispatcher.acquireDataLane())
         assertTrue(fixture.dispatcher.start())
+        awaitReader(fixture)
 
         discovery.close()
         assertEquals(0, fixture.client.closeCalls.get())
@@ -385,7 +384,9 @@ class ProductionDirectSignalDispatcherTest {
 
     private suspend fun awaitReader(fixture: Fixture) {
         withTimeout(2_000) {
-            while (fixture.client.collectionStarts.get() != 1) delay(1)
+            while (fixture.client.collectionStarts.get() != 1 ||
+                fixture.client.readerSubscriptions == 0
+            ) delay(1)
         }
     }
 
@@ -413,6 +414,7 @@ class ProductionDirectSignalDispatcherTest {
             ),
         )
         val collectionStarts = AtomicInteger(0)
+        val readerSubscriptions: Int get() = source.subscriptionCount.value
         val startCalls = AtomicInteger(0)
         val closeCalls = AtomicInteger(0)
         val fetchCalls = AtomicInteger(0)

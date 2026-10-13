@@ -10,6 +10,9 @@
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="TermLink.TerminalSurface.Validation" />
+    <Compile Include="..\..\..\win-agent\src\Common\NativeDisplayProtocol.cs" Link="NativeDisplayProtocol.cs" />
+    <Compile Include="..\..\..\win-agent\src\Common\NativeDisplaySignals.cs" Link="NativeDisplaySignals.cs" />
     <PackageReference Include="Avalonia" ExcludeAssets="analyzers" GeneratePathProperty="true" />
     <PackageReference Include="Avalonia.Desktop" />
     <PackageReference Include="Avalonia.Fonts.Inter" />
@@ -17,6 +20,9 @@
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0-windows'">
     <ProjectReference Include="..\Windows\TermLink.Platform.Windows.csproj" />
+    <None Include="..\..\..\native\terminal-core\windows-x64\termlink_terminal_ffi.dll"
+          Link="termlink_terminal_ffi.dll"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
     <ProjectReference Include="..\Agent.Local\TermLink.Agent.Local.csproj" />
@@ -26,10 +32,21 @@
   <ItemGroup>
     <AvaloniaResource Include="..\..\..\assets\brand\windows\TermLink.ico"
                       Link="Assets\TermLink.ico" />
+    <AvaloniaResource Include="..\..\..\android\terminal-engine-api\src\main\assets\termlink-fonts\CaskaydiaCoveNerdFontMono-Regular.ttf"
+                      Link="Assets\Fonts\CaskaydiaCoveNerdFontMono-Regular.ttf" />
+    <None Include="..\..\..\android\terminal-engine-api\src\main\assets\termlink-fonts\LICENSE.txt"
+          Link="licenses\terminal-font\LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\..\android\terminal-engine-api\src\main\assets\termlink-fonts\NOTICE.txt"
+          Link="licenses\terminal-font\NOTICE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\Presentation\TermLink.Presentation.csproj" />
+    <ProjectReference Include="..\..\..\win-agent\src\TerminalCore\TermLink.TerminalCore.csproj" />
     <None Include="..\..\..\LICENSE;..\..\..\NOTICE" Link="%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\..\docs\licenses\Legacy-Charsets-MIT-LICENSE.txt" Link="Legacy-Charsets-MIT-LICENSE.txt"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\..\docs\licenses\Unicode-16-LICENSE.txt" Link="Unicode-16-LICENSE.txt"
           CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="RemoveIncompatibleAvaloniaAnalyzers" BeforeTargets="CoreCompile">

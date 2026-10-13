@@ -1,10 +1,17 @@
 package dev.termlink.network.production
 
 import com.google.protobuf.ByteString
+import dev.termlink.crypto.BrokerCaptureCrypto
 import dev.termlink.crypto.CryptoDirection
+import dev.termlink.crypto.DeltaCrypto
 import dev.termlink.crypto.DeviceIdentity
 import dev.termlink.crypto.SessionCrypto
+import dev.termlink.model.HeapState
+import dev.termlink.model.TerminalBufferBudget
+import dev.termlink.model.TerminalBufferLimitException
 import dev.termlink.protocol.realtime.v1.Direction
+import dev.termlink.protocol.realtime.v1.BrokerCaptureSelectionV1
+import dev.termlink.protocol.realtime.v1.BrokerOutputPayload
 import dev.termlink.protocol.realtime.v1.Envelope
 import dev.termlink.protocol.realtime.v1.FlowControlPayload
 import dev.termlink.protocol.realtime.v1.GapPayload
@@ -25,6 +32,7 @@ import dev.termlink.protocol.realtime.v1.SessionUpsertPayload
 import dev.termlink.protocol.realtime.v1.SubscribePayload
 import dev.termlink.session.DurableAckCommit
 import dev.termlink.session.InputSubmission
+import dev.termlink.session.RemoteInput
 import dev.termlink.session.RemoteLifecycle
 import dev.termlink.session.RemoteControlLeaseLostException
 import dev.termlink.session.RendererBootstrapState
@@ -43,6 +51,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -61,6 +70,9 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.WebSocket
@@ -79,6 +91,33 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 
 class ProductionRealtimeSessionClientTest {
+    private val hostProtocolFailure = "TL-DIAG/1\ncategory=unsupported\nreason=private mode\nfamily=CSI\n" +
+        "sequence=<ESC>[?9999h\nhex=1B 5B 3F 39 39 39 39 68\nstart=1:2\nend=2:5\n" +
+        "observed_bytes=8\nhidden_bytes=0\ntruncated_bytes=0\n"
+
+    @Test
+    fun hostFailurePayloadKeepsEndedStateAndRejectsUnsafeDiagnosticText() {
+        val valid = SessionUpsertPayload.newBuilder().setLifecycle("ENDED").setExitCode(125)
+            .setTerminalProtocolDiagnostic(hostProtocolFailure).build()
+        val event = assertIs<RemoteSessionEvent.Lifecycle>(
+            ProductionRealtimeSessionClient.sessionUpsertEvent(1, valid),
+        )
+        assertEquals(RemoteLifecycle.ENDED, event.state)
+        assertEquals(hostProtocolFailure, event.protocolDiagnostic?.text)
+        for (payload in listOf(
+            valid.toBuilder().setExitCode(0).build(),
+            valid.toBuilder().clearExitCode().build(),
+            valid.toBuilder().clearTerminalProtocolDiagnostic().build(),
+            valid.toBuilder().setTerminalProtocolDiagnostic("\u001b[999t").build(),
+            valid.toBuilder().setTerminalProtocolDiagnostic("x".repeat(10241)).build(),
+        )) {
+            val ended = assertIs<RemoteSessionEvent.Lifecycle>(
+                ProductionRealtimeSessionClient.sessionUpsertEvent(2, payload),
+            )
+            assertEquals(RemoteLifecycle.ENDED, ended.state)
+            assertEquals(null, ended.protocolDiagnostic)
+        }
+    }
     private companion object {
         const val TEST_HOST_HISTORY_CHUNK_BYTES = 512 * 1024
     }
@@ -1725,7 +1764,8 @@ class ProductionRealtimeSessionClientTest {
                         } else {
                             val ended = SessionUpsertPayload.newBuilder()
                                 .setLifecycle("ENDED")
-                                .setExitCode(17)
+                                .setExitCode(125)
+                                .setTerminalProtocolDiagnostic(hostProtocolFailure)
                                 .build()
                                 .toByteArray()
                             val endedEnvelope = ProductionRealtimeClient.encryptedEnvelope(
@@ -1809,7 +1849,8 @@ class ProductionRealtimeSessionClientTest {
             assertArrayEquals(byteArrayOf(7), outputs[0])
             assertArrayEquals(byteArrayOf(8), outputs[1])
             val exited = assertIs<RemoteSessionState.Exited>(client.sessionState.value)
-            assertEquals(17, exited.exitCode)
+            assertEquals(125, exited.exitCode)
+            assertEquals(hostProtocolFailure, exited.protocolDiagnostic?.text)
         } finally {
             client.close()
             androidIdentity.destroy()
@@ -3341,6 +3382,119 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
+    fun lateRestLeaseCannotGrantControlAfterPhysicalGenerationChanges(): Unit = runBlocking {
+        val androidId = UUID.randomUUID()
+        val pcId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        val leaseId = UUID.randomUUID()
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        val engine = RecordingEngine(CopyOnWriteArrayList())
+        val requestScope = CoroutineScope(SupervisorJob(coroutineContext[kotlinx.coroutines.Job]) + Dispatchers.Default)
+        server.enqueue(MockResponse()
+            .setHeader("Content-Type", "application/json")
+            .setBodyDelay(1, TimeUnit.SECONDS)
+            .setBody("""{"lease_id":"$leaseId","expires_at":"2099-01-01T00:00:00Z","version":1}"""))
+        server.start()
+        val client = ProductionRealtimeSessionClient(
+            engine = engine,
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            val request = requestScope.async { client.requestControl() }
+            val post = withContext(Dispatchers.IO) { requireNotNull(server.takeRequest(2, TimeUnit.SECONDS)) }
+            assertEquals("POST", post.method)
+            assertEquals("/v1/sessions/$sessionId/lease", post.path)
+
+            val successor = transport.replaceGeneration()
+            transport.emitConnectedEvent(successor)
+            val failure = assertFailsWith<java.io.IOException> { withTimeout(3_000) { request.await() } }
+            assertTrue(failure.message.orEmpty().contains("transport generation change"))
+            assertFalse(client.sessionState.value is RemoteSessionState.Controlling)
+            assertTrue(engine.isReadOnly)
+            assertEquals(1, server.requestCount)
+        } finally {
+            requestScope.cancel()
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
+    fun socketChangeDuringGrantControlRollsBackTheLocalLease(): Unit = runBlocking {
+        val androidId = UUID.randomUUID()
+        val pcId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
+        val leaseId = UUID.randomUUID()
+        val androidIdentity = DeviceIdentity.generate()
+        val pcIdentity = DeviceIdentity.generate()
+        val transport = GenerationRaceSessionTransport()
+        val switched = AtomicInteger(0)
+        val engine = RecordingEngine(CopyOnWriteArrayList(), onReadOnlyChange = { readOnly ->
+            if (!readOnly && switched.compareAndSet(0, 1)) transport.replaceGeneration()
+        })
+        server.enqueue(MockResponse()
+            .setHeader("Content-Type", "application/json")
+            .setBody("""{"lease_id":"$leaseId","expires_at":"2099-01-01T00:00:00Z","version":1}"""))
+        server.start()
+        val client = ProductionRealtimeSessionClient(
+            engine = engine,
+            config = ProductionRealtimeSessionConfig(
+                rootUrl = server.url("/").toString(),
+                tokenProvider = AccessTokenProvider { "oidc-token" },
+                androidDeviceId = androidId,
+                pcDeviceId = pcId,
+                sessionId = sessionId,
+                keyEpoch = 7,
+                pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
+            ),
+            identity = androidIdentity,
+            parentScope = scope,
+            transport = transport,
+            acknowledgementObserver = ::commitAcknowledgement,
+            acknowledgementResetObserver = ::resetAcknowledgement,
+            allowCleartextForLocalTest = true,
+        )
+        try {
+            client.start()
+            withTimeout(2_000) {
+                while (!client.diagnostics().subscriberReady) kotlinx.coroutines.yield()
+            }
+            val failure = assertFailsWith<java.io.IOException> { client.requestControl() }
+            assertTrue(failure.message.orEmpty().contains("transport generation change"))
+            assertEquals(1, switched.get())
+            assertIs<RemoteSessionState.ReadOnly>(client.sessionState.value)
+            assertTrue(engine.isReadOnly)
+            assertEquals("POST", server.takeRequest(2, TimeUnit.SECONDS)?.method)
+            assertEquals(1, server.requestCount)
+        } finally {
+            client.close()
+            androidIdentity.destroy()
+            pcIdentity.destroy()
+        }
+    }
+
+    @Test
     fun lateRestLeaseCannotOverrideARealtimeLocalInputRevoke(): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
@@ -4105,6 +4259,7 @@ class ProductionRealtimeSessionClientTest {
                 dev.termlink.protocol.realtime.v1.HostHistoryRequestKindV1.HOST_HISTORY_REQUEST_KIND_V1_LATEST_SNAPSHOT,
                 request.kind,
             )
+            assertTrue(request.subscriberCapabilitiesList.isEmpty())
             val chunks = hostHistoryChunks(request.requestId, objectBytes)
 
             // The accumulator must be independent of delivery order and accept
@@ -4121,6 +4276,12 @@ class ProductionRealtimeSessionClientTest {
                 assertEquals(42uL, result.snapshotSequence)
                 assertArrayEquals(objectBytes, result.sealedObject)
                 assertEquals(objectBytes.size, result.sealedObject.size)
+                assertEquals(ProductionHostHistoryTransferEvidence(
+                    ProductionRealtimeClient.uuidFromBytes(request.requestId.toByteArray())!!,
+                    newChunksAccepted = 3,
+                    duplicateChunksAccepted = 1,
+                    chunkAcksSent = 4,
+                ), result.transferEvidence)
             } finally {
                 result.destroy()
             }
@@ -4129,6 +4290,9 @@ class ProductionRealtimeSessionClientTest {
                 it.action == HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CHUNK_ACK
             })
             assertEquals(listOf(2, 0, 0, 1), controls.map(HostHistoryControlPayload::getChunkIndex))
+            assertEquals(3L, harness.client.diagnostics().hostHistoryChunkReceivedCount)
+            assertEquals(1L, harness.client.diagnostics().hostHistoryChunkDuplicateCount)
+            assertEquals(4L, harness.client.diagnostics().hostHistoryChunkAckSentCount)
             assertTrue(controls.all { it.requestId == request.requestId })
             assertTrue(controls.all { it.objectId == chunks.first().objectId })
             assertFalse(controls.any {
@@ -4558,12 +4722,1133 @@ class ProductionRealtimeSessionClientTest {
         } finally { harness.close() }
     }
 
+    @Test
+    fun windowResizeUsesAuthenticatedHostClockAndIgnoresUncorrelatedOrReplayedTimestamps(): Unit = runBlocking {
+        for (skew in listOf(-60_000L, 60_000L)) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true)
+            try {
+                harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                    setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                        ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+                harness.client.start()
+                val subscribe = harness.awaitTerminalSubscribe()
+                val hostMillis = System.currentTimeMillis() + skew
+                harness.deliverTerminalAttachment(subscribe.requestId, nowMillis = hostMillis)
+                assertEquals(ProductionTerminalProfile.LEGACY, harness.client.awaitTerminalProfile())
+                withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+                harness.deliverTerminalAttachment(subscribe.requestId, nowMillis = hostMillis - 86_400_000)
+                harness.deliverTerminalAttachment(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(UUID.randomUUID())),
+                    nowMillis = hostMillis + 86_400_000)
+                harness.deliverOutput(byteArrayOf(65), 1, nowMillis = hostMillis - 86_400_000)
+                withTimeout(2_000) { while (harness.client.diagnostics().lastHandledSequence < 1) kotlinx.coroutines.yield() }
+                harness.client.remoteSession.grantControl(UUID.randomUUID().toString(), Long.MAX_VALUE, leaseVersion = 3)
+                val resize = harness.requestResizeAsync(null)
+                withTimeout(2_000) {
+                    while (harness.transport.sent.none { it.messageType == MessageType.RESIZE_REQUEST }) {
+                        if (resize.isCompleted) resize.await()
+                        kotlinx.coroutines.yield()
+                    }
+                }
+                val request = harness.awaitResizeRequest()
+                assertTrue("Resize deadline must follow the PC clock", request.expiresAtMs in (hostMillis + 10_000)..(hostMillis + 12_000))
+                harness.deliverResizeResponse(request.requestId.toByteArray(), 501)
+                assertEquals(TerminalSize(45, 28), withTimeout(2_000) { resize.await() })
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun encryptedHostThemeIsOrderedDeduplicatedAndMalformedStateNeverAcknowledged(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val payload = ByteArray(1044).also { it[0] = 1; it[4] = 2; it[8 + 257 * 4] = 127 }
+            val theme = dev.termlink.terminal.api.TerminalHostThemeV1.decode(payload)
+            harness.deliverHostTheme(payload, 1)
+            withTimeout(2_000) { harness.client.sessionState.first { it.lastAckedSequence == 1L } }
+            harness.deliverHostTheme(payload, 1)
+            harness.deliverHostTheme(payload.copyOf().also { it[11] = 1 }, 2)
+            withTimeout(2_000) { harness.client.transportState.first { it is ProductionTransportState.Failed } }
+            assertEquals(listOf(1L to theme), harness.engine.themes.toList())
+            assertEquals(1L, harness.client.diagnostics().durableAck)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 2 })
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun encryptedHostGeometryIsValidatedOrderedAndDeduplicated(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val value = dev.termlink.terminal.api.TerminalHostGeometryV1(9,18,1920,1080)
+            harness.deliverHostGeometry(value.encode(), 1)
+            withTimeout(2_000) { while (harness.client.diagnostics().lastHandledSequence < 1) kotlinx.coroutines.yield() }
+            harness.deliverHostGeometry(value.encode(), 1)
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1().encode(), 2)
+            withTimeout(2_000) { while (harness.client.diagnostics().lastHandledSequence < 2) kotlinx.coroutines.yield() }
+            assertEquals(listOf(1L to value, 2L to dev.termlink.terminal.api.TerminalHostGeometryV1()), harness.engine.geometries.toList())
+            harness.deliverHostGeometry(value.encode().also { it[28] = 1 }, 3)
+            withTimeout(2_000) { while (harness.client.transportState.value !is ProductionTransportState.Failed) kotlinx.coroutines.yield() }
+            assertEquals(2, harness.engine.geometries.size)
+            assertEquals(2L, harness.client.diagnostics().lastHandledSequence)
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 3 })
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun encryptedHostResizeResultRetainsErrorAndRejectsInvalidSourceWithoutAck(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1().encode(), 1)
+            val bytes = java.nio.ByteBuffer.allocate(28).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .put(1).put(5).putShort(0).putLong(1).putInt(7).putInt(0)
+                .putShort(132).putShort(0).putShort(80).putShort(24).array()
+            harness.deliverHostResizeResult(bytes, 2)
+            harness.deliverHostResizeResult(bytes, 2)
+            withTimeout(2_000) { while (harness.client.diagnostics().lastHandledSequence < 2) kotlinx.coroutines.yield() }
+            assertEquals(1, harness.engine.resizeNotices.size)
+            assertTrue(harness.engine.resizeNotices.single().describe().contains("WINDOW_RESIZE_UNSUPPORTED"))
+            java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(4, 3)
+            harness.deliverHostResizeResult(bytes, 3)
+            withTimeout(2_000) { while (harness.client.transportState.value !is ProductionTransportState.Failed) kotlinx.coroutines.yield() }
+            assertEquals(2L, harness.client.diagnostics().lastHandledSequence)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 3 })
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalAttachmentMustBeConfirmedBeforeFlowAndDoesNotAdvanceAck(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true)
+        try {
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY, ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+            harness.client.start()
+            val request = harness.awaitTerminalSubscribe()
+            val expectedCapabilities = ProductionTerminalStateContract.SUPPORTED_STATES +
+                listOf("host_history_v1", "terminal_broker_captures_v1")
+            assertEquals(expectedCapabilities, request.subscriberCapabilitiesList)
+            assertEquals(16, request.requestId.size())
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.FLOW_CONTROL })
+            harness.deliverTerminalAttachment(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(UUID.randomUUID())))
+            withTimeout(2_000) { while (harness.transport.releasedReservations < 1) kotlinx.coroutines.yield() }
+            assertFalse(harness.client.diagnostics().subscriberReady)
+            harness.deliverTerminalAttachment(request.requestId)
+            withTimeout(2_000) { while (harness.transport.sent.count { it.messageType == MessageType.FLOW_CONTROL } < 2) kotlinx.coroutines.yield() }
+            assertEquals(0L, harness.client.diagnostics().lastHandledSequence)
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+            harness.deliverTerminalAttachment(request.requestId) // A late duplicate remains control-only.
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1(9,18).encode(), 1)
+            withTimeout(2_000) { while (harness.engine.geometries.isEmpty()) kotlinx.coroutines.yield() }
+            assertEquals(1L, harness.engine.geometries.single().first)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 900 })
+            val history = harness.requestLatestHostSnapshotAsync()
+            assertEquals(expectedCapabilities, harness.awaitHostHistoryRequest().subscriberCapabilitiesList)
+            history.cancel()
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalAttachmentRejectsOldFutureOrInvalidPeerWithoutOpeningWindow(): Unit = runBlocking {
+        for ((error, state) in listOf(
+            "TERMINAL_CLIENT_UPGRADE_REQUIRED" to ProductionTerminalStateContract.STATE,
+            "" to "terminal_state_future_v1",
+            "" to "x".repeat(65),
+        )) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true)
+            try {
+                harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                    setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY, ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+                harness.client.start()
+                val request = harness.awaitTerminalSubscribe()
+                harness.deliverTerminalAttachment(request.requestId, error, state)
+                withTimeout(2_000) { while (harness.client.transportState.value !is ProductionTransportState.Failed) kotlinx.coroutines.yield() }
+                assertTrue(harness.engine.geometries.isEmpty())
+                assertEquals(0L, harness.client.diagnostics().durableAck)
+                assertTrue(harness.transport.sent.none { it.messageType == MessageType.FLOW_CONTROL })
+                assertTrue(harness.transport.disconnectReasons.isEmpty())
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun terminalAttachmentRequiresCurrentRelayCapabilitiesAndReportsTimeoutAccurately(): Unit = runBlocking {
+        for (mode in listOf("missing", "stale", "timeout", "unconfirmed-output")) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true, terminationReadinessTimeoutMillis = 300)
+            try {
+                harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(if (mode == "stale") 2 else 1,
+                    if (mode == "missing") emptySet() else setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY, ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+                harness.client.start()
+                if (mode == "unconfirmed-output") {
+                    harness.awaitTerminalSubscribe()
+                    harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1(9,18).encode(), 1)
+                }
+                withTimeout(2_000) { while (harness.client.transportState.value !is ProductionTransportState.Failed) kotlinx.coroutines.yield() }
+                val reason = (harness.client.transportState.value as ProductionTransportState.Failed).reason
+                assertTrue(reason, reason.contains(when(mode) {
+                    "timeout" -> "TERMINAL_NEGOTIATION_TIMEOUT"
+                    "unconfirmed-output" -> "TERMINAL_NEGOTIATION_TIMEOUT"
+                    else -> "TERMINAL_RELAY_UPGRADE_REQUIRED"
+                }))
+                if (mode == "missing" || mode == "stale") assertTrue(harness.transport.sent.isEmpty())
+                assertEquals(0L, harness.client.diagnostics().lastHandledSequence)
+                assertEquals(0L, harness.client.diagnostics().durableAck)
+                assertTrue(harness.transport.disconnectReasons.isEmpty())
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun terminalAttachmentReconnectFencesNewAndRetriedInputUntilCurrentConfirmation(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, inputAcceptanceTimeoutMillis = 30)
+        try {
+            val capabilities = setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY, ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE)
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1, capabilities)
+            harness.client.start()
+            val first = harness.awaitTerminalSubscribe()
+            harness.deliverTerminalAttachment(first.requestId)
+            withTimeout(2_000) { harness.client.sessionState.first { it is RemoteSessionState.Live } }
+            harness.client.remoteSession.grantControl("lease", Long.MAX_VALUE, leaseVersion = 1)
+            val pending = assertIs<InputSubmission.DeliveryUnknown>(
+                harness.client.remoteSession.submitInput("before-reconnect".encodeToByteArray()))
+            val original = harness.transport.sent.single { it.messageType == MessageType.INPUT_EVENT }.toByteArray()
+
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(2, capabilities)
+            harness.transport.emitConnected()
+            val second = harness.awaitTerminalSubscribe(count = 2)
+            assertFalse(harness.client.resendPendingInputOverRelay(pending.inputId, 2))
+            assertFailsWith<dev.termlink.session.RemoteInputRejectedException> {
+                harness.client.sendInput(RemoteInput(UUID.randomUUID(), "not-yet".encodeToByteArray()))
+            }
+            val released = harness.transport.releasedReservations
+            // Retained PC output and a delayed old confirmation can race the new SUBSCRIBE.
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1(9, 18).encode(), 1, generation = 2)
+            harness.deliverTerminalAttachment(first.requestId, generation = 2)
+            harness.deliverTerminalAttachment(second.requestId, generation = 1)
+            withTimeout(2_000) { while (harness.transport.releasedReservations < released + 3) kotlinx.coroutines.yield() }
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+            assertTrue(harness.engine.geometries.isEmpty())
+            assertEquals(1, harness.transport.sent.count { it.messageType == MessageType.INPUT_EVENT })
+
+            harness.deliverTerminalAttachment(second.requestId, generation = 2)
+            withTimeout(2_000) { while (harness.transport.relayExactSendCount.get() < 1) kotlinx.coroutines.yield() }
+            assertArrayEquals(original, harness.transport.relayExactBytes.single())
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1(9, 18).encode(), 1, generation = 2)
+            withTimeout(2_000) { harness.client.sessionState.first { it.lastAckedSequence == 1L } }
+            assertEquals(1, harness.engine.geometries.size)
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalAttachmentHistoryRecoveryReleasesIngressLockBeforeAwaitingConfirmation(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true)
+        try {
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY, ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+            harness.client.start()
+            harness.deliverTerminalAttachment(harness.awaitTerminalSubscribe().requestId)
+            withTimeout(2_000) { harness.client.sessionState.first { it is RemoteSessionState.Live } }
+            harness.client.remoteSession.accept(RemoteSessionEvent.Gap(4, 1, 3))
+            val gap = assertIs<RemoteSessionState.HistoryGap>(harness.client.sessionState.value)
+            val recovery = scope.async {
+                harness.client.recoverFromHistory((1L..3L).map { RemoteSessionEvent.Output(it, byteArrayOf(65)) }, expectedGap = gap)
+            }
+            val request = harness.awaitTerminalSubscribe(count = 2)
+            assertEquals(3L, request.resumeFromSeq)
+            assertFalse(recovery.isCompleted)
+            harness.deliverTerminalAttachment(request.requestId)
+            assertEquals(3L, withTimeout(2_000) { recovery.await() })
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1(9, 18).encode(), 4)
+            withTimeout(2_000) { harness.client.sessionState.first { it.lastAckedSequence == 4L } }
+            assertEquals(4L, harness.client.diagnostics().durableAck)
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalProfileWaitsForAuthenticatedHistoryOnlyAttachment(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, hostHistoryOnlyMode = true)
+        try {
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                    ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE,
+                    ProductionTerminalStateContract.GRAPHICS_STATE))
+            harness.client.start()
+            val request = harness.awaitTerminalSubscribe()
+            val profile = scope.async { harness.client.awaitTerminalProfile() }
+            harness.deliverTerminalAttachment(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(UUID.randomUUID())),
+                state = ProductionTerminalProfile.GRAPHICS.state)
+            withTimeout(2_000) { while (harness.transport.releasedReservations < 1) kotlinx.coroutines.yield() }
+            assertFalse(profile.isCompleted)
+            assertFalse(harness.client.diagnostics().subscriberReady)
+            harness.deliverTerminalAttachment(request.requestId, state = ProductionTerminalProfile.GRAPHICS.state)
+            assertEquals(ProductionTerminalProfile.GRAPHICS, withTimeout(2_000) { profile.await() })
+            assertEquals(0, harness.engine.renderedOutputCount)
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalProfileAncestorTimeoutRemainsCancellationAndLaterAttachmentStillWorks(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, hostHistoryOnlyMode = true,
+            terminationReadinessTimeoutMillis = 2_000)
+        try {
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                    ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE,
+                    ProductionTerminalStateContract.GRAPHICS_STATE))
+            harness.client.start()
+            val request = harness.awaitTerminalSubscribe()
+
+            assertFailsWith<kotlinx.coroutines.TimeoutCancellationException> {
+                withTimeout(100) { harness.client.awaitTerminalProfile() }
+            }
+            assertFalse(harness.client.diagnostics().subscriberReady)
+
+            harness.deliverTerminalAttachment(request.requestId, state = ProductionTerminalProfile.GRAPHICS.state)
+            assertEquals(ProductionTerminalProfile.GRAPHICS,
+                withTimeout(2_000) { harness.client.awaitTerminalProfile() })
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalProfileOwnDeadlineStillReportsNegotiationTimeout(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, hostHistoryOnlyMode = true,
+            terminationReadinessTimeoutMillis = 2_000)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS)
+            harness.transport.emitState(RealtimeState.Reconnecting(0, "test transport pause"))
+            withTimeout(2_000) {
+                harness.client.transportState.first { it is ProductionTransportState.Reconnecting }
+            }
+            val failure = assertFailsWith<TerminalCompatibilityException> {
+                harness.client.awaitTerminalProfile()
+            }
+            assertEquals("TERMINAL_NEGOTIATION_TIMEOUT", failure.code)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun graphicsV1FallbackAndUnicode16AttachmentKeepDistinctWidthProfiles(): Unit = runBlocking {
+        for (profile in listOf(ProductionTerminalProfile.GRAPHICS,
+            ProductionTerminalProfile.GRAPHICS_UNICODE16)) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true)
+            try {
+                harness.startWithProfile(profile,
+                    hostCapabilities = listOf("host_history_frozen_v1", "tlhp_v2", "state_delta_v1"))
+                assertEquals(profile, harness.client.awaitTerminalProfile())
+                assertEquals(if (profile == ProductionTerminalProfile.GRAPHICS) 1 else 2,
+                    profile.widthPolicy)
+                assertEquals(ProductionTerminalStateContract.SUPPORTED_STATES +
+                    listOf("host_history_v1", "terminal_broker_captures_v1"),
+                    harness.awaitTerminalSubscribe().subscriberCapabilitiesList)
+                assertTrue(harness.client.supportsRemoteFrozenHistory())
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun graphicsV1AndUnicode16CannotSubstituteForExpectedState(): Unit = runBlocking {
+        for ((expected, received) in listOf(
+            ProductionTerminalProfile.GRAPHICS to ProductionTerminalProfile.GRAPHICS_UNICODE16,
+            ProductionTerminalProfile.GRAPHICS_UNICODE16 to ProductionTerminalProfile.GRAPHICS,
+        )) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true,
+                expectedTerminalState = expected.state)
+            try {
+                harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                    setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                        ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+                harness.client.start()
+                val request = harness.awaitTerminalSubscribe()
+                harness.deliverTerminalAttachment(request.requestId, state = received.state)
+                assertEquals("TERMINAL_STATE_MISMATCH", assertFailsWith<TerminalCompatibilityException> {
+                    withTimeout(2_000) { harness.client.awaitTerminalProfile() }
+                }.code)
+                assertFalse(harness.client.diagnostics().subscriberReady)
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun stateDeltaContextFollowsAuthenticatedGraphicsContract(): Unit = runBlocking {
+        val contextIds = mutableListOf<ByteArray>()
+        for (profile in listOf(ProductionTerminalProfile.GRAPHICS,
+            ProductionTerminalProfile.GRAPHICS_UNICODE16)) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true)
+            try {
+                harness.startWithProfile(profile, relayCapabilities = setOf("host_history_v1"),
+                    hostCapabilities = listOf("state_delta_v1"))
+                val pending = scope.async {
+                    harness.client.requestHostStateDelta(42uL, 2048, ByteArray(32) { 7 }, 1)
+                }
+                val request = harness.awaitHostHistoryRequest()
+                val actual = request.stateDelta.contextId.toByteArray()
+                val expected = DeltaCrypto.deriveContextId(harness.sessionId, harness.pcId,
+                    profile.stateContract)
+                assertArrayEquals(expected, actual)
+                contextIds += actual
+                pending.cancel()
+                pending.join()
+            } finally { harness.close() }
+        }
+        assertFalse(contextIds[0].contentEquals(contextIds[1]))
+    }
+
+    @Test
+    fun controlLeaseChangeKeepsAuthenticatedGraphicsAttachmentForFrozenHistory(): Unit = runBlocking {
+        val leaseId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        server.enqueue(MockResponse().setResponseCode(200)
+            .setHeader("Content-Type", "application/json")
+            .setBody("""{"lease_id":"$leaseId","expires_at":"2099-01-01T00:00:00Z","version":2}"""))
+        server.start()
+        val harness = createHostHistoryHarness(
+            negotiateTerminalState = true,
+            inputAcceptanceTimeoutMillis = 30,
+            rootUrl = server.url("/").toString(),
+        )
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS,
+                hostCapabilities = listOf("host_history_frozen_v1", "tlhp_v2"))
+            assertTrue(harness.client.supportsRemoteFrozenHistory())
+            withTimeout(2_000) { harness.client.sessionState.first { it is RemoteSessionState.Live } }
+            harness.client.remoteSession.grantControl("old-lease", Long.MAX_VALUE, leaseVersion = 1)
+            val pending = assertIs<InputSubmission.DeliveryUnknown>(
+                harness.client.remoteSession.submitInput("before-lease-change".encodeToByteArray()))
+            assertTrue(harness.transport.sent.any { it.messageType == MessageType.INPUT_EVENT })
+            assertEquals(1, harness.client.semanticInputOutboxSize())
+
+            harness.client.requestControl()
+
+            assertEquals(leaseId.toString(),
+                assertIs<RemoteSessionState.Controlling>(harness.client.sessionState.value).leaseId)
+            assertEquals(0, harness.client.semanticInputOutboxSize())
+            assertFalse(harness.client.resendPendingInputOverRelay(pending.inputId, 1))
+            assertEquals(ProductionTerminalProfile.GRAPHICS,
+                withTimeout(500) { harness.client.awaitTerminalProfile() })
+            assertTrue(harness.client.supportsRemoteFrozenHistory())
+            assertEquals("/v1/sessions/${harness.sessionId}/lease", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun terminalProfileRejectsEngineMismatchAndChangedProfileOnReconnect(): Unit = runBlocking {
+        for (reconnect in listOf(false, true)) {
+            val harness = createHostHistoryHarness(negotiateTerminalState = true,
+                expectedTerminalState = if (reconnect) null else ProductionTerminalProfile.LEGACY.state)
+            try {
+                if (reconnect) {
+                    harness.startWithProfile(ProductionTerminalProfile.LEGACY)
+                    harness.transport.negotiatedCapabilities.value = harness.transport.negotiatedCapabilities.value.copy(generation = 2)
+                    harness.transport.emitConnected()
+                } else {
+                    harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                        setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                            ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE))
+                    harness.client.start()
+                }
+                val request = harness.awaitTerminalSubscribe(if (reconnect) 2 else 1)
+                val flowCount = harness.transport.sent.count { it.messageType == MessageType.FLOW_CONTROL }
+                harness.deliverTerminalAttachment(request.requestId, state = ProductionTerminalProfile.GRAPHICS.state,
+                    generation = if (reconnect) 2 else 1)
+                val failure = assertFailsWith<TerminalCompatibilityException> {
+                    withTimeout(2_000) { harness.client.awaitTerminalProfile() }
+                }
+                assertEquals("TERMINAL_STATE_MISMATCH", failure.code)
+                assertEquals(flowCount, harness.transport.sent.count { it.messageType == MessageType.FLOW_CONTROL })
+                assertFalse(harness.client.diagnostics().subscriberReady)
+                assertEquals(0L, harness.client.diagnostics().durableAck)
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun terminalProfileChangeDuringSameGenerationRefreshFencesFollowingOutput(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.LEGACY)
+            val refresh = scope.async { runCatching { harness.client.resume(0) } }
+            val request = harness.awaitTerminalSubscribe(count = 2)
+            val released = harness.transport.releasedReservations
+            harness.deliverTerminalAttachment(request.requestId, state = ProductionTerminalProfile.GRAPHICS.state)
+            harness.deliverHostGeometry(dev.termlink.terminal.api.TerminalHostGeometryV1(9, 18).encode(), 1)
+            val failure = assertIs<TerminalCompatibilityException>(withTimeout(2_000) { refresh.await() }.exceptionOrNull())
+            assertEquals("TERMINAL_STATE_MISMATCH", failure.code)
+            withTimeout(2_000) { while (harness.transport.releasedReservations < released + 2) kotlinx.coroutines.yield() }
+            assertTrue(harness.engine.geometries.isEmpty())
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+            assertFalse(harness.client.diagnostics().subscriberReady)
+            assertIs<ProductionTransportState.Failed>(harness.client.transportState.value)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun graphicsHistoryMemoryBudgetRejectsValid257ChunkEnvelopeBeforeAllocation(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, terminalBufferBudget = budget)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS)
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val request = harness.awaitHostHistoryRequest()
+            val lastChunk = hostHistoryChunks(request.requestId, ByteArray(4096)).single().toBuilder()
+                .setObjectBytes(128L * 1024 * 1024 + 4096).setChunkCount(257).setChunkIndex(256).build()
+            harness.deliverHostHistoryResponse(lastChunk, sequence = 100)
+            assertFailsWith<TerminalBufferLimitException> { withTimeout(2_000) { pending.await() } }
+            assertEquals(0L, budget.reservedBytes)
+            val control = harness.awaitHostHistoryControls(1).single()
+            assertEquals(HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL, control.action)
+            assertEquals(request.requestId, control.requestId)
+            assertIs<ProductionTransportState.Connected>(harness.client.transportState.value)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun historyMetadataCannotExpandAuthenticatedBudgetOrUseInvalidChunkIndex(): Unit = runBlocking {
+        for (mode in listOf("legacy", "unnegotiated", "graphics", "count", "negative-index", "oversized-chunk")) {
+            val budgetProbes = AtomicInteger()
+            val budget = TerminalBufferBudget { budgetProbes.incrementAndGet(); HeapState(192L * 1024 * 1024, 0) }
+            val harness = createHostHistoryHarness(negotiateTerminalState = mode != "unnegotiated", terminalBufferBudget = budget)
+            try {
+                if (mode == "unnegotiated") harness.startAndAwaitReady()
+                else harness.startWithProfile(if (mode == "legacy") ProductionTerminalProfile.LEGACY else ProductionTerminalProfile.GRAPHICS)
+                val pending = harness.requestLatestHostSnapshotAsync()
+                val request = harness.awaitHostHistoryRequest()
+                val response = hostHistoryChunks(request.requestId, byteArrayOf(1)).single().toBuilder()
+                    .setFormatName("termlink.snapshot.graphics") // This untrusted hint never selects the budget.
+                when (mode) {
+                    "legacy", "unnegotiated" -> response.setObjectBytes(64L * 1024 * 1024 + 1).setChunkCount(129)
+                    "graphics" -> response.setObjectBytes(128L * 1024 * 1024 + 4097).setChunkCount(257)
+                    "count" -> response.setChunkCount(258)
+                    "negative-index" -> response.setChunkIndex(-1)
+                    "oversized-chunk" -> response.setObjectChunk(ByteString.copyFrom(ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES + 1)))
+                }
+                harness.deliverHostHistoryResponse(response.build(), sequence = 100)
+                assertFailsWith<IllegalArgumentException> { withTimeout(2_000) { pending.await() } }
+                assertEquals(0, budgetProbes.get())
+                assertEquals(0L, budget.reservedBytes)
+                val control = harness.awaitHostHistoryControls(1).single()
+                assertEquals(HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL, control.action)
+                assertEquals(request.requestId, control.requestId)
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun graphicsHistoryNewChunksExtendIdleDeadlineBeyondOriginalTimeout(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, hostHistoryRequestTimeoutMillis = 600)
+        val bytes = ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES * 3 + 1)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS)
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val chunks = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, bytes)
+            chunks.forEachIndexed { index, chunk ->
+                delay(250)
+                harness.deliverHostHistoryResponse(chunk, sequence = 100L + index)
+                harness.awaitHostHistoryControls(index + 1)
+            }
+            requireNotNull(withTimeout(2_000) { pending.await() }).destroy()
+        } finally { bytes.fill(0); harness.close() }
+    }
+
+    @Test
+    fun graphicsHistoryDuplicateChunksDoNotExtendIdleDeadline(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, hostHistoryRequestTimeoutMillis = 300)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS)
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val first = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES + 1)).first()
+            harness.deliverHostHistoryResponse(first, sequence = 100)
+            harness.awaitHostHistoryControls(1)
+            repeat(5) { index ->
+                delay(100)
+                harness.deliverHostHistoryResponse(first, sequence = 101L + index)
+            }
+            val failure = assertFailsWith<IllegalStateException> { withTimeout(2_000) { pending.await() } }
+            assertTrue(failure.message.orEmpty().contains("timed out"))
+            assertTrue(harness.transport.sent.filter { it.messageType == MessageType.HOST_HISTORY_CONTROL }.isNotEmpty())
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun graphicsHistoryTotalDeadlineBoundsOngoingValidProgress(): Unit = runBlocking {
+        val harness = createHostHistoryHarness(negotiateTerminalState = true,
+            hostHistoryRequestTimeoutMillis = 2_000, graphicsHostHistoryTotalTimeoutMillis = 450)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS)
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val chunks = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES * 6))
+            repeat(3) { index ->
+                delay(100)
+                harness.deliverHostHistoryResponse(chunks[index], sequence = 100L + index)
+                harness.awaitHostHistoryControls(index + 1)
+            }
+            val failure = assertFailsWith<IllegalStateException> { withTimeout(1_000) { pending.await() } }
+            assertTrue(failure.message.orEmpty().contains("timed out"))
+            assertEquals(HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL,
+                harness.awaitHostHistoryControls(4).last().action)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun hostHistoryBudgetFollowsCompletedObjectUntilIdempotentDestroy(): Unit = runBlocking {
+        val mib = 1024L * 1024
+        val budget = TerminalBufferBudget { HeapState(192 * mib, 158 * mib) }
+        val harness = createHostHistoryHarness(terminalBufferBudget = budget)
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val chunk = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, byteArrayOf(1, 2, 3)).single()
+            harness.deliverHostHistoryResponse(chunk, sequence = 100)
+            val result = requireNotNull(withTimeout(2_000) { pending.await() })
+            try {
+                assertEquals(mib + 24, budget.reservedBytes)
+                assertEquals(HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CHUNK_ACK,
+                    harness.awaitHostHistoryControls(1).single().action)
+                assertFailsWith<TerminalBufferLimitException> { budget.reserve(1) }
+                harness.client.close() // The caller owns the completed object, not the client.
+                assertEquals(mib + 24, budget.reservedBytes)
+            } finally {
+                result.destroy()
+                result.close()
+            }
+            assertEquals(0L, budget.reservedBytes)
+            assertTrue(result.sealedObject.all { it == 0.toByte() })
+            assertTrue(result.ciphertextSha256.all { it == 0.toByte() })
+            budget.reserve(1).close()
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun hostHistoryBudgetReleasesIncompleteAssemblyOnEveryTerminalPath(): Unit = runBlocking {
+        for (mode in listOf("duplicate", "digest", "cancel", "timeout", "disconnect", "close")) {
+            val budget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+            val harness = createHostHistoryHarness(terminalBufferBudget = budget,
+                hostHistoryRequestTimeoutMillis = if (mode == "timeout") 1_000 else 30_000)
+            try {
+                harness.startAndAwaitReady()
+                val pending = harness.requestLatestHostSnapshotAsync()
+                val chunks = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES + 1))
+                harness.deliverHostHistoryResponse(chunks.first(), sequence = 100)
+                harness.awaitHostHistoryControls(1)
+                assertTrue(budget.reservedBytes > 0)
+                when (mode) {
+                    "duplicate" -> harness.deliverHostHistoryResponse(chunks.first().toBuilder()
+                        .setObjectChunk(ByteString.copyFrom(ByteArray(TEST_HOST_HISTORY_CHUNK_BYTES) { 1 })).build(), sequence = 101)
+                    "digest" -> harness.deliverHostHistoryResponse(chunks.last().toBuilder()
+                        .setObjectChunk(ByteString.copyFrom(byteArrayOf(1))).build(), sequence = 101)
+                    "cancel" -> pending.cancel()
+                    "disconnect" -> harness.transport.emitFailed("test disconnect")
+                    "close" -> harness.client.close()
+                }
+                assertFailsWith<Exception> { withTimeout(2_000) { pending.await() } }
+                assertEquals(mode, 0L, budget.reservedBytes)
+                if (mode !in listOf("disconnect", "close")) assertTrue(harness.transport.disconnectReasons.isEmpty())
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun hostHistoryBudgetReleasesBothPartialAndCompletedObjectWhenChunkAckFails(): Unit = runBlocking {
+        for (complete in listOf(false, true)) {
+            val budget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+            val harness = createHostHistoryHarness(terminalBufferBudget = budget)
+            try {
+                harness.startAndAwaitReady()
+                val pending = harness.requestLatestHostSnapshotAsync()
+                val chunks = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId,
+                    ByteArray(if (complete) 3 else TEST_HOST_HISTORY_CHUNK_BYTES + 1))
+                val observedReservation = AtomicLong()
+                val failAckOnce = java.util.concurrent.atomic.AtomicBoolean(true)
+                harness.transport.sendHandler = { envelope ->
+                    if (envelope.messageType == MessageType.HOST_HISTORY_CONTROL && failAckOnce.compareAndSet(true, false)) {
+                        observedReservation.set(budget.reservedBytes)
+                        false
+                    } else true
+                }
+                harness.deliverHostHistoryResponse(chunks.first(), sequence = 100)
+                assertFailsWith<IllegalStateException> { withTimeout(2_000) { pending.await() } }
+                assertTrue(observedReservation.get() > 0)
+                assertEquals(0L, budget.reservedBytes)
+                assertEquals(1L, harness.client.diagnostics().hostHistoryChunkReceivedCount)
+                assertEquals(0L, harness.client.diagnostics().hostHistoryChunkAckSentCount)
+                assertEquals(HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL,
+                    harness.awaitHostHistoryControls(1).single().action)
+                assertIs<ProductionTransportState.Connected>(harness.client.transportState.value)
+                assertTrue(harness.transport.disconnectReasons.isEmpty())
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun hostHistoryChunkAckCannotCrossPhysicalGenerationWhileResponseWaitsForSendLane(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+        val harness = createHostHistoryHarness(terminalBufferBudget = budget)
+        val sendEntered = CountDownLatch(1)
+        val releaseSend = CountDownLatch(1)
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val chunk = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, byteArrayOf(1, 2, 3)).single()
+            val blockNextRequest = java.util.concurrent.atomic.AtomicBoolean(true)
+            harness.transport.sendHandler = { envelope ->
+                if (envelope.messageType == MessageType.HOST_HISTORY_REQUEST &&
+                    blockNextRequest.compareAndSet(true, false)) {
+                    sendEntered.countDown()
+                    check(releaseSend.await(2, TimeUnit.SECONDS))
+                    false
+                } else true
+            }
+            val occupyingSendLane = harness.requestLatestHostSnapshotAsync()
+            assertTrue(withContext(Dispatchers.IO) { sendEntered.await(2, TimeUnit.SECONDS) })
+            harness.deliverHostHistoryResponse(chunk, sequence = 100)
+            withTimeout(2_000) {
+                while (harness.client.diagnostics().hostHistoryChunkReceivedCount != 1L) kotlinx.coroutines.yield()
+            }
+            assertTrue(budget.reservedBytes > 0)
+            // A physical socket can change before its connection event is processed.
+            assertTrue(harness.transport.replaceConnectedGenerationWithoutEvent() > 1)
+            releaseSend.countDown()
+            withTimeout(2_000) {
+                while (!occupyingSendLane.isCompleted || !pending.isCompleted) kotlinx.coroutines.yield()
+            }
+            assertFailsWith<IllegalStateException> { occupyingSendLane.await() }
+            assertFailsWith<IllegalStateException> { pending.await() }
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.HOST_HISTORY_CONTROL })
+            assertEquals(0L, harness.client.diagnostics().hostHistoryChunkAckSentCount)
+            assertEquals(0L, budget.reservedBytes)
+        } finally { releaseSend.countDown(); harness.close() }
+    }
+
+    @Test
+    fun hostHistoryRequestSlotsAreAtomicBeforeAnyResponseAndReusableAfterCancellation(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val requests = (0 until 12).map { harness.requestLatestHostSnapshotAsync() }
+            withTimeout(2_000) { while (requests.count { it.isCompleted } < 8) kotlinx.coroutines.yield() }
+            harness.awaitHostHistoryRequest(count = 4)
+            assertEquals(4, harness.transport.sent.count { it.messageType == MessageType.HOST_HISTORY_REQUEST })
+            val rejected = requests.filter { it.isCompleted }
+            assertEquals(8, rejected.size)
+            rejected.forEach { request -> assertFailsWith<TerminalBufferLimitException> { request.await() } }
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+            assertIs<ProductionTransportState.Connected>(harness.client.transportState.value)
+            requests.filterNot { it.isCompleted }.forEach { it.cancel(); it.join() }
+            val replacement = harness.requestLatestHostSnapshotAsync()
+            harness.awaitHostHistoryRequest(count = 5)
+            assertFalse(replacement.isCompleted)
+            replacement.cancel()
+            replacement.join()
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun hostHistoryCancellationDuringFinalAckCannotLeakOrReallocateFromLateResponse(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+        val harness = createHostHistoryHarness(terminalBufferBudget = budget)
+        val ackEntered = CountDownLatch(1)
+        val releaseAck = CountDownLatch(1)
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            val chunk = hostHistoryChunks(harness.awaitHostHistoryRequest().requestId, byteArrayOf(1, 2, 3)).single()
+            val blockOnce = java.util.concurrent.atomic.AtomicBoolean(true)
+            harness.transport.sendHandler = { envelope ->
+                if (envelope.messageType == MessageType.HOST_HISTORY_CONTROL && blockOnce.compareAndSet(true, false)) {
+                    ackEntered.countDown()
+                    check(releaseAck.await(2, TimeUnit.SECONDS))
+                }
+                true
+            }
+            val releasedBefore = harness.transport.releasedReservations
+            harness.deliverHostHistoryResponse(chunk, sequence = 100)
+            assertTrue(withContext(Dispatchers.IO) { ackEntered.await(2, TimeUnit.SECONDS) })
+            assertTrue(budget.reservedBytes > 0)
+            pending.cancel()
+            // Cancellation destroys the object while ACK sending still owns the ingress lane.
+            withTimeout(2_000) { while (budget.reservedBytes != 0L) kotlinx.coroutines.yield() }
+            releaseAck.countDown()
+            pending.join()
+            harness.deliverHostHistoryResponse(chunk, sequence = 101)
+            withTimeout(2_000) { while (harness.transport.releasedReservations < releasedBefore + 2) kotlinx.coroutines.yield() }
+            assertEquals(0L, budget.reservedBytes)
+            assertTrue(harness.transport.disconnectReasons.isEmpty())
+        } finally { releaseAck.countDown(); harness.close() }
+    }
+
+    @Test
+    fun hostHistoryFailureDoesNotSendOldCancelAfterDisconnectOrGenerationChange(): Unit = runBlocking {
+        for (reconnect in listOf(false, true)) {
+            val harness = createHostHistoryHarness()
+            try {
+                harness.startAndAwaitReady()
+                val pending = harness.requestLatestHostSnapshotAsync()
+                harness.awaitHostHistoryRequest()
+                if (reconnect) harness.transport.emitConnected()
+                else harness.transport.emitFailed("test disconnected")
+                assertFailsWith<IllegalStateException> { withTimeout(2_000) { pending.await() } }
+                assertTrue(harness.transport.sent.none { it.messageType == MessageType.HOST_HISTORY_CONTROL })
+                if (reconnect) harness.awaitTerminalSubscribe(count = 2)
+            } finally { harness.close() }
+        }
+    }
+
+    @Test
+    fun hostHistoryCancelHasBoundedWaitEvenWhenOutboundSequenceIsHeld(): Unit = runBlocking {
+        val harness = createHostHistoryHarness()
+        try {
+            harness.startAndAwaitReady()
+            val pending = harness.requestLatestHostSnapshotAsync()
+            harness.awaitHostHistoryRequest()
+            val reserved = harness.client.reserveNextEnvelopeSequenceForDirectCutover()
+            try {
+                pending.cancel()
+                // CANCEL is best effort, and must stop waiting for the send gate within one second.
+                withTimeout(2_000) { pending.join() }
+                assertTrue(harness.transport.sent.none { it.messageType == MessageType.HOST_HISTORY_CONTROL })
+            } finally { reserved.releaseForSending() }
+            val next = harness.requestLatestHostSnapshotAsync()
+            val request = harness.awaitHostHistoryRequest(count = 2)
+            next.cancel()
+            withTimeout(2_000) { next.join() }
+            val control = harness.awaitHostHistoryControls(1).single()
+            assertEquals(HostHistoryControlActionV1.HOST_HISTORY_CONTROL_ACTION_V1_CANCEL, control.action)
+            assertEquals(request.requestId, control.requestId)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun brokerOutputFetchesOnSameSocketBeforeLaterOutputIsApplied(): Unit = runBlocking {
+        val captureId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val canonical = brokerCanonical(1)
+        val selection = BrokerCaptureSelectionV1.newBuilder()
+            .setObjectId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(captureId)))
+            .setSourceEventSeq(1).setCanonicalBytes(canonical.size)
+            .setCanonicalSha256(ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(canonical)))
+            .build()
+        lateinit var live: ProductionRealtimeSessionClient
+        val resolverStarted = CompletableDeferred<Unit>()
+        val harness = createHostHistoryHarness(negotiateTerminalState = true,
+            brokerCaptureResolver = { sequence, reference ->
+                assertArrayEquals(byteArrayOf(9), reference)
+                resolverStarted.complete(Unit)
+                live.requestHostBrokerCapture(selection).close()
+                RemoteSessionEvent.BrokerOutput(sequence, byteArrayOf(65), canonical)
+            })
+        live = harness.client
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS,
+                relayCapabilities = setOf("terminal_broker_captures_v1", "host_history_v1"),
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            val expectedCapabilities = ProductionTerminalStateContract.SUPPORTED_STATES +
+                listOf("host_history_v1", "terminal_broker_captures_v1")
+            assertEquals(expectedCapabilities, harness.awaitTerminalSubscribe().subscriberCapabilitiesList)
+            withTimeout(2_000) { while (!live.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            harness.deliverBrokerOutput(byteArrayOf(9), 1)
+            withTimeout(2_000) { resolverStarted.await() }
+            harness.deliverOutput(byteArrayOf(66), 2)
+            val request = harness.awaitHostHistoryRequest()
+            assertEquals(expectedCapabilities, request.subscriberCapabilitiesList)
+            withTimeout(2_000) { while (live.diagnostics().lastReceivedSequence < 2) kotlinx.coroutines.yield() }
+            assertEquals(0, harness.engine.renderedOutputCount)
+            assertEquals(0L, live.diagnostics().durableAck)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 1 })
+
+            val sealedObject = ByteArray(344) { 7 }
+            val response = HostHistoryResponsePayload.newBuilder()
+                .setRequestId(request.requestId)
+                .setStatus(HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK)
+                .setKind(HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_BROKER_CAPTURE)
+                .setObjectId(selection.objectId).setBrokerCapture(selection)
+                .setStartSeq(1).setEndSeq(1)
+                .setKeyId("broker_capture_v1:${harness.androidId.toString().replace("-", "")}:7")
+                .setFormatName("TERMLINK_BROKER_CAPTURE_V1").setFormatVersion(1)
+                .setObjectSha256(ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(sealedObject)))
+                .setObjectBytes(sealedObject.size.toLong()).setChunkCount(1).setChunkIndex(0)
+                .setObjectChunk(ByteString.copyFrom(sealedObject)).build()
+            harness.deliverHostHistoryResponse(response, 901)
+            withTimeout(2_000) {
+                while (harness.engine.renderedOutputCount < 2 || live.diagnostics().durableAck < 2)
+                    kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) {
+                while (harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 2 })
+                    kotlinx.coroutines.yield()
+            }
+            assertEquals(2L, live.diagnostics().durableAck)
+            assertEquals(listOf(65, 66), harness.engine.renderedOutputs.map { it.single().toInt() })
+        } finally {
+            harness.close()
+            canonical.fill(0)
+        }
+    }
+
+    @Test
+    fun unicode16BrokerFetchAcceptsOnlyItsOwnCaptureKeyId(): Unit = runBlocking {
+        val captureId = UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")
+        val canonical = brokerCanonical(1)
+        val selection = BrokerCaptureSelectionV1.newBuilder()
+            .setObjectId(ByteString.copyFrom(ProductionRealtimeClient.uuidBytes(captureId)))
+            .setSourceEventSeq(1).setCanonicalBytes(canonical.size)
+            .setCanonicalSha256(ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(canonical)))
+            .build()
+        val budget = TerminalBufferBudget { HeapState(192L * 1024 * 1024, 0) }
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, terminalBufferBudget = budget)
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS_UNICODE16,
+                relayCapabilities = setOf("terminal_broker_captures_v1", "host_history_v1"),
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            val v2KeyId = BrokerCaptureCrypto.keyId(harness.androidId, 7,
+                ProductionTerminalProfile.GRAPHICS_UNICODE16.stateContract)
+            val v1KeyId = BrokerCaptureCrypto.keyId(harness.androidId, 7,
+                ProductionTerminalProfile.GRAPHICS.stateContract)
+            val sealedObject = ByteArray(BrokerCaptureCrypto.HEADER_BYTES + canonical.size + 16) { 7 }
+            for ((index, keyId) in listOf(v2KeyId, v1KeyId).withIndex()) {
+                val pending = scope.async { harness.client.requestHostBrokerCapture(selection) }
+                val request = harness.awaitHostHistoryRequest(index + 1)
+                val response = HostHistoryResponsePayload.newBuilder()
+                    .setRequestId(request.requestId)
+                    .setStatus(HostHistoryResponseStatusV1.HOST_HISTORY_RESPONSE_STATUS_V1_OK)
+                    .setKind(HostHistoryObjectKindV1.HOST_HISTORY_OBJECT_KIND_V1_BROKER_CAPTURE)
+                    .setObjectId(selection.objectId).setBrokerCapture(selection)
+                    .setStartSeq(1).setEndSeq(1).setKeyId(keyId)
+                    .setFormatName("TERMLINK_BROKER_CAPTURE_V1").setFormatVersion(1)
+                    .setObjectSha256(ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(sealedObject)))
+                    .setObjectBytes(sealedObject.size.toLong()).setChunkCount(1).setChunkIndex(0)
+                    .setObjectChunk(ByteString.copyFrom(sealedObject)).build()
+                harness.deliverHostHistoryResponse(response, 901L + index)
+                if (index == 0) requireNotNull(withTimeout(2_000) { pending.await() }).close()
+                else assertFailsWith<IllegalArgumentException> { withTimeout(2_000) { pending.await() } }
+                assertEquals(0L, budget.reservedBytes)
+            }
+        } finally { canonical.fill(0); harness.close() }
+    }
+
+    @Test
+    fun brokerQueueOverflowFailsClosedAndReleasesBudget(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(512L * 1024 * 1024, 0) }
+        val resolverStarted = CompletableDeferred<Unit>()
+        val holdResolver = CompletableDeferred<Unit>()
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, terminalBufferBudget = budget,
+            brokerCaptureResolver = { seq, _ ->
+                resolverStarted.complete(Unit)
+                holdResolver.await()
+                RemoteSessionEvent.BrokerOutput(seq, byteArrayOf(1), brokerCanonical(seq))
+            })
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS,
+                relayCapabilities = setOf("terminal_broker_captures_v1", "host_history_v1"),
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            harness.deliverBrokerOutput(byteArrayOf(9), 1)
+            withTimeout(2_000) { resolverStarted.await() }
+            repeat(32) { harness.deliverOutput(byteArrayOf(2), it + 2L) }
+            withTimeout(2_000) {
+                while (harness.client.transportState.value !is ProductionTransportState.Failed)
+                    kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) { while (budget.reservedBytes != 0L) kotlinx.coroutines.yield() }
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+            assertEquals(0, harness.engine.renderedOutputCount)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 1 })
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun brokerQueueDisconnectDropsUnappliedOutputWithoutAcknowledging(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(512L * 1024 * 1024, 0) }
+        val resolverStarted = CompletableDeferred<Unit>()
+        val holdResolver = CompletableDeferred<Unit>()
+        val harness = createHostHistoryHarness(negotiateTerminalState = true, terminalBufferBudget = budget,
+            brokerCaptureResolver = { seq, _ ->
+                resolverStarted.complete(Unit)
+                holdResolver.await()
+                RemoteSessionEvent.BrokerOutput(seq, byteArrayOf(1), brokerCanonical(seq))
+            })
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS,
+                relayCapabilities = setOf("terminal_broker_captures_v1", "host_history_v1"),
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            harness.deliverBrokerOutput(byteArrayOf(9), 1)
+            withTimeout(2_000) { resolverStarted.await() }
+            harness.deliverOutput(byteArrayOf(2), 2)
+            withTimeout(2_000) {
+                while (harness.client.diagnostics().lastReceivedSequence < 2) kotlinx.coroutines.yield()
+            }
+            harness.transport.emitFailed("test disconnect")
+            withTimeout(2_000) { while (budget.reservedBytes != 0L) kotlinx.coroutines.yield() }
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+            assertEquals(0, harness.engine.renderedOutputCount)
+            assertTrue(harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 1 })
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun delayedOldGenerationCleanupDoesNotClearSuccessorBrokerOutput(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(512L * 1024 * 1024, 0) }
+        val cleanupScheduler = TestCoroutineScheduler()
+        val oldResolverStarted = CompletableDeferred<Unit>()
+        val oldResolverFinished = CompletableDeferred<Unit>()
+        val releaseOldResolver = CompletableDeferred<Unit>()
+        val newResolverStarted = CompletableDeferred<Unit>()
+        val releaseNewResolver = CompletableDeferred<Unit>()
+        val harness = createHostHistoryHarness(
+            negotiateTerminalState = true,
+            terminalBufferBudget = budget,
+            cleanupDispatcher = StandardTestDispatcher(cleanupScheduler),
+            brokerCaptureResolver = { seq, reference ->
+                if (reference.contentEquals(byteArrayOf(1))) {
+                    oldResolverStarted.complete(Unit)
+                    try { releaseOldResolver.await() } finally { oldResolverFinished.complete(Unit) }
+                } else {
+                    assertArrayEquals(byteArrayOf(2), reference)
+                    newResolverStarted.complete(Unit)
+                    releaseNewResolver.await()
+                }
+                RemoteSessionEvent.BrokerOutput(seq, byteArrayOf(65), brokerCanonical(seq))
+            },
+        )
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS,
+                relayCapabilities = setOf("terminal_broker_captures_v1", "host_history_v1"),
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            harness.deliverBrokerOutput(byteArrayOf(1), 1)
+            withTimeout(2_000) { oldResolverStarted.await() }
+            assertTrue(budget.reservedBytes > 0L)
+
+            queueLocalReconcileBehindIncomingLock(harness.client)
+
+            harness.transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(2,
+                setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                    ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE,
+                    "terminal_broker_captures_v1", "host_history_v1"))
+            harness.transport.emitConnected()
+            val successorSubscribe = harness.awaitTerminalSubscribe(2)
+            harness.deliverTerminalAttachment(successorSubscribe.requestId,
+                state = ProductionTerminalProfile.GRAPHICS.state, generation = 2,
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            withTimeout(2_000) { oldResolverFinished.await() }
+            withTimeout(2_000) { while (budget.reservedBytes != 0L) kotlinx.coroutines.yield() }
+
+            harness.deliverBrokerOutput(byteArrayOf(2), 1, generation = 2)
+            withTimeout(2_000) { newResolverStarted.await() }
+            val successorPermit = budget.reservedBytes
+            assertTrue(successorPermit > 0L)
+            cleanupScheduler.advanceUntilIdle()
+            assertEquals(successorPermit, budget.reservedBytes)
+            assertEquals(0L, harness.client.diagnostics().durableAck)
+            releaseNewResolver.complete(Unit)
+            withTimeout(2_000) {
+                while (harness.engine.renderedOutputCount < 1 || harness.client.diagnostics().durableAck < 1 ||
+                    harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 1 }
+                ) kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) { while (budget.reservedBytes != 0L) kotlinx.coroutines.yield() }
+            assertEquals(listOf(65), harness.engine.renderedOutputs.map { it.single().toInt() })
+        } finally {
+            releaseOldResolver.complete(Unit)
+            releaseNewResolver.complete(Unit)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun delayedLocalCleanupDoesNotClearResubscribedBrokerOutput(): Unit = runBlocking {
+        val budget = TerminalBufferBudget { HeapState(512L * 1024 * 1024, 0) }
+        val cleanupScheduler = TestCoroutineScheduler()
+        val resolverStarted = CompletableDeferred<Unit>()
+        val releaseResolver = CompletableDeferred<Unit>()
+        val harness = createHostHistoryHarness(
+            negotiateTerminalState = true,
+            terminalBufferBudget = budget,
+            cleanupDispatcher = StandardTestDispatcher(cleanupScheduler),
+            reconnectDelaysMillis = listOf(0),
+            brokerCaptureResolver = { seq, _ ->
+                resolverStarted.complete(Unit)
+                releaseResolver.await()
+                RemoteSessionEvent.BrokerOutput(seq, byteArrayOf(66), brokerCanonical(seq))
+            },
+        )
+        try {
+            harness.startWithProfile(ProductionTerminalProfile.GRAPHICS,
+                relayCapabilities = setOf("terminal_broker_captures_v1", "host_history_v1"),
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            queueLocalReconcileBehindIncomingLock(harness.client)
+            val newSubscribe = harness.awaitTerminalSubscribe(2)
+            harness.deliverTerminalAttachment(newSubscribe.requestId,
+                state = ProductionTerminalProfile.GRAPHICS.state,
+                hostCapabilities = listOf("terminal_broker_captures_v1"))
+            withTimeout(2_000) { while (!harness.client.diagnostics().subscriberReady) kotlinx.coroutines.yield() }
+            harness.deliverBrokerOutput(byteArrayOf(2), 1)
+            withTimeout(2_000) { resolverStarted.await() }
+            val permit = budget.reservedBytes
+            assertTrue(permit > 0L)
+            cleanupScheduler.advanceUntilIdle()
+            assertEquals(permit, budget.reservedBytes)
+            releaseResolver.complete(Unit)
+            withTimeout(2_000) {
+                while (harness.client.diagnostics().durableAck < 1 ||
+                    harness.transport.sent.none { it.messageType == MessageType.OUTPUT_ACK && it.ack >= 1 }
+                ) kotlinx.coroutines.yield()
+            }
+            withTimeout(2_000) { while (budget.reservedBytes != 0L) kotlinx.coroutines.yield() }
+            assertEquals(listOf(66), harness.engine.renderedOutputs.map { it.single().toInt() })
+        } finally {
+            releaseResolver.complete(Unit)
+            harness.close()
+        }
+    }
+
+    private suspend fun queueLocalReconcileBehindIncomingLock(client: ProductionRealtimeSessionClient) {
+        val lock = ProductionRealtimeSessionClient::class.java.getDeclaredField("incomingProcessingMutex")
+            .apply { isAccessible = true }.get(client) as Mutex
+        val reconcile = ProductionRealtimeSessionClient::class.java.getDeclaredMethod(
+            "scheduleSessionReconcile", String::class.java, Int::class.javaPrimitiveType,
+        ).apply { isAccessible = true }
+        lock.lock()
+        try {
+            reconcile.invoke(client, "test local failure", 1)
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    private fun brokerCanonical(sequence: Long): ByteArray = ByteBuffer.allocate(136)
+        .order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+            put("TLCAPV1\u0000".encodeToByteArray())
+            putInt(32)
+            putInt(1)
+            putLong(sequence)
+            putInt(136)
+        }.array()
+
     private fun createHostHistoryHarness(
         holdLiveReplayForHostHistory: Boolean = false,
         orderedEventObserver: RemoteSessionOrderedEventObserver? = null,
         hostHistoryRequestTimeoutMillis: Long = 30_000,
         terminationReadinessTimeoutMillis: Long = 15_000,
         hostHistoryOnlyMode: Boolean = false,
+        negotiateTerminalState: Boolean = false,
+        inputAcceptanceTimeoutMillis: Long = 15_000,
+        expectedTerminalState: String? = null,
+        graphicsHostHistoryTotalTimeoutMillis: Long = 300_000,
+        terminalBufferBudget: TerminalBufferBudget = TerminalBufferBudget.global,
+        cleanupDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Default,
+        reconnectDelaysMillis: List<Long> = listOf(30_000),
+        brokerCaptureResolver: (suspend (Long, ByteArray) -> RemoteSessionEvent.BrokerOutput)? = null,
+        rootUrl: String = "https://example.test",
     ): HostHistoryHarness {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
@@ -4576,7 +5861,7 @@ class ProductionRealtimeSessionClientTest {
         val client = ProductionRealtimeSessionClient(
             engine = engine,
             config = ProductionRealtimeSessionConfig(
-                rootUrl = "https://example.test",
+                rootUrl = rootUrl,
                 tokenProvider = AccessTokenProvider { "oidc-token" },
                 androidDeviceId = androidId,
                 pcDeviceId = pcId,
@@ -4584,18 +5869,26 @@ class ProductionRealtimeSessionClientTest {
                 keyEpoch = 7,
                 pcExchangePublicKey = pcIdentity.exchange.publicKey.copyOf(),
                 keyId = keyId.copyOf(),
+                negotiateTerminalState = negotiateTerminalState,
+                expectedTerminalState = expectedTerminalState,
             ),
             identity = androidIdentity,
             parentScope = scope,
             transport = transport,
-            reconnectDelaysMillis = listOf(30_000),
+            reconnectDelaysMillis = reconnectDelaysMillis,
             acknowledgementObserver = ::commitAcknowledgement,
             acknowledgementResetObserver = ::resetAcknowledgement,
             holdLiveReplayForHostHistory = holdLiveReplayForHostHistory || hostHistoryOnlyMode,
             hostHistoryRequestTimeoutMillis = hostHistoryRequestTimeoutMillis,
+            graphicsHostHistoryTotalTimeoutMillis = graphicsHostHistoryTotalTimeoutMillis,
             terminationReadinessTimeoutMillis = terminationReadinessTimeoutMillis,
+            inputAcceptanceTimeoutMillis = inputAcceptanceTimeoutMillis,
             hostHistoryOnlyMode = hostHistoryOnlyMode,
             orderedEventObserver = orderedEventObserver,
+            terminalBufferBudget = terminalBufferBudget,
+            cleanupDispatcher = cleanupDispatcher,
+            brokerCaptureResolver = brokerCaptureResolver,
+            allowCleartextForLocalTest = rootUrl.startsWith("http://"),
         )
         return HostHistoryHarness(
             androidId = androidId,
@@ -4698,6 +5991,40 @@ class ProductionRealtimeSessionClientTest {
                 .setRequestId(ByteString.copyFrom(id)).setColumns(45).setRows(28).setErrorCode(error).build()
             transport.deliver(incomingEnvelope(MessageType.RESIZE_RESPONSE, response.toByteArray(), sequence), generation = 1)
         }
+        fun deliverHostGeometry(bytes: ByteArray, sequence: Long, generation: Int = 1) {
+            val payload = dev.termlink.protocol.realtime.v1.HostGeometryPayload.newBuilder()
+                .setGeometryV1(ByteString.copyFrom(bytes)).build().toByteArray()
+            transport.deliver(incomingEnvelope(MessageType.HOST_GEOMETRY, payload, sequence), generation = generation)
+        }
+
+        fun deliverHostResizeResult(bytes: ByteArray, sequence: Long) {
+            val payload = dev.termlink.protocol.realtime.v1.HostResizeResultPayload.newBuilder()
+                .setResultV1(ByteString.copyFrom(bytes)).build().toByteArray()
+            transport.deliver(incomingEnvelope(MessageType.HOST_RESIZE_RESULT, payload, sequence), generation = 1)
+        }
+
+        fun deliverHostTheme(bytes: ByteArray, sequence: Long) {
+            val payload = dev.termlink.protocol.realtime.v1.HostThemePayload.newBuilder()
+                .setThemeV1(ByteString.copyFrom(bytes)).build().toByteArray()
+            transport.deliver(incomingEnvelope(MessageType.HOST_THEME, payload, sequence), generation = 1)
+        }
+
+        suspend fun awaitTerminalSubscribe(count: Int = 1): SubscribePayload {
+            withTimeout(2_000) {
+                while (transport.sent.count { it.messageType == MessageType.SUBSCRIBE } < count) kotlinx.coroutines.yield()
+            }
+            return decryptOutbound(transport.sent.last { it.messageType == MessageType.SUBSCRIBE }) { SubscribePayload.parseFrom(it) }
+        }
+
+        private val attachmentSequence = AtomicLong(899)
+
+        fun deliverTerminalAttachment(requestId: ByteString, error: String = "", state: String = ProductionTerminalStateContract.STATE,
+            generation: Int = 1, hostCapabilities: List<String> = emptyList(), nowMillis: Long = System.currentTimeMillis()) {
+            val result = dev.termlink.protocol.realtime.v1.TerminalAttachResultPayload.newBuilder()
+                .setRequestId(requestId).setRequiredState(state).setErrorCode(error)
+                .addAllHostCapabilities(hostCapabilities).build()
+            transport.deliver(incomingEnvelope(MessageType.TERMINAL_ATTACH_RESULT, result.toByteArray(), attachmentSequence.incrementAndGet(), nowMillis), generation = generation)
+        }
 
         suspend fun startAndAwaitReady() {
             client.start()
@@ -4706,9 +6033,30 @@ class ProductionRealtimeSessionClientTest {
             }
         }
 
-        suspend fun awaitHostHistoryRequest(): HostHistoryRequestPayload {
+        suspend fun startWithProfile(profile: ProductionTerminalProfile,
+            relayCapabilities: Set<String> = emptySet(), hostCapabilities: List<String> = emptyList()) {
+            transport.negotiatedCapabilities.value = ProductionRealtimeNegotiatedCapabilities(1,
+                setOf(ProductionTerminalStateContract.ATTACH, ProductionTerminalStateContract.GEOMETRY,
+                    ProductionTerminalStateContract.THEME, ProductionTerminalStateContract.HOST_RESIZE) + relayCapabilities)
+            client.start()
+            deliverTerminalAttachment(awaitTerminalSubscribe().requestId, state = profile.state,
+                hostCapabilities = hostCapabilities)
+            assertEquals(profile, client.awaitTerminalProfile())
+        }
+
+        fun deliverBrokerOutput(reference: ByteArray, sequence: Long, generation: Int = 1) {
+            val payload = BrokerOutputPayload.newBuilder().setReferenceV1(ByteString.copyFrom(reference)).build()
+            transport.deliver(incomingEnvelope(MessageType.BROKER_OUTPUT, payload.toByteArray(), sequence), generation)
+        }
+
+        fun deliverOutput(bytes: ByteArray, sequence: Long, nowMillis: Long = System.currentTimeMillis()) {
+            val payload = OutputChunkPayload.newBuilder().setOutput(ByteString.copyFrom(bytes)).build()
+            transport.deliver(incomingEnvelope(MessageType.OUTPUT_CHUNK, payload.toByteArray(), sequence, nowMillis), 1)
+        }
+
+        suspend fun awaitHostHistoryRequest(count: Int = 1): HostHistoryRequestPayload {
             withTimeout(2_000) {
-                while (transport.sent.none { it.messageType == MessageType.HOST_HISTORY_REQUEST }) {
+                while (transport.sent.count { it.messageType == MessageType.HOST_HISTORY_REQUEST } < count) {
                     kotlinx.coroutines.yield()
                 }
             }
@@ -4808,7 +6156,8 @@ class ProductionRealtimeSessionClientTest {
         private fun responseEnvelope(response: HostHistoryResponsePayload, sequence: Long): Envelope =
             incomingEnvelope(MessageType.HOST_HISTORY_RESPONSE, response.toByteArray(), sequence)
 
-        private fun incomingEnvelope(messageType: MessageType, payload: ByteArray, sequence: Long): Envelope {
+        private fun incomingEnvelope(messageType: MessageType, payload: ByteArray, sequence: Long,
+            nowMillis: Long = System.currentTimeMillis()): Envelope {
             val pairwise = SessionCrypto.derivePairwiseKey(
                 pcIdentity.exchange.privateKey,
                 androidIdentity.exchange.publicKey,
@@ -4836,6 +6185,7 @@ class ProductionRealtimeSessionClientTest {
                     sessionKey = sessionKey,
                     plaintext = payload,
                     recipientId = androidId,
+                    nowMillis = nowMillis,
                 )
             } finally {
                 payload.fill(0)
@@ -5220,10 +6570,12 @@ class ProductionRealtimeSessionClientTest {
         val disconnectReasons = CopyOnWriteArrayList<String>()
         val relayExactBytes = CopyOnWriteArrayList<ByteArray>()
         val relayExactSendCount = AtomicInteger(0)
+        @Volatile var sendHandler: ((Envelope) -> Boolean)? = null
 
         override val receivedEnvelopes: Flow<ProductionReceivedEnvelope> = incoming.receiveAsFlow()
         override val receivePressure = mutablePressure
         override val state = mutableState
+        override val negotiatedCapabilities = MutableStateFlow(ProductionRealtimeNegotiatedCapabilities(1, emptySet()))
 
         val releasedReservations: Int
             get() = releaseCount.get()
@@ -5244,6 +6596,7 @@ class ProductionRealtimeSessionClientTest {
         }
 
         override fun send(envelope: Envelope): Boolean {
+            if (sendHandler?.invoke(envelope) == false) return false
             sent += envelope
             return true
         }
@@ -5296,6 +6649,10 @@ class ProductionRealtimeSessionClientTest {
         fun emitConnected() {
             connectedGeneration.set(generation.incrementAndGet())
             check(mutableState.tryEmit(RealtimeState.Connected))
+        }
+
+        fun replaceConnectedGenerationWithoutEvent(): Int = generation.incrementAndGet().also {
+            connectedGeneration.set(it)
         }
 
         fun emitFailed(reason: String) {
@@ -5374,6 +6731,7 @@ class ProductionRealtimeSessionClientTest {
         private val onDispose: () -> Unit = {},
         private val onFeed: (Long, Thread) -> Unit = { _, _ -> },
         failOnFeedSequence: Long? = null,
+        private val onReadOnlyChange: (Boolean) -> Unit = {},
     ) : TerminalEngine {
         private val inputs = MutableSharedFlow<ByteArray>(extraBufferCapacity = 8)
         private val sizes = MutableSharedFlow<TerminalSize>(extraBufferCapacity = 8)
@@ -5389,6 +6747,8 @@ class ProductionRealtimeSessionClientTest {
 
         val renderedOutputCount: Int
             get() = outputs.size
+        val renderedOutputs: List<ByteArray>
+            get() = outputs.map { it.copyOf() }
 
         override suspend fun feed(seq: Long, bytes: ByteBuffer) {
             if (pendingFeedFailureSequence == seq) {
@@ -5400,10 +6760,25 @@ class ProductionRealtimeSessionClientTest {
             outputs += value
         }
 
+        override suspend fun applyBrokerCapturedOutput(seq: Long, output: ByteArray, canonicalCaptures: ByteArray) {
+            outputs += output.copyOf()
+        }
+
         override fun resize(columns: Int, rows: Int) = Unit
+        val geometries = CopyOnWriteArrayList<Pair<Long, dev.termlink.terminal.api.TerminalHostGeometryV1>>()
+        val themes = CopyOnWriteArrayList<Pair<Long, dev.termlink.terminal.api.TerminalHostThemeV1>>()
+        val resizeNotices = CopyOnWriteArrayList<dev.termlink.terminal.api.TerminalHostResizeResultV1>()
+        override fun notifyHostResizeResult(result: dev.termlink.terminal.api.TerminalHostResizeResultV1) { resizeNotices += result }
+        override suspend fun applyHostTheme(seq: Long, theme: dev.termlink.terminal.api.TerminalHostThemeV1) {
+            themes += seq to theme
+        }
+        override suspend fun applyHostGeometry(seq: Long, geometry: dev.termlink.terminal.api.TerminalHostGeometryV1) {
+            geometries += seq to geometry
+        }
         override fun applyTheme(theme: TerminalThemeV1) = Unit
         override fun setReadOnly(readOnly: Boolean) {
             this.readOnly = readOnly
+            onReadOnlyChange(readOnly)
         }
         override fun clear() = outputs.clear()
         override fun dispose() = onDispose()

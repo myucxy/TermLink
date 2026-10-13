@@ -46,6 +46,29 @@ class TranscriptViewportStateTest {
     }
 
     @Test
+    fun terminalCoreEmptyExternalPrefixSentinelDoesNotCreateTranscriptContinuation() {
+        val empty = TranscriptViewportState(
+            sessionId = UUID.randomUUID(),
+            snapshotAnchorSequence = 80u,
+            initialBeforeLineId = 1u,
+        )
+        assertEquals(null, empty.nextBeforeLineId)
+        assertFalse(empty.hasMoreBefore)
+
+        val rebased = requireNotNull(
+            rebaseTranscriptViewportToNewerAnchor(
+                viewport = empty.copy(initialBeforeLineId = 61u, nextBeforeLineId = 61u, hasMoreBefore = true),
+                newSnapshotSequence = 90u,
+                newInitialBeforeLineId = 1u,
+                durableLiveAcknowledgement = 90u,
+            )
+        )
+        assertEquals(1uL, rebased.initialBeforeLineId)
+        assertEquals(null, rebased.nextBeforeLineId)
+        assertFalse(rebased.hasMoreBefore)
+    }
+
+    @Test
     fun firstPageUsesSnapshotCursorAndFollowingPageUsesAuthenticatedCursorChain() {
         val firstObject = UUID.randomUUID()
         val secondObject = UUID.randomUUID()

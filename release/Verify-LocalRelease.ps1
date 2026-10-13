@@ -8,7 +8,8 @@ param(
     [string]$AndroidSdkPath,
     [string]$ExpectedAndroidSignerSha256,
     [string]$ExpectedWindowsSignerSha1,
-    [switch]$RequireWindowsTimestamp
+    [switch]$RequireWindowsTimestamp,
+    [switch]$RequireSourceIdentity
 )
 
 $ErrorActionPreference = 'Stop'
@@ -527,6 +528,48 @@ Assert-Release ([string]$manifest.release_mode -ceq $expectedMode) `
     "Artifact manifest release_mode is '$($manifest.release_mode)', expected '$expectedMode'."
 $artifactRecords = @($manifest.artifacts)
 Assert-Release ($artifactRecords.Count -gt 0) 'Artifact manifest must contain at least one artifact.'
+$sourceProperty = $manifest.PSObject.Properties['source_revision']
+$coreProperty = $manifest.PSObject.Properties['core_revision']
+$hasSourceRevision = $null -ne $sourceProperty
+$hasCoreRevision = $null -ne $coreProperty
+if ($RequireSourceIdentity) {
+    Assert-Release $hasSourceRevision 'Artifact manifest is missing source_revision.'
+}
+if ($hasSourceRevision) {
+    Assert-Release ($sourceProperty.Value -is [string] -and
+        $sourceProperty.Value -cmatch '^[0-9a-f]{40}(-dirty)?$') `
+        'Artifact manifest source_revision must be a lowercase Git commit, optionally marked dirty.'
+    Assert-Release ($expectedMode -cne 'production' -or $sourceProperty.Value -cmatch '^[0-9a-f]{40}$') `
+        'Production artifact manifest requires a clean source_revision.'
+}
+if ($hasCoreRevision) {
+    Assert-Release ($coreProperty.Value -is [string] -and $coreProperty.Value -cmatch '^[0-9a-f]{40}$') `
+        'Artifact manifest core_revision must be a lowercase Git commit.'
+    Assert-Release $hasSourceRevision 'Artifact manifest core_revision requires source_revision.'
+}
+$clientRecords = @($artifactRecords | Where-Object { $_.type -in @('setup', 'msix', 'apk', 'aab') })
+if (($RequireSourceIdentity -or $hasSourceRevision) -and $clientRecords.Count -gt 0) {
+    Assert-Release $hasCoreRevision 'Client artifact manifest is missing core_revision.'
+}
+if ($hasCoreRevision -and $clientRecords.Count -gt 0) {
+    $lockRevision = [string]$sourceProperty.Value
+    $lockJson = if ($lockRevision.EndsWith('-dirty', [StringComparison]::Ordinal)) {
+        Get-Content -LiteralPath (Join-Path $repositoryRoot 'terminal-core.lock.json') -Raw
+    } else {
+        $lockOutput = @(& git -C $repositoryRoot show "${lockRevision}:terminal-core.lock.json" 2>$null)
+        Assert-Release ($LASTEXITCODE -eq 0) `
+            'Unable to read terminal-core.lock.json from the manifest source_revision.'
+        $lockOutput -join "`n"
+    }
+    $sourceLock = $lockJson | ConvertFrom-Json
+    Assert-Release ([int]$sourceLock.schema_version -eq 2 -and $sourceLock.source_dirty -is [bool]) `
+        'Source native lock is invalid.'
+    if ($expectedMode -ceq 'production') {
+        Assert-Release (-not $sourceLock.source_dirty) 'Production source native lock is dirty.'
+    }
+    Assert-Release ([string]$sourceLock.revision -ceq [string]$coreProperty.Value) `
+        'Artifact manifest core_revision does not match the source native lock.'
+}
 if ($expectedMode -ceq 'production') {
     $unsupportedProductionRecords = @($artifactRecords | Where-Object { $_.type -eq 'msix' })
     Assert-Release ($unsupportedProductionRecords.Count -eq 0) `
@@ -777,6 +820,10 @@ if ($ociRecords.Count -eq 1) {
                     "OCI version label mismatch for linux/$architecture."
                 Assert-Release ($labels.'org.opencontainers.image.revision' -match '^[0-9a-f]{40}(?:-dirty)?$') `
                     "OCI revision label is invalid for linux/$architecture."
+                if ($hasSourceRevision) {
+                    Assert-Release ($labels.'org.opencontainers.image.revision' -ceq $sourceProperty.Value) `
+                        "OCI revision label does not match source_revision for linux/$architecture."
+                }
 
                 $platformRoot = Join-Path $temporaryDirectory $architecture
                 $binaryPath = Export-TermLinkServerBinary -Layers @($imageManifest.layers) `
@@ -816,6 +863,8 @@ if ($ociRecords.Count -eq 1) {
     version = [string]$manifest.version
     build_number = [int]$manifest.build_number
     release_mode = [string]$manifest.release_mode
+    source_revision = if ($hasSourceRevision) { [string]$sourceProperty.Value } else { $null }
+    core_revision = if ($hasCoreRevision) { [string]$coreProperty.Value } else { $null }
     artifacts = $hashResults
     android = $androidResult
     android_aab = $androidAabResult

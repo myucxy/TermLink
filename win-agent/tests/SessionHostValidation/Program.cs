@@ -10,9 +10,54 @@ using TermLink.LocalIpc;
 using TermLink.SessionHost;
 using TermLink.TerminalCore;
 
+if (args.Length == 1 && args[0] == "--graphics-startup-probe") { await GraphicsStartupValidation.Run(); return; }
+if (args.Length == 1 && args[0] == "--input-bridge-fault-probe") { await GraphicsStartupValidation.RunInputBridgeFailure(); return; }
+if (args.Length == 1 && args[0] == "--graphics-startup-child") { GraphicsStartupValidation.Child(); return; }
+if (args.Length > 1 && args[0] == "--graphics-startup-host") { GraphicsStartupValidation.Host(args[1..]); return; }
+if (args.Length == 3 && args[0] == "--native-terminal") { await GraphicsStartupValidation.Display(args[1]); return; }
+if (args.Length == 1 && args[0] == "--graphics-profile-probe") { GraphicsProfileValidation.Run(false); return; }
+if (args.Length == 1 && args[0] == "--graphics-profile-native-probe") { GraphicsProfileValidation.Run(true); return; }
+if (args.Length == 4 && args[0] == "--kitty-shm-child")
+{ KittySharedMemoryBrokerValidation.Child(args[1], int.Parse(args[2]), args[3]); return; }
+if (args.Length == 2 && args[0] == "--kitty-relay-child") { KittyRelayChild.Child(args[1]); return; }
 if (args.Length == 1 && args[0] == "--mouse-probe-child") { MouseBridgeValidation.Child(); return; }
+if (args.Length == 2 && args[0] == "--shell-integration-probe") { ShellIntegrationValidation.Run(args[1]); return; }
+if (args.Length == 1 && args[0] == "--protocol-probe-child") { ProtocolTransportValidation.Child(); return; }
+if (args.Length == 2 && args[0] == "--protocol-reply-relay-child")
+{ ProtocolReplyRelayChild.Child(args[1]); return; }
+if (args.Length == 1 && args[0] == "--traditional-input-child") { TraditionalInputTransportValidation.Child(); return; }
+if (args.Length == 1 && args[0] == "--traditional-input-probe") { TraditionalInputTransportValidation.Run(); return; }
+if (args.Length == 1 && args[0] == "--protocol-transport-probe") { ProtocolTransportValidation.Run(); return; }
+if (args.Length == 1 && args[0] == "--native-display-probe") { NativeDisplayValidation.Run(); return; }
+if (args.Length == 1 && args[0] == "--native-window-child") { NativeWindowValidation.Child(); return; }
+if (args.Length == 2 && args[0] == "--native-window-child") { NativeWindowValidation.Child(args[1]); return; }
+if (args.Length == 2 && args[0] == "--native-window-probe") { NativeWindowValidation.Run(args[1]); return; }
+if (args.Length == 2 && args[0] == "--protocol-reply-window-probe") { NativeWindowValidation.RunProtocolReply(args[1]); return; }
+if (args.Length == 1 && args[0] == "--native-window-effects-selftest") { NativeWindowEffectsValidation.SelfTest(); return; }
+if (args.Length == 2 && args[0] == "--native-window-effects-child") { NativeWindowEffectsValidation.Child(args[1]); return; }
+if (args.Length == 7 && args[0] == "--native-window-effects-probe")
+{
+    try { NativeWindowEffectsValidation.Run(args[1], args[2], args[3], args[4], args[5], args[6]); }
+    catch (Exception error) { Console.Error.WriteLine(error); Environment.ExitCode = 1; }
+    return;
+}
+if (args.Length == 6 && args[0] == "--select-owned-display-theme")
+{ NativeWindowValidation.SelectOwnedDisplayTheme(args[1], args[2], args[3], args[4], args[5]); return; }
+if (args.Length == 3 && args[0] == "--claude-startup-probe")
+{
+    MouseBridgeValidation.RunClaudeStartup(args[1], args[2]);
+    return;
+}
 MouseInputValidation.Run();
+TerminalHandshakeValidation.Run();
+await BrokerCaptureTransportValidation.Run();
+TerminalFailureStoreValidation.Run();
 MouseBridgeValidation.Run();
+GeometryReplyValidation.Run();
+NativeDisplayValidation.Run();
+KittyFileBrokerValidation.Run();
+BrokerCaptureCoordinatorValidation.Run();
+await KittySharedMemoryBrokerValidation.Run();
 
 var encodedCommand = Convert.ToBase64String(Encoding.UTF8.GetBytes("cmd.exe"));
 var firstOptions = SessionHostOptions.Parse(new[] { "--command-base64", encodedCommand, "--managed-shell", "custom" });
@@ -20,6 +65,39 @@ var secondOptions = SessionHostOptions.Parse(new[] { "--command-base64", encoded
 Require(firstOptions.SessionId != Guid.Empty && secondOptions.SessionId != Guid.Empty &&
     firstOptions.SessionId != secondOptions.SessionId,
     "new managed SessionHost instances reused a Session ID");
+Require(!firstOptions.EnableBrokerCapture, "Broker capture changed the default SessionHost behavior");
+var brokerArgs = new[]
+{
+    "--command-base64", encodedCommand,
+    "--managed-shell", "custom",
+    "--native-display", Environment.ProcessPath!,
+    "--terminal-state", TerminalSemanticProfile.Graphics.StateContract,
+    "--broker-captures"
+};
+Require(SessionHostOptions.Parse(brokerArgs).EnableBrokerCapture,
+    "Graphics managed SessionHost did not enable broker captures");
+var agentBrokerArgs = new[]
+{
+    "--command-base64", encodedCommand,
+    "--agent-pipe", "broker-test", "--session-id", Guid.NewGuid().ToString("D"),
+    "--handshake-token", Convert.ToBase64String(new byte[LocalPayloadCodec.HandshakeTokenBytes]),
+    "--native-display", Environment.ProcessPath!,
+    "--terminal-state", TerminalSemanticProfile.Graphics.StateContract,
+    "--broker-captures"
+};
+Require(SessionHostOptions.Parse(agentBrokerArgs).EnableBrokerCapture,
+    "Graphics Agent SessionHost did not enable broker captures");
+RequireThrows(() => SessionHostOptions.Parse(brokerArgs.Concat(new[] { "--broker-captures" }).ToArray()),
+    "duplicate broker-captures flag was accepted");
+RequireThrows(() => SessionHostOptions.Parse(brokerArgs.Where(arg => arg != "--terminal-state" &&
+    arg != TerminalSemanticProfile.Graphics.StateContract).ToArray()),
+    "broker captures without graphics profile were accepted");
+RequireThrows(() => SessionHostOptions.Parse(brokerArgs.Where(arg => arg != "--native-display" &&
+    arg != Environment.ProcessPath).ToArray()),
+    "broker captures without native display were accepted");
+RequireThrows(() => SessionHostOptions.Parse(brokerArgs.Where(arg => arg != "--managed-shell" &&
+    arg != "custom").ToArray()),
+    "broker captures without a managed shell or Agent were accepted");
 
 var workingDirectory = Path.GetFullPath(Path.GetTempPath());
 var managedSessionId = Guid.NewGuid();
@@ -46,6 +124,10 @@ Require(!ConPtySessionHost.ShouldAbortUnregisteredSession(true, false, 749, 750)
     ConPtySessionHost.ShouldAbortUnregisteredSession(true, false, 750, 750) &&
     !ConPtySessionHost.ShouldAbortUnregisteredSession(true, true, 750, 750),
     "SessionHost registration timeout did not exclusively stop an unregistered process tree");
+Require(ConPtySessionHost.ShouldAbortInputBridge(new InvalidOperationException("input"), false) &&
+    ConPtySessionHost.ShouldAbortInputBridge(null, true) &&
+    !ConPtySessionHost.ShouldAbortInputBridge(null, false),
+    "SessionHost failed to observe a faulted input bridge before session cleanup");
 const uint processedInput = 0x0001;
 const uint lineInput = 0x0002;
 const uint echoInput = 0x0004;
@@ -80,6 +162,25 @@ var capableColorBlock = ConPtySessionHost.BuildSanitizedChildEnvironmentBlock(ca
 Require(capableColorBlock.Contains("TERM=xterm-256color", StringComparison.Ordinal) &&
     capableColorBlock.Contains("COLORTERM=truecolor", StringComparison.Ordinal),
     "SessionHost removed valid terminal color capability declarations");
+var brokerEnvironment = new Hashtable(StringComparer.Ordinal)
+{
+    ["Temp"] = @"C:\old-one", ["TEMP"] = @"C:\old-two", ["TMP"] = @"C:\old-three"
+};
+var brokerEntries = ConPtySessionHost.BuildSanitizedChildEnvironmentBlock(brokerEnvironment,
+    @"C:\private-broker-temp").Split('\0', StringSplitOptions.RemoveEmptyEntries);
+Require(brokerEntries.SequenceEqual(new[] { @"TEMP=C:\private-broker-temp", @"TMP=C:\private-broker-temp" }),
+    "SessionHost did not replace every inherited TEMP/TMP spelling for broker children");
+var sharedEnvironment = new Hashtable(StringComparer.OrdinalIgnoreCase)
+{
+    [KittySharedMemoryBroker.EnvironmentVariable] = "untrusted-pipe"
+};
+var sharedEntries = ConPtySessionHost.BuildSanitizedChildEnvironmentBlock(sharedEnvironment,
+    @"C:\private-broker-temp", "trusted-pipe").Split('\0', StringSplitOptions.RemoveEmptyEntries);
+Require(sharedEntries.Contains(KittySharedMemoryBroker.EnvironmentVariable + "=trusted-pipe") &&
+    !sharedEntries.Any(entry => entry.Contains("untrusted-pipe", StringComparison.Ordinal)) &&
+    !ConPtySessionHost.BuildSanitizedChildEnvironmentBlock(sharedEnvironment).Contains(
+        KittySharedMemoryBroker.EnvironmentVariable, StringComparison.Ordinal),
+    "SessionHost accepted an inherited shared-memory broker pipe or failed to inject its own");
 RequireThrows(() => SessionHostOptions.Parse(new[]
 {
     "--command-base64", encodedCommand,
@@ -122,6 +223,14 @@ Array.Fill(oversized, (byte)'x', 4, 4097);
 oversized[oversized.Length - 1] = 0x07;
 tracker.Process(oversized, titles.Add);
 Require(titles.Count == 2, "oversized OSC title was accepted");
+foreach (var selector in new[] { "21", "0021", "" })
+{
+    var aliasTracker = new TerminalTitleTracker();
+    var aliasTitles = new List<string>();
+    foreach (var value in Encoding.UTF8.GetBytes("\u001b]" + selector + ";中文标题\u001b\\"))
+        aliasTracker.Process(new[] { value }, aliasTitles.Add);
+    Require(aliasTitles.SequenceEqual(new[] { "中文标题" }), "split window-title alias was lost");
+}
 
 // Exercise the actual SessionHost publication boundary. Both the polled
 // console title and OSC tracker call this method, so normalization and

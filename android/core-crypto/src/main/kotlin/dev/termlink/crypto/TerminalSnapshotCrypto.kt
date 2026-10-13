@@ -1,6 +1,7 @@
 package dev.termlink.crypto
 
 import com.google.protobuf.ByteString
+import com.google.protobuf.CodedOutputStream
 import com.google.protobuf.InvalidProtocolBufferException
 import dev.termlink.protocol.realtime.v1.SnapshotCompressionV1
 import dev.termlink.protocol.realtime.v1.SnapshotParserStateV1
@@ -52,6 +53,14 @@ object TerminalSnapshotCrypto {
     const val MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES: Int =
         MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES - 4 * 1024
     const val TERMINAL_CORE_SNAPSHOT_FORMAT_NAME: String = "TERMLINK_TERMINAL_CORE_SNAPSHOT"
+    const val TERMINAL_CORE_GRAPHICS_SNAPSHOT_CONTAINER_VERSION: Int = 3
+    const val TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_VERSION: Int = 1
+    const val MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_PLAINTEXT_BYTES: Int = 128 * 1024 * 1024
+    const val MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_OBJECT_BYTES: Int =
+        MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_PLAINTEXT_BYTES + 4 * 1024
+    const val TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_NAME: String = "TERMLINK_TERMINAL_CORE_GRAPHICS_SNAPSHOT"
+    const val TERMINAL_STATE_CONTRACT_V1: String = "terminal_state_2_22_v1"
+    const val TERMINAL_STATE_CONTRACT_V2: String = "terminal_state_2_22_v2"
 
     private const val MAX_COLUMNS = 512
     private const val MAX_ROWS = 256
@@ -75,11 +84,21 @@ object TerminalSnapshotCrypto {
         "TERMLINK-TERMINAL-CORE-SNAPSHOT-KEY-V2\u0000".encodeToByteArray()
     private val terminalCoreSnapshotAadPrefix =
         "TERMLINK-TERMINAL-CORE-SNAPSHOT-OBJECT-V2\u0000".encodeToByteArray()
+    private val terminalCoreGraphicsSnapshotKeyPrefix =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-KEY-V1\u0000".encodeToByteArray()
+    private val terminalCoreGraphicsSnapshotAadPrefix =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-OBJECT-V1\u0000".encodeToByteArray()
+    private val terminalCoreGraphicsSnapshotKeyPrefixV2 =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-KEY-V2\u0000".encodeToByteArray()
+    private val terminalCoreGraphicsSnapshotAadPrefixV2 =
+        "TERMLINK-TERMINAL-CORE-GRAPHICS-SNAPSHOT-OBJECT-V2\u0000".encodeToByteArray()
 
     data class OpenedTerminalCoreSnapshot(
         val checkpoint: ByteArray,
         val initialTranscriptBeforeLineId: ULong,
         val observedLocalInputEpoch: ULong,
+        val containerVersion: Int = TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION,
+        val formatName: String = TERMINAL_CORE_SNAPSHOT_FORMAT_NAME,
     )
 
     fun snapshotKeyId(recipientDeviceId: UUID, keyEpoch: Long): String =
@@ -90,6 +109,11 @@ object TerminalSnapshotCrypto {
 
     fun terminalCoreSnapshotKeyId(recipientDeviceId: UUID, keyEpoch: Long): String =
         keyId("terminal-core-snapshot-v2:", recipientDeviceId, keyEpoch)
+
+    fun terminalCoreGraphicsSnapshotKeyId(recipientDeviceId: UUID, keyEpoch: Long,
+        stateContract: String = TERMINAL_STATE_CONTRACT_V1): String =
+        keyId(if (normalizeGraphicsStateContract(stateContract) == TERMINAL_STATE_CONTRACT_V2) "terminal-core-graphics-snapshot-v2:"
+        else "terminal-core-graphics-snapshot-v1:", recipientDeviceId, keyEpoch)
 
     fun sealSnapshot(
         pairwiseKey: ByteArray,
@@ -212,6 +236,27 @@ object TerminalSnapshotCrypto {
         observedLocalInputEpoch: ULong,
         checkpoint: ByteArray,
         nonce: ByteArray = randomNonce(),
+    ): ByteArray = sealNativeSnapshot(
+        pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch, snapshotSequence,
+        columns, rows, initialTranscriptBeforeLineId, observedLocalInputEpoch, checkpoint, nonce, graphics = false,
+    )
+
+    fun sealTerminalCoreGraphicsSnapshot(
+        pairwiseKey: ByteArray, sessionId: UUID, pcDeviceId: UUID, recipientDeviceId: UUID,
+        keyEpoch: Long, snapshotSequence: ULong, columns: Int, rows: Int,
+        initialTranscriptBeforeLineId: ULong, observedLocalInputEpoch: ULong,
+        checkpoint: ByteArray, nonce: ByteArray = randomNonce(), stateContract: String? = null,
+    ): ByteArray = sealNativeSnapshot(
+        pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch, snapshotSequence,
+        columns, rows, initialTranscriptBeforeLineId, observedLocalInputEpoch, checkpoint, nonce, graphics = true,
+        stateContract = stateContract,
+    )
+
+    private fun sealNativeSnapshot(
+        pairwiseKey: ByteArray, sessionId: UUID, pcDeviceId: UUID, recipientDeviceId: UUID,
+        keyEpoch: Long, snapshotSequence: ULong, columns: Int, rows: Int,
+        initialTranscriptBeforeLineId: ULong, observedLocalInputEpoch: ULong,
+        checkpoint: ByteArray, nonce: ByteArray, graphics: Boolean, stateContract: String? = null,
     ): ByteArray {
         validatePairwiseAndIdentity(pairwiseKey, sessionId, pcDeviceId, recipientDeviceId, keyEpoch)
         validateTerminalCoreSnapshotMetadata(
@@ -220,14 +265,16 @@ object TerminalSnapshotCrypto {
             rows,
             initialTranscriptBeforeLineId,
             observedLocalInputEpoch,
-            checkpoint,
+            checkpoint, graphics, stateContract,
         )
+        require(nonce.size == 12) { "Terminal-core snapshot nonce must be 12 bytes" }
         val nonceBytes = nonce.copyOf()
         try {
-            require(nonceBytes.size == 12) { "Terminal-core snapshot nonce must be 12 bytes" }
-            val keyId = terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch)
+            val normalizedStateContract = if (graphics) normalizeGraphicsStateContract(stateContract) else null
+            val keyId = if (graphics) terminalCoreGraphicsSnapshotKeyId(recipientDeviceId, keyEpoch, normalizedStateContract!!)
+                else terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch)
             val container = TerminalCoreSnapshotCiphertextV2.newBuilder()
-                .setContainerVersion(TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION)
+                .setContainerVersion(if (graphics) TERMINAL_CORE_GRAPHICS_SNAPSHOT_CONTAINER_VERSION else TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION)
                 .setSessionId(ByteString.copyFrom(SessionCrypto.uuidBytes(sessionId)))
                 .setPcDeviceId(ByteString.copyFrom(SessionCrypto.uuidBytes(pcDeviceId)))
                 .setRecipientDeviceId(ByteString.copyFrom(SessionCrypto.uuidBytes(recipientDeviceId)))
@@ -236,22 +283,28 @@ object TerminalSnapshotCrypto {
                 .setSnapshotSeq(snapshotSequence.toLong())
                 .setColumns(columns)
                 .setRows(rows)
-                .setFormatName(TERMINAL_CORE_SNAPSHOT_FORMAT_NAME)
-                .setFormatVersion(TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION)
+                .setFormatName(if (graphics) TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_NAME else TERMINAL_CORE_SNAPSHOT_FORMAT_NAME)
+                .setFormatVersion(if (graphics) TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_VERSION else TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION)
                 .setCompression(SnapshotCompressionV1.SNAPSHOT_COMPRESSION_V1_NONE)
                 .setUncompressedBytes(checkpoint.size.toLong())
                 .setNonce(ByteString.copyFrom(nonceBytes))
                 .setInitialTranscriptBeforeLineId(initialTranscriptBeforeLineId.toLong())
                 .setObservedLocalInputEpoch(observedLocalInputEpoch.toLong())
                 .build()
-            val key = deriveTerminalCoreSnapshotKey(
+            val maxObjectBytes = if (graphics) MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_OBJECT_BYTES else MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES
+            val ciphertextLength = checkpoint.size + 16
+            require(container.serializedSize + CodedOutputStream.computeTagSize(15) +
+                CodedOutputStream.computeUInt32SizeNoTag(ciphertextLength) + ciphertextLength <= maxObjectBytes) {
+                "Sealed terminal-core snapshot exceeds the production bound"
+            }
+            val key = deriveNativeSnapshotKey(
                 pairwiseKey,
                 sessionId,
                 recipientDeviceId,
                 keyEpoch,
-                keyId,
+                keyId, graphics, normalizedStateContract,
             )
-            val aad = terminalCoreSnapshotAssociatedData(container)
+            val aad = nativeSnapshotAssociatedData(container, graphics, normalizedStateContract)
             return try {
                 val ciphertext = SessionCrypto.encrypt(key, nonceBytes, aad, checkpoint)
                 try {
@@ -260,7 +313,7 @@ object TerminalSnapshotCrypto {
                         .build()
                         .toByteArray()
                         .also {
-                            require(it.size <= MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES) {
+                            require(it.size <= maxObjectBytes) {
                                 "Sealed terminal-core snapshot exceeds the production bound"
                             }
                         }
@@ -287,6 +340,27 @@ object TerminalSnapshotCrypto {
         expectedSnapshotSequence: ULong,
         expectedColumns: Int,
         expectedRows: Int,
+    ): OpenedTerminalCoreSnapshot = openNativeSnapshot(
+        pairwiseKey, sealedObject, expectedSessionId, expectedPcDeviceId, expectedRecipientDeviceId,
+        expectedKeyEpoch, expectedKeyId, expectedSnapshotSequence, expectedColumns, expectedRows, graphics = false,
+    )
+
+    fun openTerminalCoreGraphicsSnapshot(
+        pairwiseKey: ByteArray, sealedObject: ByteArray, expectedSessionId: UUID, expectedPcDeviceId: UUID,
+        expectedRecipientDeviceId: UUID, expectedKeyEpoch: Long, expectedKeyId: String,
+        expectedSnapshotSequence: ULong, expectedColumns: Int, expectedRows: Int,
+        expectedStateContract: String? = null,
+    ): OpenedTerminalCoreSnapshot = openNativeSnapshot(
+        pairwiseKey, sealedObject, expectedSessionId, expectedPcDeviceId, expectedRecipientDeviceId,
+        expectedKeyEpoch, expectedKeyId, expectedSnapshotSequence, expectedColumns, expectedRows, graphics = true,
+        expectedStateContract = expectedStateContract,
+    )
+
+    private fun openNativeSnapshot(
+        pairwiseKey: ByteArray, sealedObject: ByteArray, expectedSessionId: UUID, expectedPcDeviceId: UUID,
+        expectedRecipientDeviceId: UUID, expectedKeyEpoch: Long, expectedKeyId: String,
+        expectedSnapshotSequence: ULong, expectedColumns: Int, expectedRows: Int, graphics: Boolean,
+        expectedStateContract: String? = null,
     ): OpenedTerminalCoreSnapshot {
         validatePairwiseAndIdentity(
             pairwiseKey,
@@ -297,7 +371,7 @@ object TerminalSnapshotCrypto {
         )
         require(
             sealedObject.isNotEmpty() &&
-                sealedObject.size <= MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES,
+                sealedObject.size <= if (graphics) MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_OBJECT_BYTES else MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES,
         ) { "Sealed terminal-core snapshot size is invalid" }
         val container = try {
             TerminalCoreSnapshotCiphertextV2.parseFrom(sealedObject)
@@ -313,16 +387,17 @@ object TerminalSnapshotCrypto {
             expectedKeyId,
             expectedSnapshotSequence,
             expectedColumns,
-            expectedRows,
+            expectedRows, graphics, expectedStateContract,
         )
-        val key = deriveTerminalCoreSnapshotKey(
+        val normalizedStateContract = if (graphics) normalizeGraphicsStateContract(expectedStateContract) else null
+        val key = deriveNativeSnapshotKey(
             pairwiseKey,
             expectedSessionId,
             expectedRecipientDeviceId,
             expectedKeyEpoch,
-            expectedKeyId,
+            expectedKeyId, graphics, normalizedStateContract,
         )
-        val aad = terminalCoreSnapshotAssociatedData(container)
+        val aad = nativeSnapshotAssociatedData(container, graphics, normalizedStateContract)
         val plaintext = try {
             SessionCrypto.decrypt(
                 key,
@@ -344,15 +419,18 @@ object TerminalSnapshotCrypto {
                 container.rows,
                 container.initialTranscriptBeforeLineId.toULong(),
                 container.observedLocalInputEpoch.toULong(),
-                plaintext,
+                plaintext, graphics, expectedStateContract,
             )
             return OpenedTerminalCoreSnapshot(
-                checkpoint = plaintext.copyOf(),
+                checkpoint = plaintext,
                 initialTranscriptBeforeLineId = container.initialTranscriptBeforeLineId.toULong(),
                 observedLocalInputEpoch = container.observedLocalInputEpoch.toULong(),
+                containerVersion = container.containerVersion,
+                formatName = container.formatName,
             )
-        } finally {
+        } catch (error: Throwable) {
             plaintext.fill(0)
+            throw error
         }
     }
 
@@ -504,14 +582,25 @@ object TerminalSnapshotCrypto {
         recipientDeviceId: UUID,
         keyEpoch: Long,
         keyId: String,
+    ): ByteArray = deriveNativeSnapshotKey(pairwiseKey, sessionId, recipientDeviceId, keyEpoch, keyId, graphics = false, stateContract = null)
+
+    fun deriveTerminalCoreGraphicsSnapshotKey(
+        pairwiseKey: ByteArray, sessionId: UUID, recipientDeviceId: UUID, keyEpoch: Long, keyId: String,
+    ): ByteArray = deriveNativeSnapshotKey(pairwiseKey, sessionId, recipientDeviceId, keyEpoch, keyId, graphics = true, stateContract = null)
+
+    private fun deriveNativeSnapshotKey(
+        pairwiseKey: ByteArray, sessionId: UUID, recipientDeviceId: UUID, keyEpoch: Long, keyId: String, graphics: Boolean,
+        stateContract: String? = null,
     ): ByteArray = deriveObjectKey(
         pairwiseKey,
         sessionId,
         recipientDeviceId,
         keyEpoch,
         keyId,
-        terminalCoreSnapshotKeyPrefix,
-        terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch),
+        if (graphics && stateContract == TERMINAL_STATE_CONTRACT_V2) terminalCoreGraphicsSnapshotKeyPrefixV2
+        else if (graphics) terminalCoreGraphicsSnapshotKeyPrefix else terminalCoreSnapshotKeyPrefix,
+        if (graphics) terminalCoreGraphicsSnapshotKeyId(recipientDeviceId, keyEpoch, normalizeGraphicsStateContract(stateContract))
+        else terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch),
     )
 
     fun snapshotAssociatedData(value: TerminalSnapshotCiphertextV1): ByteArray {
@@ -590,10 +679,21 @@ object TerminalSnapshotCrypto {
         }
     }
 
-    fun terminalCoreSnapshotAssociatedData(value: TerminalCoreSnapshotCiphertextV2): ByteArray {
-        validateTerminalCoreSnapshotCryptographicMetadata(value)
+    fun terminalCoreSnapshotAssociatedData(value: TerminalCoreSnapshotCiphertextV2): ByteArray =
+        nativeSnapshotAssociatedData(value, graphics = false)
+
+    fun terminalCoreGraphicsSnapshotAssociatedData(value: TerminalCoreSnapshotCiphertextV2): ByteArray =
+        nativeSnapshotAssociatedData(value, graphics = true)
+    fun terminalCoreGraphicsSnapshotAssociatedData(value: TerminalCoreSnapshotCiphertextV2,
+        stateContract: String): ByteArray = nativeSnapshotAssociatedData(value, graphics = true,
+        stateContract = normalizeGraphicsStateContract(stateContract))
+
+    private fun nativeSnapshotAssociatedData(value: TerminalCoreSnapshotCiphertextV2, graphics: Boolean,
+        stateContract: String? = null): ByteArray {
+        validateTerminalCoreSnapshotCryptographicMetadata(value, graphics)
         return ByteArrayOutputStream().use { output ->
-            output.write(terminalCoreSnapshotAadPrefix)
+            output.write(if (graphics && stateContract == TERMINAL_STATE_CONTRACT_V2) terminalCoreGraphicsSnapshotAadPrefixV2
+            else if (graphics) terminalCoreGraphicsSnapshotAadPrefix else terminalCoreSnapshotAadPrefix)
             output.write(uintBytes(value.containerVersion))
             output.write(value.sessionId.toByteArray())
             output.write(value.pcDeviceId.toByteArray())
@@ -610,6 +710,7 @@ object TerminalSnapshotCrypto {
             output.write(ulongBytes(value.initialTranscriptBeforeLineId.toULong()))
             output.write(ulongBytes(value.observedLocalInputEpoch.toULong()))
             output.write(value.nonce.toByteArray())
+            if (graphics && stateContract == TERMINAL_STATE_CONTRACT_V2) writeString(output, stateContract, "terminal state contract")
             output.toByteArray()
         }
     }
@@ -624,33 +725,36 @@ object TerminalSnapshotCrypto {
         sequence: ULong,
         columns: Int,
         rows: Int,
+        graphics: Boolean, expectedStateContract: String? = null,
     ) {
-        validateTerminalCoreSnapshotCryptographicMetadata(value)
+        validateTerminalCoreSnapshotCryptographicMetadata(value, graphics)
         require(
             value.sessionId.toByteArray().contentEquals(SessionCrypto.uuidBytes(sessionId)) &&
                 value.pcDeviceId.toByteArray().contentEquals(SessionCrypto.uuidBytes(pcDeviceId)) &&
                 value.recipientDeviceId.toByteArray().contentEquals(SessionCrypto.uuidBytes(recipientDeviceId)) &&
                 value.keyEpoch == keyEpoch && value.keyId == keyId &&
-                value.keyId == terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch) &&
+                value.keyId == (if (graphics) terminalCoreGraphicsSnapshotKeyId(recipientDeviceId, keyEpoch, normalizeGraphicsStateContract(expectedStateContract)) else terminalCoreSnapshotKeyId(recipientDeviceId, keyEpoch)) &&
                 value.snapshotSeq.toULong() == sequence && value.columns == columns && value.rows == rows &&
-                value.ciphertext.size() in 16..MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES,
+                value.ciphertext.size() in 16..(if (graphics) MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_OBJECT_BYTES else MAX_TERMINAL_CORE_SNAPSHOT_OBJECT_BYTES) &&
+                (!graphics || value.ciphertext.size().toLong() == value.uncompressedBytes + 16),
         ) { "Terminal-core snapshot object metadata does not match the requested object" }
     }
 
     private fun validateTerminalCoreSnapshotCryptographicMetadata(
         value: TerminalCoreSnapshotCiphertextV2,
+        graphics: Boolean,
     ) {
         require(
-            value.containerVersion == TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION &&
+            value.containerVersion == (if (graphics) TERMINAL_CORE_GRAPHICS_SNAPSHOT_CONTAINER_VERSION else TERMINAL_CORE_SNAPSHOT_CONTAINER_VERSION) &&
                 value.sessionId.size() == 16 && value.pcDeviceId.size() == 16 &&
                 value.recipientDeviceId.size() == 16 && value.keyEpoch > 0 &&
                 utf8Length(value.keyId, "terminal-core snapshot key ID") in 8..128 &&
                 value.nonce.size() == 12 &&
-                value.formatVersion == TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION &&
-                value.formatName == TERMINAL_CORE_SNAPSHOT_FORMAT_NAME &&
+                value.formatVersion == (if (graphics) TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_VERSION else TERMINAL_CORE_SNAPSHOT_FORMAT_VERSION) &&
+                value.formatName == (if (graphics) TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT_NAME else TERMINAL_CORE_SNAPSHOT_FORMAT_NAME) &&
                 value.compression == SnapshotCompressionV1.SNAPSHOT_COMPRESSION_V1_NONE &&
                 value.uncompressedBytes > 0L &&
-                value.uncompressedBytes.toULong() <= MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES.toULong() &&
+                value.uncompressedBytes <= (if (graphics) MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_PLAINTEXT_BYTES else MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES).toLong() &&
                 value.snapshotSeq > 0L && value.columns in 1..MAX_COLUMNS && value.rows in 1..MAX_ROWS &&
                 value.initialTranscriptBeforeLineId > 0L && value.observedLocalInputEpoch >= 0L,
         ) { "Terminal-core snapshot cryptographic metadata is invalid or unsupported" }
@@ -663,13 +767,34 @@ object TerminalSnapshotCrypto {
         initialTranscriptBeforeLineId: ULong,
         observedLocalInputEpoch: ULong,
         checkpoint: ByteArray,
+        graphics: Boolean,
+        stateContract: String? = null,
     ) {
         require(
             snapshotSequence in 1uL..MAX_SUPPORTED_UINT64 && columns in 1..MAX_COLUMNS &&
                 rows in 1..MAX_ROWS && initialTranscriptBeforeLineId in 1uL..MAX_SUPPORTED_UINT64 &&
                 observedLocalInputEpoch <= MAX_SUPPORTED_UINT64 && checkpoint.isNotEmpty() &&
-                checkpoint.size <= MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES,
+                checkpoint.size <= (if (graphics) MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_PLAINTEXT_BYTES else MAX_TERMINAL_CORE_SNAPSHOT_PLAINTEXT_BYTES),
         ) { "Terminal-core snapshot metadata is invalid or unsupported" }
+        if (graphics && stateContract != null) {
+            val normalized = normalizeGraphicsStateContract(stateContract)
+            if (normalized == TERMINAL_STATE_CONTRACT_V2) {
+                require(checkpoint.size >= 52 &&
+                    ByteBuffer.wrap(checkpoint, 48, 4).order(ByteOrder.LITTLE_ENDIAN).int == 2) {
+                    "Graphics snapshot width profile does not match terminal state contract"
+                }
+            } else if (checkpoint.size >= 52) {
+                require(ByteBuffer.wrap(checkpoint, 48, 4).order(ByteOrder.LITTLE_ENDIAN).int == 1) {
+                    "Graphics snapshot width profile does not match terminal state contract"
+                }
+            }
+        }
+    }
+
+    private fun normalizeGraphicsStateContract(value: String?): String = when (value) {
+        null, TERMINAL_STATE_CONTRACT_V1 -> TERMINAL_STATE_CONTRACT_V1
+        TERMINAL_STATE_CONTRACT_V2 -> TERMINAL_STATE_CONTRACT_V2
+        else -> error("Terminal state contract is unsupported")
     }
 
     fun validateSnapshot(value: TerminalSnapshotV1) {

@@ -79,6 +79,21 @@ internal static class MouseInputValidation
         Check(Send(wide) && emitted.Count == 3, "legacy coordinate overflow closed input");
         Send(up);
         Check(emitted.Count == 4, "legacy overflow damaged later mouse input");
+        Feed("\u001bc\u001b[?1007h");
+        Send(up);
+        Check(emitted.Count == 4, "primary history wheel became an arrow");
+        Feed("\u001b[?1049h");
+        Send(up);
+        Check(emitted.Last() == "\u001b[A" && emitted.Count == 5, "alternate-scroll did not emit exactly one arrow");
+        Feed("\u001b[?1h");
+        Send(up);
+        Check(emitted.Last() == "\u001bOA", "alternate-scroll ignored cursor application mode");
+        Feed("\u001b[?1003;1006h");
+        Send(up);
+        Check(emitted.Last() == "\u001b[<64;5;6M", "mouse tracking did not take priority over alternate-scroll");
+        Feed("\u001b[?1003l\u001b[?1007l");
+        Send(up);
+        Check(emitted.Count == 7, "disabled alternate-scroll kept sending arrows");
         Console.WriteLine("Windows mouse record mapping and authority validation passed.");
     }
 }

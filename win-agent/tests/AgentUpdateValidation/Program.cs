@@ -18,15 +18,24 @@ namespace TermLink.AgentUpdate.Validation
 {
     internal static class Program
     {
-        public static async Task<int> Main()
+        public static async Task<int> Main(string[] args)
         {
             try
             {
+                if (args.Length == 1 && args[0] == "--enrollment-loopback")
+                {
+                    EnrollmentLoopbackValidation.Run();
+                    return 0;
+                }
                 ValidateBrowserAuthorizationLaunch();
                 ValidateBrowserCallbackUsesDynamicPort();
                 await ValidateBrowserCallbackIgnoresLocalProbeAsync();
                 await ValidateBrowserCallbackSurvivesEarlyBrowserCloseAsync();
                 ValidateRetainedMachineIdentity();
+                await ValidateRetainedDevicePreflightAsync();
+                AccountPersistenceRaceValidation.Run();
+                EnrollmentLoopbackValidation.Run();
+                TerminalProtocolDiagnosticPublicationValidation.Run();
                 var pcId = Guid.NewGuid();
                 var updateId = Guid.NewGuid();
                 var mutations = new List<(string Path, string Key, byte[] Body)>();
@@ -380,6 +389,75 @@ namespace TermLink.AgentUpdate.Validation
                 Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_CA_FILE", originalMarker);
                 if (Directory.Exists(root)) Directory.Delete(root, true);
             }
+        }
+
+        private static async Task ValidateRetainedDevicePreflightAsync()
+        {
+            using var identity = DeviceIdentity.Generate();
+            var deviceId = Guid.NewGuid();
+            var responses = new Queue<Func<HttpResponseMessage>>(new Func<HttpResponseMessage>[]
+            {
+                () => new HttpResponseMessage(HttpStatusCode.OK),
+                () => DeviceStatusResponse(HttpStatusCode.Unauthorized, "{\"error\":{\"code\":\"DEVICE_REVOKED\"}}"),
+                () => DeviceStatusResponse(HttpStatusCode.Unauthorized, "not-json"),
+                () => DeviceStatusResponse(HttpStatusCode.Unauthorized, "{\"error\":{\"code\":\"UNAUTHENTICATED\"}}"),
+                () => DeviceStatusResponse(HttpStatusCode.Unauthorized, new string('x', 4097)),
+                () => throw new HttpRequestException("offline")
+            });
+            var requests = 0;
+            using var http = new HttpClient(new DeviceStatusHandler(request =>
+            {
+                requests++;
+                Assert(request.Method == HttpMethod.Get &&
+                        request.RequestUri?.AbsoluteUri == "https://server.example.test/v1/devices/self" &&
+                        request.Content == null &&
+                        request.Headers.Authorization?.Scheme == "Bearer" &&
+                        request.Headers.Authorization.Parameter == "new-access-token",
+                    "retained device preflight used the wrong endpoint or token");
+                var headerDevice = request.Headers.GetValues("X-TermLink-Device").Single();
+                var timestamp = request.Headers.GetValues("X-TermLink-Timestamp").Single();
+                var nonce = request.Headers.GetValues("X-TermLink-Nonce").Single();
+                var signature = request.Headers.GetValues("X-TermLink-Signature").Single();
+                Assert(headerDevice == deviceId.ToString("D") && long.TryParse(timestamp, out var millis) &&
+                        Math.Abs(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - millis) < 60000,
+                    "retained device preflight omitted the device identity or current timestamp");
+                var nonceBytes = Convert.FromBase64String(nonce.Replace('-', '+').Replace('_', '/') + "==");
+                Assert(nonceBytes.Length == 16, "retained device preflight nonce is invalid");
+                var canonical = string.Join("\n", "TERMLINK-DEVICE-PROOF-V1", "GET", "/v1/devices/self",
+                    timestamp, nonce, Convert.ToHexString(SHA256.HashData(Array.Empty<byte>())).ToLowerInvariant());
+                var expected = identity.Sign(Encoding.UTF8.GetBytes(canonical));
+                var actual = Convert.FromBase64String(signature.Replace('-', '+').Replace('_', '/') + "==");
+                Assert(CryptographicOperations.FixedTimeEquals(expected, actual),
+                    "retained device preflight did not sign the server's canonical request");
+                return responses.Dequeue()();
+            }));
+            Task<bool> preflight() => ProductionEnrollment.IsDeviceRevokedAsync(
+                http, "https://server.example.test", "new-access-token", deviceId, identity, CancellationToken.None);
+            Assert(!await preflight(), "trusted or pending retained device was rotated");
+            Assert(await preflight(), "explicitly revoked retained device was reused");
+            for (var index = 0; index < 3; index++)
+            {
+                try { await preflight(); throw new Exception("invalid device status was accepted"); }
+                catch (ProductionEnrollmentException error) when (error.Code == "ACCOUNT_DEVICE_STATUS_UNAVAILABLE") { }
+            }
+            try { await preflight(); throw new Exception("network failure was treated as device revocation"); }
+            catch (HttpRequestException) { }
+            Assert(requests == 6 && responses.Count == 0, "retained device preflight skipped a behavior case");
+        }
+
+        private static HttpResponseMessage DeviceStatusResponse(HttpStatusCode status, string body) =>
+            new HttpResponseMessage(status) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
+
+        private sealed class DeviceStatusHandler : HttpMessageHandler
+        {
+            private readonly Func<HttpRequestMessage, HttpResponseMessage> respond;
+
+            internal DeviceStatusHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) =>
+                this.respond = respond;
+
+            protected override Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request, CancellationToken cancellationToken) =>
+                Task.FromResult(respond(request));
         }
 
         private static void ValidateBrowserCallbackUsesDynamicPort()

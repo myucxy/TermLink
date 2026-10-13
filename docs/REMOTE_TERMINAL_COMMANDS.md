@@ -20,6 +20,11 @@ Each manual profile contains:
 
 Detected Command Prompt, Windows PowerShell, PowerShell 7, and WSL profiles are generated at runtime and are read-only. Missing executables, disabled manual profiles, and invalid local configuration are not advertised.
 
+`powershell-7-enhanced` is an additional detected command with `shell_type: powershell-7`.
+It requires PowerShell 7, SessionHost and the native Desktop display in the same installation;
+it starts as the current user and requests the graphics terminal profile. The four existing
+command IDs and `supported_shells` retain their original meanings.
+
 ## Server capability
 
 The Agent includes `terminal_commands` in the signed PC upsert. Only these non-secret fields leave Windows:
@@ -34,6 +39,8 @@ The Agent includes `terminal_commands` in the signed PC upsert. Only these non-s
 ```
 
 Executable paths and arguments remain local. The server validates identifier syntax, bounded display names, source/type relationships, uniqueness, and a maximum of 24 advertised commands.
+Detected commands normally have identical IDs and shell types. The sole additional mapping is
+`powershell-7-enhanced` to `powershell-7`; this does not permit arbitrary detected IDs or shell types.
 
 ## Android launch flow
 
@@ -45,6 +52,22 @@ Executable paths and arguments remain local. The server validates identifier syn
 6. Completion binds `session_id`, `terminal_command_id`, `shell_type`, and `cwd` to the original operation.
 
 This double validation means neither Android nor the server can replace a configured command with arbitrary launch text.
+
+## Client capability negotiation
+
+The `GET /v1/pcs` response keeps older Android clients compatible while allowing a
+new client to receive the enhanced PowerShell command. A client that understands
+that command sends this exact request header:
+
+```text
+X-TermLink-PC-Command-Capabilities: powershell-7-enhanced
+```
+
+With the exact token, the response includes the stored `powershell-7-enhanced`
+detected command. If the header is missing, empty, or unknown, the server projects
+that one detected mapping out of the response. Other detected commands and manual
+custom commands remain unchanged. This is a response-only projection: the stored
+`terminal_commands`, `supported_shells`, and `capabilities` values are not modified.
 
 ## Compatibility
 

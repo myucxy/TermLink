@@ -28,3 +28,14 @@ the complete Corresponding Source required by GPLv3, including matching
 core source and build materials; a private or unavailable URL is not enough.
 Release records must identify the exact application revision, core revision
 and the actual source download location for each distributed artifact.
+
+Unicode 16.0.0 property tables in the bundled terminal-core libraries:
+Copyright Unicode, Inc. Unicode License V3.
+Full permission notice: docs/licenses/Unicode-16-LICENSE.txt; packaged in
+Android assets/licenses/termlink/ and the Windows application payload.
+
+Additional fixed legacy character mapping data in terminal-core:
+Copyright (c) Microsoft Corporation. MIT License.
+Derived from the character mapping tables of Windows Terminal revision
+6676c6f938f7e98ad680f0cecedd3bafb6529734. No external terminal parser or
+renderer is linked. Full notice: docs/licenses/Legacy-Charsets-MIT-LICENSE.txt

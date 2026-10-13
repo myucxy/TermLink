@@ -196,9 +196,9 @@ $agentProjectSource = Get-Content -LiteralPath $agentProjectPath -Raw
     $global:LASTEXITCODE = 0
 }
 Assert-True ($releaseScriptSource.Contains('status --porcelain --untracked-files=normal')) `
-    'Server source identity does not inspect the worktree status.'
-Assert-True ($releaseScriptSource.Contains('$serverSourceRevision-dirty')) `
-    'Server source identity does not distinguish dirty worktrees from clean HEAD.'
+    'Release source identity does not inspect the worktree status.'
+Assert-True ($releaseScriptSource.Contains('"$sourceRevision-dirty"')) `
+    'Release source identity does not distinguish dirty worktrees from clean HEAD.'
 Assert-True ($releaseScriptSource.Contains('$finalArtifactRecords')) `
     'Release manifest does not perform a final post-build artifact digest pass.'
 Assert-True ($releaseScriptSource.Contains('$pendingManifestPath')) `
@@ -561,6 +561,39 @@ try {
         $fixtureVerification.android_aab.version_code -eq 52) `
         'The standalone Production verifier rejected a complete, correctly signed AAB.'
 
+    $missingSourceRejected = $false
+    try {
+        $null = & $verificationScriptPath -ReleaseDirectory $aabFixtureRoot `
+            -ExpectedReleaseMode Production -ExpectedAndroidSignerSha256 $fixtureSignerSha256 `
+            -RequireSourceIdentity
+    }
+    catch { $missingSourceRejected = $_.Exception.Message.Contains('missing source_revision') }
+    Assert-True $missingSourceRejected 'A new Production client manifest omitted source_revision.'
+    $fixtureSourceRevision = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+    $fixtureCoreLock = ((& git -C $repositoryRoot show "${fixtureSourceRevision}:terminal-core.lock.json") -join "`n") |
+        ConvertFrom-Json
+    $fixtureManifest | Add-Member -NotePropertyName source_revision -NotePropertyValue $fixtureSourceRevision
+    $fixtureManifest | Add-Member -NotePropertyName core_revision -NotePropertyValue $fixtureCoreLock.revision
+    [IO.File]::WriteAllText($fixtureManifestPath, (($fixtureManifest | ConvertTo-Json -Depth 6) + "`n"),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $boundVerification = @(& $verificationScriptPath -ReleaseDirectory $aabFixtureRoot `
+        -ExpectedReleaseMode Production -ExpectedAndroidSignerSha256 $fixtureSignerSha256 `
+        -RequireSourceIdentity) -join "`n" | ConvertFrom-Json
+    Assert-True ($boundVerification.source_revision -ceq $fixtureSourceRevision -and
+        $boundVerification.core_revision -ceq $fixtureCoreLock.revision) `
+        'The Production verifier did not bind the client source and native lock revisions.'
+    $fixtureManifest.core_revision = '0' * 40
+    [IO.File]::WriteAllText($fixtureManifestPath, (($fixtureManifest | ConvertTo-Json -Depth 6) + "`n"),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $wrongCoreRejected = $false
+    try {
+        $null = & $verificationScriptPath -ReleaseDirectory $aabFixtureRoot `
+            -ExpectedReleaseMode Production -ExpectedAndroidSignerSha256 $fixtureSignerSha256 `
+            -RequireSourceIdentity
+    }
+    catch { $wrongCoreRejected = $_.Exception.Message.Contains('does not match the source native lock') }
+    Assert-True $wrongCoreRejected 'A client manifest with the wrong core revision was accepted.'
+
     $tamperedAabPath = Join-Path $aabFixtureRoot 'tampered.aab'
     Copy-Item -LiteralPath $fixtureAabPath -Destination $tamperedAabPath
     $tamperedArchive = [IO.Compression.ZipFile]::Open(
@@ -887,6 +920,45 @@ try {
     Assert-True ($verificationResult.verified -eq $true -and $verificationResult.release_mode -ceq 'production') `
         'A valid production artifact manifest did not pass the release verifier.'
 
+    $missingSourceRejected = $false
+    try {
+        $null = & $verificationScriptPath -ReleaseDirectory $manifestProbeRoot `
+            -ExpectedReleaseMode Production -RequireSourceIdentity
+    }
+    catch { $missingSourceRejected = $_.Exception.Message.Contains('missing source_revision') }
+    Assert-True $missingSourceRejected 'Strict Production verification accepted a legacy manifest without source_revision.'
+    $probeManifest | Add-Member -NotePropertyName source_revision -NotePropertyValue ((& git -C $repositoryRoot rev-parse HEAD).Trim())
+    [IO.File]::WriteAllText($probeManifestPath, (($probeManifest | ConvertTo-Json -Depth 6) + "`n"),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $boundServerVerification = @(& $verificationScriptPath -ReleaseDirectory $manifestProbeRoot `
+        -ExpectedReleaseMode Production -RequireSourceIdentity) -join "`n" | ConvertFrom-Json
+    Assert-True ($boundServerVerification.source_revision -ceq $probeManifest.source_revision -and
+        $null -eq $boundServerVerification.core_revision) `
+        'Server-only manifest required an unrelated terminal core revision.'
+    $probeManifest.source_revision = 123
+    [IO.File]::WriteAllText($probeManifestPath, (($probeManifest | ConvertTo-Json -Depth 6) + "`n"),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $wrongSourceTypeRejected = $false
+    try {
+        $null = & $verificationScriptPath -ReleaseDirectory $manifestProbeRoot `
+            -ExpectedReleaseMode Production -RequireSourceIdentity
+    }
+    catch { $wrongSourceTypeRejected = $_.Exception.Message.Contains('source_revision must be') }
+    Assert-True $wrongSourceTypeRejected 'Production manifest accepted a non-string source revision.'
+    $probeManifest.source_revision = '0' * 40 + '-dirty'
+    [IO.File]::WriteAllText($probeManifestPath, (($probeManifest | ConvertTo-Json -Depth 6) + "`n"),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+    $dirtySourceRejected = $false
+    try {
+        $null = & $verificationScriptPath -ReleaseDirectory $manifestProbeRoot `
+            -ExpectedReleaseMode Production -RequireSourceIdentity
+    }
+    catch { $dirtySourceRejected = $_.Exception.Message.Contains('clean source_revision') }
+    Assert-True $dirtySourceRejected 'Production manifest accepted a dirty source revision.'
+    $probeManifest.PSObject.Properties.Remove('source_revision')
+    [IO.File]::WriteAllText($probeManifestPath, (($probeManifest | ConvertTo-Json -Depth 6) + "`n"),
+        (New-Object Text.UTF8Encoding -ArgumentList $false))
+
     $probeManifest.artifacts[0].type = 'msix'
     [IO.File]::WriteAllText(
         $probeManifestPath,
@@ -1010,8 +1082,9 @@ try {
         -ExpectedWindowsSignerSha1 $windowsSignerSha1 `
         -Plan) -join "`n"
     $appShipPlan = $appShipPlanJson | ConvertFrom-Json
-    Assert-True ($appShipPlan.release_mode -ceq 'production' -and $appShipPlan.upload -eq $false) `
-        'AppShip production wrapper plan did not preserve the production/no-upload boundary.'
+    Assert-True ($appShipPlan.release_mode -ceq 'production' -and $appShipPlan.upload -eq $false -and
+        $appShipPlan.full_verification_performed -eq $false) `
+        'AppShip plan implied upload or full production verification.'
     Assert-True ($appShipPlan.application_slug -ceq 'termlink-android' -and
         $appShipPlan.platform -ceq 'android' -and $appShipPlan.file_kind -ceq 'apk' -and
         $appShipPlan.architecture -ceq 'universal') `
@@ -1058,6 +1131,50 @@ try {
         $appShipPreviewPlan.channel -ceq 'beta' -and
         $appShipPreviewPlan.create_application_if_missing -eq $true) `
         'Preview track was not mapped to the AppShip beta channel.'
+
+    if ($PSVersionTable.PSVersion -ge [Version]'7.2') {
+        # Exercise the real publish branch without network access. Missing source
+        # identity must fail before the reviewed client could be invoked.
+        $probePublisherPath = Join-Path $appShipProbeRoot 'never-publish.ps1'
+        [IO.File]::WriteAllText($probePublisherPath, @'
+#Requires -Version 7.2
+# schemaVersion = 'appship.publish-state/v1'
+# Idempotency-Key
+# SignatureDecision
+throw 'The AppShip publisher must not run in this self-test.'
+'@, (New-Object Text.UTF8Encoding -ArgumentList $false))
+        $probeCredential = [PSCredential]::new('fixture-only',
+            (ConvertTo-SecureString 'fixture-only' -AsPlainText -Force))
+        $publishProbe = @{
+            ManifestPath = $appShipManifestPath
+            Target = 'AndroidApk'
+            BaseURL = 'https://appship.example.test:8910'
+            Credential = $probeCredential
+            PublishScriptPath = $probePublisherPath
+            AndroidSdkPath = 'D:\AndroidSdkPlanProbe'
+            ExpectedAndroidSignerSha256 = $androidSignerSha256
+            ExpectedWindowsSignerSha1 = $windowsSignerSha1
+            SignatureApproved = $true
+            SignatureReviewNote = 'Local fixture only; no upload'
+        }
+        $missingPublishSourceRejected = $false
+        try { $null = & $appShipWrapperPath @publishProbe }
+        catch { $missingPublishSourceRejected = $_.Exception.Message.Contains('missing source_revision') }
+        Assert-True $missingPublishSourceRejected `
+            'The actual AppShip publish branch accepted a client manifest without source_revision.'
+
+        $appShipManifest | Add-Member -NotePropertyName source_revision `
+            -NotePropertyValue ((& git -C $repositoryRoot rev-parse HEAD).Trim())
+        [IO.File]::WriteAllText($appShipManifestPath,
+            (($appShipManifest | ConvertTo-Json -Depth 6) + [Environment]::NewLine),
+            (New-Object Text.UTF8Encoding -ArgumentList $false))
+        $missingPublishCoreRejected = $false
+        try { $null = & $appShipWrapperPath @publishProbe }
+        catch { $missingPublishCoreRejected = $_.Exception.Message.Contains('missing core_revision') }
+        Assert-True $missingPublishCoreRejected `
+            'The actual AppShip publish branch accepted a client manifest without core_revision.'
+        $appShipManifest.PSObject.Properties.Remove('source_revision')
+    }
 
     $appShipManifest.release_mode = 'development'
     [IO.File]::WriteAllText(

@@ -7,7 +7,7 @@ import kotlin.test.assertTrue
 class DatabaseSchemaContractTest {
     @Test
     fun roomDatabaseExportsAllSensitiveIndexesAndMetadataTables() {
-        val schema = File("schemas/dev.termlink.database.TermLinkDatabase/5.json")
+        val schema = File("schemas/dev.termlink.database.TermLinkDatabase/7.json")
         assertTrue(schema.isFile, "Room schema was not exported to ${schema.path}")
         val text = schema.readText()
         assertTrue("\"tableName\": \"event_chunks\"" in text)
@@ -17,6 +17,8 @@ class DatabaseSchemaContractTest {
         assertTrue("\"tableName\": \"ack_cursors\"" in text)
         assertTrue("\"tableName\": \"renderer_checkpoints\"" in text)
         assertTrue("\"tableName\": \"history_preferences\"" in text)
+        assertTrue("\"tableName\": \"broker_captures\"" in text)
+        assertTrue("\"canonicalBytes\"" in text)
         assertTrue("\"ciphertext\"" in text)
         assertTrue("\"ciphertextSha256\"" in text)
     }

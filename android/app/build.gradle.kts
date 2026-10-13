@@ -80,11 +80,17 @@ abstract class GenerateTailFirstE2EContract : DefaultTask() {
               "operations": [
                 "probe",
                 "open_session",
+                "close_view",
+                "reopen_selected",
+                "reselect_armed_session",
                 "inspect",
                 "page_up",
                 "open_history",
                 "close_history",
-                "show_ime"
+                "show_ime",
+                "begin_frozen_history",
+                "page_frozen_history",
+                "release_frozen_history"
               ]
             }
             """.trimIndent() + "\n",
@@ -302,6 +308,7 @@ android {
         targetSdk = 36
         versionCode = termLinkVersionCode
         versionName = termLinkVersionName
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // AppAuth declares an optional browser receiver in its library manifest.
         // The app-owned embedded flow removes that component at merge time, but
         // the library placeholder must still have a non-routable value.
@@ -372,6 +379,9 @@ android {
         }
         named("test") {
             resources.srcDir(rootProject.file("../protocol/test-vectors"))
+        }
+        named("androidTest") {
+            assets.srcDir(rootProject.file("../protocol/test-vectors"))
         }
     }
 
@@ -445,6 +455,8 @@ val verifyAiWebAssets = tasks.register("verifyAiWebAssets") {
 }
 val syncTermLinkLicenseAssets = tasks.register<Sync>("syncTermLinkLicenseAssets") {
     from(rootProject.file("../LICENSE"), rootProject.file("../NOTICE"))
+    from(rootProject.file("../docs/licenses/Unicode-16-LICENSE.txt"))
+    from(rootProject.file("../docs/licenses/Legacy-Charsets-MIT-LICENSE.txt"))
     into(layout.buildDirectory.dir("generated/termlink-license-assets/licenses/termlink"))
 }
 tasks.named("preBuild").configure { dependsOn(verifyAiWebAssets, syncTermLinkLicenseAssets) }
@@ -479,5 +491,7 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("androidx.test:core-ktx:1.6.1")
     testImplementation("org.robolectric:robolectric:4.14.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

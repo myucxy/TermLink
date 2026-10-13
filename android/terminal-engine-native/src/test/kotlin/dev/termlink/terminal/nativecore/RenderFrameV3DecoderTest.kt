@@ -18,6 +18,50 @@ import kotlin.test.assertTrue
 
 class RenderFrameV3DecoderTest {
     @Test
+    fun v4ValidatesExplicitWidthProfileWithoutRelaxingEarlierDecoders() {
+        val unicode = "a" + "\u0301".repeat(20)
+        val bytes = FrameBuilder(grapheme = unicode, version = 4).build().also {
+            it[6] = '4'.code.toByte()
+            putU16(it, 8, 4)
+            putU32(it, 60, 2)
+            putU64(it, 72, 0x7ff)
+            refreshCrc(it)
+        }
+        val frame = RenderFrameV4Decoder.decode(bytes)
+        assertEquals(4, frame.formatVersion)
+        assertEquals(dev.termlink.terminal.api.TerminalWidthProfile.UNICODE_16, frame.widthProfile)
+        assertEquals(unicode, frame.graphemes.single().text)
+        assertFalse(frame.mouseReporting)
+        val mouse = RenderFrameV4Decoder.decode(bytes.putU16AndRefresh(18, 15))
+        assertTrue(mouse.mouseReporting)
+        assertTrue(mouse.alternateScroll)
+        val palette = sectionOffset(bytes, 3)
+        val colors = RenderFrameV4Decoder.decode(bytes.putU32AndRefresh(palette + 259 * 4, 0x123456)
+            .putU32AndRefresh(palette + 260 * 4, 2).putU32AndRefresh(palette + 261 * 4, 3)).palette
+        assertEquals(0x123456, colors.selectionBackgroundRgb)
+        assertEquals(2, colors.foregroundAlias)
+        assertEquals(3, colors.backgroundAlias)
+        for (bad in listOf(256, 258, 0x01000000)) assertFailsWith<RenderFrameV4DecodeException> {
+            RenderFrameV4Decoder.decode(bytes.putU32AndRefresh(palette + 260 * 4, bad))
+        }
+        assertFailsWith<RenderFrameV3DecodeException> { RenderFrameV3Decoder.decode(bytes) }
+        for (bad in listOf(
+            bytes.putU32AndRefresh(60, 1),
+            bytes.putU32AndRefresh(60, 3),
+            bytes.putU64AndRefresh(72, 0x7f),
+            bytes.putU64AndRefresh(72, 0x1ff),
+            bytes.putU16AndRefresh(18, 16),
+            bytes.putU16AndRefresh(8, 3),
+            bytes.mutateWithoutCrc(24, 9),
+            bytes.copyOf(bytes.size - 1),
+        )) assertFailsWith<RenderFrameV4DecodeException> { RenderFrameV4Decoder.decode(bad) }
+        val overlong = FrameBuilder(grapheme = "a" + "\u0301".repeat(24), version = 4).build().also {
+            it[6] = '4'.code.toByte(); putU16(it, 8, 4); putU32(it, 60, 2)
+            putU64(it, 72, 0x7ff); refreshCrc(it)
+        }
+        assertFailsWith<RenderFrameV4DecodeException> { RenderFrameV4Decoder.decode(overlong) }
+    }
+    @Test
     fun decodesAllV3StylesColorsFlagsAndV2CursorState() {
         val styles = TerminalRenderUnderlineStyleV3.entries
         styles.forEachIndexed { styleValue, expectedStyle ->
@@ -226,9 +270,9 @@ class RenderFrameV3DecoderTest {
         assertFailsWith<RenderFrameV3DecodeException> { RenderFrameV3Decoder.decode(bytes) }
     }
 
-    private class FrameBuilder(private val underlineStyle: Int = 5) {
+    private class FrameBuilder(private val underlineStyle: Int = 5, private val grapheme: String = "A", private val version: Int = 3) {
         fun build(): ByteArray {
-            val graphemeText = "A".toByteArray(StandardCharsets.UTF_8)
+            val graphemeText = grapheme.toByteArray(StandardCharsets.UTF_8)
             val graphemes = ByteBuffer.allocate(8 + graphemeText.size).order(ByteOrder.LITTLE_ENDIAN)
             graphemes.putInt(8).putShort(graphemeText.size.toShort()).put(1).put(0).put(graphemeText)
 
@@ -242,8 +286,9 @@ class RenderFrameV3DecoderTest {
                 .putInt(0x02112233)
                 .putInt(0x02445566)
 
-            val palette = ByteBuffer.allocate(259 * 4).order(ByteOrder.LITTLE_ENDIAN)
-            repeat(259) { palette.putInt(-1) }
+            val paletteCount = if (version == 4) 264 else 259
+            val palette = ByteBuffer.allocate(paletteCount * 4).order(ByteOrder.LITTLE_ENDIAN)
+            repeat(paletteCount) { palette.putInt(-1) }
             palette.putInt(4, 0x010203)
 
             val rows = ByteBuffer.allocate(8 + 8 + 2 * CELL_RECORD_SIZE).order(ByteOrder.LITTLE_ENDIAN)
@@ -256,7 +301,7 @@ class RenderFrameV3DecoderTest {
                 listOf(
                     SectionBytes(1, 8, graphemes.array()),
                     SectionBytes(2, 16, renditions.array()),
-                    SectionBytes(259, 4, palette.array()),
+                    SectionBytes(paletteCount, 4, palette.array()),
                     SectionBytes(0, 16, ByteArray(0)),
                     SectionBytes(2, 0, rows.array()),
                     "frame v3".toByteArray(StandardCharsets.UTF_8).let {

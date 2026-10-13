@@ -1,0 +1,4 @@
+<resources>
+    <string name="native_history_capture_expired">本次历史浏览已过期，请回到底部后重新向上滚动。</string>
+    <string name="native_history_capture_limit">历史内容超出当前内存限额，请回到底部后稍后重试。</string>
+</resources>

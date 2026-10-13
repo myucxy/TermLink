@@ -2,6 +2,8 @@ package dev.termlink.history
 
 import androidx.room.withTransaction
 import dev.termlink.database.AckCursorEntity
+import dev.termlink.database.BrokerCaptureEntity
+import dev.termlink.database.BrokerCaptureReadMetadata
 import dev.termlink.database.DeviceEntity
 import dev.termlink.database.EventChunkEntity
 import dev.termlink.database.HistoryPreferenceEntity
@@ -9,6 +11,7 @@ import dev.termlink.database.PcEntity
 import dev.termlink.database.RendererCheckpointEntity
 import dev.termlink.database.SessionEntity
 import dev.termlink.database.SnapshotEntity
+import dev.termlink.database.SnapshotReadMetadata
 import dev.termlink.database.TermLinkDatabase
 import dev.termlink.database.TranscriptPageEntity
 import dev.termlink.model.DeviceSummary
@@ -19,6 +22,9 @@ import dev.termlink.model.HistoryObject
 import dev.termlink.model.PcSummary
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
+import dev.termlink.model.TerminalBufferBudget
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
@@ -51,7 +57,7 @@ data class AckCursorState(
 }
 
 /** Cached encrypted snapshot plus the durable renderer generation it anchors. */
-data class RendererCheckpointState(
+class RendererCheckpointState(
     val snapshot: EncryptedHistoryObject,
     val snapshotRows: Int,
     val snapshotColumns: Int,
@@ -62,33 +68,76 @@ data class RendererCheckpointState(
      */
     val durableAcknowledgement: ULong,
     val rendererGeneration: Long,
-) {
+) : AutoCloseable {
     init {
         require(snapshot.metadata.kind == HistoryObject.Kind.SNAPSHOT) { "renderer checkpoint must reference a snapshot" }
         require(snapshot.metadata.snapshotSequence == snapshotSequence) { "renderer checkpoint sequence mismatch" }
         require(durableAcknowledgement >= snapshotSequence) { "renderer ACK precedes its checkpoint" }
         require(rendererGeneration > 0) { "renderer generation must be positive" }
     }
+
+    override fun close() = snapshot.destroy()
 }
 
-/** Ciphertext plus non-sensitive index metadata returned by history queries. */
-data class EncryptedHistoryObject(
-    val metadata: HistoryObject,
-    val ciphertext: ByteArray,
-) {
+/** Owns its ciphertext and keeps snapshot memory admitted until [destroy] or [close]. */
+class EncryptedHistoryObject internal constructor(
+    metadata: HistoryObject,
+    ciphertext: ByteArray,
+    private val bufferBudget: TerminalBufferBudget,
+    reservation: TerminalBufferBudget.Reservation?,
+) : AutoCloseable {
+    constructor(
+        metadata: HistoryObject,
+        ciphertext: ByteArray,
+        bufferBudget: TerminalBufferBudget = TerminalBufferBudget.global,
+    ) : this(metadata, ciphertext, bufferBudget, null)
+
+    val metadata: HistoryObject
+    val ciphertext: ByteArray
+    private var reservation = reservation
+    private var destroyed = false
+
     init {
-        require(metadata.sizeBytes == ciphertext.size.toLong()) {
-            "ciphertext size does not match history metadata"
-        }
-        require(metadata.ciphertextSha256.size == HistoryRepository.SHA256_BYTES) {
-            "history ciphertext hash must be SHA-256"
-        }
-        require(MessageDigest.isEqual(metadata.ciphertextSha256, HistoryRepository.sha256(ciphertext))) {
-            "history ciphertext hash mismatch"
+        var ownedBytes: ByteArray? = null
+        try {
+            require(metadata.sizeBytes == ciphertext.size.toLong()) {
+                "ciphertext size does not match history metadata"
+            }
+            require(metadata.ciphertextSha256.size == HistoryRepository.SHA256_BYTES) {
+                "history ciphertext hash must be SHA-256"
+            }
+            this.metadata = metadata.copy(ciphertextSha256 = metadata.ciphertextSha256.copyOf())
+            if (metadata.kind == HistoryObject.Kind.SNAPSHOT && this.reservation == null) {
+                this.reservation = bufferBudget.reserve(ciphertext.size.toLong())
+            }
+            ownedBytes = ciphertext.copyOf()
+            require(MessageDigest.isEqual(metadata.ciphertextSha256, HistoryRepository.sha256(ownedBytes))) {
+                "history ciphertext hash mismatch"
+            }
+            this.ciphertext = ownedBytes
+        } catch (error: Exception) {
+            ownedBytes?.fill(0)
+            this.reservation?.close()
+            throw error
         }
     }
 
-    fun copyCiphertext(): EncryptedHistoryObject = copy(ciphertext = ciphertext.copyOf())
+    @Synchronized
+    fun copyCiphertext(): EncryptedHistoryObject {
+        check(!destroyed) { "history object has been destroyed" }
+        return EncryptedHistoryObject(metadata, ciphertext, bufferBudget)
+    }
+
+    @Synchronized
+    fun destroy() {
+        if (destroyed) return
+        destroyed = true
+        ciphertext.fill(0)
+        reservation?.close()
+        reservation = null
+    }
+
+    override fun close() = destroy()
 }
 
 data class EncryptedPreference(
@@ -177,6 +226,94 @@ class HistoryGapException(
     val receivedSequence: ULong,
 ) : IllegalStateException("history gap: expected $expectedSequence, received $receivedSequence")
 
+/** Non-sensitive index metadata for one authenticated TLBCSEA1 capture. */
+data class BrokerCaptureMetadata(
+    val sessionId: UUID,
+    val captureId: UUID,
+    val keyEpoch: Long,
+    val sourceSequence: ULong,
+    val canonicalBytes: Int,
+    val canonicalSha256: ByteArray,
+    val keyId: String,
+    val sizeBytes: Long,
+    val ciphertextSha256: ByteArray,
+    val createdAtEpochMillis: Long,
+) {
+    init {
+        require(keyEpoch > 0) { "broker capture key epoch must be positive" }
+        require(sourceSequence > 0uL && sourceSequence < Long.MAX_VALUE.toULong()) {
+            "broker capture source sequence is invalid"
+        }
+        require(canonicalBytes.toLong() in HistoryRepository.BROKER_CAPTURE_MINIMUM_CANONICAL_BYTES..
+            HistoryRepository.MAX_BROKER_CAPTURE_CANONICAL_BYTES) {
+            "broker capture canonical length is invalid"
+        }
+        require(canonicalSha256.size == HistoryRepository.SHA256_BYTES) {
+            "broker capture canonical hash must be SHA-256"
+        }
+        require(keyId.isNotBlank()) { "broker capture key id is required" }
+        require(sizeBytes == canonicalBytes.toLong() + HistoryRepository.BROKER_CAPTURE_SEALED_OVERHEAD_BYTES) {
+            "broker capture sealed size is invalid"
+        }
+        require(ciphertextSha256.size == HistoryRepository.SHA256_BYTES) {
+            "broker capture ciphertext hash must be SHA-256"
+        }
+    }
+}
+
+/** Owns a sealed capture and its bounded heap admission until [close]. */
+class EncryptedBrokerCapture internal constructor(
+    metadata: BrokerCaptureMetadata,
+    ciphertext: ByteArray,
+    private val bufferBudget: TerminalBufferBudget,
+    reservation: TerminalBufferBudget.Reservation,
+) : AutoCloseable {
+    val metadata: BrokerCaptureMetadata = metadata.copy(
+        canonicalSha256 = metadata.canonicalSha256.copyOf(),
+        ciphertextSha256 = metadata.ciphertextSha256.copyOf(),
+    )
+    val ciphertext: ByteArray = ciphertext
+    private var reservation: TerminalBufferBudget.Reservation? = reservation
+    private var destroyed = false
+
+    init {
+        require(metadata.sizeBytes == ciphertext.size.toLong()) {
+            "broker capture ciphertext size does not match metadata"
+        }
+    }
+
+    @Synchronized
+    fun copyCiphertext(): EncryptedBrokerCapture {
+        check(!destroyed) { "broker capture has been destroyed" }
+        val nextReservation = bufferBudget.reserve(ciphertext.size.toLong())
+        return try {
+            EncryptedBrokerCapture(metadata, ciphertext.copyOf(), bufferBudget, nextReservation)
+        } catch (error: Throwable) {
+            nextReservation.close()
+            throw error
+        }
+    }
+
+    @Synchronized
+    fun destroy() {
+        if (destroyed) return
+        destroyed = true
+        ciphertext.fill(0)
+        reservation?.close()
+        reservation = null
+    }
+
+    /** Transfers this object's admission permit to a later owner. */
+    @Synchronized
+    fun takeReservation(): TerminalBufferBudget.Reservation {
+        check(!destroyed) { "broker capture has been destroyed" }
+        return checkNotNull(reservation) { "broker capture reservation was already transferred" }
+            .also { reservation = null }
+    }
+
+    override fun close() = destroy()
+}
+
 /**
  * Persistence boundary for local history. The repository accepts ciphertext, never
  * plaintext terminal bytes. Decryption is an explicit callback used only by replay
@@ -185,6 +322,7 @@ class HistoryGapException(
 class HistoryRepository(
     private val database: TermLinkDatabase,
     private val clockMillis: () -> Long = System::currentTimeMillis,
+    private val bufferBudget: TerminalBufferBudget = TerminalBufferBudget.global,
 ) {
     private val devices get() = database.devices()
     private val pcs get() = database.pcs()
@@ -195,6 +333,7 @@ class HistoryRepository(
     private val acks get() = database.ackCursors()
     private val rendererCheckpoints get() = database.rendererCheckpoints()
     private val preferences get() = database.preferences()
+    private val brokerCaptures get() = database.brokerCaptures()
 
     suspend fun upsertDevice(summary: DeviceSummary) {
         requireValidDeviceKey(summary)
@@ -468,15 +607,22 @@ class HistoryRepository(
         require(formatName.isNotBlank()) { "snapshot format name is required" }
         require(formatVersion > 0) { "snapshot format version must be positive" }
         val sequence = snapshotSequence.toRoomSequence("snapshot sequence")
-        val bytes = ciphertext.copyOf()
-        require(bytes.isNotEmpty()) { "snapshot ciphertext must not be empty" }
-        val digest = sha256(bytes)
-        ciphertextSha256?.let { supplied ->
-            if (!MessageDigest.isEqual(supplied, digest)) {
-                throw HistoryIntegrityException("snapshot ciphertext hash mismatch before persistence")
-            }
+        require(ciphertext.isNotEmpty()) { "snapshot ciphertext must not be empty" }
+        knownSnapshotMaximumBytes(formatName, formatVersion)?.let { maximum ->
+            require(ciphertext.size.toLong() <= maximum) { "snapshot ciphertext size is out of bounds" }
         }
-        val entity = SnapshotEntity(
+        val reservation = bufferBudget.reserve(ciphertext.size.toLong())
+        var bytes: ByteArray? = null
+        try {
+            val ownedBytes = ciphertext.copyOf()
+            bytes = ownedBytes
+            val digest = sha256(ownedBytes)
+            ciphertextSha256?.let { supplied ->
+                if (!MessageDigest.isEqual(supplied, digest)) {
+                    throw HistoryIntegrityException("snapshot ciphertext hash mismatch before persistence")
+                }
+            }
+            val entity = SnapshotEntity(
                 id = id.requireUuidString(),
                 sessionId = sessionId.requireUuidString(),
                 snapshotSequence = sequence,
@@ -485,46 +631,271 @@ class HistoryRepository(
                 objectKey = objectKey.requireNonBlank("snapshot object key"),
                 keyId = keyId.requireNonBlank("snapshot key id"),
                 ciphertextSha256 = digest,
-                sizeBytes = bytes.size.toLong(),
-                ciphertext = bytes,
+                sizeBytes = ownedBytes.size.toLong(),
+                ciphertext = ownedBytes,
                 formatName = formatName,
                 formatVersion = formatVersion,
                 createdAtEpochMillis = clockMillis(),
                 expiresAtEpochMillis = expiresAt?.toEpochMilli(),
             )
-        database.withTransaction {
-            val existing = snapshots.get(entity.id)
-            if (existing == null) {
-                check(snapshots.insertIfAbsent(entity) != -1L) {
-                    "snapshot identity conflicts with an existing immutable object"
+            database.withTransaction {
+                val existingMetadata = snapshots.readMetadata(entity.id)
+                if (existingMetadata == null) {
+                    check(snapshots.insertIfAbsent(entity) != -1L) {
+                        "snapshot identity conflicts with an existing immutable object"
+                    }
+                } else {
+                    requireSnapshotReadSize(existingMetadata)
+                    bufferBudget.reserve(existingMetadata.ciphertextBytes).use {
+                        val existing = requireNotNull(snapshots.get(entity.id))
+                        try {
+                            requireSameSnapshot(existing, entity)
+                        } finally {
+                            existing.ciphertext.fill(0)
+                        }
+                    }
                 }
-            } else {
-                requireSameSnapshot(existing, entity)
             }
+            return id
+        } finally {
+            bytes?.fill(0)
+            reservation.close()
         }
-        return id
     }
 
-    suspend fun listHistory(sessionId: UUID): List<EncryptedHistoryObject> {
-        val chunkObjects = chunks.listForSession(sessionId.requireUuidString()).map(::chunkObject)
-        val snapshotObjects = snapshots.listForSession(sessionId.requireUuidString()).map(::snapshotObject)
-        return (chunkObjects + snapshotObjects).sortedWith(
+    /**
+     * Stores one immutable TLBCSEA1 capture.  The database only receives the
+     * sealed container; the caller remains responsible for opening its PC and
+     * recipient identities with BrokerCaptureCrypto.
+     *
+     * A repeated key is idempotent: an existing sealed object wins, even when a
+     * retry supplied a fresh nonce.  The unique source index rejects a second
+     * capture UUID for the same ordered terminal event and key epoch.
+     */
+    suspend fun putBrokerCapture(
+        sessionId: UUID,
+        captureId: UUID,
+        sourceSequence: ULong,
+        keyEpoch: Long,
+        canonicalBytes: Int,
+        canonicalSha256: ByteArray,
+        keyId: String,
+        ciphertext: ByteArray,
+        ciphertextSha256: ByteArray? = null,
+        admittedBy: TerminalBufferBudget.Reservation? = null,
+    ): EncryptedBrokerCapture {
+        val expected = brokerCaptureArguments(
+            sessionId,
+            captureId,
+            sourceSequence,
+            keyEpoch,
+            canonicalBytes,
+            canonicalSha256,
+            keyId,
+            ciphertext,
+        )
+        val digest = sha256(ciphertext)
+        ciphertextSha256?.let { supplied ->
+            if (!MessageDigest.isEqual(supplied, digest)) {
+                throw HistoryIntegrityException("broker capture ciphertext hash mismatch before persistence")
+            }
+        }
+
+        // Admission precedes the owned copy and is released before reading an
+        // already cached retry, so a duplicate cannot transiently double-budget.
+        val reservation = admittedBy?.transferTo(bufferBudget, ciphertext.size.toLong())
+            ?: bufferBudget.reserve(ciphertext.size.toLong())
+        var persistedBytes: ByteArray? = null
+        var transferred = false
+        try {
+            val owned = ciphertext.copyOf()
+            persistedBytes = owned
+            val entity = BrokerCaptureEntity(
+                sessionId = sessionId.requireUuidString(),
+                captureId = captureId.requireUuidString(),
+                keyEpoch = keyEpoch,
+                sourceSequence = sourceSequence.toLong(),
+                canonicalBytes = canonicalBytes,
+                canonicalSha256 = canonicalSha256.copyOf(),
+                keyId = keyId,
+                sizeBytes = ciphertext.size.toLong(),
+                ciphertextSha256 = digest,
+                ciphertext = owned,
+                createdAtEpochMillis = clockMillis(),
+            )
+            val existing = database.withTransaction {
+                val safeSessionId = entity.sessionId
+                val source = brokerCaptures.readMetadataForSource(safeSessionId, entity.sourceSequence, keyEpoch)
+                if (source != null) {
+                    require(source.captureId == entity.captureId) {
+                        "broker capture source sequence is already bound to another capture"
+                    }
+                }
+                val cached = brokerCaptures.readMetadata(safeSessionId, entity.captureId, keyEpoch)
+                if (cached == null) {
+                    check(brokerCaptures.insertIfAbsent(entity) != -1L) {
+                        "broker capture identity conflict could not be resolved"
+                    }
+                    null
+                } else {
+                    requireSameBrokerCapture(cached, expected)
+                    cached
+                }
+            }
+            if (existing != null) {
+                persistedBytes?.fill(0)
+                persistedBytes = null
+                reservation.close()
+                transferred = true
+                return requireNotNull(readBrokerCapture(existing))
+            }
+            // Room has bound the SQLite value; keep only the returned owned copy.
+            val returned = EncryptedBrokerCapture(
+                metadata = expected.copy(ciphertextSha256 = digest.copyOf(), createdAtEpochMillis = entity.createdAtEpochMillis),
+                ciphertext = ciphertext.copyOf(),
+                bufferBudget = bufferBudget,
+                reservation = reservation,
+            )
+            transferred = true
+            return returned
+        } finally {
+            persistedBytes?.fill(0)
+            if (!transferred) reservation.close()
+        }
+    }
+
+    /** Loads one exact session/capture/epoch object without materializing a Room BLOB. */
+    suspend fun getBrokerCapture(
+        sessionId: UUID,
+        captureId: UUID,
+        keyEpoch: Long,
+    ): EncryptedBrokerCapture? {
+        require(keyEpoch > 0) { "broker capture key epoch must be positive" }
+        val metadata = brokerCaptures.readMetadata(
+            sessionId.requireUuidString(),
+            captureId.requireUuidString(),
+            keyEpoch,
+        ) ?: return null
+        return readBrokerCapture(metadata)
+    }
+
+    private suspend fun readBrokerCapture(metadata: BrokerCaptureReadMetadata): EncryptedBrokerCapture {
+        val expected = try {
+            brokerCaptureMetadata(metadata)
+        } catch (error: IllegalArgumentException) {
+            throw HistoryIntegrityException("broker capture metadata is invalid: ${error.message}")
+        }
+        if (metadata.ciphertextBytes != metadata.sizeBytes) {
+            throw HistoryIntegrityException("broker capture ciphertext length metadata is inconsistent")
+        }
+        if (metadata.ciphertextBytes !in 1L..MAX_BROKER_CAPTURE_OBJECT_BYTES ||
+            metadata.ciphertextBytes > Int.MAX_VALUE
+        ) {
+            throw HistoryIntegrityException("broker capture ciphertext size is out of bounds")
+        }
+        val reservation = bufferBudget.reserve(metadata.ciphertextBytes)
+        var bytes: ByteArray? = null
+        var transferred = false
+        try {
+            bytes = ByteArray(metadata.ciphertextBytes.toInt())
+            val ownedBytes = requireNotNull(bytes)
+            var offset = 0
+            while (offset < ownedBytes.size) {
+                val length = minOf(BROKER_CAPTURE_CHUNK_BYTES, ownedBytes.size - offset)
+                val chunk = brokerCaptures.readCiphertextChunk(
+                    metadata.sessionId,
+                    metadata.captureId,
+                    metadata.keyEpoch,
+                    offset,
+                    length,
+                ) ?: throw HistoryIntegrityException("broker capture disappeared during read")
+                try {
+                    require(chunk.size == length) { "broker capture chunk length is inconsistent" }
+                    chunk.copyInto(ownedBytes, offset)
+                } finally {
+                    chunk.fill(0)
+                }
+                offset += length
+            }
+            if (!MessageDigest.isEqual(sha256(ownedBytes), metadata.ciphertextSha256)) {
+                throw HistoryIntegrityException("broker capture ciphertext hash mismatch")
+            }
+            try {
+                validateBrokerCaptureEnvelope(
+                    ownedBytes,
+                    UUID.fromString(metadata.sessionId),
+                    UUID.fromString(metadata.captureId),
+                    metadata.sourceSequence.toULongChecked("broker capture source sequence"),
+                    metadata.keyEpoch,
+                    metadata.canonicalBytes,
+                    metadata.canonicalSha256,
+                )
+            } catch (error: IllegalArgumentException) {
+                throw HistoryIntegrityException("broker capture sealed header is invalid: ${error.message}")
+            }
+            val result = EncryptedBrokerCapture(expected, ownedBytes, bufferBudget, reservation)
+            transferred = true
+            return result
+        } finally {
+            if (!transferred) {
+                bytes?.fill(0)
+                reservation.close()
+            }
+        }
+    }
+
+    suspend fun listHistory(sessionId: UUID): List<EncryptedHistoryObject> = readHistoryTransaction { retained ->
+        val safeSessionId = sessionId.requireUuidString()
+        val snapshotMetadata = snapshots.listReadMetadata(safeSessionId)
+        for (metadata in snapshotMetadata) retained += readSnapshot(metadata)
+        for (id in chunks.listIdsForSession(safeSessionId)) {
+            val row = requireNotNull(chunks.get(id))
+            try {
+                retained += chunkObject(row)
+            } finally {
+                row.ciphertext.fill(0)
+            }
+        }
+        retained.sortedWith(
             compareBy<EncryptedHistoryObject> {
                 it.metadata.startSequence ?: it.metadata.snapshotSequence ?: 0u
             }.thenBy { it.metadata.id.toString() },
-        ).map(EncryptedHistoryObject::copyCiphertext)
+        )
     }
 
     suspend fun latestSnapshot(sessionId: UUID, atOrBefore: ULong): EncryptedHistoryObject? {
         val sequence = atOrBefore.toRoomSequence("snapshot lookup sequence")
-        return snapshots.latestAtOrBefore(sessionId.requireUuidString(), sequence)?.let {
-            snapshotObject(it).copyCiphertext()
+        return readHistoryTransaction { retained ->
+            snapshots.latestReadMetadata(sessionId.requireUuidString(), sequence)?.let {
+                readSnapshot(it).also(retained::add)
+            }
         }
     }
 
-    suspend fun getHistoryObject(objectId: UUID): EncryptedHistoryObject? =
-        chunks.get(objectId.requireUuidString())?.let { chunkObject(it).copyCiphertext() }
-            ?: snapshots.get(objectId.requireUuidString())?.let { snapshotObject(it).copyCiphertext() }
+    suspend fun getHistoryObject(objectId: UUID): EncryptedHistoryObject? = readHistoryTransaction { retained ->
+        chunks.get(objectId.requireUuidString())?.let { row ->
+            try {
+                chunkObject(row).also(retained::add)
+            } finally {
+                row.ciphertext.fill(0)
+            }
+        } ?: snapshots.readMetadata(objectId.requireUuidString())?.let {
+            readSnapshot(it).also(retained::add)
+        }
+    }
+
+    // Failed reads (including transaction commit/cancellation) must not leave any caller-owned permits.
+    private suspend fun <T> readHistoryTransaction(block: suspend (MutableList<EncryptedHistoryObject>) -> T): T {
+        val retained = mutableListOf<EncryptedHistoryObject>()
+        var completed = false
+        try {
+            val result = database.withTransaction { block(retained) }
+            completed = true
+            return result
+        } finally {
+            if (!completed) retained.forEach(EncryptedHistoryObject::destroy)
+        }
+    }
 
     /**
      * Loads exactly one encrypted chunk containing the next replay cursor.
@@ -535,10 +906,14 @@ class HistoryRepository(
     suspend fun eventChunkContaining(sessionId: UUID, sequence: ULong): EncryptedHistoryObject? {
         val cursor = sequence.toPositiveRoomSequence("event chunk replay cursor")
         val rows = chunks.listContaining(sessionId.requireUuidString(), cursor)
-        require(rows.size <= 1) { "overlapping event chunks contain sequence $sequence" }
-        return rows.singleOrNull()?.let { row ->
-            verifyHash(row.ciphertext, row.ciphertextSha256, "event chunk ${row.id}", row.sizeBytes)
-            chunkObject(row).copyCiphertext()
+        try {
+            require(rows.size <= 1) { "overlapping event chunks contain sequence $sequence" }
+            return rows.singleOrNull()?.let { row ->
+                verifyHash(row.ciphertext, row.ciphertextSha256, "event chunk ${row.id}", row.sizeBytes)
+                chunkObject(row)
+            }
+        } finally {
+            rows.forEach { it.ciphertext.fill(0) }
         }
     }
 
@@ -763,36 +1138,33 @@ class HistoryRepository(
         val sequence = snapshotSequence.toRoomSequence("snapshot sequence")
         val rendererCursor = renderedThroughSequence.toRoomSequence("rendered cursor")
         val expectedDigest = ciphertextSha256.copyOf()
-        return database.withTransaction {
-            val snapshot = requireNotNull(snapshots.get(safeSnapshotId)) {
+        return readHistoryTransaction { retained ->
+            val metadata = requireNotNull(snapshots.readMetadata(safeSnapshotId)) {
                 "renderer checkpoint snapshot is not cached"
             }
-            require(snapshot.sessionId == safeSessionId) { "renderer checkpoint snapshot belongs to another session" }
-            require(snapshot.snapshotSequence == sequence) { "renderer checkpoint snapshot sequence mismatch" }
-            require(
-                snapshot.formatName == TERMINAL_SNAPSHOT_FORMAT && snapshot.formatVersion == 1 ||
-                    snapshot.formatName == TERMINAL_CORE_SNAPSHOT_FORMAT && snapshot.formatVersion == 2,
+            require(metadata.sessionId == safeSessionId) { "renderer checkpoint snapshot belongs to another session" }
+            require(metadata.snapshotSequence == sequence) { "renderer checkpoint snapshot sequence mismatch" }
+            val maximumSnapshotBytes = requireNotNull(
+                knownSnapshotMaximumBytes(metadata.formatName, metadata.formatVersion),
             ) {
                 "renderer checkpoint uses an unsupported snapshot format"
             }
-            val maximumSnapshotBytes = if (snapshot.formatName == TERMINAL_CORE_SNAPSHOT_FORMAT) {
-                MAX_TERMINAL_CORE_SNAPSHOT_BYTES
-            } else {
-                MAX_TERMINAL_SNAPSHOT_BYTES
-            }
-            require(snapshot.sizeBytes in 1..maximumSnapshotBytes) {
+            require(metadata.sizeBytes == metadata.ciphertextBytes &&
+                metadata.sizeBytes in 1..maximumSnapshotBytes &&
+                metadata.ciphertextBytes in 1..maximumSnapshotBytes
+            ) {
                 "renderer checkpoint snapshot size is out of bounds"
             }
-            require(snapshot.rows in 1..MAX_TERMINAL_SNAPSHOT_ROWS) {
+            require(metadata.rows in 1..MAX_TERMINAL_SNAPSHOT_ROWS) {
                 "renderer checkpoint snapshot rows are out of bounds"
             }
-            require(snapshot.columns in 1..MAX_TERMINAL_SNAPSHOT_COLUMNS) {
+            require(metadata.columns in 1..MAX_TERMINAL_SNAPSHOT_COLUMNS) {
                 "renderer checkpoint snapshot columns are out of bounds"
             }
-            require(MessageDigest.isEqual(snapshot.ciphertextSha256, expectedDigest)) {
+            val snapshot = readSnapshot(metadata).also(retained::add)
+            require(MessageDigest.isEqual(snapshot.metadata.ciphertextSha256, expectedDigest)) {
                 "renderer checkpoint snapshot hash mismatch"
             }
-            verifyHash(snapshot.ciphertext, snapshot.ciphertextSha256, "snapshot ${snapshot.id}", snapshot.sizeBytes)
 
             val cursor = requireNotNull(acks.get(safeSessionId, safeDirection)) {
                 "ACK cursor must be initialized before binding a renderer checkpoint"
@@ -825,7 +1197,7 @@ class HistoryRepository(
                     updatedAtEpochMillis = updatedAt,
                 ),
             )
-            checkpointState(snapshot, sequence, nextGeneration, rendererCursor)
+            checkpointState(snapshot, metadata, sequence, nextGeneration, rendererCursor)
         }
     }
 
@@ -833,8 +1205,8 @@ class HistoryRepository(
     suspend fun rendererCheckpointState(sessionId: UUID, direction: String): RendererCheckpointState? {
         val safeSessionId = sessionId.requireUuidString()
         val safeDirection = direction.requireNonBlank("ACK direction")
-        return database.withTransaction {
-            val checkpoint = rendererCheckpoints.get(safeSessionId, safeDirection) ?: return@withTransaction null
+        return readHistoryTransaction { retained ->
+            val checkpoint = rendererCheckpoints.get(safeSessionId, safeDirection) ?: return@readHistoryTransaction null
             val cursor = acks.get(safeSessionId, safeDirection)
                 ?: throw HistoryIntegrityException("renderer checkpoint has no ACK cursor")
             if (cursor.rendererGeneration != checkpoint.rendererGeneration ||
@@ -842,17 +1214,32 @@ class HistoryRepository(
             ) {
                 throw HistoryIntegrityException("renderer checkpoint does not match its ACK generation")
             }
-            val snapshot = snapshots.get(checkpoint.snapshotId)
+            val metadata = snapshots.readMetadata(checkpoint.snapshotId)
                 ?: throw HistoryIntegrityException("renderer checkpoint snapshot is missing")
-            if (snapshot.sessionId != safeSessionId ||
-                snapshot.snapshotSequence != checkpoint.snapshotSequence ||
-                !MessageDigest.isEqual(snapshot.ciphertextSha256, checkpoint.ciphertextSha256)
+            if (metadata.sessionId != safeSessionId ||
+                metadata.snapshotSequence != checkpoint.snapshotSequence
             ) {
                 throw HistoryIntegrityException("renderer checkpoint snapshot identity mismatch")
             }
-            verifyHash(snapshot.ciphertext, snapshot.ciphertextSha256, "snapshot ${snapshot.id}", snapshot.sizeBytes)
+            val maximumSnapshotBytes = try {
+                knownSnapshotMaximumBytes(metadata.formatName, metadata.formatVersion)
+            } catch (_: IllegalArgumentException) {
+                throw HistoryIntegrityException("renderer checkpoint uses an unsupported snapshot format")
+            } ?: throw HistoryIntegrityException("renderer checkpoint uses an unsupported snapshot format")
+            if (metadata.sizeBytes !in 1..maximumSnapshotBytes ||
+                metadata.ciphertextBytes !in 1..maximumSnapshotBytes ||
+                metadata.rows !in 1..MAX_TERMINAL_SNAPSHOT_ROWS ||
+                metadata.columns !in 1..MAX_TERMINAL_SNAPSHOT_COLUMNS
+            ) {
+                throw HistoryIntegrityException("renderer checkpoint snapshot is out of bounds")
+            }
+            val snapshot = readSnapshot(metadata).also(retained::add)
+            if (!MessageDigest.isEqual(snapshot.metadata.ciphertextSha256, checkpoint.ciphertextSha256)) {
+                throw HistoryIntegrityException("renderer checkpoint snapshot identity mismatch")
+            }
             checkpointState(
                 snapshot,
+                metadata,
                 checkpoint.snapshotSequence,
                 checkpoint.rendererGeneration,
                 cursor.highestContiguousSequence,
@@ -1061,6 +1448,7 @@ class HistoryRepository(
     suspend fun deleteSession(sessionId: UUID) {
         val id = sessionId.requireUuidString()
         database.withTransaction {
+            brokerCaptures.deleteForSession(id)
             chunks.deleteForSession(id)
             transcriptPages.deleteForSession(id)
             rendererCheckpoints.deleteForSession(id)
@@ -1075,6 +1463,7 @@ class HistoryRepository(
     suspend fun clearHistory(sessionId: UUID) {
         val id = sessionId.requireUuidString()
         database.withTransaction {
+            brokerCaptures.deleteForSession(id)
             chunks.deleteForSession(id)
             transcriptPages.deleteForSession(id)
             rendererCheckpoints.deleteForSession(id)
@@ -1086,6 +1475,7 @@ class HistoryRepository(
     /** Clears summaries, encrypted blobs, ACKs, and encrypted preferences on sign-out. */
     suspend fun clearAll() {
         database.withTransaction {
+            brokerCaptures.clear()
             chunks.clear()
             transcriptPages.clear()
             rendererCheckpoints.clear()
@@ -1161,26 +1551,194 @@ class HistoryRepository(
         )
     }
 
-    private fun chunkObject(entity: EventChunkEntity): EncryptedHistoryObject =
-        EncryptedHistoryObject(chunkMetadata(entity), entity.ciphertext.copyOf())
-
-    private fun snapshotObject(entity: SnapshotEntity): EncryptedHistoryObject =
-        EncryptedHistoryObject(
-            metadata = HistoryObject(
-                id = entity.id.toUuid(),
-                kind = HistoryObject.Kind.SNAPSHOT,
-                objectKey = entity.objectKey,
-                keyId = entity.keyId,
-                ciphertextSha256 = entity.ciphertextSha256.copyOf(),
-                sizeBytes = entity.sizeBytes,
-                startSequence = null,
-                endSequence = null,
-                snapshotSequence = entity.snapshotSequence.toULongChecked("snapshot sequence"),
-                formatName = entity.formatName,
-                formatVersion = entity.formatVersion,
-            ),
-            ciphertext = entity.ciphertext.copyOf(),
+    private fun brokerCaptureArguments(
+        sessionId: UUID,
+        captureId: UUID,
+        sourceSequence: ULong,
+        keyEpoch: Long,
+        canonicalBytes: Int,
+        canonicalSha256: ByteArray,
+        keyId: String,
+        ciphertext: ByteArray,
+    ): BrokerCaptureMetadata {
+        require(sessionId != ZERO_UUID && captureId != ZERO_UUID) {
+            "broker capture UUID is invalid"
+        }
+        require(keyEpoch > 0) { "broker capture key epoch must be positive" }
+        require(sourceSequence > 0uL && sourceSequence < Long.MAX_VALUE.toULong()) {
+            "broker capture source sequence is invalid"
+        }
+        require(canonicalSha256.size == SHA256_BYTES) {
+            "broker capture canonical hash must be SHA-256"
+        }
+        require(keyId.isNotBlank()) { "broker capture key id is required" }
+        validateBrokerCaptureEnvelope(
+            ciphertext,
+            sessionId,
+            captureId,
+            sourceSequence,
+            keyEpoch,
+            canonicalBytes,
+            canonicalSha256,
         )
+        return BrokerCaptureMetadata(
+            sessionId = sessionId,
+            captureId = captureId,
+            keyEpoch = keyEpoch,
+            sourceSequence = sourceSequence,
+            canonicalBytes = canonicalBytes,
+            canonicalSha256 = canonicalSha256.copyOf(),
+            keyId = keyId,
+            sizeBytes = ciphertext.size.toLong(),
+            ciphertextSha256 = sha256(ciphertext),
+            createdAtEpochMillis = 0,
+        )
+    }
+
+    private fun brokerCaptureMetadata(entity: BrokerCaptureReadMetadata): BrokerCaptureMetadata =
+        BrokerCaptureMetadata(
+            sessionId = entity.sessionId.toUuid(),
+            captureId = entity.captureId.toUuid(),
+            keyEpoch = entity.keyEpoch,
+            sourceSequence = entity.sourceSequence.toULongChecked("broker capture source sequence"),
+            canonicalBytes = entity.canonicalBytes,
+            canonicalSha256 = entity.canonicalSha256.copyOf(),
+            keyId = entity.keyId,
+            sizeBytes = entity.sizeBytes,
+            ciphertextSha256 = entity.ciphertextSha256.copyOf(),
+            createdAtEpochMillis = entity.createdAtEpochMillis,
+        )
+
+    private fun requireSameBrokerCapture(
+        stored: BrokerCaptureReadMetadata,
+        expected: BrokerCaptureMetadata,
+    ) {
+        require(stored.sessionId == expected.sessionId.toString() &&
+            stored.captureId == expected.captureId.toString() &&
+            stored.keyEpoch == expected.keyEpoch &&
+            stored.sourceSequence == expected.sourceSequence.toRoomSequence("broker capture source sequence") &&
+            stored.canonicalBytes == expected.canonicalBytes &&
+            MessageDigest.isEqual(stored.canonicalSha256, expected.canonicalSha256) &&
+            stored.keyId == expected.keyId &&
+            stored.sizeBytes == expected.sizeBytes &&
+            stored.ciphertextBytes == expected.sizeBytes &&
+            stored.ciphertextSha256.size == SHA256_BYTES
+        ) { "broker capture identity is already bound to different immutable content" }
+    }
+
+    private fun validateBrokerCaptureEnvelope(
+        sealed: ByteArray,
+        sessionId: UUID,
+        captureId: UUID,
+        sourceSequence: ULong,
+        keyEpoch: Long,
+        canonicalBytes: Int,
+        canonicalSha256: ByteArray,
+    ) {
+        require(canonicalBytes in BROKER_CAPTURE_MINIMUM_CANONICAL_BYTES..MAX_BROKER_CAPTURE_CANONICAL_BYTES) {
+            "broker capture canonical length is invalid"
+        }
+        require(canonicalSha256.size == SHA256_BYTES) {
+            "broker capture canonical hash must be SHA-256"
+        }
+        val expectedSize = canonicalBytes.toLong() + BROKER_CAPTURE_SEALED_OVERHEAD_BYTES
+        require(sealed.size.toLong() == expectedSize && sealed.size <= MAX_BROKER_CAPTURE_OBJECT_BYTES) {
+            "broker capture sealed size is invalid"
+        }
+        require(sealed.size >= BROKER_CAPTURE_HEADER_BYTES) {
+            "broker capture sealed header is truncated"
+        }
+        val view = ByteBuffer.wrap(sealed).order(ByteOrder.BIG_ENDIAN)
+        require(sealed.matchesBytes(0, BROKER_CAPTURE_MAGIC) &&
+            view.getShort(8).toInt() == 1 &&
+            view.getShort(10).toInt() == BROKER_CAPTURE_HEADER_BYTES &&
+            sealed.matchesBytes(12, sessionId.uuidBytes()) &&
+            sealed.matchesBytes(60, captureId.uuidBytes()) &&
+            view.getLong(76).toULong() == sourceSequence &&
+            view.getLong(84) == keyEpoch &&
+            view.getInt(92) == canonicalBytes &&
+            MessageDigest.isEqual(sealed.copyOfRange(96, 128), canonicalSha256) &&
+            (sealed.matchesBytes(140, BROKER_CAPTURE_STATE_CONTRACT) ||
+                sealed.matchesBytes(140, BROKER_CAPTURE_UNICODE_STATE_CONTRACT)) &&
+            (162 until BROKER_CAPTURE_HEADER_BYTES).all { sealed[it] == 0.toByte() }
+        ) { "broker capture sealed header identity is invalid" }
+    }
+
+    private fun ByteArray.matchesBytes(offset: Int, expected: ByteArray): Boolean =
+        offset >= 0 && offset + expected.size <= size && expected.indices.all { this[offset + it] == expected[it] }
+
+    private fun UUID.uuidBytes(): ByteArray = ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
+        .putLong(mostSignificantBits).putLong(leastSignificantBits).array()
+
+    private fun chunkObject(entity: EventChunkEntity): EncryptedHistoryObject =
+        EncryptedHistoryObject(chunkMetadata(entity), entity.ciphertext, bufferBudget)
+
+    private fun requireSnapshotReadSize(metadata: SnapshotReadMetadata) {
+        val maximumSnapshotBytes = try {
+            knownSnapshotMaximumBytes(metadata.formatName, metadata.formatVersion)
+        } catch (_: IllegalArgumentException) {
+            throw HistoryIntegrityException("unsupported snapshot format in local history")
+        }
+        if (metadata.sizeBytes <= 0 || metadata.sizeBytes != metadata.ciphertextBytes ||
+            (maximumSnapshotBytes != null && metadata.sizeBytes > maximumSnapshotBytes)
+        ) {
+            throw HistoryIntegrityException("snapshot ciphertext size is out of bounds")
+        }
+    }
+
+    /** Must be called inside the metadata query's transaction. */
+    private suspend fun readSnapshot(metadata: SnapshotReadMetadata): EncryptedHistoryObject {
+        requireSnapshotReadSize(metadata)
+        val reservation = bufferBudget.reserve(metadata.ciphertextBytes)
+        var bytes: ByteArray? = null
+        var transferred = false
+        try {
+            val entity = snapshots.get(metadata.id)
+                ?: throw HistoryIntegrityException("snapshot disappeared during read")
+            bytes = entity.ciphertext
+            verifyHash(entity.ciphertext, entity.ciphertextSha256, "snapshot ${entity.id}", entity.sizeBytes)
+            val result = EncryptedHistoryObject(
+                metadata = HistoryObject(
+                    id = entity.id.toUuid(),
+                    kind = HistoryObject.Kind.SNAPSHOT,
+                    objectKey = entity.objectKey,
+                    keyId = entity.keyId,
+                    ciphertextSha256 = entity.ciphertextSha256.copyOf(),
+                    sizeBytes = entity.sizeBytes,
+                    startSequence = null,
+                    endSequence = null,
+                    snapshotSequence = entity.snapshotSequence.toULongChecked("snapshot sequence"),
+                    formatName = entity.formatName,
+                    formatVersion = entity.formatVersion,
+                ),
+                ciphertext = entity.ciphertext,
+                bufferBudget = bufferBudget,
+                reservation = reservation,
+            )
+            transferred = true
+            return result
+        } finally {
+            bytes?.fill(0)
+            if (!transferred) reservation.close()
+        }
+    }
+
+    private fun knownSnapshotMaximumBytes(formatName: String, formatVersion: Int): Long? = when (formatName) {
+        TERMINAL_SNAPSHOT_FORMAT -> {
+            require(formatVersion == 1) { "unsupported terminal snapshot format version" }
+            MAX_TERMINAL_SNAPSHOT_BYTES
+        }
+        TERMINAL_CORE_SNAPSHOT_FORMAT -> {
+            require(formatVersion == 2) { "unsupported terminal-core snapshot format version" }
+            MAX_TERMINAL_CORE_SNAPSHOT_BYTES
+        }
+        TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT -> {
+            require(formatVersion == 1) { "unsupported terminal-core graphics snapshot format version" }
+            MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_BYTES
+        }
+        // Generic history storage remains compatible; renderer binding rejects these formats.
+        else -> null
+    }
 
     private fun transcriptPage(entity: TranscriptPageEntity): EncryptedTranscriptPage =
         EncryptedTranscriptPage(
@@ -1202,14 +1760,15 @@ class HistoryRepository(
         )
 
     private fun checkpointState(
-        snapshot: SnapshotEntity,
+        snapshot: EncryptedHistoryObject,
+        metadata: SnapshotReadMetadata,
         snapshotSequence: Long,
         rendererGeneration: Long,
         acknowledgement: Long,
     ): RendererCheckpointState = RendererCheckpointState(
-        snapshot = snapshotObject(snapshot).copyCiphertext(),
-        snapshotRows = snapshot.rows,
-        snapshotColumns = snapshot.columns,
+        snapshot = snapshot,
+        snapshotRows = metadata.rows,
+        snapshotColumns = metadata.columns,
         snapshotSequence = snapshotSequence.toULongChecked("snapshot sequence"),
         durableAcknowledgement = acknowledgement.toULongChecked("ACK sequence"),
         rendererGeneration = rendererGeneration,
@@ -1366,12 +1925,22 @@ class HistoryRepository(
         const val BOUNDED_EVENT_REPLAY_FORMAT = "BOUNDED_EVENT_REPLAY"
         const val TERMINAL_SNAPSHOT_FORMAT = "TERMLINK_TERMINAL_SNAPSHOT"
         const val TERMINAL_CORE_SNAPSHOT_FORMAT = "TERMLINK_TERMINAL_CORE_SNAPSHOT"
+        const val TERMINAL_CORE_GRAPHICS_SNAPSHOT_FORMAT = "TERMLINK_TERMINAL_CORE_GRAPHICS_SNAPSHOT"
         const val TERMINAL_TRANSCRIPT_FORMAT = "TERMLINK_TERMINAL_TRANSCRIPT"
         const val MAX_TERMINAL_SNAPSHOT_BYTES = 2L * 1024 * 1024
         const val MAX_TERMINAL_CORE_SNAPSHOT_BYTES = 64L * 1024 * 1024
+        // Encrypted container budget; native plaintext admission is enforced by JNI.
+        const val MAX_TERMINAL_CORE_GRAPHICS_SNAPSHOT_BYTES = 128L * 1024 * 1024 + 4096
         const val MAX_TERMINAL_TRANSCRIPT_BYTES = 512L * 1024
         const val MAX_TERMINAL_SNAPSHOT_ROWS = 256
         const val MAX_TERMINAL_SNAPSHOT_COLUMNS = 512
+        const val BROKER_CAPTURE_HEADER_BYTES = 192
+        const val BROKER_CAPTURE_SEALED_OVERHEAD_BYTES = BROKER_CAPTURE_HEADER_BYTES + 16L
+        const val BROKER_CAPTURE_MINIMUM_CANONICAL_BYTES = 136L
+        const val MAX_BROKER_CAPTURE_CANONICAL_BYTES = 32L * 1024 * 1024
+        const val MAX_BROKER_CAPTURE_OBJECT_BYTES =
+            MAX_BROKER_CAPTURE_CANONICAL_BYTES + BROKER_CAPTURE_SEALED_OVERHEAD_BYTES
+        const val BROKER_CAPTURE_CHUNK_BYTES = 512 * 1024
         const val SESSION_PREFERENCE_SCOPE = "session"
         const val SHA256_BYTES = 32
         const val DEFAULT_SEARCH_LIMIT = 100
@@ -1381,5 +1950,10 @@ class HistoryRepository(
 
         fun sha256(input: ByteArray): ByteArray =
             MessageDigest.getInstance("SHA-256").digest(input)
+
+        internal val ZERO_UUID = UUID(0, 0)
+        internal val BROKER_CAPTURE_MAGIC = "TLBCSEA1".encodeToByteArray()
+        internal val BROKER_CAPTURE_STATE_CONTRACT = "terminal_state_2_22_v1".encodeToByteArray()
+        internal val BROKER_CAPTURE_UNICODE_STATE_CONTRACT = "terminal_state_2_22_v2".encodeToByteArray()
     }
 }

@@ -128,7 +128,7 @@ internal static class Program
                     "--managed-session-id", sessionId.ToString("D"),
                     "--registry-pipe", controlPipe,
                     "--registration-timeout-ms", "15000",
-                    "--timeout-ms", "120000"
+                    "--timeout-ms", "120000", "--diagnostics"
                 },
                 testRoot,
                 caPath,
@@ -147,13 +147,18 @@ internal static class Program
                     "--managed-session-id", peerSessionId.ToString("D"),
                     "--registry-pipe", controlPipe,
                     "--registration-timeout-ms", "15000",
-                    "--timeout-ms", "120000"
+                    "--timeout-ms", "120000", "--diagnostics"
                 },
                 testRoot,
                 caPath,
                 acceptanceDataRoot,
                 out peerHostError);
             var peerSessionHostPid = peerSessionHost.Id;
+
+            // A headless launcher may close stdin while the managed session
+            // remains alive. Protocol replies must keep their ConPTY pipe.
+            sessionHost.StandardInput.Close();
+            peerSessionHost.StandardInput.Close();
 
             await WaitForSessionRegistrationAsync(
                 controlPipe, sessionId, sessionHostPid, TimeSpan.FromSeconds(20)).ConfigureAwait(false);
@@ -223,6 +228,8 @@ internal static class Program
                         new SubscribePayload
                         {
                             ResumeFromSeq = 0,
+                    RequestId = ByteString.CopyFrom(GuidBytes(Guid.NewGuid())),
+                    SubscriberCapabilities = { "terminal_state_2_21_v2" },
                             SubscriberExchangePublicKey = ByteString.CopyFrom(
                                 androidIdentity.Exchange.PublicKey)
                         }.ToByteArray()),
@@ -312,6 +319,8 @@ internal static class Program
             }
             if (!string.IsNullOrWhiteSpace(relay?.LastFailure))
                 Console.Error.WriteLine("Loopback Relay failure: " + relay.LastFailure);
+            if (sessionHost?.HasExited == true) Console.Error.WriteLine("SessionHost exit code: " + sessionHost.ExitCode);
+            if (peerSessionHost?.HasExited == true) Console.Error.WriteLine("Peer SessionHost exit code: " + peerSessionHost.ExitCode);
             if (hostError?.IsCompleted == true)
                 Console.Error.WriteLine("SessionHost stderr: " + await hostError.ConfigureAwait(false));
             if (peerHostError?.IsCompleted == true)
@@ -349,6 +358,7 @@ internal static class Program
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = true,
             StandardOutputEncoding = new UTF8Encoding(false),
             StandardErrorEncoding = new UTF8Encoding(false)
         };
@@ -518,6 +528,8 @@ internal static class Program
                 new SubscribePayload
                 {
                     ResumeFromSeq = 0,
+                    RequestId = ByteString.CopyFrom(GuidBytes(Guid.NewGuid())),
+                    SubscriberCapabilities = { "terminal_state_2_21_v2" },
                     SubscriberExchangePublicKey = ByteString.CopyFrom(androidExchangePublicKey)
                 }.ToByteArray()),
             generation).ConfigureAwait(false);
@@ -1214,7 +1226,7 @@ internal static class Program
                             "cumulative_ack",
                             "e2ee_x25519_chacha20poly1305",
                             "flow_control_v1",
-                            "lease_v1"
+                            "lease_v1", "terminal_attach_v1", "terminal_host_geometry_v1", "terminal_host_theme_v1", "terminal_host_resize_v1"
                         }
                     });
                     await WriteWebSocketFrameAsync(
@@ -1245,7 +1257,8 @@ internal static class Program
                     {
                         var envelope = Envelope.Parser.ParseFrom(frame.Payload);
                         var sessionId = GuidFromBytes(envelope.SessionId.Span);
-                        sessionEnvelopeCounts.AddOrUpdate(sessionId, 1, (_, count) => count + 1);
+                        if (envelope.MessageType != MessageType.TerminalAttachResult)
+                            sessionEnvelopeCounts.AddOrUpdate(sessionId, 1, (_, count) => count + 1);
                     }
                 }
             }

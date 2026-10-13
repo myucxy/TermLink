@@ -6,6 +6,41 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 
+/** SQLite computes the BLOB length without materializing its bytes in the Java heap. */
+data class SnapshotReadMetadata(
+    val id: String,
+    val sessionId: String,
+    val snapshotSequence: Long,
+    val rows: Int,
+    val columns: Int,
+    val sizeBytes: Long,
+    val ciphertextBytes: Long,
+    val formatName: String,
+    val formatVersion: Int,
+)
+
+private const val SNAPSHOT_READ_COLUMNS =
+    "id, sessionId, snapshotSequence, rows, columns, sizeBytes, LENGTH(ciphertext) AS ciphertextBytes, formatName, formatVersion"
+
+/** Metadata-only broker capture projection; the ciphertext is read in bounded slices. */
+data class BrokerCaptureReadMetadata(
+    val sessionId: String,
+    val captureId: String,
+    val keyEpoch: Long,
+    val sourceSequence: Long,
+    val canonicalBytes: Int,
+    val canonicalSha256: ByteArray,
+    val keyId: String,
+    val sizeBytes: Long,
+    val ciphertextSha256: ByteArray,
+    val ciphertextBytes: Long,
+    val createdAtEpochMillis: Long,
+)
+
+private const val BROKER_CAPTURE_READ_COLUMNS =
+    "sessionId, captureId, keyEpoch, sourceSequence, canonicalBytes, canonicalSha256, keyId, " +
+        "sizeBytes, ciphertextSha256, LENGTH(ciphertext) AS ciphertextBytes, createdAtEpochMillis"
+
 @Dao
 interface DeviceDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -111,6 +146,9 @@ interface EventChunkDao {
     @Query("SELECT * FROM event_chunks WHERE sessionId = :sessionId ORDER BY startSequence ASC, endSequence ASC, id ASC")
     suspend fun listForSession(sessionId: String): List<EventChunkEntity>
 
+    @Query("SELECT id FROM event_chunks WHERE sessionId = :sessionId ORDER BY startSequence ASC, endSequence ASC, id ASC")
+    suspend fun listIdsForSession(sessionId: String): List<String>
+
     @Query("SELECT * FROM event_chunks WHERE id = :id LIMIT 1")
     suspend fun get(id: String): EventChunkEntity?
 
@@ -141,6 +179,19 @@ interface EventChunkDao {
 interface SnapshotDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertIfAbsent(entity: SnapshotEntity): Long
+
+    @Query("SELECT " + SNAPSHOT_READ_COLUMNS + " FROM snapshots WHERE id = :id LIMIT 1")
+    suspend fun readMetadata(id: String): SnapshotReadMetadata?
+
+    @Query(
+        "SELECT " + SNAPSHOT_READ_COLUMNS + " FROM snapshots WHERE sessionId = :sessionId " +
+            "AND snapshotSequence <= :atOrBeforeSequence " +
+            "ORDER BY snapshotSequence DESC, createdAtEpochMillis DESC, id ASC LIMIT 1",
+    )
+    suspend fun latestReadMetadata(sessionId: String, atOrBeforeSequence: Long): SnapshotReadMetadata?
+
+    @Query("SELECT " + SNAPSHOT_READ_COLUMNS + " FROM snapshots WHERE sessionId = :sessionId ORDER BY snapshotSequence ASC, id ASC")
+    suspend fun listReadMetadata(sessionId: String): List<SnapshotReadMetadata>
 
     @Query(
         "SELECT * FROM snapshots WHERE sessionId = :sessionId " +
@@ -353,5 +404,46 @@ interface HistoryPreferenceDao {
     suspend fun deleteScope(scope: String)
 
     @Query("DELETE FROM history_preferences")
+    suspend fun clear()
+}
+
+@Dao
+interface BrokerCaptureDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(entity: BrokerCaptureEntity): Long
+
+    @Query(
+        "SELECT " + BROKER_CAPTURE_READ_COLUMNS + " FROM broker_captures " +
+            "WHERE sessionId = :sessionId AND captureId = :captureId AND keyEpoch = :keyEpoch LIMIT 1",
+    )
+    suspend fun readMetadata(sessionId: String, captureId: String, keyEpoch: Long): BrokerCaptureReadMetadata?
+
+    @Query(
+        "SELECT " + BROKER_CAPTURE_READ_COLUMNS + " FROM broker_captures " +
+            "WHERE sessionId = :sessionId AND sourceSequence = :sourceSequence AND keyEpoch = :keyEpoch LIMIT 1",
+    )
+    suspend fun readMetadataForSource(
+        sessionId: String,
+        sourceSequence: Long,
+        keyEpoch: Long,
+    ): BrokerCaptureReadMetadata?
+
+    /** SQLite SUBSTR is 1-based; keeping each read at 512 KiB avoids CursorWindow limits. */
+    @Query(
+        "SELECT SUBSTR(ciphertext, :offset + 1, :length) FROM broker_captures " +
+            "WHERE sessionId = :sessionId AND captureId = :captureId AND keyEpoch = :keyEpoch LIMIT 1",
+    )
+    suspend fun readCiphertextChunk(
+        sessionId: String,
+        captureId: String,
+        keyEpoch: Long,
+        offset: Int,
+        length: Int,
+    ): ByteArray?
+
+    @Query("DELETE FROM broker_captures WHERE sessionId = :sessionId")
+    suspend fun deleteForSession(sessionId: String)
+
+    @Query("DELETE FROM broker_captures")
     suspend fun clear()
 }

@@ -80,6 +80,9 @@ class ProductionApiClient(
 
     private fun executeOnce(method: String, path: String, body: ByteArray, idempotencyKey: String?, includeDeviceProof: Boolean, token: String): JsonElement {
         val builder = Request.Builder().url(root + path).header("Authorization", "Bearer $token")
+        if (method == "GET" && path == "/v1/pcs") {
+            builder.header("X-TermLink-PC-Command-Capabilities", "powershell-7-enhanced")
+        }
         if (idempotencyKey != null) builder.header("Idempotency-Key", idempotencyKey)
         if (includeDeviceProof) {
             val proof = DeviceProof.create(identity, deviceId.toString(), method, path, body)

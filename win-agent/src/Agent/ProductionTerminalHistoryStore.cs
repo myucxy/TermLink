@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -62,6 +63,26 @@ namespace TermLink.Agent
                 FormatVersion = FormatVersion,
                 Plaintext = Plaintext == null ? null : (byte[])Plaintext.Clone()
             };
+        }
+    }
+
+    internal sealed class ProductionTerminalHistoryPreviousSnapshot
+    {
+        public Guid SessionId { get; set; }
+        public ProductionTerminalHistoryArtifact Artifact { get; set; }
+    }
+
+    internal sealed class ProductionTerminalHistoryDeltaSnapshotPair : IDisposable
+    {
+        public ProductionTerminalHistoryArtifact Current { get; set; }
+        public ProductionTerminalHistoryArtifact Previous { get; set; }
+
+        public void Dispose()
+        {
+            if (Current?.Plaintext != null) CryptographicOperations.ZeroMemory(Current.Plaintext);
+            if (Previous?.Plaintext != null) CryptographicOperations.ZeroMemory(Previous.Plaintext);
+            Current = null;
+            Previous = null;
         }
     }
 
@@ -164,9 +185,14 @@ namespace TermLink.Agent
     internal sealed class ProductionTerminalHistoryStore
     {
         private const int MaximumTranscriptPublicationPageCount = 100_000;
+        private const int GraphicsSnapshotV222RequiredFeaturesOffset = 64;
+        private const ulong GraphicsSnapshotV222StandaloneC1Feature = 0x10_0000;
         private const string WalExtension = ".wal.dpapi";
         private const string CheckpointFileName = "checkpoint.dpapi";
         private const string OutboxFileName = "outbox.dpapi";
+        private const string PreviousSnapshotFileName = "previous-snapshot.dpapi";
+        private const long MaximumPreviousSnapshotProtectedBytes =
+            2L * SnapshotCrypto.MaxTerminalCoreGraphicsSnapshotPlaintextBytes + 1024 * 1024;
         private const string ChunkOutboxFileName = "chunk-outbox.dpapi";
         private const string TranscriptArchiveDirectoryName = "transcript-archive";
         private const string TranscriptArchiveExtension = ".transcript.dpapi";
@@ -177,34 +203,69 @@ namespace TermLink.Agent
         private readonly string root;
         private readonly Guid pcDeviceId;
         private readonly Action<string, byte[]> durableWrite;
+        private readonly Func<Guid, TerminalSemanticProfile> profileProvider;
         private readonly ConcurrentDictionary<Guid, object> sessionLocks = new ConcurrentDictionary<Guid, object>();
+        private readonly ConcurrentDictionary<Guid, TerminalSemanticProfile> validatedProfiles = new ConcurrentDictionary<Guid, TerminalSemanticProfile>();
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
             PropertyNameCaseInsensitive = false
         };
 
         public ProductionTerminalHistoryStore(string root, Guid pcDeviceId)
-            : this(root, pcDeviceId, AtomicWrite)
+            : this(root, pcDeviceId, AtomicWrite, null)
+        {
+        }
+
+        public ProductionTerminalHistoryStore(string root, Guid pcDeviceId, Func<Guid, TerminalSemanticProfile> profileProvider)
+            : this(root, pcDeviceId, AtomicWrite, profileProvider)
+        {
+        }
+
+        internal ProductionTerminalHistoryStore(string root, Guid pcDeviceId, Action<string, byte[]> durableWrite)
+            : this(root, pcDeviceId, durableWrite, null)
         {
         }
 
         internal ProductionTerminalHistoryStore(
             string root,
             Guid pcDeviceId,
-            Action<string, byte[]> durableWrite)
+            Action<string, byte[]> durableWrite,
+            Func<Guid, TerminalSemanticProfile> profileProvider)
         {
             if (string.IsNullOrWhiteSpace(root)) throw new ArgumentException("History store root is required.", nameof(root));
             if (pcDeviceId == Guid.Empty) throw new ArgumentException("PC device ID is required.", nameof(pcDeviceId));
             this.durableWrite = durableWrite ?? throw new ArgumentNullException(nameof(durableWrite));
+            this.profileProvider = profileProvider;
             this.root = Path.GetFullPath(root);
             this.pcDeviceId = pcDeviceId;
             Directory.CreateDirectory(this.root);
+            Directory.CreateDirectory(BrokerCaptureRootPath);
             CompleteInterruptedDeletes();
         }
 
         public string RootPath => root;
+        internal string BrokerCaptureRootPath => Path.Combine(root, "broker-captures");
         // Consumers retain only metadata. Never retain or modify the borrowed payload.
         internal event Action<LocalFrame> FrameObserved;
+
+        internal string TerminalCompatibilityError(Guid sessionId)
+        {
+            lock (SessionLock(sessionId))
+            {
+                try { RequireSessionProfile(sessionId, false); return string.Empty; }
+                catch (TerminalHistoryProfileException error) { return error.Code; }
+            }
+        }
+
+        internal TerminalSemanticProfile GetSessionProfile(Guid sessionId)
+        {
+            lock (SessionLock(sessionId))
+            {
+                RequireSessionProfile(sessionId, false);
+                return validatedProfiles.TryGetValue(sessionId, out var profile) ? profile
+                    : throw new TerminalHistoryProfileException(TerminalSessionProfile.Missing);
+            }
+        }
 
         public void AppendCommittedFrame(LocalFrame frame)
         {
@@ -263,6 +324,7 @@ namespace TermLink.Agent
             lock (SessionLock(sessionId))
             {
                 gapDetected = false;
+                RequireSessionProfile(sessionId, false);
                 var directory = ResolveWalDirectory(sessionId);
                 var frames = new List<LocalFrame>(maximumFrames);
                 if (!Directory.Exists(directory)) return frames;
@@ -305,6 +367,7 @@ namespace TermLink.Agent
             ValidateSessionId(sessionId);
             lock (SessionLock(sessionId))
             {
+                RequireSessionProfile(sessionId, false);
                 var directory = WalDirectory(sessionId);
                 if (!Directory.Exists(directory)) return new List<LocalFrame>();
                 var paths = Directory.GetFiles(directory, "*" + WalExtension)
@@ -479,8 +542,10 @@ namespace TermLink.Agent
             var snapshot = outbox.Artifacts.Single(
                 value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
             var expectedAuthorityVersion =
-                snapshot.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
-                snapshot.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion
+                (snapshot.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
+                snapshot.FormatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion) ||
+                (snapshot.FormatName == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName &&
+                snapshot.FormatVersion == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion)
                     ? 2
                     : snapshot.FormatName == SnapshotCrypto.SnapshotFormatName &&
                         snapshot.FormatVersion == SnapshotCrypto.FormatVersion
@@ -530,6 +595,7 @@ namespace TermLink.Agent
             bool allowAuthorityUpgrade = false)
         {
             var path = Path.Combine(SessionDirectory(outbox.SessionId), OutboxFileName);
+            var previousPath = Path.Combine(SessionDirectory(outbox.SessionId), PreviousSnapshotFileName);
             var existing = File.Exists(path)
                 ? ReadPersistedOutbox(path, outbox.SessionId)
                 : null;
@@ -554,6 +620,21 @@ namespace TermLink.Agent
                     }
                 }
             }
+            if (existing != null && existing.SnapshotSequence < outbox.SnapshotSequence)
+            {
+                // The current outbox remains the only delivery authority. Keep just its
+                // snapshot in a separate DPAPI domain before replacing it with the new S.
+                var previous = new ProductionTerminalHistoryPreviousSnapshot
+                {
+                    SessionId = outbox.SessionId,
+                    Artifact = existing.Artifacts.Single(value =>
+                        value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
+                };
+                try { WriteJson(previousPath, outbox.SessionId, "previous-snapshot", previous); }
+                finally { CryptographicOperations.ZeroMemory(previous.Artifact.Plaintext); }
+            }
+            else if (existing == null && File.Exists(previousPath))
+                File.Delete(previousPath);
             WriteJson(path, outbox.SessionId, "outbox", outbox);
             return true;
         }
@@ -595,6 +676,173 @@ namespace TermLink.Agent
                 var value = ReadPersistedOutbox(path, sessionId);
                 if (value.SessionId != sessionId) throw new InvalidDataException("Terminal outbox session mismatch.");
                 return value.Clone();
+            }
+        }
+
+        // A future Delta producer may compare this exact prior artifact with the
+        // current outbox only when its observed current S still matches.
+        internal ProductionTerminalHistoryArtifact ReadPreviousSnapshotArtifact(
+            Guid sessionId, ulong currentSnapshotSequence)
+        {
+            ValidateSessionId(sessionId);
+            if (currentSnapshotSequence == 0) throw new ArgumentOutOfRangeException(nameof(currentSnapshotSequence));
+            lock (SessionLock(sessionId))
+            {
+                if (File.Exists(DeleteMarkerPath(sessionId))) return null;
+                var directory = ResolveSessionDirectory(sessionId);
+                var currentPath = Path.Combine(directory, OutboxFileName);
+                if (!File.Exists(currentPath)) return null;
+                var current = ReadPersistedOutbox(currentPath, sessionId);
+                try
+                {
+                    return current.SnapshotSequence == currentSnapshotSequence
+                        ? ReadPreviousSnapshotArtifactFromCurrent(sessionId, current)
+                        : null;
+                }
+                finally
+                {
+                    foreach (var artifact in current.Artifacts)
+                        if (artifact?.Plaintext != null)
+                            CryptographicOperations.ZeroMemory(artifact.Plaintext);
+                    foreach (var delivery in current.Deliveries.Values)
+                        foreach (var sealedObject in delivery.SealedObjects.Values)
+                            if (sealedObject != null) CryptographicOperations.ZeroMemory(sealedObject);
+                }
+            }
+        }
+
+        private ProductionTerminalHistoryArtifact ReadPreviousSnapshotArtifactFromCurrent(
+            Guid sessionId, ProductionTerminalHistoryOutbox current)
+        {
+            var directory = ResolveSessionDirectory(sessionId);
+            var checkpointPath = Path.Combine(directory, CheckpointFileName);
+            var previousPath = Path.Combine(directory, PreviousSnapshotFileName);
+            if (!File.Exists(checkpointPath) || !File.Exists(previousPath)) return null;
+            if (new FileInfo(previousPath).Length > MaximumPreviousSnapshotProtectedBytes)
+                throw new InvalidDataException("Previous terminal snapshot exceeds its protected size limit.");
+            var checkpoint = ReadJson<ProductionTerminalHistoryCheckpoint>(
+                checkpointPath, sessionId, "checkpoint");
+            try
+            {
+                ValidateCheckpoint(checkpoint);
+                var currentSnapshot = current.Artifacts.Single(value =>
+                    value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+                if (checkpoint.SessionId != sessionId || !checkpoint.SnapshotEligible ||
+                    checkpoint.LastSequence != current.SnapshotSequence ||
+                    !CryptographicOperations.FixedTimeEquals(
+                        checkpoint.SnapshotPlaintext, currentSnapshot.Plaintext))
+                    return null;
+            }
+            finally
+            {
+                if (checkpoint?.SnapshotPlaintext != null)
+                    CryptographicOperations.ZeroMemory(checkpoint.SnapshotPlaintext);
+                if (checkpoint?.TranscriptPlaintexts != null)
+                    foreach (var transcript in checkpoint.TranscriptPlaintexts)
+                        if (transcript != null) CryptographicOperations.ZeroMemory(transcript);
+            }
+            var retained = ReadJson<ProductionTerminalHistoryPreviousSnapshot>(
+                previousPath, sessionId, "previous-snapshot");
+            try
+            {
+                var previous = retained?.Artifact;
+                if (retained?.SessionId != sessionId || previous == null ||
+                    previous.Kind != ProductionTerminalHistoryArtifactKind.Snapshot ||
+                    previous.SnapshotSequence == 0 || previous.UploadOrder != 0 ||
+                    string.IsNullOrWhiteSpace(previous.ArtifactId) ||
+                    previous.InitialTranscriptBeforeLineId == 0 ||
+                    previous.TranscriptPageCount < 0 ||
+                    previous.TranscriptPageCount > MaximumTranscriptPublicationPageCount ||
+                    previous.Plaintext == null || previous.Plaintext.Length == 0 ||
+                    !IsSupportedSnapshotFormat(previous.FormatName, previous.FormatVersion))
+                    throw new InvalidDataException("Previous terminal snapshot is invalid.");
+                if (previous.SnapshotSequence >= current.SnapshotSequence) return null;
+                ValidateSnapshotPlaintext(new ProductionTerminalHistoryOutbox
+                { SessionId = sessionId, SnapshotSequence = previous.SnapshotSequence }, previous);
+                retained.Artifact = null;
+                return previous;
+            }
+            finally
+            {
+                if (retained?.Artifact?.Plaintext != null)
+                    CryptographicOperations.ZeroMemory(retained.Artifact.Plaintext);
+            }
+        }
+
+        internal ProductionTerminalHistoryDeltaSnapshotPair ReadDeltaSnapshotPair(
+            Guid sessionId, ulong requestedSnapshotSequence)
+        {
+            ValidateSessionId(sessionId);
+            lock (SessionLock(sessionId))
+            {
+                if (File.Exists(DeleteMarkerPath(sessionId))) return null;
+                if (!RequireSessionProfile(sessionId, false).IsGraphics)
+                    return null;
+                var path = Path.Combine(ResolveSessionDirectory(sessionId), OutboxFileName);
+                if (!File.Exists(path)) return null;
+                var outbox = ReadPersistedOutbox(path, sessionId);
+                try
+                {
+                    if (requestedSnapshotSequence != 0 &&
+                        requestedSnapshotSequence != outbox.SnapshotSequence) return null;
+                    var current = outbox.Artifacts.Single(value =>
+                        value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+                    if (current.FormatName != SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName ||
+                        current.FormatVersion != SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion)
+                        throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
+                    var previous = ReadPreviousSnapshotArtifactFromCurrent(sessionId, outbox);
+                    outbox.Artifacts.Remove(current);
+                    return new ProductionTerminalHistoryDeltaSnapshotPair
+                    { Current = current, Previous = previous };
+                }
+                finally
+                {
+                    foreach (var artifact in outbox.Artifacts)
+                        if (artifact?.Plaintext != null) CryptographicOperations.ZeroMemory(artifact.Plaintext);
+                    foreach (var delivery in outbox.Deliveries.Values)
+                        foreach (var bytes in delivery.SealedObjects.Values)
+                            if (bytes != null) CryptographicOperations.ZeroMemory(bytes);
+                }
+            }
+        }
+
+        // Frozen browsing must never normalize or rewrite the persisted outbox.
+        internal ProductionTerminalHistoryArtifact ReadExactGraphicsSnapshot(
+            Guid sessionId, ulong snapshotSequence, out ulong availableSequence)
+        {
+            ValidateSessionId(sessionId);
+            availableSequence = 0;
+            lock (SessionLock(sessionId))
+            {
+                if (File.Exists(DeleteMarkerPath(sessionId))) return null;
+                if (!RequireSessionProfile(sessionId, false).IsGraphics)
+                    throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
+                var path = Path.Combine(ResolveSessionDirectory(sessionId), OutboxFileName);
+                if (!File.Exists(path)) return null;
+                var outbox = ReadJson<ProductionTerminalHistoryOutbox>(path, sessionId, "outbox");
+                try
+                {
+                    ValidateOutbox(outbox);
+                    availableSequence = outbox.SnapshotSequence;
+                    if (snapshotSequence != availableSequence) return null;
+                    var artifact = outbox.Artifacts.Single(value =>
+                        value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+                    if (artifact.FormatName != SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName ||
+                        artifact.FormatVersion != SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion)
+                        throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
+                    return artifact.Clone();
+                }
+                finally
+                {
+                    if (outbox?.Artifacts != null)
+                        foreach (var artifact in outbox.Artifacts)
+                            if (artifact?.Plaintext != null) CryptographicOperations.ZeroMemory(artifact.Plaintext);
+                    if (outbox?.Deliveries != null)
+                        foreach (var delivery in outbox.Deliveries.Values)
+                            if (delivery?.SealedObjects != null)
+                                foreach (var bytes in delivery.SealedObjects.Values)
+                                    if (bytes != null) CryptographicOperations.ZeroMemory(bytes);
+                }
             }
         }
 
@@ -818,6 +1066,7 @@ namespace TermLink.Agent
                 MarkSessionDeleted(sessionId);
                 var directory = ResolveSessionDirectory(sessionId);
                 if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+                validatedProfiles.TryRemove(sessionId, out _);
             }
         }
 
@@ -950,6 +1199,49 @@ namespace TermLink.Agent
         }
 
         private object SessionLock(Guid sessionId) => sessionLocks.GetOrAdd(sessionId, _ => new object());
+
+        private TerminalSemanticProfile RequireSessionProfile(Guid sessionId, bool createIfEmpty)
+        {
+            var expected = profileProvider?.Invoke(sessionId);
+            if (validatedProfiles.TryGetValue(sessionId, out var cached))
+            {
+                if (expected != null && cached != expected) throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
+                return cached;
+            }
+            var directory = ResolveSessionDirectory(sessionId);
+            var path = Path.Combine(directory, TerminalSessionProfile.FileName);
+            if (File.Exists(path))
+            {
+                if (new FileInfo(path).Length > TerminalSessionProfile.MaximumProtectedBytes)
+                    throw new TerminalHistoryProfileException(TerminalSessionProfile.Invalid);
+                byte[] bytes = null;
+                try
+                {
+                    bytes = ReadProtected(path, sessionId, "terminal-profile");
+                    var actual = TerminalSessionProfile.Read(bytes, sessionId);
+                    if (expected != null && actual != expected) throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
+                    validatedProfiles[sessionId] = actual;
+                    return actual;
+                }
+                catch (InvalidDataException) { throw new TerminalHistoryProfileException(TerminalSessionProfile.Invalid); }
+                finally { if (bytes != null) CryptographicOperations.ZeroMemory(bytes); }
+            }
+            // Absence never proves legacy semantics. Do not stamp or rewrite old payloads.
+            if (Directory.Exists(directory) && Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
+                .Any(file => !string.Equals(file, Path.Combine(directory, InactiveSinceFileName), StringComparison.OrdinalIgnoreCase)))
+                throw new TerminalHistoryProfileException(TerminalSessionProfile.Missing);
+            if (profileProvider != null && expected == null) throw new TerminalHistoryProfileException(TerminalSessionProfile.Missing);
+            var profile = expected ?? TerminalSemanticProfile.Legacy;
+            if (!createIfEmpty) return profile;
+            var descriptor = TerminalSessionProfile.Encode(sessionId, profile);
+            try
+            {
+                WriteProtectedAtomic(path, sessionId, "terminal-profile", descriptor);
+                validatedProfiles[sessionId] = profile;
+            }
+            finally { CryptographicOperations.ZeroMemory(descriptor); }
+            return profile;
+        }
 
         private string ResolveSessionDirectory(Guid sessionId)
         {
@@ -1179,7 +1471,7 @@ namespace TermLink.Agent
             }
         }
 
-        private static void ValidateOutbox(ProductionTerminalHistoryOutbox value)
+        private void ValidateOutbox(ProductionTerminalHistoryOutbox value)
         {
             if (value == null || value.SessionId == Guid.Empty || value.SnapshotSequence == 0 ||
                 value.Artifacts == null || value.Artifacts.Count == 0 || value.Deliveries == null)
@@ -1238,30 +1530,56 @@ namespace TermLink.Agent
             formatName == SnapshotCrypto.SnapshotFormatName &&
                 formatVersion == SnapshotCrypto.FormatVersion ||
             formatName == SnapshotCrypto.TerminalCoreSnapshotFormatName &&
-                formatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion;
+                formatVersion == SnapshotCrypto.TerminalCoreSnapshotFormatVersion ||
+            formatName == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName &&
+                formatVersion == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion;
 
-        private static void ValidateSnapshotPlaintext(
+        private void ValidateSnapshotPlaintext(
             ProductionTerminalHistoryOutbox outbox,
             ProductionTerminalHistoryArtifact artifact)
         {
-            if (artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName)
+            TerminalSemanticProfile profile;
+            lock (SessionLock(outbox.SessionId)) profile = RequireSessionProfile(outbox.SessionId, false);
+            bool graphics = profile.IsGraphics;
+            bool graphicsFormat = artifact.FormatName == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName;
+            if (graphics != graphicsFormat)
+                throw new TerminalHistoryProfileException(TerminalSessionProfile.Mismatch);
+            if (graphicsFormat || artifact.FormatName == SnapshotCrypto.TerminalCoreSnapshotFormatName)
             {
-                if (artifact.Plaintext.Length > SnapshotCrypto.MaxTerminalCoreSnapshotPlaintextBytes ||
+                if (artifact.Plaintext.Length > (graphics ? SnapshotCrypto.MaxTerminalCoreGraphicsSnapshotPlaintextBytes
+                    : SnapshotCrypto.MaxTerminalCoreSnapshotPlaintextBytes) ||
                     artifact.ObservedLocalInputEpoch > long.MaxValue)
                     throw new InvalidDataException("Terminal-core snapshot outbox plaintext is out of bounds.");
                 try
                 {
-                    using var terminal = NativeTerminalCoreV2.ImportSnapshot(artifact.Plaintext);
+                    using var terminal = graphics ? NativeTerminalCoreV2.ImportGraphicsSnapshot(artifact.Plaintext)
+                        : NativeTerminalCoreV2.ImportSnapshot(artifact.Plaintext);
+                    // Only read this exact 2.22 header after the graphics importer has fully validated it.
+                    if (graphics && (BinaryPrimitives.ReadUInt64LittleEndian(artifact.Plaintext.AsSpan(
+                        GraphicsSnapshotV222RequiredFeaturesOffset, 8)) & GraphicsSnapshotV222StandaloneC1Feature) != 0)
+                        throw new InvalidDataException("Terminal-core snapshot output differs from its persisted profile.");
                     var presentation = terminal.GetPresentationInfo();
                     if (presentation.NextSourceSequence != checked(outbox.SnapshotSequence + 1))
                         throw new InvalidDataException(
                             "Terminal-core snapshot source sequence does not match its outbox.");
                     using var checkpoint = terminal.CaptureCheckpoint();
-                    var frameBytes = checkpoint.ExportRenderFrameV3();
+                    var frameBytes = graphics ? checkpoint.ExportRenderFrameV5() : checkpoint.ExportRenderFrameV3();
                     try
                     {
-                        var frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
-                        if (frame.Columns != artifact.Columns || frame.Rows != artifact.Rows)
+                        int columns, rows;
+                        if (graphics)
+                        {
+                            var frame = NativeTerminalRenderFrameV5Decoder.Decode(frameBytes);
+                            if (frame.Text.WidthProfile != (NativeTerminalWidthProfile)profile.WidthProfile)
+                                throw new InvalidDataException("Terminal-core snapshot width differs from its persisted profile.");
+                            columns = frame.Columns; rows = frame.Rows;
+                        }
+                        else
+                        {
+                            var frame = NativeTerminalRenderFrameV3Decoder.Decode(frameBytes);
+                            columns = frame.Columns; rows = frame.Rows;
+                        }
+                        if (columns != artifact.Columns || rows != artifact.Rows)
                             throw new InvalidDataException(
                                 "Terminal-core snapshot dimensions do not match its outbox.");
                     }
@@ -1424,6 +1742,7 @@ namespace TermLink.Agent
 
         private void WriteProtectedAtomic(string path, Guid sessionId, string domain, byte[] plaintext)
         {
+            if (domain != "terminal-profile" && domain != "inactive-since") RequireSessionProfile(sessionId, true);
             Directory.CreateDirectory(Path.GetDirectoryName(path));
             var entropy = Entropy(sessionId, domain);
             byte[] protectedBytes = null;
@@ -1441,7 +1760,17 @@ namespace TermLink.Agent
 
         private byte[] ReadProtected(string path, Guid sessionId, string domain)
         {
-            var stored = File.ReadAllBytes(path);
+            if (domain != "terminal-profile" && domain != "inactive-since") RequireSessionProfile(sessionId, false);
+            byte[] stored;
+            if (domain == "terminal-profile")
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (stream.Length == 0 || stream.Length > TerminalSessionProfile.MaximumProtectedBytes)
+                    throw new TerminalHistoryProfileException(TerminalSessionProfile.Invalid);
+                stored = new byte[checked((int)stream.Length)];
+                stream.ReadExactly(stored);
+            }
+            else stored = File.ReadAllBytes(path);
             var entropy = Entropy(sessionId, domain);
             try { return ProtectedData.Unprotect(stored, entropy, DataProtectionScope.CurrentUser); }
             catch (CryptographicException error)

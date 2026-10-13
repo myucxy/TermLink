@@ -115,6 +115,8 @@ namespace TermLink.Agent
         public string AccountKey { get; private set; }
         public string AccessToken { get; private set; }
         public string RefreshToken { get; private set; }
+        // Guid.Empty is the readable legacy format; a fresh login always gets a new generation.
+        internal Guid LoginGeneration { get; private set; }
         public DateTime AccessTokenExpiresAtUtc { get; private set; }
         private readonly object tokenSync = new object();
 
@@ -125,6 +127,7 @@ namespace TermLink.Agent
             public string AccountKey { get; set; }
             public string AccessToken { get; set; }
             public string RefreshToken { get; set; }
+            public Guid LoginGeneration { get; set; }
             public long AccessTokenExpiresAtUnixSeconds { get; set; }
         }
 
@@ -189,6 +192,7 @@ namespace TermLink.Agent
                             AccountKey = storedAccountKey ?? tokenAccountKey,
                             AccessToken = stored.AccessToken,
                             RefreshToken = stored.RefreshToken,
+                            LoginGeneration = stored.LoginGeneration,
                             AccessTokenExpiresAtUtc = string.IsNullOrWhiteSpace(stored.RefreshToken)
                                 ? DateTime.MaxValue
                                 : DateTimeOffset.FromUnixTimeSeconds(stored.AccessTokenExpiresAtUnixSeconds).UtcDateTime
@@ -333,7 +337,7 @@ namespace TermLink.Agent
 
         public static void Save(Guid deviceId, DeviceIdentity identity, string accessToken)
         {
-            SaveCore(deviceId, identity, null, accessToken, null, DateTime.MaxValue);
+            SaveCore(deviceId, identity, null, accessToken, null, DateTime.MaxValue, Guid.NewGuid());
         }
 
         public static void SaveWithRefreshToken(
@@ -349,7 +353,8 @@ namespace TermLink.Agent
                 ReadAccountKey(accessToken, null),
                 accessToken,
                 refreshToken,
-                accessTokenExpiresAtUtc);
+                accessTokenExpiresAtUtc,
+                Guid.NewGuid());
         }
 
         internal static void SaveWithRefreshToken(
@@ -360,7 +365,8 @@ namespace TermLink.Agent
             string refreshToken,
             DateTime accessTokenExpiresAtUtc)
         {
-            SaveCore(deviceId, identity, accountKey, accessToken, refreshToken, accessTokenExpiresAtUtc);
+            SaveCore(deviceId, identity, accountKey, accessToken, refreshToken,
+                accessTokenExpiresAtUtc, Guid.NewGuid());
         }
 
         private static void SaveCore(
@@ -369,7 +375,8 @@ namespace TermLink.Agent
             string accountKey,
             string accessToken,
             string refreshToken,
-            DateTime accessTokenExpiresAtUtc)
+            DateTime accessTokenExpiresAtUtc,
+            Guid loginGeneration)
         {
             if (deviceId == Guid.Empty || identity == null || string.IsNullOrWhiteSpace(accessToken) ||
                 (!string.IsNullOrWhiteSpace(refreshToken) &&
@@ -388,6 +395,7 @@ namespace TermLink.Agent
                     AccountKey = accountKey,
                     AccessToken = accessToken,
                     RefreshToken = refreshToken,
+                    LoginGeneration = loginGeneration,
                     AccessTokenExpiresAtUnixSeconds = string.IsNullOrWhiteSpace(refreshToken)
                         ? 0
                         : new DateTimeOffset(accessTokenExpiresAtUtc).ToUnixTimeSeconds()
@@ -450,7 +458,14 @@ namespace TermLink.Agent
                 throw new InvalidDataException("Refreshed credentials changed the OIDC account subject.");
             }
             var resolvedAccountKey = AccountKey ?? incomingAccountKey;
-            SaveCore(DeviceId, Identity, resolvedAccountKey, accessToken, refreshToken, accessTokenExpiresAtUtc);
+            lock (ProductionAccountStorage.WriteSync)
+            {
+                using var current = TryLoad();
+                // A retired runtime must not overwrite a newer account authorization.
+                if (MatchesCurrent(current))
+                    SaveCore(DeviceId, Identity, resolvedAccountKey, accessToken, refreshToken,
+                        accessTokenExpiresAtUtc, LoginGeneration);
+            }
             lock (tokenSync)
             {
                 AccountKey = resolvedAccountKey;
@@ -459,6 +474,11 @@ namespace TermLink.Agent
                 AccessTokenExpiresAtUtc = accessTokenExpiresAtUtc;
             }
         }
+
+        internal bool MatchesCurrent(ProductionCredentials current) => current != null &&
+            current.DeviceId == DeviceId && string.Equals(current.AccountKey, AccountKey, StringComparison.Ordinal) &&
+            current.LoginGeneration == LoginGeneration &&
+            string.Equals(current.GetRefreshToken(), GetRefreshToken(), StringComparison.Ordinal);
 
         public void Dispose()
         {
@@ -474,6 +494,7 @@ namespace TermLink.Agent
 
     internal static class ProductionAccountStorage
     {
+        internal static readonly object WriteSync = new object();
         private const string AcceptanceCAEnvironment = "TERMLINK_ACCEPTANCE_CA_FILE";
         private const string AcceptanceRootEnvironment = "TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT";
         private const string ConfigFileName = "production-config.json";
@@ -573,38 +594,41 @@ namespace TermLink.Agent
         // directories, and unrelated TermLink data are never removed.
         internal static void ForgetLocalAccount(string localApplicationDataRoot)
         {
-            if (string.IsNullOrWhiteSpace(localApplicationDataRoot))
-                throw new InvalidOperationException("The local application data directory is unavailable.");
-            var localRoot = Path.GetFullPath(localApplicationDataRoot);
-            var termLinkRoot = Path.GetFullPath(Path.Combine(localRoot, "TermLink"));
-            if (!string.Equals(
-                Path.GetRelativePath(localRoot, termLinkRoot),
-                "TermLink",
-                StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("The TermLink account data path is outside LocalApplicationData.");
-            if (Directory.Exists(termLinkRoot) &&
-                (File.GetAttributes(termLinkRoot) & FileAttributes.ReparsePoint) != 0)
+            lock (WriteSync)
             {
-                throw new InvalidOperationException("The TermLink account data directory cannot be a reparse point.");
-            }
+                if (string.IsNullOrWhiteSpace(localApplicationDataRoot))
+                    throw new InvalidOperationException("The local application data directory is unavailable.");
+                var localRoot = Path.GetFullPath(localApplicationDataRoot);
+                var termLinkRoot = Path.GetFullPath(Path.Combine(localRoot, "TermLink"));
+                if (!string.Equals(
+                    Path.GetRelativePath(localRoot, termLinkRoot),
+                    "TermLink",
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The TermLink account data path is outside LocalApplicationData.");
+                if (Directory.Exists(termLinkRoot) &&
+                    (File.GetAttributes(termLinkRoot) & FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new InvalidOperationException("The TermLink account data directory cannot be a reparse point.");
+                }
 
-            Exception firstError = null;
-            foreach (var fileName in new[] { CredentialsFileName, ConfigFileName })
-            {
-                var path = Path.GetFullPath(Path.Combine(termLinkRoot, fileName));
-                if (!string.Equals(Path.GetDirectoryName(path), termLinkRoot, StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(Path.GetFileName(path), fileName, StringComparison.Ordinal))
+                Exception firstError = null;
+                foreach (var fileName in new[] { CredentialsFileName, ConfigFileName })
                 {
-                    throw new InvalidOperationException("A TermLink account file path escaped its known location.");
+                    var path = Path.GetFullPath(Path.Combine(termLinkRoot, fileName));
+                    if (!string.Equals(Path.GetDirectoryName(path), termLinkRoot, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(Path.GetFileName(path), fileName, StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException("A TermLink account file path escaped its known location.");
+                    }
+                    try { File.Delete(path); }
+                    catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                    {
+                        if (firstError == null) firstError = error;
+                    }
                 }
-                try { File.Delete(path); }
-                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
-                {
-                    if (firstError == null) firstError = error;
-                }
+                if (firstError != null)
+                    throw new IOException("One or more local TermLink account files could not be removed.", firstError);
             }
-            if (firstError != null)
-                throw new IOException("One or more local TermLink account files could not be removed.", firstError);
         }
 
         private static string GetKnownFilePath(string localApplicationDataRoot, string fileName)

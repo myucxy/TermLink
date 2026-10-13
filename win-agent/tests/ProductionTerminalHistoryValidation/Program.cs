@@ -139,6 +139,24 @@ namespace TermLink.ProductionTerminalHistory.Validation
 
         public static async Task<int> Main(string[] args)
         {
+            if (args.Length == 1 && args[0] == "--restricted-history-access")
+            {
+                RestrictedHistoryAccessValidation.Run();
+                return 0;
+            }
+            if (args.Length == 1 && args[0] == "--snapshot-inspector-selfcheck")
+                return FixtureSnapshotInspection.SelfCheck();
+            if (args.Length == 4 && args[0] == "--inspect-fixture-snapshots")
+            {
+                if (!Guid.TryParse(args[2], out var pcDeviceId) ||
+                    !Guid.TryParse(args[3], out var sessionId)) return 2;
+                return FixtureSnapshotInspection.Run(args[1], pcDeviceId, sessionId);
+            }
+            if (args.Length == 2 && args[0] == "--write-state-delta-fixture")
+            {
+                StateDeltaHostValidation.Run(args[1]);
+                return 0;
+            }
             if ((args.Length == 4 || args.Length == 5) &&
                 string.Equals(args[0], "--inspect-host-history", StringComparison.Ordinal))
             {
@@ -156,6 +174,14 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 ValidateUploaderConstructorCompatibility();
                 await ValidateHostHistoryRequestStateAsync();
                 ValidateEmptyHostHistoryResponseContract();
+                FrozenHistoryHostValidation.Run();
+                FrozenHistoryWireValidation.Run();
+                StateDeltaHostValidation.Run();
+                BrokerCaptureHostValidation.Run();
+                BrokerCaptureRestoreValidation.Run();
+                PrivateHistoryDirectoryValidation.Run();
+                RestrictedHistoryAccessValidation.Run();
+                ValidateSnapshotBaselineRetention(root, pcDeviceId);
                 ValidateRuntimeCapabilityAndPublicationGate(root, pcDeviceId);
                 ValidateRuntimePublicationReconcileOrder();
                 await ValidateHistoryWorkerRetryWakeupSeamsAsync();
@@ -872,12 +898,14 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 Directory.CreateDirectory(legacy);
                 var marker = Path.Combine(legacy, "marker.wal.dpapi");
                 File.WriteAllBytes(marker, Encoding.UTF8.GetBytes("legacy-history-marker"));
+                PrivateHistoryDirectoryValidation.AddInheritedUsersWrite(legacy);
                 migrate.Invoke(null, new object[] { pcDeviceId, destination });
                 var migratedMarker = Path.Combine(destination, "marker.wal.dpapi");
                 Require(!Directory.Exists(legacy) && File.Exists(migratedMarker) &&
                     File.ReadAllText(migratedMarker, Encoding.UTF8) == "legacy-history-marker" &&
                     !Directory.EnumerateFileSystemEntries(destination, "*.tmp").Any(),
                     "Legacy terminal history was not moved atomically into the new directory.");
+                PrivateHistoryDirectoryValidation.ValidatePrivateTree(accountRoot, destination);
 
                 // An existing destination is never merged or overwritten. This
                 // protects a concurrently-started Agent from a legacy move.
@@ -1011,13 +1039,17 @@ namespace TermLink.ProductionTerminalHistory.Validation
             var runtimeProducerType = runtimeType.Assembly.GetType(
                 "TermLink.Agent.ProductionTerminalHistoryProducer",
                 throwOnError: true);
+            var runtimeSessionId = Guid.NewGuid();
+            new ProductionTerminalHistoryStore(Path.Combine(root, "runtime-gate"), pcDeviceId)
+                .AppendCommittedFrame(new LocalFrame(LocalFrameType.Output, runtimeSessionId, 1,
+                    Encoding.UTF8.GetBytes("runtime-gate")));
             var runtimeStore = Activator.CreateInstance(
                 runtimeStoreType,
                 new object[] { Path.Combine(root, "runtime-gate"), pcDeviceId });
             var runtimeProducer = Activator.CreateInstance(
                 runtimeProducerType,
                 new[] { runtimeStore, (object)pcDeviceId });
-            Require(process.Invoke(null, new[] { (object)true, runtimeProducer, Guid.NewGuid() }) != null,
+            Require(process.Invoke(null, new[] { (object)true, runtimeProducer, runtimeSessionId }) != null,
                 "Enabled terminal snapshot production did not invoke the gated producer.");
 
             var sessionId = Guid.NewGuid();
@@ -1056,6 +1088,15 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 BindingFlags.Instance | BindingFlags.NonPublic);
             Require(replace != null && reconcile != null,
                 "Account runtime replacement no longer exposes its post-publication reconcile seam.");
+
+            var attach = runtimeType.GetMethod("Attach", BindingFlags.Instance | BindingFlags.Public);
+            var attachCalls = ReadInvokedMethods(attach);
+            var restoreDeletedIndex = attachCalls.FindIndex(value => value.Name == "RestoreDeletedSessions");
+            var recoverRetainedIndex = attachCalls.FindIndex(value => value.Name == "RecoverRetainedSessions");
+            var queueRecoveredIndex = attachCalls.FindIndex(value => value.Name == "QueueRegisteredSessionsForReplay");
+            Require(restoreDeletedIndex >= 0 && recoverRetainedIndex > restoreDeletedIndex &&
+                queueRecoveredIndex > recoverRetainedIndex,
+                "Runtime started replay before protected retained-session recovery completed.");
 
             var calls = ReadInvokedMethods(replace);
             var attachIndex = calls.FindIndex(value =>
@@ -1332,6 +1373,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     4,
                     Encoding.UTF8.GetBytes("!"))
             };
+            foreach (var frame in frames) producer.AppendCommittedFrame(frame);
             var result = producer.ProcessSession(
                 sessionId,
                 frames,
@@ -1803,6 +1845,11 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 pcDeviceId,
                 terminalCoreShadowEnabled: false);
             var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007d");
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Output,
+                sessionId,
+                1,
+                Encoding.UTF8.GetBytes("lifecycle")));
             producer.ProcessSession(
                 sessionId,
                 new[]
@@ -1878,6 +1925,11 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     pcDeviceId),
                 pcDeviceId);
             var activeSession = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007e");
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                activeSession,
+                1,
+                LocalPayloadCodec.Resize(80, 24)));
             var pending = producer.ProcessSession(
                 activeSession,
                 new[]
@@ -1893,6 +1945,16 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 "A live terminal without its first Output was not kept snapshot-pending.");
 
             var terminalSession = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000007f");
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Resize,
+                terminalSession,
+                1,
+                LocalPayloadCodec.Resize(80, 24)));
+            producer.AppendCommittedFrame(new LocalFrame(
+                LocalFrameType.Lifecycle,
+                terminalSession,
+                2,
+                LocalPayloadCodec.Lifecycle(LocalLifecycleState.Ended, 0)));
             var unsupported = producer.ProcessSession(
                 terminalSession,
                 new[]
@@ -2244,7 +2306,19 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     LocalFrameType.Output,
                     sessionId,
                     3,
-                    Encoding.UTF8.GetBytes("query-replay-ok"))
+                    Encoding.UTF8.GetBytes("query-replay-ok")),
+                new LocalFrame(LocalFrameType.HostGeometry, sessionId, 4,
+                    new NativeTerminalHostGeometryV1(9,18,1920,1080,0,0).Encode()),
+                new LocalFrame(LocalFrameType.Output, sessionId, 5, Encoding.UTF8.GetBytes("\x1b[16t")),
+                new LocalFrame(LocalFrameType.HostTheme, sessionId, 6, NativeTerminalHostThemeV1.Create(false,
+                    Enumerable.Repeat(0xffffffU, 259).ToArray()).Encode()),
+                new LocalFrame(LocalFrameType.Output, sessionId, 7, Encoding.UTF8.GetBytes("\x1b[?2031h")),
+                new LocalFrame(LocalFrameType.Output, sessionId, 8, Encoding.UTF8.GetBytes("\x1b[96$|")),
+                new LocalFrame(LocalFrameType.Resize, sessionId, 9, LocalPayloadCodec.Resize(96, 24)),
+                new LocalFrame(LocalFrameType.HostResizeResult, sessionId, 10, LocalPayloadCodec.HostResizeResult(new LocalHostResizeResult {
+                    SourceSequence = 8, SourceOffsetEnd = 6, RequestedColumns = 96, ActualColumns = 96, ActualRows = 24, Error = LocalResizeError.OK
+                })),
+                new LocalFrame(LocalFrameType.Output, sessionId, 11, Encoding.UTF8.GetBytes("resize-replayed"))
             };
 
             var store = new ProductionTerminalHistoryStore(
@@ -2257,9 +2331,10 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 terminalCoreSnapshotAuthorityEnabled: true,
                 terminalCoreShadowObserver: null))
             {
+                foreach (var frame in frames) producer.AppendCommittedFrame(frame);
                 var result = producer.ProcessSession(sessionId, frames);
-                Require(result.SnapshotEligible && result.LastSequence == 3,
-                    "V2-only capability queries made terminal-core history ineligible.");
+                Require(result.SnapshotEligible && result.LastSequence == 11,
+                    "V2-only capability queries made terminal-core history ineligible: " + result.IneligibilityCode + "; seq=" + result.LastSequence);
                 var checkpoint = producer.LoadCheckpoint(sessionId);
                 Require(checkpoint.AuthorityVersion == 2 &&
                     checkpoint.SnapshotPlaintext?.Length > 0,
@@ -2268,8 +2343,15 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 {
                     using var restored = NativeTerminalCoreV2.ImportSnapshot(
                         checkpoint.SnapshotPlaintext);
-                    Require(restored.GetPresentationInfo().NextSourceSequence == 4,
+                    Require(restored.GetPresentationInfo().NextSourceSequence == 12,
                         "Discarded replay Host Effects changed the restored source cursor.");
+                    var geometryReply = restored.ApplyOutputWithHostEffectsV2(12, Encoding.UTF8.GetBytes("\x1b[16t"));
+                    Require(geometryReply.Records.Single().Payload.SequenceEqual(Encoding.UTF8.GetBytes("\x1b[6;18;9t")),
+                        "Durable history lost selected-host geometry.");
+                    var themeReply = restored.ApplyOutputWithHostEffectsV2(13, Encoding.UTF8.GetBytes("\x1b[?996n"));
+                    Require(themeReply.Records.Single().Payload.SequenceEqual(Encoding.UTF8.GetBytes("\x1b[?997;2n")),
+                        "Durable history lost selected-host theme.");
+
                 }
                 finally
                 {
@@ -2282,12 +2364,100 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 foreach (var frame in frames) shadow.Apply(frame);
                 var observed = shadow.ObserveCheckpoint(
                     portable: null,
-                    expectedSequence: 3,
+                    expectedSequence: 11,
                     portableReasonCode: "HOST_EFFECT_V2_REPLAY");
                 Require(observed.Status == "SHADOW_READY" &&
-                    observed.LastAppliedSequence == 3 &&
-                    observed.NextSourceSequence == 4,
+                    observed.LastAppliedSequence == 11 &&
+                    observed.NextSourceSequence == 12,
                     "V2-only capability queries retired or advanced the diagnostic shadow twice.");
+            }
+        }
+
+        private static void ValidateSnapshotBaselineRetention(string root, Guid pcDeviceId)
+        {
+            var baselineRoot = Path.Combine(root, "s7-snapshot-baseline");
+            var sessionId = Guid.Parse("aaaaaaaa-0000-4000-8000-0000000000a7");
+            var store = new ProductionTerminalHistoryStore(baselineRoot, pcDeviceId,
+                _ => TerminalSemanticProfile.Graphics);
+            byte[] priorSnapshot = null;
+            try
+            {
+                using (var producer = new ProductionTerminalHistoryProducer(store, pcDeviceId,
+                    terminalCoreShadowEnabled: false,
+                    terminalCoreSnapshotAuthorityEnabled: true,
+                    terminalCoreShadowObserver: null))
+                {
+                    for (ulong sequence = 1; sequence <= 4; sequence++)
+                    {
+                        producer.AppendCommittedFrame(new LocalFrame(LocalFrameType.Output,
+                            sessionId, sequence,
+                            Encoding.UTF8.GetBytes("baseline-" + sequence + "\r\n")));
+                        Require(producer.ProcessSession(sessionId).SnapshotEligible,
+                            "S7 baseline fixture did not produce a graphics snapshot.");
+                        var outbox = store.LoadOutbox(sessionId);
+                        var current = outbox.Artifacts.Single(value =>
+                            value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot);
+                        var previous = store.ReadPreviousSnapshotArtifact(sessionId, sequence);
+                        try
+                        {
+                            Require(outbox.SnapshotSequence == sequence &&
+                                current.SnapshotSequence == sequence &&
+                                current.FormatName == SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName,
+                                "Retaining a baseline changed the current snapshot outbox.");
+                            Require(sequence == 1 ? previous == null :
+                                previous != null && previous.SnapshotSequence == sequence - 1 &&
+                                previous.Plaintext.AsSpan().SequenceEqual(priorSnapshot),
+                                "Only the immediately previous exact snapshot may be retained.");
+                            Require(store.ReadPreviousSnapshotArtifact(sessionId, sequence + 1) == null,
+                                "A stale observed current S accessed an unrelated baseline.");
+                            store.SaveOutbox(outbox.Clone());
+                            var unchanged = store.ReadPreviousSnapshotArtifact(sessionId, sequence);
+                            try
+                            {
+                                Require(sequence == 1 ? unchanged == null :
+                                    unchanged != null && unchanged.SnapshotSequence == sequence - 1,
+                                    "Rewriting the same S replaced its previous baseline.");
+                            }
+                            finally
+                            {
+                                if (unchanged?.Plaintext != null)
+                                    CryptographicOperations.ZeroMemory(unchanged.Plaintext);
+                            }
+                            var path = Path.Combine(baselineRoot, sessionId.ToString("N"),
+                                "previous-snapshot.dpapi");
+                            Require(File.Exists(path) == (sequence > 1) &&
+                                Directory.GetFiles(Path.GetDirectoryName(path), "previous-snapshot*.dpapi").Length <= 1,
+                                "Snapshot baseline files grew beyond one previous artifact.");
+                            if (priorSnapshot != null) CryptographicOperations.ZeroMemory(priorSnapshot);
+                            priorSnapshot = (byte[])current.Plaintext.Clone();
+                        }
+                        finally
+                        {
+                            if (previous?.Plaintext != null)
+                                CryptographicOperations.ZeroMemory(previous.Plaintext);
+                            foreach (var artifact in outbox.Artifacts)
+                                CryptographicOperations.ZeroMemory(artifact.Plaintext);
+                        }
+                    }
+                }
+                var reopened = new ProductionTerminalHistoryStore(baselineRoot, pcDeviceId,
+                    _ => TerminalSemanticProfile.Graphics);
+                var recovered = reopened.ReadPreviousSnapshotArtifact(sessionId, 4);
+                try { Require(recovered?.SnapshotSequence == 3,
+                    "The immediately previous snapshot did not survive a store restart."); }
+                finally
+                {
+                    if (recovered?.Plaintext != null)
+                        CryptographicOperations.ZeroMemory(recovered.Plaintext);
+                }
+                store.DeleteSession(sessionId);
+                Require(reopened.ReadPreviousSnapshotArtifact(sessionId, 4) == null &&
+                    !Directory.Exists(Path.Combine(baselineRoot, sessionId.ToString("N"))),
+                    "Deleting a session did not evict its snapshot baseline.");
+            }
+            finally
+            {
+                if (priorSnapshot != null) CryptographicOperations.ZeroMemory(priorSnapshot);
             }
         }
 
@@ -2415,6 +2585,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                     pcDeviceId),
                 pcDeviceId))
             {
+                foreach (var frame in frames) portable.AppendCommittedFrame(frame);
                 var result = portable.ProcessSession(sessionId, frames);
                 portableCheckpoint = portable.LoadCheckpoint(sessionId);
                 portableOutbox = portable.LoadOutbox(sessionId);
@@ -2434,6 +2605,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 terminalCoreSnapshotAuthorityEnabled: true,
                 terminalCoreShadowObserver: null))
             {
+                foreach (var frame in frames) core.AppendCommittedFrame(frame);
                 var result = core.ProcessSession(sessionId, frames);
                 coreCheckpoint = core.LoadCheckpoint(sessionId);
                 coreOutbox = core.LoadOutbox(sessionId);
@@ -2650,6 +2822,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                         observedShadow = value;
                         shadowReady.Set();
                     });
+                foreach (var frame in frames) producer.AppendCommittedFrame(frame);
                 var result = producer.ProcessSession(
                     sessionId,
                     frames,
@@ -4022,6 +4195,7 @@ namespace TermLink.ProductionTerminalHistory.Validation
                 case OperandType.InlineSig:
                 case OperandType.InlineString:
                 case OperandType.InlineTok:
+                case OperandType.InlineType:
                 case OperandType.ShortInlineR:
                     return 4;
                 case OperandType.InlineI8:

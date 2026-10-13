@@ -305,6 +305,8 @@ namespace TermLink.Agent
         private const int MaxRealtimeEnvelopeBytes = 1024 * 1024;
         private const int HostHistoryResponseChunkBytes = 512 * 1024;
         private static readonly bool HostHistoryDataPlaneEnabled = true;
+        private static readonly bool BrokerCaptureProductEnabled = true;
+        private const string BrokerCaptureRecoveryUnavailable = "BROKER_CAPTURE_RECOVERY_UNAVAILABLE";
         private static readonly TimeSpan MetadataUpsertCadence = TimeSpan.FromMilliseconds(250);
         private static readonly TimeSpan SessionMetadataHeartbeatInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan PCHeartbeatInterval = TimeSpan.FromSeconds(15);
@@ -381,6 +383,8 @@ namespace TermLink.Agent
             public byte[] PairwiseKey;
             public long KeyEpoch;
             public DateTime LastActivityUtc;
+            public bool TerminalStateAccepted;
+            public bool BrokerCaptureAccepted;
             public ulong HighestAck;
             public ulong LastSentSequence;
             public bool FlowPaused;
@@ -533,14 +537,21 @@ namespace TermLink.Agent
         private readonly ConcurrentDictionary<Guid, byte> resizeRequests = new ConcurrentDictionary<Guid, byte>();
         private readonly ConcurrentDictionary<Guid, ProductionHostHistoryResponseRequest> hostHistoryRequests =
             new ConcurrentDictionary<Guid, ProductionHostHistoryResponseRequest>();
+        private readonly ConcurrentDictionary<(Guid SessionId, Guid DeviceId), Guid> pendingStateDeltas =
+            new ConcurrentDictionary<(Guid SessionId, Guid DeviceId), Guid>();
+        private readonly ConcurrentDictionary<(Guid SessionId, Guid DeviceId), Guid> pendingBrokerCaptures =
+            new ConcurrentDictionary<(Guid SessionId, Guid DeviceId), Guid>();
         private readonly ConcurrentDictionary<Guid, byte> destroyedHistorySessions =
             new ConcurrentDictionary<Guid, byte>();
         private readonly ConcurrentDictionary<Guid, Task> historyDeletionTasks =
             new ConcurrentDictionary<Guid, Task>();
         private readonly SemaphoreSlim hostHistoryResponseGate = new SemaphoreSlim(2, 2);
+        private readonly SemaphoreSlim stateDeltaGenerationGate = new SemaphoreSlim(1, 1);
+        private static readonly SemaphoreSlim brokerCaptureGenerationGate = new SemaphoreSlim(1, 1);
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private readonly Channel<ProductionDirectDataIngressDelivery> commonIngressQueue;
         private readonly ProductionTerminalHistoryStore terminalHistoryStore;
+        internal string BrokerCaptureRootPath => terminalHistoryStore.BrokerCaptureRootPath;
         private readonly ProductionTerminalHistoryProducer terminalHistoryProducer;
         private readonly ProductionHostHistoryService hostHistoryService;
         private readonly bool terminalSnapshotEnabled;
@@ -614,7 +625,7 @@ namespace TermLink.Agent
                 reconnectPreferences ?? throw new ArgumentNullException(nameof(reconnectPreferences)));
             directPeerRoutes = new ProductionDirectPeerRouteRegistry();
             directTransportSupervisor = new ProductionDirectTransportSupervisor();
-            relayExactOutbox = new ProductionRelayExactOutbox();
+            relayExactOutbox = new ProductionRelayExactOutbox(canSendSession: CanFlushTerminalRetry);
             directDataAdmission = new ProductionDirectDataPlaneAdmission(
                 DirectTransportDataPlaneBuildEnabled);
             commonIngressQueue = Channel.CreateBounded<ProductionDirectDataIngressDelivery>(
@@ -727,8 +738,12 @@ namespace TermLink.Agent
             directDataRuntime = createdDataRuntime;
             directShadowRuntime = createdShadowRuntime;
             var historyRoot = ProductionTerminalHistoryRoot(config);
+            var storageRoot = Path.GetDirectoryName(ProductionAgentConfig.DefaultPath);
+            TermLink.Common.PrivateHistoryDirectory.Prepare(storageRoot, Path.GetDirectoryName(historyRoot));
             MigrateLegacyTerminalHistory(config.PcId, historyRoot);
-            terminalHistoryStore = new ProductionTerminalHistoryStore(historyRoot, credentials.DeviceId);
+            TermLink.Common.PrivateHistoryDirectory.Prepare(storageRoot, historyRoot);
+            terminalHistoryStore = new ProductionTerminalHistoryStore(historyRoot, credentials.DeviceId,
+                profileProvider: sessionId => registry?.GetSessionProfile(sessionId));
             terminalHistoryStore.FrameObserved += ObserveCatalogFrame;
             terminalHistoryProducer = new ProductionTerminalHistoryProducer(
                 terminalHistoryStore,
@@ -743,6 +758,14 @@ namespace TermLink.Agent
                 sessionId => destroyedHistorySessions.ContainsKey(sessionId) ||
                     terminalHistoryStore.IsSessionDeleted(sessionId),
                 WriteHostHistoryDiagnostic);
+            foreach (var deletedSessionId in terminalHistoryStore.DeletedSessionIds())
+            {
+                try { hostHistoryService.DeleteBrokerCaptureSession(deletedSessionId); }
+                catch (Exception error) when (error is IOException || error is InvalidDataException ||
+                    error is UnauthorizedAccessException)
+                { WriteHostHistoryDiagnostic("broker_capture_cleanup_deferred session=" +
+                    deletedSessionId.ToString("N") + " type=" + error.GetType().Name); }
+            }
 #if TERMLINK_DIRECT_DATA_PLANE_ACCEPTANCE
             directAcceptanceDiagnostics =
                 ProductionDirectAcceptanceDiagnosticsServer.TryCreateFromEnvironment(
@@ -752,23 +775,37 @@ namespace TermLink.Agent
 
         // Temporary host-history diagnostics: bounded structural metadata only
         // (session/kind/status), never terminal text or key material.
+        private static readonly object HostHistoryDiagnosticWriteSync = new object();
+
         private static void WriteHostHistoryDiagnostic(string message)
         {
             try
             {
-                var root = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "TermLink", "logs");
-                Directory.CreateDirectory(root);
-                File.AppendAllText(
-                    Path.Combine(root, "TermLink-background-runtime.log"),
-                    DateTime.UtcNow.ToString("O") + " host-history-diag " + message + Environment.NewLine,
-                    new UTF8Encoding(false));
+                lock (HostHistoryDiagnosticWriteSync)
+                {
+                    var root = Path.Combine(
+                        ProductionAccountStorage.ResolveLocalApplicationDataRoot(),
+                        "TermLink", "logs");
+                    Directory.CreateDirectory(root);
+                    File.AppendAllText(
+                        Path.Combine(root, "TermLink-background-runtime.log"),
+                        DateTime.UtcNow.ToString("O") + " host-history-diag " + message + Environment.NewLine,
+                        new UTF8Encoding(false));
+                }
             }
             catch
             {
                 // Diagnostics must never become a request-path dependency.
             }
+        }
+
+        private static void WriteHostHistoryPeerAckDiagnostic(string message)
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(
+                    "TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT")) ||
+                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(
+                    "TERMLINK_ACCEPTANCE_CA_FILE"))) return;
+            WriteHostHistoryDiagnostic("peer_ack pid=" + Environment.ProcessId + " " + message);
         }
 
         private static string ProductionTerminalHistoryRoot(ProductionAgentConfig config)
@@ -794,6 +831,8 @@ namespace TermLink.Agent
                 "production-history",
                 pcId.ToString("N"));
             if (Directory.Exists(destination) || !Directory.Exists(legacy)) return;
+            TermLink.Common.PrivateHistoryDirectory.Prepare(
+                Path.GetDirectoryName(ProductionAgentConfig.DefaultPath), legacy);
             Directory.CreateDirectory(Path.GetDirectoryName(destination));
             try { Directory.Move(legacy, destination); }
             catch (IOException)
@@ -860,10 +899,24 @@ namespace TermLink.Agent
             bool typedInputEnabled,
             bool directTransportDataEnabled)
         {
+            return BuildHelloPayloadWithFeatures(
+                terminalSnapshotEnabled,
+                typedInputEnabled,
+                directTransportDataEnabled,
+                BrokerCaptureProductEnabled);
+        }
+
+        internal static byte[] BuildHelloPayloadWithFeatures(
+            bool terminalSnapshotEnabled,
+            bool typedInputEnabled,
+            bool directTransportDataEnabled,
+            bool brokerCaptureEnabled)
+        {
             var capabilities = ProductionRealtimeCapabilities.BuildAdvertisedCapabilities(
                 terminalSnapshotEnabled,
                 typedInputEnabled,
-                directTransportDataEnabled);
+                directTransportDataEnabled,
+                brokerCaptureEnabled);
             return JsonSerializer.SerializeToUtf8Bytes(new
             {
                 role = "pc",
@@ -921,7 +974,37 @@ namespace TermLink.Agent
             // Token-free retention is a recovery aid. A local storage failure
             // must not prevent the authenticated runtime from serving sessions;
             // server-side machine resolution remains available.
-            ProductionIdentityStore.TrySave(config, credentials);
+            try
+            {
+                lock (ProductionAccountStorage.WriteSync)
+                {
+                    using var current = ProductionCredentials.TryLoad();
+                    if (credentials.MatchesCurrent(current)) ProductionIdentityStore.TrySave(config, credentials);
+                }
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException ||
+                error is CryptographicException || error is JsonException || error is ArgumentException)
+            {
+                // The retention check is best effort, just like the retained identity write.
+            }
+        }
+
+        internal static bool SaveCurrentKeyEpoch(ProductionAgentConfig config, ProductionCredentials credentials)
+        {
+            lock (ProductionAccountStorage.WriteSync)
+            {
+                using var currentCredentials = ProductionCredentials.TryLoad();
+                var current = ProductionAgentConfig.TryLoad();
+                if (!credentials.MatchesCurrent(currentCredentials) || current == null ||
+                    current.PcId != config.PcId ||
+                    !string.Equals(current.AccountKey, config.AccountKey, StringComparison.Ordinal) ||
+                    !string.Equals(current.ServerUrl, config.ServerUrl, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(current.OIDCIssuer, config.OIDCIssuer, StringComparison.Ordinal)) return false;
+                if (config.KeyEpoch <= current.KeyEpoch) return true;
+                current.KeyEpoch = config.KeyEpoch;
+                ProductionAgentConfig.Save(current);
+                return true;
+            }
         }
 
         public void Attach(SessionRegistry registry)
@@ -933,6 +1016,7 @@ namespace TermLink.Agent
                 if (this.registry != null) throw new InvalidOperationException("Production runtime is already attached.");
                 this.registry = registry;
                 registry.RestoreDeletedSessions(terminalHistoryStore.DeletedSessionIds());
+                registry.RecoverRetainedSessions();
                 QueueRegisteredSessionsForReplay();
                 QueuePersistedHistoryForReplay();
                 historyUploader = new ProductionHistoryUploader(
@@ -1863,6 +1947,19 @@ namespace TermLink.Agent
             connectionSupervisor.ObserveSessionSoftFailure();
         }
 
+        private bool CanFlushTerminalRetry(Guid peerId, Guid sessionId)
+        {
+            var relay = realtimeCapabilityState.Snapshot();
+            if (!relay.Connected || !relay.Capabilities.Contains(ProductionTerminalStateContract.Attach) ||
+                !relay.Capabilities.Contains(ProductionRealtimeCapabilities.TerminalHostGeometryV1) ||
+                !relay.Capabilities.Contains(ProductionRealtimeCapabilities.TerminalHostThemeV1) ||
+                !relay.Capabilities.Contains(ProductionRealtimeCapabilities.TerminalHostResizeV1) ||
+                !subscribers.TryGetValue(sessionId, out var routes) ||
+                !routes.TryGetValue(peerId, out var subscriber)) return false;
+            lock (subscriber.Sync)
+                return !subscriber.Removed && subscriber.TerminalStateAccepted && !subscriber.FlowPaused;
+        }
+
         private async Task<bool> SendRelayOutboxEnvelopeAsync(
             ClientWebSocket active,
             ProductionRelayExactSendRequest request,
@@ -1925,12 +2022,14 @@ namespace TermLink.Agent
         {
             foreach (var sessionId in terminalHistoryStore.ListSessions())
             {
+                if (IsBrokerCaptureRecoveryUnavailable(sessionId)) continue;
                 QueuePersistedHistoryBacklog(sessionId);
             }
             if (registry != null)
             {
                 foreach (var session in registry.GetSummaries())
                 {
+                    if (IsBrokerCaptureRecoveryUnavailable(session.SessionId)) continue;
                     persistedHistoryBacklogSessions.TryRemove(session.SessionId, out _);
                     historyReconcileSessions[session.SessionId] = 0;
                     QueueNewHistoryWork(session.SessionId);
@@ -1946,6 +2045,7 @@ namespace TermLink.Agent
         {
             if (sessionId == Guid.Empty ||
                 destroyedHistorySessions.ContainsKey(sessionId) ||
+                IsBrokerCaptureRecoveryUnavailable(sessionId) ||
                 (registry != null && registry.ContainsActiveSession(sessionId)) ||
                 pendingHistorySessions.ContainsKey(sessionId) ||
                 persistedHistoryWorkSessions.ContainsKey(sessionId) ||
@@ -1962,6 +2062,7 @@ namespace TermLink.Agent
             var queued = false;
             foreach (var session in registry.GetSummaries())
             {
+                if (IsBrokerCaptureRecoveryUnavailable(session.SessionId)) continue;
                 pendingSessions.AddOrUpdate(
                     session.SessionId,
                     _ => new PendingSession { ShellType = session.ShellType },
@@ -1976,10 +2077,21 @@ namespace TermLink.Agent
 
         public void OnCommitted(ManagedShellType shellType, LocalFrame frame)
         {
-            if (Volatile.Read(ref disposed) != 0 || frame == null) return;
-            // SessionAgent has already durably committed this frame before the
-            // callback. Copy it into an in-memory handoff so Production WAL IO
-            // and snapshot work can never delay Host ACK or realtime enqueue.
+            if (frame == null) return;
+            if (Volatile.Read(ref disposed) != 0)
+            {
+                if (frame.Type == LocalFrameType.BrokerOutput)
+                    throw new InvalidOperationException("BROKER_CAPTURE_RUNTIME_UNAVAILABLE");
+                return;
+            }
+            if (frame.Type == LocalFrameType.BrokerOutput)
+            {
+                brokerCaptureGenerationGate.Wait(cancellation.Token);
+                try { PersistAndVerifyBrokerCaptureReference(frame); }
+                finally { brokerCaptureGenerationGate.Release(); }
+            }
+            // BrokerOutput is WAL-verified above before the Host ACK. Other
+            // frames keep the asynchronous history handoff.
             var historyDestroyed = destroyedHistorySessions.ContainsKey(frame.SessionId);
             if (!historyDestroyed)
             {
@@ -2030,7 +2142,8 @@ namespace TermLink.Agent
                 new CommittedEvent { ShellType = shellType, Frame = frame },
                 DateTimeOffset.UtcNow);
             ObserveCatalogFrame(frame);
-            if (terminalSnapshotEnabled && frame.Type == LocalFrameType.Output)
+            if (terminalSnapshotEnabled &&
+                frame.Type is LocalFrameType.Output or LocalFrameType.BrokerOutput)
             {
                 StageTailFirstSnapshotPublication(publicationState, frame.Sequence);
             }
@@ -2097,6 +2210,7 @@ namespace TermLink.Agent
             }
 
             destroyedHistorySessions.TryAdd(sessionId, 0);
+            hostHistoryService.InvalidateFrozenSession(sessionId);
             terminalHistoryPersistenceFailures.TryRemove(sessionId, out _);
             ApplyDestroyedSessionHistoryState(sessionId);
             ScheduleSessionHistoryDeletion(sessionId);
@@ -2146,11 +2260,19 @@ namespace TermLink.Agent
                     {
                         await Task.Delay(25).ConfigureAwait(false);
                     }
+                    var captureRequests = hostHistoryRequests.Values
+                        .Where(value => value.SessionId == sessionId &&
+                            value.Kind == HostHistoryRequestKindV1.BrokerCapture)
+                        .Select(value => value.Completion).ToArray();
+                    await Task.WhenAll(captureRequests).WaitAsync(TimeSpan.FromSeconds(10))
+                        .ConfigureAwait(false);
                     terminalHistoryStore.DeleteSession(sessionId);
+                    hostHistoryService.DeleteBrokerCaptureSession(sessionId);
                 }
                 catch (Exception error) when (error is IOException ||
                     error is UnauthorizedAccessException ||
-                    error is InvalidOperationException)
+                    error is InvalidOperationException || error is InvalidDataException ||
+                    error is TimeoutException)
                 {
                     // The tombstone keeps the session inaccessible. A later
                     // runtime start sees no active registration and retries
@@ -2609,6 +2731,9 @@ namespace TermLink.Agent
                 "terminal_window_resize_v1"
             };
             if (terminalSnapshotCapable) capabilities.Insert(1, "terminal_snapshot_v2");
+            capabilities.Add(ProductionTerminalStateContract.State);
+            capabilities.Add(TermLink.LocalIpc.TerminalSemanticProfile.Graphics.StateContract);
+            capabilities.Add(TermLink.LocalIpc.TerminalSemanticProfile.GraphicsUnicode16.StateContract);
             var normalizedCommands = terminalCommands.Select(command => new
             {
                 id = command.Id,
@@ -2652,14 +2777,21 @@ namespace TermLink.Agent
             });
         }
 
-        private async Task UpsertPCAsync(CancellationToken token)
+        private Task UpsertPCAsync(CancellationToken token) => UpsertPCWithCommandsAsync(
+            ManagedTerminalLauncher.DetectSupportedShellTypes(),
+            ManagedTerminalLauncher.DetectTerminalCommandCapabilities(), token);
+
+        private async Task UpsertPCWithCommandsAsync(
+            string[] supportedShells,
+            TerminalCommandCapability[] terminalCommands,
+            CancellationToken token)
         {
             var legacyBody = BuildPCUpsertBodyWithTerminalCommands(
                 config.PcName,
                 config.AgentVersion,
                 config.KeyEpoch,
-                ManagedTerminalLauncher.DetectSupportedShellTypes(),
-                ManagedTerminalLauncher.DetectTerminalCommandCapabilities());
+                supportedShells,
+                terminalCommands);
             var body = BuildStablePCAgentUpsertBodyWithTerminalCommands(
                 config.PcName,
                 config.AgentVersion,
@@ -2667,9 +2799,11 @@ namespace TermLink.Agent
                 RuntimeInformation.OSDescription,
                 PCAgentArchitecture(RuntimeInformation.OSArchitecture),
                 terminalSnapshotEnabled,
-                ManagedTerminalLauncher.DetectSupportedShellTypes(),
-                ManagedTerminalLauncher.DetectTerminalCommandCapabilities(),
+                supportedShells,
+                terminalCommands,
                 config.MachineId);
+            byte[] compatibleBody = null;
+            byte[] compatibleLegacyBody = null;
             try
             {
                 var response = await SendAsync(
@@ -2683,15 +2817,41 @@ namespace TermLink.Agent
                     ? await ReadServerErrorCodeAsync(response, token).ConfigureAwait(false)
                     : string.Empty;
                 if (response.StatusCode == HttpStatusCode.BadRequest && errorCode == "INVALID_REQUEST" &&
-                    string.IsNullOrWhiteSpace(config.MachineId))
+                    terminalCommands.Any(command => command.Id == ManagedTerminalLauncher.EnhancedPowerShell7CommandId))
                 {
+                    var compatibleCommands = terminalCommands.Where(command =>
+                        command.Id != ManagedTerminalLauncher.EnhancedPowerShell7CommandId).ToArray();
+                    compatibleBody = BuildStablePCAgentUpsertBodyWithTerminalCommands(
+                        config.PcName, config.AgentVersion, config.KeyEpoch,
+                        RuntimeInformation.OSDescription, PCAgentArchitecture(RuntimeInformation.OSArchitecture),
+                        terminalSnapshotEnabled, supportedShells, compatibleCommands, config.MachineId);
                     response.Dispose();
                     response = await SendAsync(
                         HttpMethod.Put,
                         "/v1/pcs/" + config.PcId.ToString("D"),
-                        legacyBody,
+                        compatibleBody,
                         true,
-                        DeviceScopedPCUpsertIdempotencyKey(config.PcId, credentials.DeviceId, legacyBody),
+                        DeviceScopedPCUpsertIdempotencyKey(config.PcId, credentials.DeviceId, compatibleBody),
+                        token).ConfigureAwait(false);
+                    errorCode = response.StatusCode == HttpStatusCode.BadRequest
+                        ? await ReadServerErrorCodeAsync(response, token).ConfigureAwait(false)
+                        : string.Empty;
+                    if (string.IsNullOrWhiteSpace(config.MachineId))
+                        compatibleLegacyBody = BuildPCUpsertBodyWithTerminalCommands(
+                            config.PcName, config.AgentVersion, config.KeyEpoch,
+                            supportedShells, compatibleCommands);
+                }
+                if (response.StatusCode == HttpStatusCode.BadRequest && errorCode == "INVALID_REQUEST" &&
+                    string.IsNullOrWhiteSpace(config.MachineId))
+                {
+                    var fallbackBody = compatibleLegacyBody ?? legacyBody;
+                    response.Dispose();
+                    response = await SendAsync(
+                        HttpMethod.Put,
+                        "/v1/pcs/" + config.PcId.ToString("D"),
+                        fallbackBody,
+                        true,
+                        DeviceScopedPCUpsertIdempotencyKey(config.PcId, credentials.DeviceId, fallbackBody),
                         token).ConfigureAwait(false);
                 }
                 using (response)
@@ -2704,6 +2864,8 @@ namespace TermLink.Agent
             {
                 CryptographicOperations.ZeroMemory(body);
                 CryptographicOperations.ZeroMemory(legacyBody);
+                if (compatibleBody != null) CryptographicOperations.ZeroMemory(compatibleBody);
+                if (compatibleLegacyBody != null) CryptographicOperations.ZeroMemory(compatibleLegacyBody);
             }
         }
 
@@ -2733,7 +2895,7 @@ namespace TermLink.Agent
                             "KEY_EPOCH_ADVANCED").ConfigureAwait(false);
                         var previousEpoch = config.KeyEpoch;
                         config.KeyEpoch = keyEpoch;
-                        try { ProductionAgentConfig.Save(config); }
+                        try { SaveCurrentKeyEpoch(config, credentials); }
                         catch
                         {
                             config.KeyEpoch = previousEpoch;
@@ -2972,11 +3134,13 @@ namespace TermLink.Agent
                             ProductionRealtimeCapabilities.BuildAdvertisedCapabilities(
                                 terminalSnapshotEnabled,
                                 typedInputEnabled,
-                                DirectTransportDataPlaneBuildEnabled);
+                                DirectTransportDataPlaneBuildEnabled,
+                                BrokerCaptureProductEnabled);
                         var hello = BuildHelloPayloadWithFeatures(
                             terminalSnapshotEnabled,
                             typedInputEnabled,
-                            DirectTransportDataPlaneBuildEnabled);
+                            DirectTransportDataPlaneBuildEnabled,
+                            BrokerCaptureProductEnabled);
                         try
                         {
                             await SendWebSocketAsync(
@@ -3399,6 +3563,12 @@ namespace TermLink.Agent
                 {
                     try
                     {
+                    if (IsBrokerCaptureRecoveryUnavailable(pending.Key))
+                    {
+                        if (TryRemovePending(pending.Key, pending.Value))
+                            RemovePublishedSequence(pending.Key);
+                        continue;
+                    }
                     var terminalPublished = false;
                     ulong resumeFrom;
                     publishedSequences.TryGetValue(pending.Key, out resumeFrom);
@@ -3531,7 +3701,8 @@ namespace TermLink.Agent
         private void QueueHistoryUpload(Guid sessionId, bool terminal)
         {
             if (sessionId == Guid.Empty || Volatile.Read(ref disposed) != 0 ||
-                destroyedHistorySessions.ContainsKey(sessionId)) return;
+                destroyedHistorySessions.ContainsKey(sessionId) ||
+                IsBrokerCaptureRecoveryUnavailable(sessionId)) return;
             RecordLiveHistoryActivity();
             persistedHistoryBacklogSessions.TryRemove(sessionId, out _);
             if (terminal)
@@ -3591,6 +3762,15 @@ namespace TermLink.Agent
                     try
                     {
                         var queuedFrames = DrainPendingHistoryFrames(pending.Key);
+                        if (IsBrokerCaptureRecoveryUnavailable(pending.Key))
+                        {
+                            foreach (var frame in queuedFrames)
+                                CryptographicOperations.ZeroMemory(frame.Payload);
+                            historyReconcileSessions.TryRemove(pending.Key, out _);
+                            persistedHistoryWorkSessions.TryRemove(pending.Key, out _);
+                            terminalHistorySessions.TryRemove(pending.Key, out _);
+                            continue;
+                        }
                         var reconcile = historyReconcileSessions.TryRemove(pending.Key, out _) ||
                             terminalHistoryPersistenceFailures.ContainsKey(pending.Key);
                         reconciledThisPass = reconcile;
@@ -3608,10 +3788,10 @@ namespace TermLink.Agent
                                 out latest))
                             {
                                 foreach (var frame in bufferedFrames)
-                                    terminalHistoryStore.AppendCommittedFrame(frame);
+                                    await PersistHistoryFrameAsync(frame, workToken).ConfigureAwait(false);
                             }
                             foreach (var frame in queuedFrames)
-                                terminalHistoryStore.AppendCommittedFrame(frame);
+                                await PersistHistoryFrameAsync(frame, workToken).ConfigureAwait(false);
                             uploadFrames = terminalHistoryStore.ReadFrames(
                                 pending.Key,
                                 () => workToken.IsCancellationRequested ||
@@ -3630,7 +3810,7 @@ namespace TermLink.Agent
                         else
                         {
                             foreach (var frame in queuedFrames)
-                                terminalHistoryStore.AppendCommittedFrame(frame);
+                                await PersistHistoryFrameAsync(frame, workToken).ConfigureAwait(false);
                             uploadFrames = queuedFrames;
                         }
                         terminalPass = terminalHistorySessions.ContainsKey(pending.Key) ||
@@ -3699,6 +3879,14 @@ namespace TermLink.Agent
                         retryImmediately = true;
                         RequeueHistoryWork(pending.Key, persistedBacklogPass, pending.Value);
                         retry = true;
+                    }
+                    catch (TerminalHistoryProfileException error)
+                    {
+                        // Preserve this journal for an explicit migration. Retrying with the
+                        // same decoder cannot fix a missing or incompatible producer profile.
+                        terminalHistoryPersistenceFailures[pending.Key] = error.Code;
+                        terminalHistoryProducer.RetireShadowSession(pending.Key);
+                        ObserveTerminalSnapshotFailure(pending.Key);
                     }
                     catch (ProductionTerminalHistoryReconcileRequiredException)
                     {
@@ -3841,6 +4029,7 @@ namespace TermLink.Agent
             {
                 if (!persistedHistoryBacklogSessions.TryRemove(sessionId, out _)) continue;
                 if (destroyedHistorySessions.ContainsKey(sessionId)) continue;
+                if (IsBrokerCaptureRecoveryUnavailable(sessionId)) continue;
                 if (registry != null && registry.ContainsActiveSession(sessionId)) continue;
                 historyReconcileSessions[sessionId] = 0;
                 persistedHistoryWorkSessions[sessionId] = 0;
@@ -3993,7 +4182,8 @@ namespace TermLink.Agent
                 return null;
             }
             var latestOutput = frames
-                .Where(value => value != null && value.Type == LocalFrameType.Output)
+                .Where(value => value != null &&
+                    value.Type is LocalFrameType.Output or LocalFrameType.BrokerOutput)
                 .Select(value => value.Sequence)
                 .DefaultIfEmpty(0UL)
                 .Max();
@@ -4001,9 +4191,14 @@ namespace TermLink.Agent
             var snapshots = outbox.Artifacts
                 .Where(value => value.Kind == ProductionTerminalHistoryArtifactKind.Snapshot)
                 .ToList();
+            var profile = terminalHistoryStore.GetSessionProfile(sessionId);
+            var expectedFormat = profile.IsGraphics ? SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatName
+                : SnapshotCrypto.TerminalCoreSnapshotFormatName;
+            var expectedVersion = profile.IsGraphics ? SnapshotCrypto.TerminalCoreGraphicsSnapshotFormatVersion
+                : SnapshotCrypto.TerminalCoreSnapshotFormatVersion;
             if (snapshots.Count != 1 || snapshots[0].SnapshotSequence != checkpoint.LastSequence ||
-                snapshots[0].FormatName != SnapshotCrypto.TerminalCoreSnapshotFormatName ||
-                snapshots[0].FormatVersion != SnapshotCrypto.TerminalCoreSnapshotFormatVersion ||
+                snapshots[0].FormatName != expectedFormat ||
+                snapshots[0].FormatVersion != expectedVersion ||
                 !CryptographicOperations.FixedTimeEquals(
                     checkpoint.SnapshotPlaintext,
                     snapshots[0].Plaintext))
@@ -4085,6 +4280,7 @@ namespace TermLink.Agent
                 switch (item.Frame.Type)
                 {
                     case LocalFrameType.Output:
+                    case LocalFrameType.BrokerOutput:
                         state.LastOutputSequence = item.Frame.Sequence;
                         MarkRestDirtyLocked(state);
                         break;
@@ -4394,6 +4590,7 @@ namespace TermLink.Agent
             {
                 return true;
             }
+            await EnsureBrokerCaptureReadyAsync(item.Frame, token).ConfigureAwait(false);
             var state = publicationStates.GetOrAdd(item.Frame.SessionId, _ => new SessionPublicationState());
             var metadata = ApplyPublicationFrame(state, item, DateTimeOffset.UtcNow);
             if (item.Frame.Type == LocalFrameType.LocalInputObserved)
@@ -4430,7 +4627,10 @@ namespace TermLink.Agent
             {
                 var messageType = MapMessageType(item.Frame);
                 if (messageType == MessageType.Unspecified) continue;
-                IMessage payload = BuildRealtimePayload(item.Frame, item.ShellType, metadata);
+                if (messageType == MessageType.BrokerOutput && !subscriber.BrokerCaptureAccepted)
+                    throw new InvalidDataException("TERMINAL_CLIENT_UPGRADE_REQUIRED");
+                IMessage payload = BuildRealtimePayload(item.Frame, item.ShellType, metadata,
+                    includeTerminalDiagnostic: true);
                 var payloadBytes = payload.ToByteArray();
                 try
                 {
@@ -4440,6 +4640,36 @@ namespace TermLink.Agent
                 finally { CryptographicOperations.ZeroMemory(payloadBytes); }
             }
             return delivered;
+        }
+
+        private async Task EnsureBrokerCaptureReadyAsync(LocalFrame frame, CancellationToken token)
+        {
+            if (frame.Type != LocalFrameType.BrokerOutput) return;
+            if (!BrokerCaptureProductEnabled)
+                throw new InvalidDataException("BrokerOutput product publication is disabled.");
+            await PersistHistoryFrameAsync(frame, token).ConfigureAwait(false);
+        }
+
+        private async Task PersistHistoryFrameAsync(LocalFrame frame, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            if (frame.Type != LocalFrameType.BrokerOutput)
+            {
+                terminalHistoryStore.AppendCommittedFrame(frame);
+                return;
+            }
+            using var lease = await ProductionHostHistoryGateLease.AcquireAsync(
+                brokerCaptureGenerationGate, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            PersistAndVerifyBrokerCaptureReference(frame);
+        }
+
+        private void PersistAndVerifyBrokerCaptureReference(LocalFrame frame)
+        {
+            if (destroyedHistorySessions.ContainsKey(frame.SessionId) ||
+                terminalHistoryStore.IsSessionDeleted(frame.SessionId))
+                throw new InvalidDataException("SESSION_HISTORY_DESTROYED");
+            hostHistoryService.PersistAndVerifyBrokerCaptureReference(frame);
         }
 
         private static bool IsStaleLocalInputLeaseReleaseDenial(
@@ -5093,6 +5323,9 @@ namespace TermLink.Agent
                     {
                         throw new InvalidDataException("Subscribe cursor or exchange key is invalid.");
                     }
+                    if (!await NegotiateTerminalStateAsync(
+                        active, sessionId, subscriber, envelope.Seq, subscribe, token).ConfigureAwait(false))
+                        return;
                     await ReplaySubscriberAsync(
                         active,
                         sessionId,
@@ -5154,6 +5387,7 @@ namespace TermLink.Agent
                     {
                         throw new InvalidDataException("Flow control payload is invalid.");
                     }
+                    relayExactOutbox.NotifySessionAdmissionChanged();
                     NotifyRelayCapacityReleased(
                         relayExactOutbox.PruneDurablyAcknowledged(
                             senderId,
@@ -5180,6 +5414,8 @@ namespace TermLink.Agent
                 }
                 if (envelope.MessageType == MessageType.ResizeRequest)
                 {
+                    lock (subscriber.Sync)
+                        if (!subscriber.TerminalStateAccepted) throw new InvalidDataException("TERMINAL_ATTACHMENT_REQUIRED");
                     var resize = ResizePayload.Parser.ParseFrom(plaintext);
                     // Legacy automatic viewport notifications remain inert. Only
                     // an explicit, leased, bounded one-shot request is executable.
@@ -5210,9 +5446,25 @@ namespace TermLink.Agent
                         return;
                     }
                     var requestId = GuidFromBytes(historyRequest.RequestId.Span);
-                    var responseRequest = new ProductionHostHistoryResponseRequest(sessionId, senderId);
+                    if (historyRequest.Kind == HostHistoryRequestKindV1.StateDelta)
+                        WriteHostHistoryPeerAckDiagnostic("event=request_received session=" + sessionId.ToString("N") +
+                            " sender=" + senderId.ToString("N") + " request_id=" + requestId.ToString("N") +
+                            " kind=StateDelta");
+                    var deltaKey = (sessionId, senderId);
+                    var deltaAdmitted = historyRequest.Kind != HostHistoryRequestKindV1.StateDelta ||
+                        pendingStateDeltas.TryAdd(deltaKey, requestId);
+                    var brokerAdmitted = historyRequest.Kind != HostHistoryRequestKindV1.BrokerCapture ||
+                        pendingBrokerCaptures.TryAdd(deltaKey, requestId);
+                    var responseRequest = new ProductionHostHistoryResponseRequest(
+                        sessionId, senderId, historyRequest.Kind);
                     if (!hostHistoryRequests.TryAdd(requestId, responseRequest))
                     {
+                        if (historyRequest.Kind == HostHistoryRequestKindV1.StateDelta && deltaAdmitted)
+                            ((ICollection<KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>>)pendingStateDeltas)
+                                .Remove(new KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>(deltaKey, requestId));
+                        if (historyRequest.Kind == HostHistoryRequestKindV1.BrokerCapture && brokerAdmitted)
+                            ((ICollection<KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>>)pendingBrokerCaptures)
+                                .Remove(new KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>(deltaKey, requestId));
                         responseRequest.Dispose();
                         return;
                     }
@@ -5228,6 +5480,8 @@ namespace TermLink.Agent
                             requestSequence,
                             requestId,
                             responseRequest,
+                            deltaAdmitted,
+                            brokerAdmitted,
                             token),
                         CancellationToken.None);
                     return;
@@ -5237,18 +5491,28 @@ namespace TermLink.Agent
                     HostHistoryControlPayload control;
                     try { control = HostHistoryControlPayload.Parser.ParseFrom(plaintext); }
                     catch (InvalidProtocolBufferException) { return; }
+                    if (control.RequestId.Length != 16) return;
                     var requestId = GuidFromBytes(control.RequestId.Span);
-                    if (requestId == Guid.Empty || !hostHistoryRequests.TryGetValue(requestId, out var pending) ||
-                        pending.SessionId != sessionId || pending.DeviceId != senderId) return;
+                    if (requestId == Guid.Empty) return;
+                    var hasPending = hostHistoryRequests.TryGetValue(requestId, out var pending);
+                    if (hasPending && (pending.SessionId != sessionId || pending.DeviceId != senderId)) return;
                     if (control.Action == HostHistoryControlActionV1.Cancel)
                     {
-                        pending.Cancel();
+                        pending?.Cancel();
+                        if (!hasPending || pending.Kind == HostHistoryRequestKindV1.FrozenBegin)
+                            hostHistoryService.CancelFrozenBegin(sessionId, senderId, control.RequestId);
                         return;
                     }
-                    if (control.Action != HostHistoryControlActionV1.ChunkAck || control.ObjectId.Length != 16)
+                    if (!hasPending || control.Action != HostHistoryControlActionV1.ChunkAck ||
+                        control.ObjectId.Length != 16)
                         return;
                     var objectId = GuidFromBytes(control.ObjectId.Span);
-                    if (objectId != Guid.Empty) pending.Acknowledge(objectId, control.ChunkIndex);
+                    if (objectId != Guid.Empty && pending.Acknowledge(objectId, control.ChunkIndex) &&
+                        pending.Kind == HostHistoryRequestKindV1.StateDelta)
+                        WriteHostHistoryPeerAckDiagnostic("event=ack_accepted session=" + sessionId.ToString("N") +
+                            " sender=" + senderId.ToString("N") + " request_id=" + requestId.ToString("N") +
+                            " kind=StateDelta object_id=" + objectId.ToString("N") +
+                            " chunk_index=" + control.ChunkIndex);
                     return;
                 }
                 if (envelope.MessageType == MessageType.SessionTerminateRequest)
@@ -5311,6 +5575,8 @@ namespace TermLink.Agent
                     return;
                 }
                 if (envelope.MessageType != MessageType.InputEvent) return;
+                lock (subscriber.Sync)
+                    if (!subscriber.TerminalStateAccepted) throw new InvalidDataException("TERMINAL_ATTACHMENT_REQUIRED");
                 var input = InputEventPayload.Parser.ParseFrom(plaintext);
                 if (input.InputId.Length != 16 || input.LeaseId.Length != 16 || input.InputSeq == 0 || input.Input.Length == 0) return;
                 // A valid input becomes applied only after SessionHost has
@@ -5746,7 +6012,8 @@ namespace TermLink.Agent
                 payload = BuildRealtimePayload(
                     resultFrame,
                     replayShellType,
-                    replayMetadata).ToByteArray();
+                    replayMetadata,
+                    includeTerminalDiagnostic: true).ToByteArray();
                 await SendEncryptedAsync(
                     active,
                     sessionId,
@@ -5789,6 +6056,8 @@ namespace TermLink.Agent
             ulong requestSequence,
             Guid requestId,
             ProductionHostHistoryResponseRequest responseRequest,
+            bool deltaAdmitted,
+            bool brokerAdmitted,
             CancellationToken token)
         {
             using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
@@ -5796,6 +6065,8 @@ namespace TermLink.Agent
                 responseRequest.CancellationToken);
             var requestToken = linkedCancellation.Token;
             ProductionHostHistoryGateLease gateLease = null;
+            var selectedBegin = false;
+            var fullyDelivered = false;
             try
             {
                 gateLease = await ProductionHostHistoryGateLease.AcquireAsync(
@@ -5812,19 +6083,55 @@ namespace TermLink.Agent
                 };
                 try
                 {
-                    using var selection = hostHistoryService.Select(sessionId, request, recipient);
+                    var capabilityError = ValidateTerminalState(sessionId, request.SubscriberCapabilities, out _);
+                    if (capabilityError.Length == 0) capabilityError = TerminalSessionCompatibilityError(sessionId);
+                    ProductionHostHistoryGateLease deltaGenerationLease = null;
+                    ProductionHostHistorySelection selected;
+                    try
+                    {
+                        if (deltaAdmitted && request.Kind == HostHistoryRequestKindV1.StateDelta &&
+                            string.IsNullOrEmpty(capabilityError))
+                            deltaGenerationLease = await ProductionHostHistoryGateLease.AcquireAsync(
+                                stateDeltaGenerationGate, requestToken).ConfigureAwait(false);
+                        if (brokerAdmitted && request.Kind == HostHistoryRequestKindV1.BrokerCapture &&
+                            string.IsNullOrEmpty(capabilityError))
+                            deltaGenerationLease = await ProductionHostHistoryGateLease.AcquireAsync(
+                                brokerCaptureGenerationGate, requestToken).ConfigureAwait(false);
+                        selected = !deltaAdmitted || !brokerAdmitted
+                        ? new ProductionHostHistorySelection
+                        {
+                            Status = HostHistoryResponseStatusV1.Rejected,
+                            ErrorCode = !deltaAdmitted ? "DELTA_BUSY" : "BROKER_CAPTURE_BUSY"
+                        }
+                        : string.IsNullOrEmpty(capabilityError)
+                        ? hostHistoryService.Select(sessionId, request, recipient, request.RequestId, requestToken)
+                        : new ProductionHostHistorySelection
+                        {
+                            Status = HostHistoryResponseStatusV1.Rejected,
+                            ErrorCode = capabilityError
+                        };
+                    }
+                    finally { deltaGenerationLease?.Dispose(); }
+                    using var selection = selected;
+                    selectedBegin = request.Kind == HostHistoryRequestKindV1.FrozenBegin &&
+                        selection.Status == HostHistoryResponseStatusV1.Ok && selection.Object != null;
                     WriteHostHistoryDiagnostic("selection session=" + sessionId.ToString("N") +
                         " status=" + selection.Status + " errorCode=" + selection.ErrorCode +
                         " hasObject=" + (selection.Object != null));
-                    await SendHostHistorySelectionAsync(
+                    fullyDelivered = await SendHostHistorySelectionAsync(
                         active,
                         sessionId,
                         subscriber,
                         request.RequestId,
+                        request.Kind,
+                        request.SnapshotSeq,
                         requestSequence,
                         selection,
                         responseRequest,
                         requestToken).ConfigureAwait(false);
+                    if (selectedBegin && fullyDelivered)
+                        hostHistoryService.MarkFrozenBeginDelivered(
+                            sessionId, subscriber.DeviceId, request.RequestId);
                 }
                 finally { CryptographicOperations.ZeroMemory(pairwiseKey); }
             }
@@ -5839,26 +6146,48 @@ namespace TermLink.Agent
             }
             finally
             {
+                if (selectedBegin && !fullyDelivered)
+                    hostHistoryService.CancelUndeliveredFrozenBegin(
+                        sessionId, subscriber.DeviceId, request.RequestId);
+                var gateReleased = gateLease != null;
                 gateLease?.Dispose();
-                ((ICollection<KeyValuePair<Guid, ProductionHostHistoryResponseRequest>>)hostHistoryRequests)
+                var requestRemoved = ((ICollection<KeyValuePair<Guid, ProductionHostHistoryResponseRequest>>)hostHistoryRequests)
                     .Remove(new KeyValuePair<Guid, ProductionHostHistoryResponseRequest>(
                         requestId,
                         responseRequest));
+                var deltaRemoved = false;
+                if (request.Kind == HostHistoryRequestKindV1.StateDelta && deltaAdmitted)
+                    deltaRemoved = ((ICollection<KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>>)pendingStateDeltas)
+                        .Remove(new KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>(
+                            (sessionId, subscriber.DeviceId), requestId));
+                if (request.Kind == HostHistoryRequestKindV1.BrokerCapture && brokerAdmitted)
+                    ((ICollection<KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>>)pendingBrokerCaptures)
+                        .Remove(new KeyValuePair<(Guid SessionId, Guid DeviceId), Guid>(
+                            (sessionId, subscriber.DeviceId), requestId));
                 responseRequest.Dispose();
+                if (request.Kind == HostHistoryRequestKindV1.StateDelta)
+                    WriteHostHistoryPeerAckDiagnostic("event=request_released session=" + sessionId.ToString("N") +
+                        " sender=" + subscriber.DeviceId.ToString("N") + " request_id=" + requestId.ToString("N") +
+                        " kind=StateDelta fully_delivered=" + fullyDelivered.ToString().ToLowerInvariant() +
+                        " request_removed=" + requestRemoved.ToString().ToLowerInvariant() +
+                        " delta_removed=" + deltaRemoved.ToString().ToLowerInvariant() +
+                        " gate_released=" + gateReleased.ToString().ToLowerInvariant() + " disposed=true");
             }
         }
 
-        private async Task SendHostHistorySelectionAsync(
+        private async Task<bool> SendHostHistorySelectionAsync(
             ClientWebSocket active,
             Guid sessionId,
             Subscriber subscriber,
             ByteString requestId,
+            HostHistoryRequestKindV1 requestKind,
+            ulong requestedSnapshotSequence,
             ulong requestSequence,
             ProductionHostHistorySelection selection,
             ProductionHostHistoryResponseRequest responseRequest,
             CancellationToken token)
         {
-            if (destroyedHistorySessions.ContainsKey(sessionId)) return;
+            if (destroyedHistorySessions.ContainsKey(sessionId)) return false;
             var historyObject = selection.Object;
             var objectBytes = historyObject?.SealedObject?.LongLength ?? 0;
             var sendCount = historyObject == null
@@ -5875,7 +6204,7 @@ namespace TermLink.Agent
             {
                 for (var index = 0; index < sendCount; index++)
                 {
-                    if (destroyedHistorySessions.ContainsKey(sessionId)) return;
+                    if (destroyedHistorySessions.ContainsKey(sessionId)) return false;
                     var offset = checked(index * HostHistoryResponseChunkBytes);
                     var count = historyObject == null
                         ? 0
@@ -5887,7 +6216,10 @@ namespace TermLink.Agent
                         chunkCount,
                         digest,
                         offset,
-                        count);
+                        count,
+                        requestKind,
+                        selection.FrozenHistory,
+                        requestedSnapshotSequence);
                     Task chunkAcknowledgement = null;
                     if (historyObject != null)
                     {
@@ -5917,6 +6249,13 @@ namespace TermLink.Agent
                         await chunkAcknowledgement.ConfigureAwait(false);
                     }
                 }
+                if (requestKind == HostHistoryRequestKindV1.StateDelta && historyObject != null)
+                    WriteHostHistoryPeerAckDiagnostic("event=all_chunks_acked session=" + sessionId.ToString("N") +
+                        " sender=" + subscriber.DeviceId.ToString("N") +
+                        " request_id=" + GuidFromBytes(requestId.Span).ToString("N") +
+                        " kind=StateDelta object_id=" + historyObject.ObjectId.ToString("N") +
+                        " count=" + chunkCount);
+                return true;
             }
             finally
             {
@@ -6176,6 +6515,25 @@ namespace TermLink.Agent
             // DELETE operation. Coupling the key to its immutable local frame
             // identity prevents an old replay from fencing a later lease.
             return "local-input-priority-" + sessionId.ToString("N") + "-" + frameSequence.ToString("X16");
+        }
+
+        internal async Task<bool> AuthorizeLocalClipboardAsync(Guid sessionId, CancellationToken token)
+        {
+            var active = !IsReauthenticationRequired && Volatile.Read(ref disposed) == 0 &&
+                registry != null && registry.ContainsActiveSession(sessionId);
+            try { File.AppendAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TermLink", "clipboard-agent-debug.log"), $"{DateTime.UtcNow:O} precheck active={active} session={sessionId.ToString("N")[..8]}\n"); } catch { }
+            if (!active) return false;
+            // No cached lease and no force-release: a copy request cannot take control from a phone.
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, cancellation.Token);
+            using var response = await SendAsync(HttpMethod.Get,
+                "/v1/sessions/" + sessionId.ToString("D") + "/lease", Array.Empty<byte>(), true, null, linked.Token).ConfigureAwait(false);
+            try { File.AppendAllText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TermLink", "clipboard-agent-debug.log"), $"{DateTime.UtcNow:O} lease status={(int)response.StatusCode}\n"); } catch { }
+            if (response.StatusCode != HttpStatusCode.NotFound) return false;
+            using var document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(linked.Token).ConfigureAwait(false));
+            return document.RootElement.TryGetProperty("error", out var error) &&
+                error.TryGetProperty("code", out var code) && code.GetString() == "LEASE_NOT_FOUND" &&
+                !IsReauthenticationRequired && !linked.IsCancellationRequested &&
+                Volatile.Read(ref disposed) == 0 && registry.ContainsActiveSession(sessionId);
         }
 
         private async Task<bool> LeaseMatchesAsync(
@@ -6462,9 +6820,9 @@ namespace TermLink.Agent
         {
             try
             {
-                return RememberSubscriber(
-                    sessionId,
-                    await GetSubscriberAsync(sessionId, deviceId, token).ConfigureAwait(false));
+                // Control/history requests may recover an authorized route, but
+                // only SUBSCRIBE can negotiate and open the terminal stream.
+                return await GetSubscriberAsync(sessionId, deviceId, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (OperationCanceledException) { return null; }
@@ -6766,7 +7124,7 @@ namespace TermLink.Agent
                         {
                             var previousEpoch = config.KeyEpoch;
                             config.KeyEpoch = keyEpoch;
-                            try { ProductionAgentConfig.Save(config); }
+                            try { SaveCurrentKeyEpoch(config, credentials); }
                             catch
                             {
                                 config.KeyEpoch = previousEpoch;
@@ -6825,6 +7183,9 @@ namespace TermLink.Agent
                     {
                         if (transitioning) EndDirectAuthorityTransition();
                     }
+                    if (epochAdvanced) changedPeers.UnionWith(candidates.Keys);
+                    foreach (var peer in changedPeers)
+                        hostHistoryService.InvalidateFrozenRecipient(peer);
                 }
                 finally
                 {
@@ -7037,6 +7398,85 @@ namespace TermLink.Agent
             }
         }
 
+        private string TerminalSessionCompatibilityError(Guid sessionId)
+        {
+            var error = registry?.TerminalCompatibilityError(sessionId) ?? string.Empty;
+            return error.Length != 0 ? error : terminalHistoryStore.TerminalCompatibilityError(sessionId);
+        }
+
+        private bool IsBrokerCaptureRecoveryUnavailable(Guid sessionId) =>
+            string.Equals(registry?.TerminalCompatibilityError(sessionId),
+                BrokerCaptureRecoveryUnavailable, StringComparison.Ordinal);
+
+        private string ValidateTerminalState(Guid sessionId, IEnumerable<string> capabilities,
+            out TerminalSemanticProfile profile)
+        {
+            profile = null;
+            try { profile = registry?.GetSessionProfile(sessionId) ?? terminalHistoryStore.GetSessionProfile(sessionId); }
+            catch (TerminalHistoryProfileException profileError) { return profileError.Code; }
+            var relay = realtimeCapabilityState.Snapshot();
+            var error = ProductionTerminalStateContract.Validate(capabilities,
+                relay.Connected && relay.Capabilities.Contains(ProductionTerminalStateContract.Attach),
+                relay.Connected && relay.Capabilities.Contains(ProductionRealtimeCapabilities.TerminalHostGeometryV1) &&
+                    relay.Capabilities.Contains(ProductionRealtimeCapabilities.TerminalHostThemeV1) &&
+                    relay.Capabilities.Contains(ProductionRealtimeCapabilities.TerminalHostResizeV1), profile.StateContract);
+            if (error.Length != 0) return error;
+            return ProductionRealtimeCapabilities.ValidateBrokerCaptureSession(
+                BrokerCaptureProductEnabled,
+                profile.IsGraphics,
+                relay.Capabilities,
+                capabilities);
+        }
+
+        private async Task<bool> NegotiateTerminalStateAsync(
+            ClientWebSocket active, Guid sessionId, Subscriber subscriber, ulong requestSequence,
+            SubscribePayload request, CancellationToken token)
+        {
+            var error = ValidateTerminalState(sessionId, request.SubscriberCapabilities, out var profile);
+            if (error.Length == 0) error = TerminalSessionCompatibilityError(sessionId);
+            if (request.RequestId.Length != 16 || GuidFromBytes(request.RequestId.Span) == Guid.Empty)
+                error = "TERMINAL_CLIENT_UPGRADE_REQUIRED";
+            lock (subscriber.Sync)
+            {
+                subscriber.TerminalStateAccepted = error.Length == 0;
+                subscriber.BrokerCaptureAccepted = error.Length == 0 &&
+                    BrokerCaptureProductEnabled && profile?.IsGraphics == true;
+                // Pause the prior generation before publishing the result.
+                subscriber.FlowPaused = true;
+            }
+            if (error.Length != 0)
+            {
+                RemoveSubscriber(sessionId, subscriber.DeviceId, subscriber);
+                CancelHostHistoryRequests(sessionId, subscriber.DeviceId);
+            }
+            var relay = realtimeCapabilityState.Snapshot();
+            if (!relay.Connected || !relay.Capabilities.Contains(ProductionTerminalStateContract.Attach))
+                return false;
+            var attachResult = new TerminalAttachResultPayload
+            {
+                RequestId = request.RequestId,
+                RequiredState = profile?.StateContract ?? string.Empty,
+                ErrorCode = error
+            };
+            if (error.Length == 0 && profile?.IsGraphics == true)
+            {
+                attachResult.HostCapabilities.Add("host_history_frozen_v1");
+                attachResult.HostCapabilities.Add("tlhp_v2");
+                if (TermLink.TerminalCore.NativeTerminalDelta.SupportsV1())
+                    attachResult.HostCapabilities.Add("state_delta_v1");
+                if (BrokerCaptureProductEnabled)
+                    attachResult.HostCapabilities.Add(ProductionRealtimeCapabilities.TerminalBrokerCapturesV1);
+            }
+            var payload = attachResult.ToByteArray();
+            try
+            {
+                await SendSessionControlEnvelopeAsync(active, sessionId, subscriber, requestSequence,
+                    MessageType.TerminalAttachResult, payload, token).ConfigureAwait(false);
+            }
+            finally { CryptographicOperations.ZeroMemory(payload); }
+            return error.Length == 0;
+        }
+
         private async Task ReplaySubscriberAsync(
             ClientWebSocket active,
             Guid sessionId,
@@ -7170,7 +7610,11 @@ namespace TermLink.Agent
                 {
                     var messageType = MapMessageType(frame);
                     if (messageType == MessageType.Unspecified) continue;
-                    var payload = BuildRealtimePayload(frame, replayShellType, replayMetadata).ToByteArray();
+                    await EnsureBrokerCaptureReadyAsync(frame, token).ConfigureAwait(false);
+                    if (messageType == MessageType.BrokerOutput && !subscriber.BrokerCaptureAccepted)
+                        throw new InvalidDataException("TERMINAL_CLIENT_UPGRADE_REQUIRED");
+                    var payload = BuildRealtimePayload(frame, replayShellType, replayMetadata,
+                        includeTerminalDiagnostic: true).ToByteArray();
                     try
                     {
                         var sent = await SendEncryptedCoreAsync(
@@ -7386,6 +7830,10 @@ namespace TermLink.Agent
 
         private async Task<bool> SendEncryptedCoreAsync(ClientWebSocket active, Guid sessionId, Subscriber subscriber, MessageType type, Direction direction, ulong sequence, byte[] plaintext, CancellationToken token)
         {
+            lock (subscriber.Sync)
+            {
+                if (!subscriber.TerminalStateAccepted) return false;
+            }
             var cached = PrepareCachedSubscriberFrameForSend(
                 subscriber,
                 sequence,
@@ -7545,7 +7993,11 @@ namespace TermLink.Agent
         private static MessageType MapMessageType(LocalFrame frame)
         {
             if (frame.Type == LocalFrameType.Output) return MessageType.OutputChunk;
+            if (frame.Type == LocalFrameType.BrokerOutput) return MessageType.BrokerOutput;
             if (frame.Type == LocalFrameType.Resize) return MessageType.ResizeApplied;
+            if (frame.Type == LocalFrameType.HostTheme) return MessageType.HostTheme;
+            if (frame.Type == LocalFrameType.HostResizeResult) return MessageType.HostResizeResult;
+            if (frame.Type == LocalFrameType.HostGeometry) return MessageType.HostGeometry;
             if (frame.Type == LocalFrameType.Title) return MessageType.SessionUpsert;
             if (frame.Type == LocalFrameType.SessionRemoved) return MessageType.SessionRemoved;
             if (frame.Type == LocalFrameType.Gap) return MessageType.Gap;
@@ -7571,13 +8023,16 @@ namespace TermLink.Agent
 
         private static IMessage BuildPayload(LocalFrame frame)
         {
-            return BuildRealtimePayload(frame, ManagedShellType.Custom, null);
+            return BuildRealtimePayload(frame, ManagedShellType.Custom, null,
+                includeTerminalDiagnostic: false);
         }
 
         private static IMessage BuildRealtimePayload(
             LocalFrame frame,
             ManagedShellType shellType,
-            SessionPublicationSnapshot metadata)
+            SessionPublicationSnapshot metadata,
+            TerminalFailureStore failureStore = null,
+            bool includeTerminalDiagnostic = false)
         {
             if (frame.Type == LocalFrameType.Output)
             {
@@ -7587,6 +8042,29 @@ namespace TermLink.Agent
                     SourceEventSeq = frame.Sequence,
                     PresentationRevision = frame.Sequence
                 };
+            }
+            if (frame.Type == LocalFrameType.BrokerOutput)
+            {
+                using var reference = TermLink.TerminalCore.NativeTerminalBrokerOutputReferenceV1.Decode(frame.Payload);
+                if (reference.SourceSequence != frame.Sequence)
+                    throw new InvalidDataException("BrokerOutput reference source sequence is invalid.");
+                return new BrokerOutputPayload { ReferenceV1 = ByteString.CopyFrom(frame.Payload) };
+            }
+            if (frame.Type == LocalFrameType.HostTheme)
+            {
+                TermLink.TerminalCore.NativeTerminalHostThemeV1.Decode(frame.Payload);
+                return new HostThemePayload { ThemeV1 = ByteString.CopyFrom(frame.Payload) };
+            }
+            if (frame.Type == LocalFrameType.HostResizeResult)
+            {
+                if (LocalPayloadCodec.ParseHostResizeResult(frame.Payload).SourceSequence >= frame.Sequence)
+                    throw new InvalidDataException("Host resize result precedes its request.");
+                return new HostResizeResultPayload { ResultV1 = ByteString.CopyFrom(frame.Payload) };
+            }
+            if (frame.Type == LocalFrameType.HostGeometry)
+            {
+                TermLink.TerminalCore.NativeTerminalHostGeometryV1.Decode(frame.Payload);
+                return new HostGeometryPayload { GeometryV1 = ByteString.CopyFrom(frame.Payload) };
             }
             if (frame.Type == LocalFrameType.Resize)
             {
@@ -7622,7 +8100,23 @@ namespace TermLink.Agent
                 var lifecycle = LocalPayloadCodec.ParseLifecycle(frame.Payload, out var exitCode);
                 var state = lifecycle == LocalLifecycleState.Ended ? "ENDED" : LifecycleText(lifecycle);
                 var payload = BuildSessionMetadataPayload(shellType, state, metadata);
-                if (lifecycle == LocalLifecycleState.Ended) payload.ExitCode = exitCode;
+                if (lifecycle == LocalLifecycleState.Ended)
+                {
+                    payload.ExitCode = exitCode;
+                    if (exitCode == 125 && includeTerminalDiagnostic)
+                    {
+                        try
+                        {
+                            var diagnostic = (failureStore ?? new TerminalFailureStore())
+                                .ReadAuthorityBody(frame.SessionId);
+                            if (diagnostic != null) payload.TerminalProtocolDiagnostic = diagnostic;
+                        }
+                        catch (Exception error) when (error is not OutOfMemoryException)
+                        {
+                            // A local diagnostic read must never suppress the Ended event.
+                        }
+                    }
+                }
                 return payload;
             }
             if (frame.Type == LocalFrameType.Title)
@@ -8667,6 +9161,7 @@ namespace TermLink.Agent
             terminalHistoryPersistenceFailures.Clear();
             terminalCoreShadowStates.Clear();
             terminalHistoryProducer.Dispose();
+            hostHistoryService.Dispose();
             publishedSequences.Clear();
             foreach (var state in publicationStates.Values) state.RestUpsertGate.Dispose();
             publicationStates.Clear();

@@ -1014,72 +1014,74 @@ internal class ProductionDirectDataRuntime(
             runCatching(value.native::close)
             return false
         }
-        val actor = ProductionDirectDataPeerActor(
-            value.peerDeviceId,
-            value.pathFence,
-            value.keyEpoch,
-            value.native,
-            multiplexer,
-            relaySender,
-            signalProcessor,
-            signer,
-            scope,
-            clockMillis,
-            queueFramesPerPeer,
-            queueBytesPerPeer,
-            pumpIntervalMillis,
-            ticketWire = value.ticketWire,
-            renewTicket = value.renewTicket,
-            onCarrier = { direction, carrier ->
-                when (carrier) {
-                    DirectNativeCarrierV5.LAN_DIRECT,
-                    DirectNativeCarrierV5.NAT_DIRECT,
-                    -> registry.markDirectionActive(
-                        value.peerDeviceId,
-                        value.pathFence,
-                        direction,
-                        if (carrier == DirectNativeCarrierV5.LAN_DIRECT) {
-                            ProductionDirectPathKind.LAN
-                        } else {
-                            ProductionDirectPathKind.NAT
-                        },
-                    )
-                    DirectNativeCarrierV5.RELAY -> registry.markDirectionRelay(
-                        value.peerDeviceId,
-                        value.pathFence,
-                        direction,
-                    )
-                }
-            },
-            onSessionCarrier = { sessionId, direction, carrier ->
-                sessionCarrierObserver(
-                    value.peerDeviceId,
-                    value.pathFence,
-                    sessionId,
-                    direction,
-                    carrier,
-                )
-            },
-            onRetired = actorRetired@{ retired, reason ->
-                // A stale install never owned the registry fence. Its actor still
-                // runs its local native cleanup, but must not re-enter failPeer(),
-                // which is reserved for the currently installed actor.
-                if (reason == ProductionDirectPeerRetirementReason.STALE_INSTALL) {
-                    return@actorRetired
-                }
-                if (registry.failPeer(retired.peerDeviceId, retired.pathFence, reason)) {
-                    peerRetirementObserver(retired.peerDeviceId, reason)
-                }
+        val (actor, installed) = synchronized(actorLifecycleLock) {
+            // Close and registration share one boundary. A late installer must
+            // not create a lazy actor after closeAndJoin has seen an empty map.
+            if (closed.get()) {
+                runCatching(value.native::close)
+                return false
             }
-        )
-        val installed = synchronized(actorLifecycleLock) {
+            val actor = ProductionDirectDataPeerActor(
+                value.peerDeviceId,
+                value.pathFence,
+                value.keyEpoch,
+                value.native,
+                multiplexer,
+                relaySender,
+                signalProcessor,
+                signer,
+                scope,
+                clockMillis,
+                queueFramesPerPeer,
+                queueBytesPerPeer,
+                pumpIntervalMillis,
+                ticketWire = value.ticketWire,
+                renewTicket = value.renewTicket,
+                onCarrier = { direction, carrier ->
+                    when (carrier) {
+                        DirectNativeCarrierV5.LAN_DIRECT,
+                        DirectNativeCarrierV5.NAT_DIRECT,
+                        -> registry.markDirectionActive(
+                            value.peerDeviceId,
+                            value.pathFence,
+                            direction,
+                            if (carrier == DirectNativeCarrierV5.LAN_DIRECT) {
+                                ProductionDirectPathKind.LAN
+                            } else {
+                                ProductionDirectPathKind.NAT
+                            },
+                        )
+                        DirectNativeCarrierV5.RELAY -> registry.markDirectionRelay(
+                            value.peerDeviceId,
+                            value.pathFence,
+                            direction,
+                        )
+                    }
+                },
+                onSessionCarrier = { sessionId, direction, carrier ->
+                    sessionCarrierObserver(
+                        value.peerDeviceId,
+                        value.pathFence,
+                        sessionId,
+                        direction,
+                        carrier,
+                    )
+                },
+                onRetired = actorRetired@{ retired, reason ->
+                    // A stale install never owned the registry fence. Its actor still
+                    // runs its local native cleanup, but must not re-enter failPeer(),
+                    // which is reserved for the currently installed actor.
+                    if (reason == ProductionDirectPeerRetirementReason.STALE_INSTALL) {
+                        return@actorRetired
+                    }
+                    if (registry.failPeer(retired.peerDeviceId, retired.pathFence, reason)) {
+                        peerRetirementObserver(retired.peerDeviceId, reason)
+                    }
+                }
+            )
             actors[actor] = Unit
             actor.invokeOnCompletion { actors.remove(actor) }
-            if (closed.get()) {
-                false
-            } else {
-                registry.install(actor)
-            }
+            actor to registry.install(actor)
         }
         if (!installed) {
             actor.retire(
@@ -1227,14 +1229,19 @@ internal class ProductionDirectDataRuntime(
             registry.close()
         }
         gatewayRegistration.close()
-        scopeJob.cancel()
+        // Retired actors run native cleanup on their own lane. Cancelling their
+        // parent here can prevent a lazy actor from entering its finally block.
+        scopeJob.complete()
     }
 
     suspend fun closeAndJoin() {
         close()
         withContext(NonCancellable) {
             while (true) {
-                val remaining = actors.keys.toList()
+                // ConcurrentHashMap key removal can race Kotlin's one-element
+                // toList() shortcut between size and iterator.next(). Its Java
+                // array snapshot tolerates removals during traversal.
+                val remaining = actors.keys.toTypedArray()
                 if (remaining.isEmpty()) break
                 remaining.forEach { it.closeAndJoin() }
             }

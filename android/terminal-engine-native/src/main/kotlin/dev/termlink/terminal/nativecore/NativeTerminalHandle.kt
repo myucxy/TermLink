@@ -13,7 +13,9 @@ import dev.termlink.terminal.api.TerminalMouseButtons
 import dev.termlink.terminal.api.TerminalMouseInput
 import dev.termlink.terminal.api.TerminalMouseWheelDirection
 import dev.termlink.terminal.api.TerminalOutputProfile
+import dev.termlink.terminal.api.TerminalWidthProfile
 import dev.termlink.terminal.api.TerminalSize
+import dev.termlink.terminal.api.TerminalRenderFrameV5
 
 /**
  * Exclusive, idempotently closeable owner of one opaque native terminal handle.
@@ -26,10 +28,12 @@ class NativeTerminalHandle private constructor(
     private val bridge: NativeBridge,
     private val limits: NativeTerminalLimits,
     allocation: NativeBridgeTerminal,
+    val graphicsProfile: Boolean = false,
 ) : AutoCloseable {
     private val lock = Any()
     private var allocation: NativeBridgeTerminal? = allocation
     private var unusable = false
+    private var firstNativeFailure: NativeTerminalException? = null
 
     val isClosed: Boolean
         get() = synchronized(lock) { allocation == null }
@@ -39,6 +43,18 @@ class NativeTerminalHandle private constructor(
 
     val presentationRevision: Long
         get() = synchronized(lock) { requireUsable().presentationRevision }
+
+    fun captureHistory(): NativeHistoryCapture = synchronized(lock) {
+        val info = invokeBridge("historyBegin") { bridge.historyBegin(requireUsable().handle) }
+        try {
+            require(info.captureId > 0 && info.ownerId > 0 && info.revision == requireUsable().presentationRevision &&
+                info.accountedBytes in 1..64L * 1024 * 1024 && info.leaseMillis == 300_000L) { "invalid history capture metadata" }
+            NativeHistoryCapture(bridge, info, graphicsProfile)
+        } catch (error: Throwable) {
+            bridge.historyRelease(info)
+            throw error
+        }
+    }
 
     fun apply(batch: NativeEventBatch): NativeBridgeApplyReceipt = synchronized(lock) {
         val current = requireUsable()
@@ -124,6 +140,37 @@ class NativeTerminalHandle private constructor(
                 throw error
             }
         }
+
+    /** Replays one host-captured, path-free broker Output without opening local resources. */
+    fun applyBrokerCapturedV1(output: NativeBrokerOutputV1): TerminalHostEffectFrameV2 = synchronized(lock) {
+        val current = requireUsable()
+        require(graphicsProfile) { "Broker capture replay requires the graphics profile" }
+        val batch = NativeEventBatch.of(listOf(NativeSourceEvent.Output(output.sourceSequence, output.copyOutput())), limits)
+        require(batch.firstSourceSequence == current.nextSourceSequence) {
+            "source sequence mismatch: expected ${current.nextSourceSequence}, received ${batch.firstSourceSequence}"
+        }
+        val raw = invokeBridge(
+            operation = "applyBrokerCapturedV1",
+            poisonOnException = true,
+            poisonOnFailure = { it !in RETRYABLE_APPLY_FAILURES && it != NativeTerminalStatus.UNSUPPORTED },
+        ) { bridge.applyBrokerCapturedV1(current.handle, output) }
+        validateApplyReceipt("applyBrokerCapturedV1", batch, raw.receipt)
+        if (raw.frameByteCount !in HOST_EFFECT_HEADER_BYTES..TERMLINK_HOST_EFFECT_FRAME_V2_MAX_BYTES) {
+            failMalformed("applyBrokerCapturedV1.frameBounds", "host-effect frame is outside the supported byte range")
+        }
+        try {
+            val decoded = try { HostEffectFrameV2Decoder.decode(raw.copyHostEffectFrame()) }
+            catch (_: RuntimeException) {
+                failMalformed("applyBrokerCapturedV1.frameDecode", "host-effect frame is malformed")
+            }
+            allocation = current.copy(nextSourceSequence = raw.receipt.nextSourceSequence,
+                presentationRevision = raw.receipt.presentationRevision)
+            decoded
+        } catch (error: Throwable) {
+            unusable = true
+            throw error
+        }
+    }
 
     fun apply(
         events: List<NativeSourceEvent>,
@@ -217,10 +264,10 @@ class NativeTerminalHandle private constructor(
         applyWithHostEffectsV2(listOf(NativeSourceEvent.Gap(sourceSequence)))
 
     fun render(
-        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes.coerceAtMost(TERMLINK_RENDER_FRAME_V3_MAX_BYTES),
     ): NativeRenderFrame = synchronized(lock) {
         val current = requireUsable()
-        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+        require(maxPayloadBytes in 1..minOf(limits.maxRenderFrameBytes, TERMLINK_RENDER_FRAME_V3_MAX_BYTES)) {
             "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
         }
         val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
@@ -258,12 +305,61 @@ class NativeTerminalHandle private constructor(
         NativeRenderFrame(decoded)
     }
 
+    private val supportsRenderV4: Boolean by lazy {
+        try { bridge.renderFrameV4FormatVersion == 4 } catch (_: UnsatisfiedLinkError) { false }
+    }
+
+    /** Selects a supported frame API; each wire decoder remains strict. */
+    internal fun renderTextAtScrollback(offsetRows: Long): NativeScrollbackTextFrame =
+        if (graphicsProfile) renderV5AtScrollback(offsetRows)
+        else if (supportsRenderV4) renderV4AtScrollback(offsetRows)
+        else renderV3AtScrollback(offsetRows, limits.maxRenderFrameBytes.coerceAtMost(TERMLINK_RENDER_FRAME_V3_MAX_BYTES))
+
+    fun renderV5(maxPayloadBytes: Int = limits.maxRenderFrameBytes): TerminalRenderFrameV5 = synchronized(lock) {
+        val current = requireUsable()
+        require(graphicsProfile) { "Render V5 requires the explicit graphics profile" }
+        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes)
+        val raw = invokeBridge("renderV5") { bridge.renderV5(current.handle, NativeRenderRequest(maxPayloadBytes)) }
+        decodeRenderFrameV5("renderV5", current, raw.payload, maxPayloadBytes)
+    }
+
+    fun renderV5AtScrollback(offsetRows: Long, maxPayloadBytes: Int = limits.maxRenderFrameBytes): NativeScrollbackTextFrame = synchronized(lock) {
+        val current = requireUsable()
+        require(graphicsProfile) { "Render V5 requires the explicit graphics profile" }
+        require(offsetRows in 0..UNSIGNED_INT_MAX && maxPayloadBytes in 1..limits.maxRenderFrameBytes)
+        val raw = invokeBridge("renderV5AtScrollback") {
+            bridge.renderV5AtScrollback(current.handle, offsetRows, NativeRenderRequest(maxPayloadBytes))
+        }
+        if (raw.availableRows !in 0..UNSIGNED_INT_MAX || raw.generationRows < 0 ||
+            raw.appliedOffsetRows != offsetRows.coerceAtMost(raw.availableRows)) {
+            throw NativeTerminalContractException("renderV5AtScrollback.metadata", "bridge returned inconsistent scrollback metadata")
+        }
+        NativeScrollbackFrameV5(decodeRenderFrameV5("renderV5AtScrollback", current, raw.payload, maxPayloadBytes),
+            raw.availableRows, raw.generationRows, raw.appliedOffsetRows)
+    }
+
+    private fun decodeRenderFrameV5(operation: String, current: NativeBridgeTerminal, payload: ByteArray, maxPayloadBytes: Int): TerminalRenderFrameV5 {
+        if (payload.size > minOf(maxPayloadBytes, limits.maxRenderFrameBytes, TERMLINK_RENDER_FRAME_V5_MAX_BYTES)) {
+            throw NativeTerminalContractException("$operation.frameBounds", "frame payload exceeds the requested bound")
+        }
+        val decoded = try { RenderFrameV5Decoder.decode(payload) }
+        catch (error: RenderFrameV5DecodeException) {
+            throw NativeTerminalContractException("$operation.frameDecode", error.message ?: "malformed frame")
+        }
+        if (decoded.nextSourceSequence != current.nextSourceSequence || decoded.presentationRevision != current.presentationRevision) {
+            throw NativeTerminalContractException("$operation.revision", "frame revision does not match the owned terminal")
+        }
+        try { limits.validateSize(decoded.size, "render frame v5") }
+        catch (error: IllegalArgumentException) { throw NativeTerminalContractException("$operation.dimensions", error.message ?: "invalid frame size") }
+        return decoded
+    }
+
     /** Exports the canonical V3 frame consumed by the production Android terminal view. */
     fun renderV3(
-        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes.coerceAtMost(TERMLINK_RENDER_FRAME_V3_MAX_BYTES),
     ): NativeRenderFrameV3 = synchronized(lock) {
         val current = requireUsable()
-        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+        require(maxPayloadBytes in 1..minOf(limits.maxRenderFrameBytes, TERMLINK_RENDER_FRAME_V3_MAX_BYTES)) {
             "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
         }
         val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
@@ -274,13 +370,13 @@ class NativeTerminalHandle private constructor(
     /** Exports a local-history V3 projection and its immutable scrollback metadata. */
     fun renderV3AtScrollback(
         offsetRows: Long,
-        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes.coerceAtMost(TERMLINK_RENDER_FRAME_V3_MAX_BYTES),
     ): NativeScrollbackFrameV3 = synchronized(lock) {
         val current = requireUsable()
         require(offsetRows in 0..UNSIGNED_INT_MAX) {
             "scrollback offset rows must be in 0..$UNSIGNED_INT_MAX"
         }
-        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+        require(maxPayloadBytes in 1..minOf(limits.maxRenderFrameBytes, TERMLINK_RENDER_FRAME_V3_MAX_BYTES)) {
             "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
         }
         val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
@@ -345,6 +441,104 @@ class NativeTerminalHandle private constructor(
         }
         try {
             limits.validateSize(decoded.size, "render frame v3")
+        } catch (error: IllegalArgumentException) {
+            throw NativeTerminalContractException(
+                "$operation.dimensions",
+                error.message ?: "invalid frame size",
+            )
+        }
+        decoded
+    }
+
+    /** Exports the canonical V4 frame consumed by the production Android terminal view. */
+    fun renderV4(
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+    ): NativeRenderFrameV4 = synchronized(lock) {
+        val current = requireUsable()
+        requireV4Abi(bridge)
+        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+            "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
+        }
+        val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
+        val raw = invokeBridge("renderV4") { bridge.renderV4(current.handle, request) }
+        NativeRenderFrameV4(decodeRenderFrameV4("renderV4", current, raw.payload, maxPayloadBytes))
+    }
+
+    /** Exports a local-history V4 projection and its immutable scrollback metadata. */
+    fun renderV4AtScrollback(
+        offsetRows: Long,
+        maxPayloadBytes: Int = limits.maxRenderFrameBytes,
+    ): NativeScrollbackFrameV4 = synchronized(lock) {
+        val current = requireUsable()
+        requireV4Abi(bridge)
+        require(offsetRows in 0..UNSIGNED_INT_MAX) {
+            "scrollback offset rows must be in 0..$UNSIGNED_INT_MAX"
+        }
+        require(maxPayloadBytes in 1..limits.maxRenderFrameBytes) {
+            "render payload limit must be in 1..${limits.maxRenderFrameBytes}"
+        }
+        val request = NativeRenderRequest(maxPayloadBytes = maxPayloadBytes)
+        val raw = invokeBridge("renderV4AtScrollback") {
+            bridge.renderV4AtScrollback(current.handle, offsetRows, request)
+        }
+        if (raw.availableRows !in 0..UNSIGNED_INT_MAX || raw.generationRows < 0 ||
+            raw.appliedOffsetRows !in 0..raw.availableRows ||
+            raw.appliedOffsetRows != offsetRows.coerceAtMost(raw.availableRows)
+        ) {
+            throw NativeTerminalContractException(
+                "renderV4AtScrollback.metadata",
+                "bridge returned inconsistent scrollback metadata",
+            )
+        }
+        NativeScrollbackFrameV4(
+            renderFrame = decodeRenderFrameV4(
+                "renderV4AtScrollback",
+                current,
+                raw.payload,
+                maxPayloadBytes,
+            ),
+            availableRows = raw.availableRows,
+            generationRows = raw.generationRows,
+            appliedOffsetRows = raw.appliedOffsetRows,
+        )
+    }
+
+    private fun decodeRenderFrameV4(
+        operation: String,
+        current: NativeBridgeTerminal,
+        payload: ByteArray,
+        maxPayloadBytes: Int,
+    ) = run {
+        if (payload.size > maxPayloadBytes || payload.size > limits.maxRenderFrameBytes) {
+            throw NativeTerminalContractException(
+                "$operation.frameBounds",
+                "frame payload exceeds the requested bound",
+            )
+        }
+        val decoded = try {
+            RenderFrameV4Decoder.decode(payload)
+        } catch (error: RenderFrameV4DecodeException) {
+            throw NativeTerminalContractException(
+                "$operation.frameDecode",
+                error.message ?: "malformed frame",
+            )
+        }
+        if (decoded.nextSourceSequence != current.nextSourceSequence) {
+            throw NativeTerminalContractException(
+                "$operation.sourceSequence",
+                "expected next source sequence ${current.nextSourceSequence}, " +
+                    "received ${decoded.nextSourceSequence}",
+            )
+        }
+        if (decoded.presentationRevision != current.presentationRevision) {
+            throw NativeTerminalContractException(
+                "$operation.presentationRevision",
+                "expected presentation revision ${current.presentationRevision}, " +
+                    "received ${decoded.presentationRevision}",
+            )
+        }
+        try {
+            limits.validateSize(decoded.size, "render frame v4")
         } catch (error: IllegalArgumentException) {
             throw NativeTerminalContractException(
                 "$operation.dimensions",
@@ -498,6 +692,18 @@ class NativeTerminalHandle private constructor(
         encoded.payload.copyOf()
     }
 
+    fun hostSignals(): dev.termlink.terminal.api.TerminalHostSignals = synchronized(lock) {
+        val current = requireUsable()
+        val raw = invokeBridge("hostSignalsV1") { bridge.hostSignalsV1(current.handle) }
+        dev.termlink.terminal.api.TerminalHostSignals.decode(raw.payload)
+    }
+
+    fun shellState(): dev.termlink.terminal.api.TerminalShellState = synchronized(lock) {
+        val current = requireUsable()
+        val raw = invokeBridge("shellStateV1") { bridge.shellStateV1(current.handle) }
+        dev.termlink.terminal.api.TerminalShellState.decode(raw.payload, current.nextSourceSequence)
+    }
+
     fun exportCheckpoint(
         maxPayloadBytes: Int = limits.maxCheckpointBytes,
     ): NativeCheckpoint = synchronized(lock) {
@@ -506,7 +712,8 @@ class NativeTerminalHandle private constructor(
             "checkpoint payload limit must be in 1..${limits.maxCheckpointBytes}"
         }
         val raw = invokeBridge("exportCheckpoint") {
-            bridge.exportCheckpoint(current.handle, maxPayloadBytes)
+            if (graphicsProfile) bridge.exportCheckpointGraphicsV1(current.handle, maxPayloadBytes)
+            else bridge.exportCheckpoint(current.handle, maxPayloadBytes)
         }
         if (raw.nextSourceSequence != current.nextSourceSequence) {
             throw NativeTerminalContractException(
@@ -531,6 +738,9 @@ class NativeTerminalHandle private constructor(
                 "checkpoint exceeds the requested bound",
             )
         }
+        if (isGraphicsSnapshot(raw.payload) != graphicsProfile) {
+            throw NativeTerminalContractException("exportCheckpoint", "checkpoint graphics profile does not match the terminal")
+        }
         NativeCheckpoint(
             nextSourceSequence = raw.nextSourceSequence,
             presentationRevision = raw.presentationRevision,
@@ -551,7 +761,10 @@ class NativeTerminalHandle private constructor(
 
     private fun requireUsable(): NativeBridgeTerminal {
         val current = allocation ?: error("Native terminal handle is closed")
-        check(!unusable) { "Native terminal handle is unusable after a failed mutating call" }
+        if (unusable) {
+            firstNativeFailure?.let { throw it }
+            error("Native terminal handle is unusable after a failed mutating call")
+        }
         return current
     }
 
@@ -611,18 +824,20 @@ class NativeTerminalHandle private constructor(
                 if (poisonOnFailure(status)) {
                     unusable = true
                 }
-                throw NativeTerminalException(
+                val failure = NativeTerminalException(
                     operation = operation,
                     status = status,
                     rawStatusCode = result.statusCode,
                     diagnostic = result.diagnostic?.take(MAX_DIAGNOSTIC_CHARACTERS),
                 )
+                if (unusable && firstNativeFailure == null) firstNativeFailure = failure
+                throw failure
             }
         }
     }
 
     companion object {
-        private const val MAX_DIAGNOSTIC_CHARACTERS = 4_096
+        private const val MAX_DIAGNOSTIC_CHARACTERS = 8_192
         private const val HOST_EFFECT_HEADER_BYTES = 64
         private val RETRYABLE_APPLY_FAILURES = setOf(
             NativeTerminalStatus.INVALID_ARGUMENT,
@@ -687,6 +902,7 @@ class NativeTerminalHandle private constructor(
             initialNextSourceSequence: Long,
             limits: NativeTerminalLimits = NativeTerminalLimits(),
         ): NativeTerminalHandle {
+            require(!limits.graphicsProfile) { "Graphics limits require the explicit graphics factory" }
             limits.validateSize(size, "initial terminal")
             require(initialNextSourceSequence in 0 until Long.MAX_VALUE) {
                 "initial next source sequence must be in 0..${Long.MAX_VALUE - 1L}"
@@ -728,6 +944,7 @@ class NativeTerminalHandle private constructor(
             historyCapacityRows: Long = 0,
             limits: NativeTerminalLimits = NativeTerminalLimits(),
         ): NativeTerminalHandle {
+            require(!limits.graphicsProfile) { "Graphics limits require the explicit graphics factory" }
             limits.validateSize(size, "initial terminal")
             require(initialNextSourceSequence in 0 until Long.MAX_VALUE) {
                 "initial next source sequence must be in 0..${Long.MAX_VALUE - 1L}"
@@ -766,19 +983,76 @@ class NativeTerminalHandle private constructor(
             return NativeTerminalHandle(bridge, limits, allocation)
         }
 
+        fun createWithProfiles(
+            bridge: NativeBridge,
+            size: TerminalSize,
+            initialNextSourceSequence: Long,
+            outputProfile: TerminalOutputProfile,
+            widthProfile: TerminalWidthProfile,
+            historyCapacityRows: Long = 0,
+            limits: NativeTerminalLimits? = null,
+            graphicsProfile: Boolean = false,
+        ): NativeTerminalHandle {
+            val selectedLimits = profileLimits(limits, graphicsProfile)
+            selectedLimits.validateSize(size, "initial terminal")
+            require(initialNextSourceSequence in 0 until Long.MAX_VALUE) {
+                "initial next source sequence must be in 0..${Long.MAX_VALUE - 1L}"
+            }
+            require(historyCapacityRows in 0..UNSIGNED_INT_MAX) {
+                "history capacity rows must be in 0..$UNSIGNED_INT_MAX"
+            }
+            requireAbi(bridge)
+            if (graphicsProfile) requireGraphicsAbi(bridge) else requireV4Abi(bridge)
+            val config = NativeTerminalConfigV4(
+                columns = size.columns,
+                rows = size.rows,
+                initialSourceSequence = initialNextSourceSequence,
+                historyCapacityRows = historyCapacityRows,
+                outputProfile = outputProfile.toNativeOutputProfile(),
+                widthProfile = widthProfile.wireValue,
+            )
+            val allocation = invokeOpeningBridge(if (graphicsProfile) "createGraphicsV1" else "createV4") {
+                if (graphicsProfile) bridge.createGraphicsV1(config) else bridge.createV4(config)
+            }
+            try {
+                validateAllocation("createV4", allocation)
+                if (
+                    allocation.nextSourceSequence != initialNextSourceSequence ||
+                    allocation.presentationRevision != initialNextSourceSequence
+                ) {
+                    throw NativeTerminalContractException(
+                        "createV4",
+                        "a new terminal must retain the requested next source sequence and use " +
+                            "that sequence as its presentation revision",
+                    )
+                }
+            } catch (error: NativeTerminalContractException) {
+                discardMalformedAllocation(bridge, allocation)
+                throw error
+            }
+            return NativeTerminalHandle(bridge, selectedLimits, allocation, graphicsProfile)
+        }
+
         fun importCheckpoint(
             bridge: NativeBridge,
             checkpoint: ByteArray,
-            limits: NativeTerminalLimits = NativeTerminalLimits(),
+            limits: NativeTerminalLimits? = null,
+            graphicsProfile: Boolean = false,
         ): NativeTerminalHandle {
+            val selectedLimits = profileLimits(limits ?: if (graphicsProfile) NativeTerminalLimits.graphics() else NativeTerminalLimits(), graphicsProfile)
             require(checkpoint.isNotEmpty()) { "checkpoint must not be empty" }
-            require(checkpoint.size <= limits.maxCheckpointBytes) {
-                "checkpoint exceeds ${limits.maxCheckpointBytes} bytes"
+            require(checkpoint.size <= selectedLimits.maxCheckpointBytes) {
+                "checkpoint exceeds ${selectedLimits.maxCheckpointBytes} bytes"
+            }
+            if (isGraphicsSnapshot(checkpoint) != graphicsProfile) {
+                throw NativeTerminalException("importCheckpoint.profile", NativeTerminalStatus.INCOMPATIBLE_SNAPSHOT,
+                    diagnostic = "Snapshot graphics profile does not match the explicitly selected terminal profile")
             }
             requireAbi(bridge)
+            if (graphicsProfile) requireGraphicsAbi(bridge)
             val ownedCheckpoint = checkpoint.copyOf()
-            val allocation = invokeOpeningBridge("importCheckpoint") {
-                bridge.importCheckpoint(ownedCheckpoint)
+            val allocation = invokeOpeningBridge(if (graphicsProfile) "importSnapshotGraphicsV1" else "importCheckpoint") {
+                if (graphicsProfile) bridge.importSnapshotGraphicsV1(ownedCheckpoint) else bridge.importCheckpoint(ownedCheckpoint)
             }
             try {
                 validateAllocation("importCheckpoint", allocation)
@@ -786,7 +1060,26 @@ class NativeTerminalHandle private constructor(
                 discardMalformedAllocation(bridge, allocation)
                 throw error
             }
-            return NativeTerminalHandle(bridge, limits, allocation)
+            return NativeTerminalHandle(bridge, selectedLimits, allocation, graphicsProfile)
+        }
+
+        private fun profileLimits(limits: NativeTerminalLimits?, graphicsProfile: Boolean): NativeTerminalLimits =
+            (limits ?: if (graphicsProfile) NativeTerminalLimits.graphics() else NativeTerminalLimits(maxRenderFrameBytes = TERMLINK_RENDER_FRAME_V4_MAX_BYTES)).also {
+                require(graphicsProfile || !it.graphicsProfile) { "Graphics limits require the explicit graphics profile" }
+            }
+
+        private fun isGraphicsSnapshot(bytes: ByteArray): Boolean = bytes.size >= 12 &&
+            bytes.copyOfRange(0, 8).contentEquals(byteArrayOf(84, 76, 83, 78, 80, 50, 83, 0)) &&
+            bytes[8] == 2.toByte() && bytes[9] == 0.toByte() && bytes[10] == 22.toByte() && bytes[11] == 0.toByte()
+
+        private fun requireGraphicsAbi(bridge: NativeBridge) {
+            val supported = try {
+                bridge.configV4StructSize == TERMLINK_CONFIG_V4_STRUCT_SIZE &&
+                    bridge.renderFrameV5FormatVersion == 5 && bridge.maxRenderFrameV5Bytes == TERMLINK_RENDER_FRAME_V5_MAX_BYTES &&
+                    bridge.maxGraphicsSnapshotBytes == TERMLINK_GRAPHICS_SNAPSHOT_MAX_BYTES
+            } catch (_: UnsatisfiedLinkError) { false }
+            if (!supported) throw NativeTerminalException("graphics profile discovery", NativeTerminalStatus.UNSUPPORTED,
+                diagnostic = "The paired native library does not support the explicit graphics profile")
         }
 
         private fun requireAbi(bridge: NativeBridge) {
@@ -909,6 +1202,16 @@ class NativeTerminalHandle private constructor(
                     diagnostic = "expected $TERMLINK_INPUT_V3_STRUCT_SIZE, " +
                         "received $actualInputV3Size",
                 )
+            }
+        }
+
+        private fun requireV4Abi(bridge: NativeBridge) {
+            val configSize = readDiscovery("configV4StructSize") { bridge.configV4StructSize }
+            val format = readDiscovery("renderFrameV4FormatVersion") { bridge.renderFrameV4FormatVersion }
+            val maximum = readDiscovery("maxRenderFrameV4Bytes") { bridge.maxRenderFrameV4Bytes }
+            if (configSize != TERMLINK_CONFIG_V4_STRUCT_SIZE || format != 4 || maximum != TERMLINK_RENDER_FRAME_V4_MAX_BYTES) {
+                throw NativeTerminalException("V4 discovery", NativeTerminalStatus.ABI_MISMATCH,
+                    diagnostic = "expected config=112/render=4/max=33554432; received $configSize/$format/$maximum")
             }
         }
 

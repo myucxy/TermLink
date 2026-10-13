@@ -161,6 +161,56 @@ class ProductionDirectDataRuntimeTest {
     }
 
     @Test
+    fun closeAndJoinDoesNotReturnBeforeNativeCleanupCompletes(): Unit = runBlocking {
+        val fixture = fixture(pumpIntervalMillis = 30_000)
+        val native = FakeNative(path(1))
+        native.cancelEntered = CountDownLatch(1)
+        native.releaseCancel = CountDownLatch(1)
+        assertTrue(fixture.runtime.installPromotedPeer(
+            install(uuid(2), native, fixture.runtime.captureGate(true, 7), 7),
+        ))
+
+        val closing = async(Dispatchers.Default) { fixture.runtime.closeAndJoin() }
+        try {
+            assertTrue(native.cancelEntered!!.await(2, TimeUnit.SECONDS))
+            assertFalse(closing.isCompleted)
+            assertFalse(native.closed.get())
+        } finally {
+            native.releaseCancel!!.countDown()
+        }
+        withTimeout(2_000) { closing.await() }
+        assertTrue(native.closed.get())
+    }
+
+    @Test
+    fun closeAndJoinToleratesConcurrentRemovalOfTheLastActor(): Unit = runBlocking {
+        repeat(32) {
+            val fixture = fixture(pumpIntervalMillis = 30_000)
+            val native = FakeNative(path(1))
+            val peer = uuid(2)
+            assertTrue(fixture.runtime.installPromotedPeer(
+                install(peer, native, fixture.runtime.captureGate(true, 7), 7),
+            ))
+            val release = CountDownLatch(1)
+            val retiring = async(Dispatchers.Default) {
+                release.await()
+                fixture.runtime.retirePeer(peer, ProductionDirectPeerRetirementReason.DIRECT_FAILURE)
+            }
+            val closing = async(Dispatchers.Default) {
+                release.await()
+                fixture.runtime.closeAndJoin()
+            }
+            release.countDown()
+            withTimeout(3_000) {
+                retiring.await()
+                closing.await()
+            }
+            assertTrue(native.closed.get())
+            assertEquals(0, fixture.socket.disconnects.get())
+        }
+    }
+
+    @Test
     fun sessionDeregisterRunsBothDirectionsOnThePeerLaneAndIsRepeatable(): Unit = runBlocking {
         val fixture = fixture(pumpIntervalMillis = 30_000)
         val peer = uuid(2)
@@ -832,6 +882,8 @@ class ProductionDirectDataRuntimeTest {
         val failArbitrateIngress = AtomicBoolean(false)
         @Volatile var routeEntered: CountDownLatch? = null
         @Volatile var releaseRoute: CountDownLatch? = null
+        @Volatile var cancelEntered: CountDownLatch? = null
+        @Volatile var releaseCancel: CountDownLatch? = null
         @Volatile var lastSignature: ByteArray? = null
 
         override fun pathInfo() = DirectNativeResultV5.Success(
@@ -887,6 +939,8 @@ class ProductionDirectDataRuntimeTest {
         override fun receiveEnvelope() = DirectNativeResultV5.Success(incoming.poll())
         override fun cancel(): DirectNativeResultV5<Unit> {
             cancels.incrementAndGet()
+            cancelEntered?.countDown()
+            releaseCancel?.await(2, TimeUnit.SECONDS)
             drainActions(actionsOnCancel)
             return ok()
         }

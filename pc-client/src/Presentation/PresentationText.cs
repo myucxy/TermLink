@@ -11,6 +11,12 @@ namespace TermLink.Presentation;
 /// </summary>
 public static class PresentationText
 {
+    public static string TerminalProtocolDiagnostic => Pick("协议错误详情", "Protocol error details");
+    public static string CopyTerminalDiagnostic => Pick("复制诊断", "Copy diagnostic");
+    public static string CloseTerminalDiagnostic => Pick("关闭", "Close");
+    public static string TerminalProtocolDiagnosticContext => Pick(
+        "Windows 权威核心拒绝了输出，已请求停止该会话桥接。下方为首次错误；检测位置不一定是首个无效参数的位置。",
+        "The Windows authority rejected output and requested this session bridge to stop. The first error is shown below; the detection position may differ from the first invalid parameter.");
     public static string AgentStateUnknown => Pick("暂时无法读取本机 Agent，账户与会话状态待确认。", "Local Agent unavailable. Account and session status are unconfirmed.");
     private static bool IsChinese =>
         CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.Equals("zh", StringComparison.OrdinalIgnoreCase);

@@ -42,12 +42,13 @@ import okhttp3.OkHttpClient
 class ProductContractsTest {
     @Test
     fun directDataPlaneHelloCapabilitiesAreOptionalAndGatedTogether() {
-        assertEquals(setOf("host_history_v1", "host_session_catalog_v1", "host_session_cleanup_v1", "ai_agent_v1", "terminal_window_resize_v1"), productRealtimeOptionalCapabilities(false))
+        assertEquals(setOf("host_history_v1", "terminal_broker_captures_v1", "host_session_catalog_v1", "host_session_cleanup_v1", "ai_agent_v1", "terminal_window_resize_v1", "terminal_host_geometry_v1", "terminal_host_theme_v1", "terminal_host_resize_v1", "terminal_attach_v1"), productRealtimeOptionalCapabilities(false))
         assertEquals(
             setOf(
                 "host_history_v1",
+                "terminal_broker_captures_v1",
                 "host_session_catalog_v1", "host_session_cleanup_v1", "ai_agent_v1",
-                "terminal_window_resize_v1",
+                "terminal_window_resize_v1", "terminal_host_geometry_v1", "terminal_host_theme_v1", "terminal_host_resize_v1", "terminal_attach_v1",
                 "direct_session_cutover_v1",
                 "direct_transport_data_v1",
             ),
@@ -668,6 +669,33 @@ class ProductContractsTest {
                 ),
             ).isEmpty(),
         )
+    }
+
+    @Test
+    fun hostProtocolFailureShowsExactDetailsWithoutChangingOtherSessionFailures() {
+        val sessionId = UUID.randomUUID()
+        val otherId = UUID.randomUUID()
+        val original = mapOf(otherId to SessionOpenFailure(SessionOpenFailureCode.REALTIME_CONNECTION))
+        val text = "TL-DIAG/1\ncategory=unsupported\nreason=private mode\nfamily=CSI\n" +
+            "sequence=<ESC>[?9999h\nhex=1B 5B 3F 39 39 39 39 68\nstart=1:2\nend=2:5\n" +
+            "observed_bytes=8\nhidden_bytes=0\ntruncated_bytes=0\n"
+        for ((category, code) in listOf(
+            "unsupported" to SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY,
+            "malformed" to SessionOpenFailureCode.MALFORMED_TERMINAL_SEQUENCE,
+            "limit_exceeded" to SessionOpenFailureCode.TERMINAL_RESOURCE_LIMIT,
+        )) {
+            val diagnostic = requireNotNull(dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
+                125, text.replace("category=unsupported", "category=$category"),
+            ))
+            val failures = sessionFailuresAfterRuntimeState(original, sessionId,
+                RemoteSessionState.Exited(9, 125, diagnostic))
+            assertEquals(original[otherId], failures[otherId])
+            assertEquals(code, failures[sessionId]?.code)
+            assertEquals(diagnostic.text, failures[sessionId]?.protocolDiagnostic?.text)
+            assertEquals(SessionProtocolDiagnosticSource.WINDOWS_HOST, failures[sessionId]?.protocolDiagnosticSource)
+            assertEquals("<ESC>[?9999h", failures[sessionId]?.protocolDiagnostic?.sequence)
+        }
+        assertEquals(original, sessionFailuresAfterRuntimeState(original, sessionId, RemoteSessionState.Exited(9, 0)))
     }
 
     @Test

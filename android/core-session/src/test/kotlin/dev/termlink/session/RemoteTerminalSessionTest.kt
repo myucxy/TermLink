@@ -31,6 +31,162 @@ import kotlin.test.assertIs
 @OptIn(ExperimentalCoroutinesApi::class)
 class RemoteTerminalSessionTest {
     @Test
+    fun brokerOutputAppliesBeforeAckAndClosesItsBudgetLease() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        var released = 0
+        val raw = byteArrayOf(65)
+        val canonical = brokerCanonical(1)
+        val event = RemoteSessionEvent.BrokerOutput(1, raw, canonical,
+            resourceLease = AutoCloseable { released++ })
+        raw.fill(0)
+        canonical.fill(0)
+        assertEquals(EventAcceptance.Applied(1), session.accept(event))
+        runCurrent()
+        assertEquals(1, released)
+        assertFailsWith<IllegalStateException> { event.copyOutput() }
+        assertEquals(1L, engine.brokerFeeds.single().first)
+        assertArrayEquals(byteArrayOf(65), engine.brokerFeeds.single().second)
+        assertEquals(listOf(1L), outbound.acknowledgements)
+        session.close()
+    }
+
+    @Test
+    fun brokerFailureDoesNotAckAndDuplicateReleasesItsLease() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        session.accept(RemoteSessionEvent.Output(1, byteArrayOf(65)))
+        runCurrent()
+        var released = 0
+        val duplicate = RemoteSessionEvent.BrokerOutput(1, byteArrayOf(66), brokerCanonical(1),
+            resourceLease = AutoCloseable { released++ })
+        assertEquals(EventAcceptance.Duplicate(1), session.accept(duplicate))
+        assertEquals(1, released)
+        engine.failBroker = true
+        val failed = RemoteSessionEvent.BrokerOutput(2, byteArrayOf(67), brokerCanonical(2),
+            resourceLease = AutoCloseable { released++ })
+        assertFailsWith<IllegalStateException> { session.accept(failed) }
+        runCurrent()
+        assertEquals(2, released)
+        assertEquals(listOf(1L), outbound.acknowledgements)
+        assertFailsWith<IllegalStateException> { failed.copyCanonicalCaptures() }
+        session.close()
+    }
+
+    @Test
+    fun staleBrokerRendererGenerationCannotApplyOrAckAndReleasesLease() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        val generation = session.currentRendererGeneration
+        session.resetAndReplay(listOf(RemoteSessionEvent.Output(1, byteArrayOf(65))))
+        runCurrent()
+        var released = 0
+        val broker = RemoteSessionEvent.BrokerOutput(2, byteArrayOf(66), brokerCanonical(2),
+            resourceLease = AutoCloseable { released++ })
+        assertFailsWith<IllegalStateException> { session.accept(broker, generation) }
+        runCurrent()
+        assertEquals(1, released)
+        assertTrue(engine.brokerFeeds.isEmpty())
+        assertEquals(listOf(1L), outbound.acknowledgements)
+        session.close()
+    }
+
+    @Test
+    fun largeBrokerCaptureRetiresObserverWithoutSkippingRendererOrAck() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val observerClosed = CompletableDeferred<Unit>()
+        val observer = object : RemoteSessionOrderedEventObserver {
+            override suspend fun observe(notification: OrderedRemoteSessionNotification) = Unit
+            override fun close() { observerClosed.complete(Unit) }
+        }
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope,
+            orderedEventObserver = observer)
+        session.onConnected()
+        val canonical = ByteArray(4 * 1024 * 1024).also { brokerCanonical(1).copyInto(it) }
+        var released = 0
+        val event = RemoteSessionEvent.BrokerOutput(1, byteArrayOf(65), canonical,
+            resourceLease = AutoCloseable { released++ })
+        canonical.fill(0)
+        assertEquals(EventAcceptance.Applied(1), session.accept(event))
+        observerClosed.awaitObserverCompletion()
+        runCurrent()
+        assertEquals(1, released)
+        assertEquals(1, engine.brokerFeeds.size)
+        assertEquals(listOf(1L), outbound.acknowledgements)
+        session.close()
+    }
+
+    private fun brokerCanonical(sequence: Long): ByteArray = ByteBuffer.allocate(136)
+        .order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+            put("TLCAPV1\u0000".encodeToByteArray())
+            putInt(32)
+            putInt(1)
+            putLong(sequence)
+            putInt(136)
+            putInt(0)
+            putInt(1)
+            putInt(96)
+            putInt(1)
+            putInt('f'.code)
+            putLong(sequence)
+            putInt(1)
+            putInt(0)
+            position(128)
+            putInt(4)
+            putInt(0)
+        }.array()
+
+    @Test
+    fun hostResizeResultIsOrderedAndDoesNotReplayTheActionOrNotice() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
+        session.onConnected()
+        val output = RemoteSessionEvent.Output(1, byteArrayOf(65))
+        val value = dev.termlink.terminal.api.TerminalHostResizeResultV1(1, 7, 0, 132, 0, 80, 24, 5)
+        val result = RemoteSessionEvent.HostResizeResult(2, value)
+        session.accept(output)
+        session.accept(output)
+        session.accept(result)
+        session.accept(result)
+        assertEquals(listOf(value), engine.resizeNotices)
+        assertEquals(listOf(1L), engine.liveOutputNotices)
+        assertTrue(engine.resizes.isEmpty())
+        session.resetAndReplay(listOf(output, result))
+        assertEquals(listOf(value), engine.resizeNotices)
+        assertEquals(listOf(1L), engine.liveOutputNotices)
+        assertTrue(engine.resizes.isEmpty())
+        assertFailsWith<IllegalArgumentException> { RemoteSessionEvent.HostResizeResult(1, value) }
+        session.close()
+    }
+
+    @Test
+    fun hostGeometryIsOrderedDeduplicatedAndReplayedWithoutLosingTheAckBoundary() = runTest {
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound()
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        val value = dev.termlink.terminal.api.TerminalHostGeometryV1(9,18,1920,1080)
+        val event = RemoteSessionEvent.HostGeometry(1, value)
+        assertEquals(EventAcceptance.Applied(1), session.accept(event))
+        session.accept(event)
+        runCurrent()
+        assertEquals(listOf(1L to value), engine.geometries)
+        assertEquals(1L, session.state.value.lastAckedSequence)
+        assertEquals(2L, session.resetAndReplay(listOf(event, RemoteSessionEvent.Output(2, byteArrayOf(1)))))
+        runCurrent()
+        assertEquals(listOf(1L to value), engine.geometries)
+        assertEquals(2L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
     fun presentationRevisionRegressionRequiresAuthenticatedResync() = runTest {
         val engine = RecordingEngine()
         val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
@@ -119,6 +275,49 @@ class RemoteTerminalSessionTest {
 
         assertEquals(listOf(0L, 1L), outbound.resumes)
         assertEquals(1L, session.state.value.lastAckedSequence)
+        session.close()
+    }
+
+    @Test
+    fun firstConnectionProjectionPreservesAlreadyGrantedLeaseButReconnectRevokesIt() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(
+            engine, RecordingOutbound(), backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+        )
+        session.grantControl("lease", 10_000, leaseVersion = 7)
+
+        assertTrue(session.onConnected { cursor -> assertEquals(0L, cursor) })
+        assertIs<RemoteSessionState.Controlling>(session.state.value)
+        assertFalse(engine.readOnlyState)
+        assertEquals(EventAcceptance.Applied(1), session.accept(RemoteSessionEvent.Output(1, byteArrayOf(65))))
+        runCurrent()
+        val afterOutput = assertIs<RemoteSessionState.Controlling>(session.state.value)
+        assertEquals(1L, afterOutput.lastAckedSequence)
+        assertEquals(7L, afterOutput.leaseVersion)
+
+        session.onDisconnected("network switch")
+        assertIs<RemoteSessionState.Reconnecting>(session.state.value)
+        assertTrue(engine.readOnlyState)
+        assertTrue(session.onConnected { cursor -> assertEquals(1L, cursor) })
+        assertIs<RemoteSessionState.Live>(session.state.value)
+        assertTrue(engine.readOnlyState)
+        session.close()
+    }
+
+    @Test
+    fun disconnectBeforeFirstProjectionFencesALateControlGrant() = runTest {
+        val engine = RecordingEngine()
+        val session = RemoteTerminalSession(
+            engine, RecordingOutbound(), backgroundScope,
+            clockMillis = { testScheduler.currentTime },
+        )
+        session.onDisconnected("initial socket retired")
+        session.grantControl("late-lease", 10_000, leaseVersion = 1)
+
+        assertTrue(session.onConnected { cursor -> assertEquals(0L, cursor) })
+        assertIs<RemoteSessionState.Live>(session.state.value)
+        assertTrue(engine.readOnlyState)
         session.close()
     }
 
@@ -1183,6 +1382,29 @@ class RemoteTerminalSessionTest {
     }
 
     @Test
+    fun hostProtocolFailureSurvivesFinalAckFailureAndNeverPermitsMoreInput() = runTest {
+        val text = "TL-DIAG/1\ncategory=unsupported\nreason=private mode\nfamily=CSI\n" +
+            "sequence=<ESC>[?9999h\nhex=1B 5B 3F 39 39 39 39 68\nstart=1:2\nend=2:5\n" +
+            "observed_bytes=8\nhidden_bytes=0\ntruncated_bytes=0\n"
+        val diagnostic = requireNotNull(dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(125, text))
+        val engine = RecordingEngine()
+        val outbound = RecordingOutbound().apply { failAck = true }
+        val session = RemoteTerminalSession(engine, outbound, backgroundScope)
+        session.onConnected()
+        assertEquals(EventAcceptance.Applied(1),
+            session.accept(RemoteSessionEvent.Lifecycle(1, RemoteLifecycle.ENDED, 125, diagnostic)))
+        runCurrent()
+        val exited = assertIs<RemoteSessionState.Exited>(session.state.value)
+        assertEquals(125, exited.exitCode)
+        assertEquals(text, exited.protocolDiagnostic?.text)
+        assertTrue(engine.readOnlyState)
+        assertEquals(InputSubmission.RejectedExited, session.submitInput(byteArrayOf(1)))
+        assertEquals(EventAcceptance.IgnoredAfterExit, session.accept(RemoteSessionEvent.Output(2, byteArrayOf(2))))
+        assertEquals(text, assertIs<RemoteSessionState.Exited>(session.state.value).protocolDiagnostic?.text)
+        session.close()
+    }
+
+    @Test
     fun closeRejectsFurtherSessionWorkBeforeEngineCanBeReused() = runTest {
         val engine = RecordingEngine()
         val session = RemoteTerminalSession(engine, RecordingOutbound(), backgroundScope)
@@ -1427,7 +1649,14 @@ class RemoteTerminalSessionTest {
         override val inputEvents: Flow<ByteArray> = inputs
         override val sizeEvents: Flow<TerminalSize> = sizes
         val feeds = mutableListOf<Pair<Long, ByteArray>>()
+        val brokerFeeds = mutableListOf<Pair<Long, ByteArray>>()
+        var failBroker = false
         val resizes = mutableListOf<TerminalSize>()
+        val resizeNotices = mutableListOf<dev.termlink.terminal.api.TerminalHostResizeResultV1>()
+        val liveOutputNotices = mutableListOf<Long>()
+        override fun notifyLiveOutputApplied(sequence: Long) { liveOutputNotices += sequence }
+        override fun notifyHostResizeResult(result: dev.termlink.terminal.api.TerminalHostResizeResultV1) { resizeNotices += result }
+        val geometries = mutableListOf<Pair<Long, dev.termlink.terminal.api.TerminalHostGeometryV1>>()
         var readOnlyState = true
         var clearCount = 0
         var disposed = false
@@ -1446,8 +1675,16 @@ class RemoteTerminalSessionTest {
             feeds += seq to copy
         }
 
+        override suspend fun applyBrokerCapturedOutput(seq: Long, output: ByteArray, canonicalCaptures: ByteArray) {
+            if (failBroker) error("broker capture apply failed")
+            brokerFeeds += seq to output.copyOf()
+        }
+
         override fun resize(columns: Int, rows: Int) {
             resizes += TerminalSize(columns, rows)
+        }
+        override suspend fun applyHostGeometry(seq: Long, geometry: dev.termlink.terminal.api.TerminalHostGeometryV1) {
+            geometries += seq to geometry
         }
 
         override fun applyTheme(theme: TerminalThemeV1) = Unit
@@ -1459,6 +1696,7 @@ class RemoteTerminalSessionTest {
         override fun clear() {
             clearCount++
             feeds.clear()
+            geometries.clear()
         }
 
         override fun dispose() {
