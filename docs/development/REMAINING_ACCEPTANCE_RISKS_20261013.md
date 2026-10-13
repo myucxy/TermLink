@@ -348,3 +348,26 @@
 3. **Kitty**
    - 原 `KITTY_TRANSFER_NOT_VISIBLE` 已消除。
    - 新失败集中在 shared registration / `s` phase；需检查 `KITTY_CHILD_FAILED`、child stderr、Host exit code 与 Android shared resource ACK。
+
+
+## 追加（2026-10-14 · r425/r426 live-marker 修复复验）
+
+**修复**：TailFirst Frozen lifecycle 的 `open_session` readiness 不再要求
+live marker（`Invoke-TailFirstProductE2E.ps1`，receiver 早已支持 optional
+live_marker）。此前 r398-r421 全部 `SURFACE_TIMEOUT` 的阻塞点已消除。
+
+**复验结果**（ExternalHttps · termlink2 · recovery 包 · r130 SessionHost）：
+
+| Run | 结果 |
+|---|---|
+| r425 | open/begin/page/并发实时输出全部断言通过（live_ack 78→79）；失败于 `frozen-history-relay-reconnect` 的 inspect `OPERATION_TIMEOUT` |
+| r426 | 同 r425，同位置失败——确定性可复现，非瞬态 |
+
+**当前定性**：Frozen 打开与冻结浏览主链路已恢复；剩余缺陷收窄为
+"Host 失联 + 冻结浏览叠加时的 inspect hook 超时"。普通（非冻结）会话的
+Relay 重连恢复已被常规使用与历史 run 证明。该缺陷按产品方向决策记为
+已知限制，发布说明不得宣传 Frozen lifecycle 全量能力，修复排入后续
+（取证方向：Android logcat ANR/广播投递、hook 超时窗口）。
+
+**发布门禁状态**：基础版本（Relay Only，不宣传 Frozen 全量 / Shell
+command location / Kitty shared s / WAL retry / theme authority）可发布。
