@@ -68,3 +68,28 @@ Setup `76a88bbed1a9c820a64ab36a10e953092ccb0c9589c6e381fd5585c2085595c7`。
 如新版本发现问题，以更高 build 发布已知良好源码；手动回退先核验平台
 降级限制及备份，不卸载或清空用户数据，不覆盖原发布哈希。未授权的
 仓库公开不执行。
+
+
+## 热修复 0.3.4 · Build 134（2026-10-14，Windows 专用）
+
+133 发布后一台 Windows 机器报告：升级后 Agent 进程存在但 100% CPU、UI 状态异常、
+后台运行时卡在 `loading local account, session, and history state` 反复重启。
+受影响机器的 Agent 转储（`F:\TermLink.Agent.DMP`）抓到热点栈：
+`PrivateHistoryDirectory.SetSecurityInfo ← ProtectContents`——22 组能力波次新增的
+历史目录 ACL 加固在每次启动时对既有大历史树**逐文件无条件重写受保护 DACL**，
+全树耗时超过客户端 watchdog 重启窗口，永远无法完成就绪（0.3.3 同机正常）。
+
+**修复**（termlink `9721f2e`）：`PrivateHistoryDirectory.OpenAndProtect` 改为
+先比对存储的 DACL 与期望描述符，一致即跳过写——每次启动只读校验（可跨重启
+收敛），仅对缺失/未保护/陈旧的条目付费写。安全语义不变（所有者信任、
+重解析/硬链接拒绝、受保护 DACL 校验原样保留）。历史验证套件全绿（继承 ACL
+迁移、长路径幂等、真实 CreateFileW 拒绝校验）。
+
+**发布**：`TermLink-Setup-0.3.4.134-x64.exe`（185,029,664 B，
+SHA-256 `99dd94df…7836fe6e0`）已发 AppShip stable `published`/`ready`
+（release `855a62de-6ce6-459e-9c04-52ab4b698df6`），公共更新端点实测
+build 133→134 optional。仅 Windows 需更新；Android/Server 不受影响
+（PrivateHistoryDirectory 仅存在于 win-agent）。
+
+**受影响机器恢复步骤**：更新到 134 后 Agent 会完成收敛（首次启动可能仍需
+一到两轮重启循环，每轮都有进展，数轮内就绪并稳定）；无需手动移动历史目录。
