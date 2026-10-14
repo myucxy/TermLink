@@ -408,3 +408,21 @@ DEVICE_REVOKED），因此任何"设备身份与所连服务器数据库不匹�
 **产品改进待办**：agent 侧应将 DEVICE_PENDING / UNAUTHENTICATED /
 DEVICE_DISABLED 与"状态不可用"区分呈现（分别给出"等待信任"、"请重新注册"、
 "设备已禁用"指引），登录流程对边缘 502 应先重试再失败。
+
+
+## 追加（2026-10-14 · 未识别拒绝的诊断日志增强，termlink 0050346）
+
+按用户要求，未识别的服务端拒绝不再只留笼统错误码：
+
+- `IsDeviceRevokedAsync` 对非 200/非 DEVICE_REVOKED 的响应解析
+  `error.code` 与 `error.message_key`（有界、不含原始响应体与凭据），
+  异常消息追加 `http_status=<n> server_code=<…> server_message_key=<…>`，
+  例如 `… http_status=403 server_code=DEVICE_PENDING
+  server_message_key=auth.devicePending`。
+- 控制管道日志（TermLink-control-runtime.log）对
+  ProductionEnrollmentException 追加 `message=<有界消息>`（其余异常类型
+  维持 type+site-only，避免记录潜在敏感文本）。
+- 网络失败保持原契约：以 `HttpRequestException` 原样传播（测试固化），
+  日志记为 `failure=HttpRequestException site=IsDeviceRevokedAsync`。
+- 该增强随下一个 Windows 构建发布；已发布 134 的机器遇到新报错时，
+  升级后即可在日志中看到具体服务端拒绝码。
