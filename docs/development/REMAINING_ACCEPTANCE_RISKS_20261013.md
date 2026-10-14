@@ -371,3 +371,40 @@ Relay 重连恢复已被常规使用与历史 run 证明。该缺陷按产品方
 
 **发布门禁状态**：基础版本（Relay Only，不宣传 Frozen 全量 / Shell
 command location / Kitty shared s / WAL retry / theme authority）可发布。
+
+
+## 追加（2026-10-14 · 登录报 ACCOUNT_DEVICE_STATUS_UNAVAILABLE 的成因）
+
+**现象**：部分电脑登录时提示「操作没有完成…ACCOUNT_DEVICE_STATUS_UNAVAILABLE」，
+agent 侧 control-runtime 记录
+`BeginAccountAuthorization failure=ProductionEnrollmentException site=IsDeviceRevokedAsync`。
+
+**机制**：登录（BeginAccountAuthorization）时 agent 用保留的设备身份调
+`GET /v1/devices/self`（带设备证明头）核验设备状态（ProductionEnrollment.cs
+IsDeviceRevokedAsync）。仅两种结果被视为正常：200（未吊销）、401 且
+`error.code == DEVICE_REVOKED`（已吊销）。**其余一律抛
+ACCOUNT_DEVICE_STATUS_UNAVAILABLE**，包括：
+
+- `401 UNAUTHENTICATED`：令牌无效/设备在该服务器数据库中不存在/设备证明不匹配
+  ——典型场景：机器的保留身份是在**另一台服务器**（termlink2 旧库 vs 生产库）
+  注册的，server-url 与身份归属不一致，或服务器端数据库被重建（termlink2 于
+  10-10 切换为 recovery 库）
+- `403 DEVICE_PENDING`：设备已注册但尚未 TRUSTED
+- `401 DEVICE_DISABLED`：设备被禁用
+- 边缘 502/超时（termlink.kget.cc / termlink2 经 NAS Lucky 转发，实测有抖动）
+
+**两台服务器实测**：对未知设备均返回 `401 UNAUTHENTICATED`（非
+DEVICE_REVOKED），因此任何"设备身份与所连服务器数据库不匹配"的机器都会
+稳定复现此错误。
+
+**按机处置**：
+1. 查该机 `%LOCALAPPDATA%\TermLink\server-url.txt` 指向哪台服务器；
+2. 到对应服务器核对 devices 表中该机器设备行（存在？trust_state？disabled/revoked？）；
+3. 身份属于另一台服务器 → 改回对应 server-url，或清除保留身份后重新登录
+   （产生新设备注册）；
+4. DEVICE_PENDING → 完成设备信任批准；
+5. 边缘 502 → NAS Lucky 上游稳定性问题，重试即可。
+
+**产品改进待办**：agent 侧应将 DEVICE_PENDING / UNAUTHENTICATED /
+DEVICE_DISABLED 与"状态不可用"区分呈现（分别给出"等待信任"、"请重新注册"、
+"设备已禁用"指引），登录流程对边缘 502 应先重试再失败。
