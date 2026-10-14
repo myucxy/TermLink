@@ -91,7 +91,7 @@ internal static class PrivateHistoryDirectory
                 (attributes & FileAttributes.Directory) == 0 && info.Links != 1)
                 throw new InvalidDataException("Private history entry is redirected or hard linked.");
             var result = GetSecurityInfo(handle, 1, OwnerInformation | DaclInformation,
-                out var owner, out _, out _, out _, out var descriptor);
+                out var owner, out _, out var dacl, out _, out var descriptor);
             if (result != 0) throw new Win32Exception((int)result);
             try
             {
@@ -102,17 +102,39 @@ internal static class PrivateHistoryDirectory
                     throw new InvalidDataException("Private history entry has an untrusted owner.");
                 var inheritance = (attributes & FileAttributes.Directory) != 0 ? "OICI" : "";
                 var security = new RawSecurityDescriptor($"D:P(A;{inheritance};FA;;;{current.Value})(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)");
-                var acl = security.DiscretionaryAcl;
-                var bytes = new byte[acl.BinaryLength];
-                acl.GetBinaryForm(bytes, 0);
+                var expectedAcl = security.DiscretionaryAcl;
+                var expectedBytes = new byte[expectedAcl.BinaryLength];
+                expectedAcl.GetBinaryForm(expectedBytes, 0);
+                if (HasProtectedDacl(descriptor, expectedBytes)) return handle;
                 result = SetSecurityInfo(handle, 1, DaclInformation | ProtectedDaclInformation,
-                    IntPtr.Zero, IntPtr.Zero, bytes, IntPtr.Zero);
+                    IntPtr.Zero, IntPtr.Zero, expectedBytes, IntPtr.Zero);
                 if (result != 0) throw new Win32Exception((int)result, "Private history permissions cannot be protected.");
             }
             finally { LocalFree(descriptor); }
             return handle;
         }
         catch { handle.Dispose(); throw; }
+    }
+
+    private static bool HasProtectedDacl(IntPtr descriptor, byte[] expectedDaclBytes)
+    {
+        // SetSecurityInfo with a protected DACL propagates the descriptor to
+        // the whole subtree and is the dominant startup cost on hosts with
+        // large histories. Comparing the stored DACL first keeps the daily
+        // pass read-only (resumable across watchdog restarts) and only pays
+        // the write on entries that are genuinely unprotected or stale.
+        var length = (int)GetSecurityDescriptorLength(descriptor);
+        var bytes = new byte[length];
+        Marshal.Copy(descriptor, bytes, 0, length);
+        var security = new RawSecurityDescriptor(bytes, 0);
+        if ((security.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0)
+            return false;
+        var stored = security.DiscretionaryAcl;
+        if (stored.BinaryLength != expectedDaclBytes.Length)
+            return false;
+        var storedBytes = new byte[stored.BinaryLength];
+        stored.GetBinaryForm(storedBytes, 0);
+        return storedBytes.AsSpan().SequenceEqual(expectedDaclBytes);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -136,6 +158,8 @@ internal static class PrivateHistoryDirectory
     [DllImport("advapi32.dll")]
     private static extern uint SetSecurityInfo(SafeFileHandle handle, uint type, uint information,
         IntPtr owner, IntPtr group, byte[] dacl, IntPtr sacl);
+    [DllImport("advapi32.dll")]
+    private static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
     [DllImport("kernel32.dll")]
     private static extern IntPtr LocalFree(IntPtr memory);
 }
