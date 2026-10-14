@@ -591,7 +591,8 @@ namespace TermLink.Agent
             request.Headers.TryAddWithoutValidation("X-TermLink-Timestamp", timestamp);
             request.Headers.TryAddWithoutValidation("X-TermLink-Nonce", nonce);
             request.Headers.TryAddWithoutValidation("X-TermLink-Signature", Base64Url(identity.Sign(Encoding.UTF8.GetBytes(canonical))));
-            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token)
+                .ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.OK) return false;
             if (response.StatusCode == HttpStatusCode.Unauthorized && response.Content != null)
             {
@@ -621,7 +622,46 @@ namespace TermLink.Agent
             }
             throw new ProductionEnrollmentException(
                 "ACCOUNT_DEVICE_STATUS_UNAVAILABLE",
-                "The existing TermLink device status could not be verified safely.");
+                "The existing TermLink device status could not be verified safely." +
+                await DescribeServerRejectionAsync(response, token).ConfigureAwait(false));
+        }
+
+        private static async Task<string> DescribeServerRejectionAsync(
+            HttpResponseMessage response, CancellationToken token)
+        {
+            // Unrecognized device-status rejections carry the server's status
+            // and bounded, credential-free error metadata into the exception
+            // message so field logs distinguish device pending/disabled,
+            // unknown-device and gateway failures. Raw bodies are never kept.
+            var detail = " http_status=" + ((int)response.StatusCode);
+            if (response.Content == null) return detail;
+            try
+            {
+                await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+                var bytes = new byte[4097];
+                var count = 0;
+                while (count < bytes.Length)
+                {
+                    var read = await stream.ReadAsync(bytes.AsMemory(count), token).ConfigureAwait(false);
+                    if (read == 0) break;
+                    count += read;
+                }
+                if (count > 4096) return detail + " server_body=truncated";
+                using var document = JsonDocument.Parse(bytes.AsMemory(0, count));
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object ||
+                    !root.TryGetProperty("error", out var error) ||
+                    error.ValueKind != JsonValueKind.Object) return detail;
+                if (error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String)
+                    detail += " server_code=" + code.GetString();
+                if (error.TryGetProperty("message_key", out var key) && key.ValueKind == JsonValueKind.String)
+                    detail += " server_message_key=" + key.GetString();
+                return detail;
+            }
+            catch
+            {
+                return detail;
+            }
         }
 
         private static async Task<MachineResolutionResponse> ResolveMachineAsync(

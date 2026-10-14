@@ -2208,8 +2208,19 @@ namespace TermLink.Agent
                     " control-request command=" + command +
                     " failure=" + error.GetType().Name +
                     " site=" + failureSite +
-                    (sourceLine > 0 ? " line=" + sourceLine : string.Empty) +
-                    Environment.NewLine;
+                    (sourceLine > 0 ? " line=" + sourceLine : string.Empty);
+                // Enrollment exceptions carry fixed, credential-free diagnostic
+                // text (status codes and server error codes) that field logs
+                // need to distinguish unrecognized server rejections. Every
+                // other failure keeps the type+site-only record.
+                if (error is ProductionEnrollmentException enrollmentError)
+                {
+                    var message = (enrollmentError.Message ?? string.Empty)
+                        .Replace('\r', ' ').Replace('\n', ' ');
+                    if (message.Length > 300) message = message[..300];
+                    line += " message=" + message;
+                }
+                line += Environment.NewLine;
                 var root = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "TermLink",
