@@ -41,7 +41,7 @@
 | --- | --- | --- |
 | Android | `TermLink-Android-0.3.4-133.apk`（43,602,771 B） | ✅ AppShip stable `published`/`ready`：release `bd0780c9-23d8-47b3-9741-1cedd357d68d`，artifact `25079562-da7b-458e-a857-f778f74c429d`；公共更新端点实测 build 0→133 optional |
 | Windows | `TermLink-Setup-0.3.4.133-x64.exe`（185,029,664 B） | ✅ AppShip stable `published`/`ready`：release `41432cf1-94a8-4ac6-954f-395669fae835`，artifact `e3a62946-beac-4e9b-b6f9-411dd4daa5bd`；公共更新端点实测 |
-| Server | `TermLink-Server-0.3.4-133.oci.tar`（linux/amd64+arm64 index，220,129,280 B） | ⚠️ 本地 OCI tar 就绪；Docker Hub 推送被网络阻断（registry-1.docker.io 直连与本机 7897 代理均不可达）。网络恢复后 `docker load -i <tar>` 再 `docker push docker.io/myucxy/termlink:0.3.4-build.133`（双架构标签分别 load 后 push 并创建 manifest）；无 Cosign 签名（机器无 cosign 密钥，沿用 0.3.0 先例） |
+| Server | `docker.io/myucxy/termlink:0.3.4-build.133` | ✅ 已推送 Docker Hub：多架构 manifest list，index digest `sha256:5d9e1faa7af554af250186d57cf3bc3c8a678d0572a3672b8cf5d648674f5ac3`，amd64 `4b81c6b5…` / arm64 `6a9ef177…`；本地 OCI tar（220,129,280 字节）同目录留存。无 Cosign 签名（机器无 cosign 密钥，沿用 0.3.0 先例） |
 
 ### Server 镜像构建说明
 
@@ -49,8 +49,8 @@ gcr.io distroless 与 buildkit 内 proxy.golang.org 均不可达，采用主机�
 （Go 1.26.2，与官方 Dockerfile 同版 ldflags 注入 0.3.4+133/修订/时间）+
 本地 alpine:3.22 基底（amd64/arm64 双二进制 + `select-arch.sh` 运行时
 选架构 + Git CA bundle；`Dockerfile.local-0334`）。冒烟：amd64 容器
-正常启动并按预期拒绝缺省配置。网络恢复后建议走代理重跑官方
-`server/Dockerfile` 回到 distroless 基线再补推。
+正常启动并按预期拒绝缺省配置。镜像经宿主机侧 Python registry 客户端直推（走 7897 代理，daemon 内代理路径不通）。
+网络稳定后建议走代理重跑官方 `server/Dockerfile` 回到 distroless 基线再补推签名版。
 
 ## 对应源码（GPLv3）
 
