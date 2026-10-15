@@ -49,7 +49,8 @@ function Assert-Baseline($State, [guid]$Session, [long]$WalSequence, [long[]]$Wa
     Require-WalFault ([long]$State.live_ack -ge $WalSequence) 'BROKER_ACK_BEHIND_WAL'
 }
 
-function Assert-Recovered($State, [guid]$Session, [long]$SourceSequence, [long]$BeforeAck) {
+function Assert-Recovered($State, [guid]$Session, [long]$SourceSequence, [long]$BeforeAck, [bool]$WalCommitted) {
+    Require-WalFault $WalCommitted 'BROKER_RETRY_WAL_MISSING'
     Require-WalFault ([guid]$State.session_id -eq $Session -and
         $State.realtime_subscriber_ready -eq $true -and
         $State.live_marker_visible -eq $true -and
@@ -190,6 +191,25 @@ function Invoke-Hook([string]$Operation) {
     throw [TimeoutException]::new('HOOK_RESPONSE_TIMEOUT')
 }
 
+# Bounded best-effort forensics for a failed recovery inspect: the raw debug
+# hook response (sanitized by the receiver; still truncated) and a tag-filtered
+# logcat excerpt written next to the evidence file.
+function Read-HookResponseForensics {
+    $read = Invoke-Program $AdbPath @('-s', $EmulatorSerial, 'exec-out', 'run-as',
+        $AndroidPackageName, 'cat', 'no_backup/tail-first-e2e/response.json') 10
+    $raw = [string]$read.Output
+    return @{ exit_code = $read.ExitCode; output_length = $raw.Length;
+        output_prefix = $raw.Substring(0, [Math]::Min(4096, $raw.Length)) }
+}
+
+function Save-HookFailureLogcat([string]$DestinationPath) {
+    $read = Invoke-Program $AdbPath @('-s', $EmulatorSerial, 'logcat', '-d', '-t', '600',
+        '-s', 'TermLinkRealtime', 'TermLinkFrozenHistory', 'TermLinkTailFirst') 15
+    if ($read.ExitCode -ne 0) { return 'LOGCAT_ADB_FAILED' }
+    [IO.File]::WriteAllText($DestinationPath, $read.Output, [Text.UTF8Encoding]::new($false))
+    return 'LOGCAT_SAVED'
+}
+
 $script:evidence = [ordered]@{}
 if ($SelfTest) {
     $id = [guid]::NewGuid()
@@ -204,19 +224,22 @@ if ($SelfTest) {
     $recovered = [pscustomobject]@{ session_id = "$id";
         realtime_subscriber_ready = $true; live_marker_visible = $true; broker_capture_count = 1;
         broker_capture_last_sequence = 13; live_ack = 13 }
-    Assert-Recovered $recovered $id 13 12
+    Assert-Recovered $recovered $id 13 12 $true
+    $rejected = $false
+    try { Assert-Recovered $recovered $id 13 12 $false } catch { $rejected = $true }
+    Require-WalFault $rejected 'MISSING_COMMITTED_WAL_ACCEPTED'
     $arm.baseline_session_ids = @("$id")
     $rejected = $false
     try { Assert-Arm $arm 'broker-selftest' $id } catch { $rejected = $true }
     Require-WalFault $rejected 'BASELINE_SESSION_ACCEPTED'
     $recovered.broker_capture_last_sequence = 14
     $rejected = $false
-    try { Assert-Recovered $recovered $id 13 12 } catch { $rejected = $true }
+    try { Assert-Recovered $recovered $id 13 12 $true } catch { $rejected = $true }
     Require-WalFault $rejected 'UNRELATED_BROKER_SOURCE_ACCEPTED'
     $recovered.broker_capture_last_sequence = 13
     $recovered.PSObject.Properties.Remove('live_marker_visible')
     $rejected = $false
-    try { Assert-Recovered $recovered $id 13 12 } catch { $rejected = $true }
+    try { Assert-Recovered $recovered $id 13 12 $true } catch { $rejected = $true }
     Require-WalFault $rejected 'MISSING_LIVE_MARKER_ACCEPTED'
     $baseline.PSObject.Properties.Remove('realtime_subscriber_ready')
     $rejected = $false
@@ -403,10 +426,16 @@ try {
     $evidence.stage = 'waiting-for-retry'
     $deadline = [DateTime]::UtcNow.AddSeconds(120)
     $after = $null
+    $retryInspectFailures = [Collections.Generic.List[object]]::new()
+    $firstRetryFailureCode = $null
     do {
-        if ([IO.File]::Exists($blockedWalPath)) {
+        # Probe during recovery, but success still requires the replacement WAL
+        # file: removing the blocker directory alone does not prove durability.
+        $retryFailureCode = $null
+        try {
             $candidate = Invoke-Hook 'inspect' @{ live_marker = $script:liveMarker }
-            if ([guid]$candidate.session_id -eq $ExpectedSessionId -and
+            if ([IO.File]::Exists($blockedWalPath) -and
+                [guid]$candidate.session_id -eq $ExpectedSessionId -and
                 [int]$candidate.broker_capture_count -eq 1 -and
                 [long]$candidate.broker_capture_last_sequence -eq $next -and
                 [long]$candidate.live_ack -gt $evidence.ack_before -and
@@ -414,11 +443,50 @@ try {
                 $after = $candidate
                 break
             }
+        } catch [TimeoutException] {
+            $retryFailureCode = 'HOOK_RESPONSE_TIMEOUT'
+        } catch {
+            $retryFailureCode = [string]$_.Exception.Message
+            if ($retryFailureCode -cnotmatch '^[A-Z][A-Z0-9_]{2,80}$') {
+                $retryFailureCode = 'HOOK_RESPONSE_FAILED'
+            }
+        }
+        if ($null -ne $retryFailureCode) {
+            if ($null -eq $firstRetryFailureCode) { $firstRetryFailureCode = $retryFailureCode }
+            try {
+                $forensics = Read-HookResponseForensics
+            } catch {
+                $forensics = @{ exit_code = 'FORENSICS_FAILED'; output_length = 0; output_prefix = '' }
+            }
+            $retryInspectFailures.Add([ordered]@{
+                observed_at_utc = [DateTime]::UtcNow.ToString('o')
+                failure_code = $retryFailureCode
+                hook_exit_code = $forensics.exit_code
+                hook_output_length = $forensics.output_length
+                hook_output_prefix = $forensics.output_prefix
+            })
         }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
-    Require-WalFault ($null -ne $after) 'BROKER_RETRY_NOT_CORRELATED'
-    Assert-Recovered $after $ExpectedSessionId $next $evidence.ack_before
+    if ($retryInspectFailures.Count -gt 0) {
+        $evidence.first_retry_failure_code = $firstRetryFailureCode
+        $evidence.retry_inspect_failures = $retryInspectFailures
+    }
+    if ($null -eq $after) {
+        if ($retryInspectFailures.Count -gt 0) {
+            try {
+                $evidence.hook_failure_logcat = Save-HookFailureLogcat (
+                    [IO.Path]::Combine($runRoot, 'hook-failure-logcat.txt'))
+            } catch {
+                $evidence.hook_failure_logcat = 'LOGCAT_CAPTURE_FAILED'
+            }
+        }
+        $retryReportCode = if ($null -ne $firstRetryFailureCode) {
+            $firstRetryFailureCode
+        } else { 'BROKER_RETRY_NOT_CORRELATED' }
+        Require-WalFault ($null -ne $after) $retryReportCode
+    }
+    Assert-Recovered $after $ExpectedSessionId $next $evidence.ack_before ([IO.File]::Exists($blockedWalPath))
     Require-WalFault ((Get-CaptureCount $captureRoot $captureDirectory) -eq 1) `
         'BROKER_SIDECAR_COUNT_CHANGED'
     $evidence.ack_after = [long]$after.live_ack

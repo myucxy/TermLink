@@ -93,7 +93,8 @@ object FrozenHistoryCrypto {
             Cipher.getInstance("AES/GCM/NoPadding").run {
                 init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
                 updateAAD(aad)
-                require(doFinal(value.ciphertext.asReadOnlyByteBuffer(), ByteBuffer.wrap(plaintext)) == plaintext.size) {
+                val ciphertext = value.ciphertext.toByteArray()
+                require(doFinal(ciphertext, 0, ciphertext.size, plaintext) == plaintext.size) {
                     "Frozen history plaintext length does not match authenticated metadata"
                 }
             }

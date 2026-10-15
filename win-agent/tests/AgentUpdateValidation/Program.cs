@@ -33,6 +33,7 @@ namespace TermLink.AgentUpdate.Validation
                 await ValidateBrowserCallbackSurvivesEarlyBrowserCloseAsync();
                 ValidateRetainedMachineIdentity();
                 await ValidateRetainedDevicePreflightAsync();
+                await ValidateDeviceStatusResponseHandlingAsync();
                 AccountPersistenceRaceValidation.Run();
                 EnrollmentLoopbackValidation.Run();
                 TerminalProtocolDiagnosticPublicationValidation.Run();
@@ -443,6 +444,189 @@ namespace TermLink.AgentUpdate.Validation
             try { await preflight(); throw new Exception("network failure was treated as device revocation"); }
             catch (HttpRequestException) { }
             Assert(requests == 6 && responses.Count == 0, "retained device preflight skipped a behavior case");
+        }
+
+        private sealed record StatusCase(
+            string Name,
+            Func<HttpContent> ContentFactory,
+            HttpStatusCode Status,
+            bool ExpectRevoked,
+            string[] MessageParts);
+
+        private sealed class TrackedContent(string body) : StringContent(body)
+        {
+            public bool WasDisposed { get; private set; }
+            protected override void Dispose(bool disposing)
+            {
+                WasDisposed = true;
+                base.Dispose(disposing);
+            }
+        }
+
+        private sealed class NonSeekableStream(Stream inner) : Stream
+        {
+            public override bool CanRead => inner.CanRead;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => inner.Position;
+                set => throw new NotSupportedException();
+            }
+            public override void Flush() { }
+            public override int Read(byte[] buffer, int offset, int count) =>
+                inner.Read(buffer, offset, count);
+            public override long Seek(long offset, SeekOrigin origin) =>
+                throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) =>
+                throw new NotSupportedException();
+        }
+
+        private sealed class NonSeekableTrackedContent(string body) : StringContent(body)
+        {
+            public bool WasDisposed { get; private set; }
+            protected override Task<Stream> CreateContentReadStreamAsync()
+            {
+                var stream = base.CreateContentReadStreamAsync().ConfigureAwait(false)
+                    .GetAwaiter().GetResult();
+                return Task.FromResult<Stream>(new NonSeekableStream(stream));
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                WasDisposed = true;
+                base.Dispose(disposing);
+            }
+        }
+
+        private sealed class TrackedHandler(HttpResponseMessage response) : HttpMessageHandler
+        {
+            protected override Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request, CancellationToken token) =>
+                Task.FromResult(response);
+        }
+
+        private sealed class ThrowingHandler(Exception error) : HttpMessageHandler
+        {
+            protected override Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request, CancellationToken token) =>
+                Task.FromException<HttpResponseMessage>(error);
+        }
+
+        private static async Task ValidateDeviceStatusResponseHandlingAsync()
+        {
+            // 表驱动回归：设备状态响应只读一次、正确释放、未识别拒绝保留
+            // http_status/server_code/server_message_key 诊断。TrackedContent
+            // 额外断言响应体已释放；NonSeekableTrackedContent 覆盖不可回退
+            // 流（无 seek、无二次读取）。
+            using var identity = DeviceIdentity.Generate();
+            var deviceId = Guid.NewGuid();
+            var cases = new StatusCase[]
+            {
+                new("200 empty body",
+                    () => new TrackedContent(string.Empty),
+                    HttpStatusCode.OK, false, Array.Empty<string>()),
+                new("200 with body ignores content",
+                    () => new TrackedContent("{\"error\":{\"code\":\"DEVICE_REVOKED\"}}"),
+                    HttpStatusCode.OK, false, Array.Empty<string>()),
+                new("401 DEVICE_REVOKED",
+                    () => new TrackedContent("{\"error\":{\"code\":\"DEVICE_REVOKED\"}}"),
+                    HttpStatusCode.Unauthorized, true, Array.Empty<string>()),
+                new("401 DEVICE_DISABLED",
+                    () => new TrackedContent("{\"error\":{\"code\":\"DEVICE_DISABLED\",\"message_key\":\"auth.deviceDisabled\"}}"),
+                    HttpStatusCode.Unauthorized, false,
+                    new[] { "http_status=401", "server_code=DEVICE_DISABLED", "server_message_key=auth.deviceDisabled" }),
+                new("401 UNAUTHENTICATED",
+                    () => new TrackedContent("{\"error\":{\"code\":\"UNAUTHENTICATED\",\"message_key\":\"auth.unauthenticated\"}}"),
+                    HttpStatusCode.Unauthorized, false,
+                    new[] { "http_status=401", "server_code=UNAUTHENTICATED", "server_message_key=auth.unauthenticated" }),
+                new("403 DEVICE_PENDING",
+                    () => new TrackedContent("{\"error\":{\"code\":\"DEVICE_PENDING\",\"message_key\":\"auth.devicePending\"}}"),
+                    HttpStatusCode.Forbidden, false,
+                    new[] { "http_status=403", "server_code=DEVICE_PENDING", "server_message_key=auth.devicePending" }),
+                new("502 html body",
+                    () => new TrackedContent("<html>gateway error</html>"),
+                    HttpStatusCode.BadGateway, false, new[] { "http_status=502" }),
+                new("502 empty body",
+                    () => new TrackedContent(string.Empty),
+                    HttpStatusCode.BadGateway, false, new[] { "http_status=502" }),
+                new("401 non-object body",
+                    () => new TrackedContent("[1,2,3]"),
+                    HttpStatusCode.Unauthorized, false, new[] { "http_status=401" }),
+                new("401 bad json",
+                    () => new TrackedContent("{not-json"),
+                    HttpStatusCode.Unauthorized, false, new[] { "http_status=401" }),
+                new("401 truncated at 4097",
+                    () => new TrackedContent(new string('x', 4097)),
+                    HttpStatusCode.Unauthorized, false,
+                    new[] { "http_status=401", "server_body=truncated" }),
+                new("401 truncated beyond 12000",
+                    () => new TrackedContent(new string('x', 12000)),
+                    HttpStatusCode.Unauthorized, false,
+                    new[] { "http_status=401", "server_body=truncated" }),
+                new("401 non-seekable truncated",
+                    () => new NonSeekableTrackedContent(new string('x', 5000)),
+                    HttpStatusCode.Unauthorized, false,
+                    new[] { "http_status=401", "server_body=truncated" }),
+            };
+            foreach (var testCase in cases)
+            {
+                var content = testCase.ContentFactory();
+                var tracked = content as TrackedContent;
+                using var response = new HttpResponseMessage(testCase.Status) { Content = content };
+                using var http = new HttpClient(new TrackedHandler(response));
+                string message = string.Empty;
+                var revoked = false;
+                try
+                {
+                    revoked = await ProductionEnrollment.IsDeviceRevokedAsync(
+                        http, "https://server.example.test", "access-token",
+                        deviceId, identity, CancellationToken.None);
+                }
+                catch (ProductionEnrollmentException error)
+                {
+                    message = error.Message;
+                }
+
+                Assert(revoked == testCase.ExpectRevoked,
+                    $"device status case '{testCase.Name}' revoked mismatch: {message}");
+                foreach (var part in testCase.MessageParts)
+                    Assert(message.Contains(part),
+                        $"device status case '{testCase.Name}' message missing '{part}': {message}");
+                if (tracked != null)
+                    Assert(tracked.WasDisposed,
+                        $"device status case '{testCase.Name}' left the response content undisposed");
+            }
+
+            // 网络异常与显式取消保持原类型传播，不被吞成服务端拒绝。
+            var failureCases = new (Exception error, Type expected)[]
+            {
+                (new HttpRequestException("offline"), typeof(HttpRequestException)),
+                (new TaskCanceledException("cancelled"), typeof(TaskCanceledException)),
+            };
+            foreach (var (error, expectedType) in failureCases)
+            {
+                using var http = new HttpClient(new ThrowingHandler(error));
+                var matched = false;
+                try
+                {
+                    await ProductionEnrollment.IsDeviceRevokedAsync(
+                        http, "https://server.example.test", "access-token",
+                        deviceId, identity, CancellationToken.None);
+                }
+                catch (Exception caught)
+                {
+                    matched = expectedType.IsInstanceOfType(caught);
+                }
+
+                Assert(matched,
+                    "network failure or cancellation lost its original exception type");
+            }
+
+            Console.WriteLine(
+                $"Device status response handling: {cases.Length} table cases plus network/cancellation passed (single bounded read, using-disposed responses).");
         }
 
         private static HttpResponseMessage DeviceStatusResponse(HttpStatusCode status, string body) =>

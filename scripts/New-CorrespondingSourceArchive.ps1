@@ -145,7 +145,7 @@ function Read-ByteLine {
     while ($true) {
         $value = $Stream.ReadByte()
         if ($value -lt 0) { throw 'Unexpected end of Git cat-file output.' }
-        if ($value -eq 10) { return $buffer.ToArray() }
+        if ($value -eq 10) { return ,$buffer.ToArray() }
         $buffer.Add([byte]$value)
     }
 }
@@ -163,7 +163,10 @@ function Read-ExactBytes {
         if ($count -le 0) { throw 'Unexpected end of Git cat-file blob.' }
         $offset += $count
     }
-    return $buffer
+    # The comma keeps byte[] intact: a bare return enumerates the array, so a
+    # single-byte blob would reach callers as a scalar byte and an empty blob
+    # as $null, breaking .Length/SHA-256 handling downstream.
+    return ,$buffer
 }
 
 function Get-GitBlobBytes {
@@ -216,15 +219,24 @@ function Get-GitBlobBytes {
 
 function Test-PrivatePath {
     param([Parameter(Mandatory)][string]$Path)
-    return $Path -match '(?i)(^|/)(?:\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|private[-_]?keys?)(/|$)' -or
+    # Sensitive parent directories and key files are evaluated before any
+    # template exemption, so a `.env.example` leaf under secrets/,
+    # credentials/ or private-keys/ is still rejected by this gate.
+    if ($Path -match '(?i)(^|/)(?:credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|private[-_]?keys?)(/|$)' -or
         $Path -match '(?i)\.(?:pfx|p12|jks|keystore|pem|key)$' -or
-        $Path -match '(?i)(^|/)(?:id_(?:rsa|dsa|ecdsa)|authorized_keys)$'
+        $Path -match '(?i)(^|/)(?:id_(?:rsa|dsa|ecdsa)|authorized_keys)$') { return $true }
+    # The only intentionally tracked placeholder template is server/.env.example;
+    # the content scan (Test-PrivateBytes) still inspects every byte of it.
+    # Every other `.env.example` leaf and the whole `.env*` family stays
+    # rejected by the pattern below.
+    if ($Path -match '(?i)^server/\.env\.example$') { return $false }
+    return $Path -match '(?i)(^|/)\.env(?:\..*)?(/|$)'
 }
 
 function Test-PrivateBytes {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte[]]$Bytes
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes
     )
     $text = [Text.Encoding]::UTF8.GetString($Bytes)
     $patterns = @(
@@ -240,7 +252,7 @@ function Test-PrivateBytes {
 }
 
 function Get-Sha256Bytes {
-    param([Parameter(Mandatory)][byte[]]$Bytes)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
     return ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($Bytes))).Replace('-', '').ToLowerInvariant()
 }
 
@@ -253,7 +265,7 @@ function Add-ZipBytes {
     param(
         [Parameter(Mandatory)][IO.Compression.ZipArchive]$Archive,
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
         [Parameter(Mandatory)][int]$Mode
     )
     $entry = $Archive.CreateEntry($Name, [IO.Compression.CompressionLevel]::Optimal)

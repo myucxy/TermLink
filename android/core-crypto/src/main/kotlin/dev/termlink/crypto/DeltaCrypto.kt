@@ -83,8 +83,9 @@ object DeltaCrypto {
             Cipher.getInstance("AES/GCM/NoPadding").run {
                 init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
                 updateAAD(aad)
-                require(doFinal(ByteBuffer.wrap(sealedObject, HEADER_BYTES, sealedObject.size - HEADER_BYTES),
-                    ByteBuffer.wrap(plaintext)) == plaintext.size) { "Delta plaintext length is invalid" }
+                // Android 9's ByteBuffer adapter can demand ciphertext-sized output for GCM decryption.
+                require(doFinal(sealedObject, HEADER_BYTES, sealedObject.size - HEADER_BYTES,
+                    plaintext) == plaintext.size) { "Delta plaintext length is invalid" }
             }
             validateNative(plaintext, expectedContextId, expectedProfile, expectedBaseNextSequence,
                 expectedTargetNextSequence, expectedBaseSnapshotBytes, expectedTargetSnapshotBytes,

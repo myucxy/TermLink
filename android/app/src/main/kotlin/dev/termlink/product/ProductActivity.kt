@@ -894,6 +894,10 @@ class ProductActivity : ComponentActivity() {
         repository = repositoryOwner.repository
         pendingRemoteDownloadSelection = savedInstanceState?.remoteDownloadSelection()
         enableEdgeToEdge()
+        // Before Android 11, IME insets need resize notifications to keep the terminal dock above the keyboard.
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        }
         applyProductStatusBarPolicy(window, resources.configuration.orientation)
         val initialKeepScreenOn = loadKeepScreenOnPreference(this)
         applyKeepScreenOn(window, initialKeepScreenOn)

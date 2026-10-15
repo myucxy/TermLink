@@ -65,6 +65,12 @@ function New-Fixture {
     }
     $lock = [ordered]@{ schema_version = 2; repository = 'fixture'; revision = $coreRevision; source_dirty = $false; toolchain = '1.97.1'; artifacts = @($records) }
     Write-Utf8 (Join-Path $app 'terminal-core.lock.json') (($lock | ConvertTo-Json -Depth 8) + "`n")
+    # Empty and single-byte tracked blobs: a bare `return $buffer` in the
+    # cat-file reader unrolls these into $null / a scalar byte, which crashed
+    # the manifest builder under strict mode.
+    $null = New-Item -ItemType Directory -Force -Path (Join-Path $app 'fixtures')
+    [IO.File]::WriteAllBytes((Join-Path $app 'fixtures/empty-placeholder'), [byte[]]::new(0))
+    [IO.File]::WriteAllBytes((Join-Path $app 'fixtures/one-byte-marker'), [byte[]](46))
     Invoke-Git -Repository $app -Arguments @('add', '--all')
     Invoke-Git -Repository $app -Arguments @('commit', '--quiet', '-m', 'fixture app')
     $applicationRevision = (& git -C $app rev-parse HEAD).Trim()
@@ -148,6 +154,9 @@ try {
         $names = @($zip.Entries | ForEach-Object FullName)
         Assert-Condition ($names -contains 'termlink/terminal-core.lock.json' -and $names -contains 'terminal-core/scripts/Build-ToTermLink.ps1') 'Tracked build/lock files are missing.'
         Assert-Condition ($names -notcontains '.git/config' -and $names -notcontains 'SOURCE-MANIFEST.json.sha256') 'Git metadata or recursive archive hash leaked.'
+        Assert-Condition ($names -contains 'termlink/fixtures/empty-placeholder' -and $names -contains 'termlink/fixtures/one-byte-marker') 'Empty and single-byte tracked blobs are missing.'
+        Assert-Condition ($zip.GetEntry('termlink/fixtures/empty-placeholder').Length -eq 0) 'Empty tracked blob was not preserved.'
+        Assert-Condition ($zip.GetEntry('termlink/fixtures/one-byte-marker').Length -eq 1) 'Single-byte tracked blob was not preserved.'
         $manifestEntry = $zip.GetEntry('SOURCE-MANIFEST.json')
         Assert-Condition ($null -ne $manifestEntry) 'SOURCE-MANIFEST.json is missing.'
         $reader = [IO.StreamReader]::new($manifestEntry.Open(), [Text.UTF8Encoding]::new($false))
@@ -280,6 +289,63 @@ try {
     Write-Utf8 $manifestPath (($secretRevisionManifest | ConvertTo-Json -Depth 8) + "`n")
     Invoke-ArchiveExpectFailure -Arguments $archiveArguments -Name 'tracked credential rejection'
     Invoke-Git -Repository $fixture.Application -Arguments @('reset', '--hard', '--quiet', 'HEAD~1')
+    Write-Utf8 $manifestPath $originalManifestText
+
+    # `.env.example` 是有意跟踪的占位符模板：路径豁免放行，但内容扫描仍生效
+    #（真实密钥模式依旧拒绝）。`.env` 本体仍被路径扫描拒绝。
+    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
+    if (Test-Path -LiteralPath "$archive.sha256.json") { Remove-Item -LiteralPath "$archive.sha256.json" -Force }
+    Write-Utf8 (Join-Path $fixture.Application 'server/.env.example') 'DATABASE_URL=placeholder\nAPI_KEY=your-key-here\n'
+    Invoke-Git -Repository $fixture.Application -Arguments @('add', '--all')
+    Invoke-Git -Repository $fixture.Application -Arguments @('commit', '--quiet', '-m', 'env example fixture')
+    $exampleRevisionManifest = $originalManifestText | ConvertFrom-Json
+    $exampleRevisionManifest.source_revision = (& git -C $fixture.Application rev-parse HEAD).Trim()
+    Write-Utf8 $manifestPath (($exampleRevisionManifest | ConvertTo-Json -Depth 8) + "`n")
+    & $script:NewScript @archiveArguments | Out-Null
+    Assert-Condition (Test-Path -LiteralPath $archive -PathType Leaf) '.env.example template was wrongly rejected.'
+    Write-Host 'PASS .env.example template archive accepted with content scan intact'
+    Remove-Item -LiteralPath $archive -Force
+    if (Test-Path -LiteralPath "$archive.sha256.json") { Remove-Item -LiteralPath "$archive.sha256.json" -Force }
+    Invoke-Git -Repository $fixture.Application -Arguments @('reset', '--hard', '--quiet', 'HEAD~1')
+
+    # 合法模板命中私钥内容时仍被内容扫描拒绝：模板例外不豁免 Test-PrivateBytes。
+    Write-Utf8 (Join-Path $fixture.Application 'server/.env.example') 'DATABASE_URL=placeholder\n-----BEGIN RSA PRIVATE KEY-----\nFAKE-KEY-MATERIAL\n'
+    Invoke-Git -Repository $fixture.Application -Arguments @('add', '--all')
+    Invoke-Git -Repository $fixture.Application -Arguments @('commit', '--quiet', '-m', 'template private key fixture')
+    $templateKeyManifest = $originalManifestText | ConvertFrom-Json
+    $templateKeyManifest.source_revision = (& git -C $fixture.Application rev-parse HEAD).Trim()
+    Write-Utf8 $manifestPath (($templateKeyManifest | ConvertTo-Json -Depth 8) + "`n")
+    Invoke-ArchiveExpectFailure -Arguments $archiveArguments -Name 'template private key content rejection'
+    Invoke-Git -Repository $fixture.Application -Arguments @('reset', '--hard', '--quiet', 'HEAD~1')
+    Write-Utf8 $manifestPath $originalManifestText
+
+    # 敏感父目录下的 .env.example 不被模板例外放行：secrets/credentials/
+    # private-keys 父目录拒绝必须先于叶名例外生效。
+    foreach ($sensitiveParent in @('secrets', 'credentials', 'private-keys')) {
+        Write-Utf8 (Join-Path $fixture.Application ($sensitiveParent + '/.env.example')) 'PLACEHOLDER=value-here\n'
+    }
+    Invoke-Git -Repository $fixture.Application -Arguments @('add', '--all')
+    Invoke-Git -Repository $fixture.Application -Arguments @('commit', '--quiet', '-m', 'sensitive parent template fixture')
+    $sensitiveParentManifest = $originalManifestText | ConvertFrom-Json
+    $sensitiveParentManifest.source_revision = (& git -C $fixture.Application rev-parse HEAD).Trim()
+    Write-Utf8 $manifestPath (($sensitiveParentManifest | ConvertTo-Json -Depth 8) + "`n")
+    Invoke-ArchiveExpectFailure -Arguments $archiveArguments -Name 'sensitive parent .env.example rejection'
+    Invoke-Git -Repository $fixture.Application -Arguments @('reset', '--hard', '--quiet', 'HEAD~1')
+    Write-Utf8 $manifestPath $originalManifestText
+
+    Write-Utf8 (Join-Path $fixture.Application 'server/.env') 'DATABASE_URL=real-secret-value\n'
+    Invoke-Git -Repository $fixture.Application -Arguments @('add', '--all')
+    Invoke-Git -Repository $fixture.Application -Arguments @('commit', '--quiet', '-m', 'env real fixture')
+    $realEnvManifest = $originalManifestText | ConvertFrom-Json
+    $realEnvManifest.source_revision = (& git -C $fixture.Application rev-parse HEAD).Trim()
+    Write-Utf8 $manifestPath (($realEnvManifest | ConvertTo-Json -Depth 8) + "`n")
+    $realEnvFailed = $false
+    try { & $script:NewScript @archiveArguments | Out-Null }
+    catch { $realEnvFailed = $true; Write-Host "PASS tracked .env rejection: $($_.Exception.Message)" }
+    Assert-Condition $realEnvFailed 'A tracked .env file was unexpectedly accepted.'
+    Invoke-Git -Repository $fixture.Application -Arguments @('reset', '--hard', '--quiet', 'HEAD~1')
+    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
+    if (Test-Path -LiteralPath "$archive.sha256.json") { Remove-Item -LiteralPath "$archive.sha256.json" -Force }
     Write-Utf8 $manifestPath $originalManifestText
 
     Write-Utf8 (Join-Path $fixture.Core 'README.md') '# dirty core fixture\n'

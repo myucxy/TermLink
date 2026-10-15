@@ -591,50 +591,30 @@ namespace TermLink.Agent
             request.Headers.TryAddWithoutValidation("X-TermLink-Timestamp", timestamp);
             request.Headers.TryAddWithoutValidation("X-TermLink-Nonce", nonce);
             request.Headers.TryAddWithoutValidation("X-TermLink-Signature", Base64Url(identity.Sign(Encoding.UTF8.GetBytes(canonical))));
-            var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token)
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token)
                 .ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.OK) return false;
-            if (response.StatusCode == HttpStatusCode.Unauthorized && response.Content != null)
-            {
-                await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-                var bytes = new byte[4097];
-                var count = 0;
-                while (count < bytes.Length)
-                {
-                    var read = await stream.ReadAsync(bytes.AsMemory(count), token).ConfigureAwait(false);
-                    if (read == 0) break;
-                    count += read;
-                }
-                if (count <= 4096)
-                {
-                    try
-                    {
-                        using var document = JsonDocument.Parse(bytes.AsMemory(0, count));
-                        var root = document.RootElement;
-                        if (root.ValueKind == JsonValueKind.Object &&
-                            root.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.Object &&
-                            error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String &&
-                            code.GetString() == "DEVICE_REVOKED")
-                            return true;
-                    }
-                    catch (JsonException) { }
-                }
-            }
+            var (revoked, detail) = await ReadDeviceStatusRejectionAsync(response, token).ConfigureAwait(false);
+            if (revoked) return true;
             throw new ProductionEnrollmentException(
                 "ACCOUNT_DEVICE_STATUS_UNAVAILABLE",
-                "The existing TermLink device status could not be verified safely." +
-                await DescribeServerRejectionAsync(response, token).ConfigureAwait(false));
+                "The existing TermLink device status could not be verified safely." + detail);
         }
 
-        private static async Task<string> DescribeServerRejectionAsync(
+        private static async Task<(bool Revoked, string Detail)> ReadDeviceStatusRejectionAsync(
             HttpResponseMessage response, CancellationToken token)
         {
-            // Unrecognized device-status rejections carry the server's status
-            // and bounded, credential-free error metadata into the exception
-            // message so field logs distinguish device pending/disabled,
-            // unknown-device and gateway failures. Raw bodies are never kept.
+            // Non-200 device-status rejections are read exactly once with a
+            // bounded forward-only window (no seek, no second read) so
+            // chunked or non-seekable streams behave the same. The single
+            // parse drives both the revocation decision and the sanitized
+            // http_status/server_code/server_message_key diagnostics; raw
+            // bodies and credentials are never retained or logged.
             var detail = " http_status=" + ((int)response.StatusCode);
-            if (response.Content == null) return detail;
+            if (response.Content == null) return (false, detail);
+            string serverCode = null;
+            string serverMessageKey = null;
+            var truncated = false;
             try
             {
                 await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
@@ -646,22 +626,45 @@ namespace TermLink.Agent
                     if (read == 0) break;
                     count += read;
                 }
-                if (count > 4096) return detail + " server_body=truncated";
-                using var document = JsonDocument.Parse(bytes.AsMemory(0, count));
-                var root = document.RootElement;
-                if (root.ValueKind != JsonValueKind.Object ||
-                    !root.TryGetProperty("error", out var error) ||
-                    error.ValueKind != JsonValueKind.Object) return detail;
-                if (error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String)
-                    detail += " server_code=" + code.GetString();
-                if (error.TryGetProperty("message_key", out var key) && key.ValueKind == JsonValueKind.String)
-                    detail += " server_message_key=" + key.GetString();
-                return detail;
+                if (count > 4096)
+                {
+                    truncated = true;
+                }
+                else
+                {
+                    using var document = JsonDocument.Parse(bytes.AsMemory(0, count));
+                    var root = document.RootElement;
+                    if (root.ValueKind == JsonValueKind.Object &&
+                        root.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.Object)
+                    {
+                        if (error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String)
+                            serverCode = code.GetString();
+                        if (error.TryGetProperty("message_key", out var key) && key.ValueKind == JsonValueKind.String)
+                            serverMessageKey = key.GetString();
+                    }
+                }
             }
-            catch
+            catch (JsonException) { }
+            var revoked = response.StatusCode == HttpStatusCode.Unauthorized &&
+                string.Equals(serverCode, "DEVICE_REVOKED", StringComparison.Ordinal);
+            if (serverCode != null) detail += " server_code=" + SanitizeExternalToken(serverCode);
+            if (serverMessageKey != null) detail += " server_message_key=" + SanitizeExternalToken(serverMessageKey);
+            if (truncated) detail += " server_body=truncated";
+            return (revoked, detail);
+        }
+
+        private static string SanitizeExternalToken(string value)
+        {
+            // error.code/message_key are server-controlled external input:
+            // strip control characters (including CR/LF) and bound the length
+            // before they can reach exception messages or log fields.
+            var builder = new System.Text.StringBuilder(value.Length);
+            foreach (var character in value)
             {
-                return detail;
+                if (!char.IsControl(character)) builder.Append(character);
             }
+            var text = builder.ToString();
+            return text.Length > 96 ? text[..96] : text;
         }
 
         private static async Task<MachineResolutionResponse> ResolveMachineAsync(

@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -mod=readonly \
     -buildvcs=false \
     -trimpath \
-    -ldflags="-s -w -X github.com/termlink/termlink/server/internal/buildinfo.injectedVersion=${VERSION} -X github.com/termlink/termlink/server/internal/buildinfo.injectedRevision=${REVISION} -X github.com/termlink/termlink/server/internal/buildinfo.injectedCreated=${CREATED}" \
+    -ldflags="-s -w -X github.com/termlink/termlink/server/internal/buildinfo.injectedVersion=${VERSION%%+*} -X github.com/termlink/termlink/server/internal/buildinfo.injectedRevision=${REVISION} -X github.com/termlink/termlink/server/internal/buildinfo.injectedCreated=${CREATED}" \
     -o /out/termlink-server \
     ./cmd/termlink-server && \
     test -n "${SOURCE_DATE_EPOCH}" && \

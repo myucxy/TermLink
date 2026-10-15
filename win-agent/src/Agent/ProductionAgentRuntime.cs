@@ -739,7 +739,11 @@ namespace TermLink.Agent
             directShadowRuntime = createdShadowRuntime;
             var historyRoot = ProductionTerminalHistoryRoot(config);
             var storageRoot = Path.GetDirectoryName(ProductionAgentConfig.DefaultPath);
-            TermLink.Common.PrivateHistoryDirectory.Prepare(storageRoot, Path.GetDirectoryName(historyRoot));
+            // 迁移前只保护祖先路径：不创建、不递归扫描目标历史目录（末段），
+            // 避免初始化显式扫描兄弟机器历史；目标内容的完整加固在迁移
+            // 判定之后执行一次。必须传最终 historyRoot——PreparePaths 自己
+            // 排除末段，传父目录会漏检倒数第二段（History）的重解析点。
+            TermLink.Common.PrivateHistoryDirectory.PreparePaths(storageRoot, historyRoot);
             MigrateLegacyTerminalHistory(config.PcId, historyRoot);
             TermLink.Common.PrivateHistoryDirectory.Prepare(storageRoot, historyRoot);
             terminalHistoryStore = new ProductionTerminalHistoryStore(historyRoot, credentials.DeviceId,

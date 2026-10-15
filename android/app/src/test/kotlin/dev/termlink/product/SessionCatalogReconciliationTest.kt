@@ -7,8 +7,11 @@ import dev.termlink.model.PcSummary
 import dev.termlink.model.PcCapabilityIds
 import dev.termlink.model.SessionState
 import dev.termlink.model.SessionSummary
+import dev.termlink.network.production.TermLinkApiException
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalSize
+import java.io.IOException
+import java.net.SocketTimeoutException
 import java.time.Instant
 import java.util.UUID
 import org.junit.Assert.assertEquals
@@ -359,6 +362,28 @@ class SessionCatalogReconciliationTest {
                 listOf(session(sessionA), otherSession),
             ),
         )
+    }
+
+    @Test
+    fun transportLevelCatalogPollFailureDoesNotAuthorizeSessionTeardown() {
+        // r425/r426 regression: an airplane-mode relay outage failed the
+        // 2-second foreground session-catalog poll. Its catch treated that as
+        // authoritative "nothing exists", destroyed every open live session
+        // and the frozen capture, and the resulting surface unregister left
+        // the E2E inspect hook timing out through the whole reconnect stage.
+        // A failure that never reached the server carries no authority about
+        // which sessions exist and must not re-authorize that teardown;
+        // answered requests and local data failures still do.
+        assertTrue(isTransportCatalogPollFailure(IOException("connect: network is unreachable")))
+        assertTrue(isTransportCatalogPollFailure(SocketTimeoutException("catalog poll timed out")))
+        assertTrue(isTransportCatalogPollFailure(NativeOidcException(
+            NativeOidcFailure.NETWORK, cause = IOException("no route to host"))))
+        assertFalse(isTransportCatalogPollFailure(TermLinkApiException(401, "UNAUTHENTICATED", null)))
+        assertFalse(isTransportCatalogPollFailure(TermLinkApiException(502, "HTTP_502", null)))
+        assertFalse(isTransportCatalogPollFailure(
+            NativeOidcException(NativeOidcFailure.TOKEN_REQUEST_FAILED)))
+        assertFalse(isTransportCatalogPollFailure(
+            IllegalStateException("Authentication lifecycle changed")))
     }
 
     private fun pc(online: Boolean) = PcSummary(

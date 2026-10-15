@@ -76,8 +76,7 @@ object BrokerCaptureCrypto {
                 Cipher.getInstance("AES/GCM/NoPadding").run {
                     init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonceBytes))
                     updateAAD(aad)
-                    require(doFinal(ByteBuffer.wrap(canonical), ByteBuffer.wrap(result, HEADER_BYTES,
-                        canonical.size + 16)) == canonical.size + 16) {
+                    require(doFinal(canonical, 0, canonical.size, result, HEADER_BYTES) == canonical.size + 16) {
                         "Broker capture ciphertext length is invalid"
                     }
                 }
@@ -132,8 +131,8 @@ object BrokerCaptureCrypto {
                 Cipher.getInstance("AES/GCM/NoPadding").run {
                     init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
                     updateAAD(aad)
-                    require(doFinal(ByteBuffer.wrap(sealedObject, HEADER_BYTES,
-                        expectedCanonicalLength + 16), ByteBuffer.wrap(canonical)) == expectedCanonicalLength) {
+                    require(doFinal(sealedObject, HEADER_BYTES,
+                        expectedCanonicalLength + 16, canonical) == expectedCanonicalLength) {
                         "Broker capture plaintext length is invalid"
                     }
                 }

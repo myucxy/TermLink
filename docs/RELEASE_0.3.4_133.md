@@ -55,10 +55,48 @@ gcr.io distroless 与 buildkit 内 proxy.golang.org 均不可达，采用主机�
 ## 对应源码（GPLv3）
 
 `artifacts/release/0.3.4-133/TermLink-Corresponding-Source-0.3.4-133.zip`
-为早期旧包（源码已前进），发布前未附源码下载链接。待办：用
-`scripts/New-CorrespondingSourceArchive.ps1` 以当前双仓库 HEAD 重生成，
-经维护者确认后挂到可达 URL 并在下一版更新说明补链接（私有 core 公开
-需维护者确认，不自动改仓库可见性）。
+为早期旧包，不能作为本轮已发布制品的对应源码，保留用于追溯；发布前未附
+源码下载链接。下表的新候选包已按各已发布版本的精确应用/core revision
+生成，不能用当前 HEAD 替换历史来源。后续交付复用已核验候选，并补可达
+下载入口与实际下载哈希记录；不自动改 core 仓库可见性。
+
+### 2026-10-15 本机候选源码包（prepared/local_verified；外部交付 pending）
+
+以各已发布版本的精确干净 checkout 重新打包，仅本机留存于
+`.workspace-validation/review-20261015/source-delivery/output/`，
+尚未挂接任何可达 URL，未向外部交付：
+
+| 包 | 应用 revision | core revision | 字节数 | SHA-256 |
+| --- | --- | --- | --- | --- |
+| `TermLink-Corresponding-Source-0.3.4-133.zip` | `d9fc97ba8d47dfd2a6e9eb30f66e8b47d56c9476` | `1c907c51b3c6652b23a7d7216ff1bb13d3410a69` | 21,819,614 | `0ce09ced1bbbc0343450581cbf53717c4b765d77186387432d0e3a1dc79d7158` |
+| `TermLink-Corresponding-Source-0.3.4-134.zip` | `9721f2ec6407815897a06d10740e7dd37901bcd1` | `1c907c51b3c6652b23a7d7216ff1bb13d3410a69` | 21,824,099 | `46b16b4c08fe4c9ee0799f7e786b579867d43f7330d47c6a311227998fff30f7` |
+
+- 133 包关联制品：APK `c92d34a1…4b20b2`、Setup `395a8407…ba5a8f6`；134 包关联
+  Setup `99dd94df…7836fe6e0`（与上表发布记录哈希一致）。
+- 核验状态：打包器自测通过；Codex 复审已对两包做全部跟踪文件的
+  blob SHA-1/SHA-256/大小/mode 与 Git 来源独立核验
+  （`.workspace-validation/review-20261015/rereview-source-verification.json`）。
+- 2026-10-15 后续收口：已从原发布会话工具记录恢复最终 Dockerfile、选择脚本和
+  成功的 Go 预编译命令；选择脚本与 CA bundle 另从原 OCI 逐层提取并匹配，
+  CA 与本机 Git bundle 字节一致。从 `d9fc97b`、Go 1.26.2 复编的 amd64/arm64
+  二进制与 OCI 中原文件 SHA-256 完全一致。
+- Server 独立源码候选：`TermLink-Server-Corresponding-Source-0.3.4-133-v2.zip`，
+  77,244,586 B，SHA-256 `6f862df345990911fd0e38cf0346b7b5dc53feb2cae5addfcb32958e32baac7a`。
+  包含 Server/前端/协议源码、恢复的构建材料和 82 份依赖源码 ZIP；已验证解包后
+  在空模块缓存中仅用本地 file proxy 复编，两架构仍与发布文件完全一致。
+  首个无 v2 后缀的 Server 候选缺少一个拆分模块父包，已被 v2 取代，不交付旧候选。
+- 原始镜像的实际基底为 amd64 Alpine 3.22.5、arm64 Alpine 3.22.6；旧 Dockerfile
+  使用了可变 `alpine:3.22` 标签。精确 layer/config digest 和原始材料来源记录在本机
+  `source-delivery/server-133-materials/RECOVERY-MANIFEST.json`，不能冒称重建整个镜像 digest。
+- OCI 检查另发现旧镜像未带项目 LICENSE、NOTICE、THIRD_PARTY_NOTICES.md；本轮不覆盖
+  旧镜像，下次授权发布须按现有官方 Dockerfile 的许可复制步骤核验。Alpine 基底的
+  对应源码/分发资料仍须核对，Server 全镜像交付不能据此标为完成。
+- 旧构建注入的 `0.3.4+133` 会被 Server 的三段数字版本解析器拒绝，导致运行时版本
+  显示未知。本机官方 `server/Dockerfile` 已改为仅在 Go 链接时去掉 `+build` 后缀，
+  三段 Version 满足运行时解析；OCI label、镜像 tag 和清单仍保留完整 build。
+  实际 Dockerfile 的 shell 表达式、发布计划及 linker buildinfo 测试通过，不改变旧二进制。
+- 本机交付入口与校验和：工作区 `.workspace-validation/review-20261015/source-delivery/index.html`、
+  `DELIVERY-MANIFEST.json`、`SHA256SUMS.txt`。三个候选均未上传，外部源码交付仍 pending。
 
 ## 回滚
 

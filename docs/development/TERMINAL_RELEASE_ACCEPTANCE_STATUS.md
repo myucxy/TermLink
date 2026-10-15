@@ -1,6 +1,6 @@
 # 终端产品发布验收状态
 
-更新至 2026-10-11 的 r230。范围固定为 C01–C14、H01–H04、E02–E04、G01，共 **22 组**。本文是持续更新的证据账本；矩阵要求以工作区兄弟仓库 `../terminal-core/PRODUCT_ACCEPTANCE_MATRIX_20261010.md` 为准。当前只验收 **Relay Only**，LAN/NAT/直连不在本轮范围。
+保留 2026-10-11 r230 历史快照，并追加 2026-10-15 模拟器/MI 6/WAL 复验。范围固定为 C01–C14、H01–H04、E02–E04、G01，共 **22 组**。本文是持续更新的证据账本；矩阵要求以工作区兄弟仓库 `../terminal-core/PRODUCT_ACCEPTANCE_MATRIX_20261010.md` 为准。当前只验收 **Relay Only**，LAN/NAT/直连不在本轮范围。
 
 ## 判定规则
 
@@ -9,6 +9,19 @@
 - 每次复测使用新 RunId，保存 parent/child evidence、候选 APK/Windows/core 哈希、origin、设备和 recipient 身份、UTC 时间。已知失败保留；新成功只覆盖相应子项。
 
 ## 最新证据快照
+
+2026-10-15 追加独立复验（不改写下方 r230 历史快照）：
+
+| 新证据 | 结果 | 边界 |
+| --- | --- | --- |
+| `artifacts/broker-product-e2e/review-20261015-wal-r2/{evidence,broker-wal-fault}.json` | termlink2 真实 Relay WAL 故障恢复 passed；阻塞期间 ACK 45，解除后 WAL/source/ACK 46、capture 1、图片像素通过，Host exit 0。 | 仅本故障场景，r412 历史 hook 静默未复现；不关闭完整组。 |
+| 工作区 `.workspace-validation/device-validation-20261015/mi6-relay-r5/` | MI 6/Android9 可见 Relay 会话、输出、IME 两帧布局和输入返回 passed，ACK 46→94。 | 使用独立 recovery 包的 fixture；通知/音频/剪贴板和全触摸矩阵未验。 |
+| 同目录 `mi6-instrumentation-final.log`、`emulator-instrumentation-final.log` | 真机/模拟器各 6/6 通过，包括旧 Android GCM 修复后的真实 JNI Delta、Frozen/Broker Capture 解密及 tag 拒绝。 | 设备代码测试，不等价于所有产品 UI/网络场景。 |
+| `artifacts/tail-first-e2e/review-20261015-frozen-r3/evidence.json` | Frozen begin/PAGE/并发 live/离线保留通过；完整 parent 失败 FROZEN_RELAY_RECONNECT_NOT_OBSERVED。 | 系统 HTTPS 联网探测超时，网络未 VALIDATED、available count=0；实际 socket generation 4/ready 不代替重连后 PAGE，E02 保持未完成。 |
+
+完整报告见工作区 `.workspace-validation/device-validation-20261015/REPORT.md`；保留失败批次和候选哈希。本轮未提交或发布，22 组的整组通过数不因此增加。
+
+2026-10-16 更新：`artifacts/tail-first-e2e/review-20261016-frozen-r6/evidence.json` 已 `passed/complete`，44 项断言全部通过，覆盖离线保留、Relay 新代次订阅、原 capture 重连后分页、截断历史边界、释放、300 秒 TTL 不被 PAGE 续期及过期槽复用。脚本改为检查同一会话的实际 Relay socket/transport/订阅恢复；公网联网验证计数保留为诊断，不能作为访问专用 Relay 的前置条件。测试中 available count=0、连接 generation=4，实际分页成功。r3/r4/r5 失败仍保留；本轮不修改系统 DNS/联网探测或产品网络验证策略。E02 此 Frozen 生命周期场景完成，不等价于全部 22 组关闭。
 
 | 证据 | 可确认的结果 | 边界 |
 | --- | --- | --- |

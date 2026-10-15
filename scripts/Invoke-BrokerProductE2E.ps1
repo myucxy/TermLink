@@ -920,8 +920,10 @@ while ($true) {
     if ([IO.File]::Exists('broker-send.trigger')) {
         [IO.File]::Delete('broker-send.trigger')
         $path = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('broker-image.rgba'))
+        # Keep the recovery marker below the two image rows in the same write after clearing the display.
         [Console]::Write(([char]27 + '[2J' + [char]27 + '[H' +
-            [char]27 + '_Ga=T,t=f,f=32,s=16,v=16,S=1024,i=77,q=2,c=4,r=2;' + $path + [char]27 + '\'))
+            [char]27 + '_Ga=T,t=f,f=32,s=16,v=16,S=1024,i=77,q=2,c=4,r=2;' + $path + [char]27 + '\' +
+            [char]27 + '[4;1H' + '__LIVE_MARKER__'))
         [Console]::Out.Flush()
     }
     if ([IO.File]::Exists('protocol-smoke.trigger')) {

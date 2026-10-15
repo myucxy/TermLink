@@ -18,7 +18,9 @@ foreach ($required in @('Assert-Arm', 'Assert-Baseline', 'Assert-Recovered',
     'broker_capture_last_sequence -eq $next', 'ack_during_fault',
     'GetOwner([Security.Principal.SecurityIdentifier])', 'GetAccessRules($true, $true',
     'FOREIGN_WRITE_ACL_ACCEPTED', 'Assert-LocalDirectory $runRoot',
-    'Assert-LocalDirectory $history', 'Assert-LocalDirectory $captureRoot')) {
+    'Assert-LocalDirectory $history', 'Assert-LocalDirectory $captureRoot',
+    'Read-HookResponseForensics', 'Save-HookFailureLogcat',
+    'first_retry_failure_code', 'retry_inspect_failures', 'HOOK_RESPONSE_TIMEOUT')) {
     if (-not $source.Contains($required)) { throw "BROKER_WAL_FAULT_GUARD_MISSING: $required" }
 }
 if ($source.Contains('Remove-Item -Recurse') -or $source.Contains('Directory]::Delete($history')) {
@@ -26,6 +28,10 @@ if ($source.Contains('Remove-Item -Recurse') -or $source.Contains('Directory]::D
 }
 if ($source.Contains('$State.session_running')) {
     throw 'BROKER_WAL_FAULT_UNSUPPORTED_INSPECT_FIELD'
+}
+if (-not $source.Contains('BROKER_RETRY_WAL_MISSING') -or
+    -not $source.Contains('MISSING_COMMITTED_WAL_ACCEPTED')) {
+    throw 'BROKER_WAL_FAULT_DURABILITY_GUARD_MISSING'
 }
 $powershell = (Get-Process -Id $PID).Path
 $result = & $powershell -NoProfile -File $runner -SelfTest 2>&1

@@ -229,10 +229,13 @@ try {
                 throw ('BROKER_DELTA_SEED_SELFTEST_FAILED: ' + $stderr.Trim())
             }
             $lines = @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
-            $expectedCount = if ($seedMode) { 2 } else { 5200 }
+            # Non-seed mode ends with the explicit live-marker line the runner
+            # added for the WAL baseline/recovery phases (5200 markers + 1).
+            $expectedCount = if ($seedMode) { 2 } else { 5201 }
+            $expectedLast = if ($seedMode) { 'TLTF_SELFTEST_5200' } else { 'TLTF_LIVE_SELFTEST' }
             if ($lines.Count -ne $expectedCount -or
                 $lines[0] -cne 'TLTF_SELFTEST_0001' -or
-                $lines[$lines.Count - 1] -cne 'TLTF_SELFTEST_5200') {
+                $lines[$lines.Count - 1] -cne $expectedLast) {
                 throw 'BROKER_DELTA_SEED_SELFTEST_OUTPUT_INVALID'
             }
         } finally {
@@ -241,6 +244,50 @@ try {
     }
 } finally {
     if ([IO.Directory]::Exists($seedSelfCheckRoot)) { [IO.Directory]::Delete($seedSelfCheckRoot, $true) }
+}
+# The broker-send capture clears the screen, so the live marker must be
+# re-placed below the image in that same bounded write for WAL recovery.
+$sendStart = $child.IndexOf("if ([IO.File]::Exists('broker-send.trigger')) {")
+if ($sendStart -lt 0) { throw 'BROKER_SEND_TRIGGER_BLOCK_MISSING' }
+$sendFlush = $child.IndexOf('[Console]::Out.Flush()', $sendStart)
+if ($sendFlush -lt $sendStart) { throw 'BROKER_SEND_TRIGGER_BLOCK_MISSING' }
+$sendEnd = $child.IndexOf("`n    }", $sendFlush)
+if ($sendEnd -lt $sendFlush) { throw 'BROKER_SEND_TRIGGER_BLOCK_MISSING' }
+$sendBlock = $child.Substring($sendStart, $sendEnd + "`n    }".Length - $sendStart)
+if ([regex]::Matches($sendBlock, [regex]::Escape('[Console]::Write(')).Count -ne 1 -or
+    $sendBlock.IndexOf('i=77,q=2,c=4,r=2') -lt 0 -or
+    $sendBlock.IndexOf('[4;1H') -lt $sendBlock.IndexOf('i=77,q=2,c=4,r=2') -or
+    $sendBlock.IndexOf('__LIVE_MARKER__') -lt $sendBlock.IndexOf('[4;1H')) {
+    throw 'BROKER_SEND_LIVE_MARKER_NOT_BELOW_IMAGE'
+}
+$sendSandbox = Join-Path ([IO.Path]::GetTempPath()) ('termlink-broker-send-selfcheck-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $sendSandbox -Force | Out-Null
+$sendCwd = [Environment]::CurrentDirectory
+$sendPayload = $null
+try {
+    [IO.File]::WriteAllText((Join-Path $sendSandbox 'broker-send.trigger'), '')
+    [Environment]::CurrentDirectory = $sendSandbox
+    $sendWriter = [IO.StringWriter]::new()
+    $sendOutput = [Console]::Out
+    try {
+        [Console]::SetOut($sendWriter)
+        . ([ScriptBlock]::Create($sendBlock.Replace('__LIVE_MARKER__', 'TLTF_LIVE_SENDTEST')))
+    } finally {
+        [Console]::SetOut($sendOutput)
+        $sendPayload = $sendWriter.ToString()
+        $sendWriter.Dispose()
+    }
+    $expectedSend = [string][char]27 + '[2J' + [char]27 + '[H' + [char]27 +
+        '_Ga=T,t=f,f=32,s=16,v=16,S=1024,i=77,q=2,c=4,r=2;' +
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('broker-image.rgba')) + [char]27 + '\' +
+        [char]27 + '[4;1H' + 'TLTF_LIVE_SENDTEST'
+    if ($sendPayload -cne $expectedSend) { throw 'BROKER_SEND_MARKER_NOT_IN_CAPTURE_WRITE' }
+} finally {
+    [Environment]::CurrentDirectory = $sendCwd
+    if ([IO.Directory]::Exists($sendSandbox)) {
+        [IO.File]::Delete((Join-Path $sendSandbox 'broker-send.trigger'))
+        [IO.Directory]::Delete($sendSandbox, $false)
+    }
 }
 $replyChildSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\win-agent\tests\SessionHostValidation\ProtocolReplyRelayChild.cs') -Raw
 if (-not $replyChildSource.Contains('idle.Elapsed < TimeSpan.FromMinutes(2)')) {

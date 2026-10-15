@@ -107,6 +107,38 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tok
 Assert-True ($parseErrors.Count -eq 0) `
     ("Invoke-TailFirstProductE2E.ps1 parser errors:`n" + (($parseErrors | ForEach-Object { $_.Message }) -join "`n"))
 
+$relayRecoveryFunction = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-RelaySubscriptionRecovered'
+}, $true))
+Assert-True ($relayRecoveryFunction.Count -eq 1) 'The runner must share one Relay recovery check.'
+Invoke-Expression $relayRecoveryFunction[0].Extent.Text
+$relayBefore = [pscustomobject]@{
+    session_id = [guid]::NewGuid().ToString('D'); realtime_connected_generation = 1
+}
+$relayAfter = [pscustomobject]@{
+    session_id = $relayBefore.session_id; realtime_connected_generation = 2
+    realtime_socket_state = 'CONNECTED'; realtime_transport_state = 'CONNECTED'
+    realtime_subscriber_ready = $true; realtime_network_available_count = 0
+}
+Assert-True (Test-RelaySubscriptionRecovered $relayBefore $relayAfter) `
+    'An authenticated Relay successor was rejected because public Internet validation did not run.'
+foreach ($change in @(
+    @{ session_id = [guid]::NewGuid().ToString('D') },
+    @{ realtime_connected_generation = 0 }, @{ realtime_connected_generation = 1 },
+    @{ realtime_socket_state = 'RECONNECTING' }, @{ realtime_transport_state = 'CONNECTING' },
+    @{ realtime_subscriber_ready = $false }, @{ realtime_subscriber_ready = 'true' }
+)) {
+    $invalidRecovery = $relayAfter | ConvertTo-Json | ConvertFrom-Json
+    foreach ($key in $change.Keys) { $invalidRecovery.$key = $change[$key] }
+    Assert-True (-not (Test-RelaySubscriptionRecovered $relayBefore $invalidRecovery)) `
+        "Relay recovery accepted invalid $(@($change.Keys)[0])."
+}
+Assert-True ($source.Contains('Test-RelaySubscriptionRecovered $frozenLive $candidate') -and
+    $source.Contains('Test-RelaySubscriptionRecovered $previousPageObservation $onlineRecoveryObservation')) `
+    'Frozen and Transcript recovery must both verify the Relay successor.'
+
 $frozenTransitionFunction = @($ast.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -489,8 +521,7 @@ foreach ($failureProof in @(
     '[DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)',
     "'online-retry-observed-network-recovery'",
     "'online-retry-retains-history-objects'",
-    "realtime_socket_state -ceq 'CONNECTED'",
-    "realtime_transport_state -ceq 'CONNECTED'",
+    'Test-RelaySubscriptionRecovered $previousPageObservation $onlineRecoveryObservation',
     "realtime_remote_state -ceq 'CONTROLLING'"
 )) {
     Assert-True ($failureRetentionSource.Contains($failureProof)) `

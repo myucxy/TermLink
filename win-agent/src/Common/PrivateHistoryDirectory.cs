@@ -23,6 +23,56 @@ internal static class PrivateHistoryDirectory
 
     internal static void Prepare(string storageRoot, string historyDirectory)
     {
+        var (boundary, segments, current) = ValidateAndProtectRoot(storageRoot, historyDirectory);
+        var held = new List<SafeFileHandle>();
+        try
+        {
+            // 完整 Prepare 保护全链（含目标段）并递归扫描目标内容；
+            // 仅 PreparePaths 排除最后一段供迁移前使用。递归必须使用循环
+            // 结束后的规范化最终路径：原始输入可能是正斜杠等形式，拼接
+            // \\?\ 前缀后无法打开。
+            var path = boundary;
+            held.Add(ProtectDirectory(path, current));
+            foreach (var segment in segments)
+            {
+                path = Path.Combine(path, segment);
+                held.Add(ProtectDirectory(path, current));
+            }
+
+            ProtectContents(path, current, 0);
+        }
+        finally
+        {
+            for (var index = held.Count - 1; index >= 0; index--) held[index].Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 只创建并保护从 storageRoot 到目标历史目录父段的祖先链，不创建、
+    /// 不保护、不递归扫描最后一段（目标历史目录本身）。用于运行初始化的
+    /// 迁移前阶段：目标目录必须保持不存在，让 legacy 迁移判定正常工作，
+    /// 同时避免初始化显式递归扫描兄弟机器的历史。
+    /// <paramref name="historyDirectory"/> 必须是最终 historyRoot（如
+    /// storage/Data/History/machine）：本方法自行排除末段，调用方传父目录
+    /// 会漏检倒数第二段的重解析点，让迁移把历史移出私有根目录。
+    /// </summary>
+    internal static void PreparePaths(string storageRoot, string historyDirectory)
+    {
+        var (boundary, segments, current) = ValidateAndProtectRoot(storageRoot, historyDirectory);
+        var held = new List<SafeFileHandle>();
+        try
+        {
+            ProtectAncestorChain(boundary, segments, current, held);
+        }
+        finally
+        {
+            for (var index = held.Count - 1; index >= 0; index--) held[index].Dispose();
+        }
+    }
+
+    private static (string Boundary, string[] Segments, SecurityIdentifier Current)
+        ValidateAndProtectRoot(string storageRoot, string historyDirectory)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(storageRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(historyDirectory);
         if (!Path.IsPathFullyQualified(storageRoot) || !Path.IsPathFullyQualified(historyDirectory))
@@ -34,22 +84,26 @@ internal static class PrivateHistoryDirectory
             throw new InvalidDataException("History must be inside the TermLink storage directory.");
         using var identity = WindowsIdentity.GetCurrent();
         var current = identity.User ?? throw new InvalidDataException("Current Windows identity is unavailable.");
-        var held = new List<SafeFileHandle>();
-        try
+        return (boundary,
+            Path.GetRelativePath(boundary, history).Split(Path.DirectorySeparatorChar),
+            current);
+    }
+
+    private static string ProtectAncestorChain(
+        string boundary, string[] segments, SecurityIdentifier current,
+        List<SafeFileHandle> held)
+    {
+        // 打开并保护除最后一段外的全部路径段；最后一段（目标历史目录）
+        // 由完整 Prepare 创建、保护并递归扫描内容。
+        var path = boundary;
+        held.Add(ProtectDirectory(path, current));
+        for (var index = 0; index + 1 < segments.Length; index++)
         {
-            var path = boundary;
+            path = Path.Combine(path, segments[index]);
             held.Add(ProtectDirectory(path, current));
-            foreach (var segment in Path.GetRelativePath(boundary, history).Split(Path.DirectorySeparatorChar))
-            {
-                path = Path.Combine(path, segment);
-                held.Add(ProtectDirectory(path, current));
-            }
-            ProtectContents(history, current, 0);
         }
-        finally
-        {
-            for (var index = held.Count - 1; index >= 0; index--) held[index].Dispose();
-        }
+
+        return path;
     }
 
     private static SafeFileHandle ProtectDirectory(string path, SecurityIdentifier current)
@@ -130,7 +184,10 @@ internal static class PrivateHistoryDirectory
         if ((security.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0)
             return false;
         var stored = security.DiscretionaryAcl;
-        if (stored.BinaryLength != expectedDaclBytes.Length)
+        // A NULL DACL (no DACL at all) and an empty DACL are both unprotected:
+        // neither matches the expected descriptor, and DiscretionaryAcl is
+        // null precisely for the NULL form that used to crash this compare.
+        if (stored == null || stored.BinaryLength != expectedDaclBytes.Length)
             return false;
         var storedBytes = new byte[stored.BinaryLength];
         stored.GetBinaryForm(storedBytes, 0);

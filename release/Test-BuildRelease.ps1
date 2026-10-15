@@ -768,6 +768,10 @@ Assert-True (@($planObject.steps).Count -eq 4) 'The expected target steps were n
 
 $serverStep = @($planObject.steps | Where-Object { $_.id -eq 'server-image' })[0]
 $serverArguments = @($serverStep.arguments)
+Assert-True ($serverArguments -contains 'VERSION=12.34.56+321') `
+    'The server OCI version label must retain its release build metadata.'
+Assert-True ($serverArguments -contains 'termlink-server:12.34.56-build.321') `
+    'The server image tag lost its independent build number.'
 Assert-True ($serverArguments -contains '--output') 'The server plan does not export a local OCI artifact.'
 Assert-True (-not ($serverArguments -contains '--push')) 'The server plan contains a push argument.'
 Assert-True ($serverStep.publish -eq $false) 'The server step unexpectedly enables publishing.'

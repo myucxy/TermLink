@@ -152,6 +152,21 @@ function Assert-E2E {
     if (-not $Condition) { Stop-TailFirstE2E -Code $Code -PublicMessage $Message }
 }
 
+function Test-RelaySubscriptionRecovered {
+    param([Parameter(Mandatory)]$Before, [Parameter(Mandatory)]$Current)
+    try {
+        # Android's public Internet validation is independent of the authenticated TermLink Relay.
+        return [guid]$Before.session_id -ne [guid]::Empty -and
+            $Current.session_id -ceq $Before.session_id -and
+            $Before.realtime_connected_generation -gt 0 -and
+            $Current.realtime_connected_generation -gt $Before.realtime_connected_generation -and
+            $Current.realtime_socket_state -ceq 'CONNECTED' -and
+            $Current.realtime_transport_state -ceq 'CONNECTED' -and
+            $Current.realtime_subscriber_ready -is [bool] -and $Current.realtime_subscriber_ready
+    }
+    catch { return $false }
+}
+
 function Test-FrozenPageTransition {
     param(
         [Parameter(Mandatory)]$Reference,
@@ -1343,6 +1358,43 @@ function Test-FailureSessionIdentity {
     return $Arm.baseline_session_ids -cnotcontains $CandidateId
 }
 
+# Local fixture forensics: schema-screened hook response (<=1 MiB) and filtered logcat.
+function Save-HookFailureForensics {
+    if ($null -eq $script:adbPath) { return }
+    $hookResponseSaved = $false
+    $logcatSaved = $false
+    try {
+        $result = Invoke-NativeCapture $script:adbPath `
+            @('-s', $serial, 'exec-out', 'run-as', $AndroidPackageName, 'cat', $hookResponsePath) 10
+        if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$result.StdOut)) {
+            Assert-E2E ([Text.Encoding]::UTF8.GetByteCount([string]$result.StdOut) -le 1048576) `
+                'E2E_HOOK_RESPONSE_TOO_LARGE' 'The failed Debug hook response exceeded 1 MiB.'
+            $candidate = [string]$result.StdOut | ConvertFrom-Json -ErrorAction Stop
+            Assert-NoSensitiveFields $candidate
+            [IO.File]::WriteAllText((Join-Path $artifactDirectory 'failed-stage-hook-response.json'),
+                [string]$result.StdOut, [Text.UTF8Encoding]::new($false))
+            $hookResponseSaved = $true
+        }
+    }
+    catch {}
+    try {
+        $logcat = Invoke-NativeCapture $script:adbPath @('-s', $serial, 'logcat', '-d', '-t', '600',
+            '-s', 'TermLinkRealtime', 'TermLinkFrozenHistory', 'TermLinkTailFirst', 'TermLinkTranscript') 15
+        if ($logcat.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$logcat.StdOut)) {
+            [IO.File]::WriteAllText((Join-Path $artifactDirectory 'failed-stage-logcat.txt'),
+                [string]$logcat.StdOut, [Text.UTF8Encoding]::new($false))
+            $logcatSaved = $true
+        }
+    }
+    catch {}
+    if ($null -ne $script:evidence.failure) {
+        $script:evidence.failure | Add-Member -NotePropertyName failed_hook_response_saved `
+            -NotePropertyValue $hookResponseSaved
+        $script:evidence.failure | Add-Member -NotePropertyName failed_stage_logcat_saved `
+            -NotePropertyValue $logcatSaved
+    }
+}
+
 function Save-FrozenOpenFailureEvidence {
     param([Parameter(Mandatory)]$OpenRequest, [Parameter(Mandatory)]$Arm,
         [Parameter(Mandatory)][string]$Marker)
@@ -2049,6 +2101,7 @@ $null = Start-ThreadJob -ArgumentList $frozenOutputTrigger, '__FROZEN_MARKER__' 
             $script:evidence.stage = $script:stage
             try {
                 Set-AndroidAirplaneMode $true
+                $script:evidence.cleanup.network_failure_injected = $true
                 $offlineDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
                 $frozenOffline = $null
                 do {
@@ -2080,10 +2133,7 @@ $null = Start-ThreadJob -ArgumentList $frozenOutputTrigger, '__FROZEN_MARKER__' 
             do {
                 $candidate = Get-StateObservation 'frozen-relay-online' (
                     Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker })
-                if ($candidate.realtime_network_available_count -gt $frozenOffline.realtime_network_available_count -and
-                    $candidate.realtime_connected_generation -gt $frozenLive.realtime_connected_generation -and
-                    $candidate.realtime_socket_state -ceq 'CONNECTED' -and
-                    $candidate.realtime_subscriber_ready) {
+                if (Test-RelaySubscriptionRecovered $frozenLive $candidate) {
                     $frozenOnline = $candidate
                     break
                 }
@@ -2540,11 +2590,7 @@ $null = Start-ThreadJob -ArgumentList $frozenOutputTrigger, '__FROZEN_MARKER__' 
 
     $script:stage = 'history-network-recovery'
     $script:evidence.stage = $script:stage
-    # A cold emulator can expose the replacement network as partial
-    # connectivity for tens of seconds while Android's validation probes
-    # settle. Reuse the runner's bounded observation budget so this gate still
-    # waits for the product callback and the full realtime stack, without a
-    # shorter platform-timing false negative.
+    # Wait for the actual Relay successor; public Internet validation is diagnostic only.
     $onlineRecoveryDeadline = [DateTime]::UtcNow.AddSeconds($ObservationTimeoutSeconds)
     $onlineRecoveryObservation = $null
     $appObservedNetworkRecovery = $false
@@ -2552,12 +2598,8 @@ $null = Start-ThreadJob -ArgumentList $frozenOutputTrigger, '__FROZEN_MARKER__' 
         $onlineRecoveryResponse = Invoke-HookOperation 'inspect' @{ live_marker = $liveMarker }
         $onlineRecoveryObservation = Get-StateObservation 'history-online-recovery' $onlineRecoveryResponse
         $appObservedNetworkRecovery =
-            $onlineRecoveryObservation.realtime_network_available_count -gt
-                $offlineBaselineObservation.realtime_network_available_count -and
-            $onlineRecoveryObservation.realtime_socket_state -ceq 'CONNECTED' -and
-            $onlineRecoveryObservation.realtime_transport_state -ceq 'CONNECTED' -and
-            $onlineRecoveryObservation.realtime_remote_state -ceq 'CONTROLLING' -and
-            $onlineRecoveryObservation.realtime_subscriber_ready
+            (Test-RelaySubscriptionRecovered $previousPageObservation $onlineRecoveryObservation) -and
+            $onlineRecoveryObservation.realtime_remote_state -ceq 'CONTROLLING'
         if (-not $appObservedNetworkRecovery) { Start-Sleep -Milliseconds 250 }
     } while (-not $appObservedNetworkRecovery -and [DateTime]::UtcNow -lt $onlineRecoveryDeadline)
     Add-Assertion 'online-retry-observed-network-recovery' 'true' $appObservedNetworkRecovery `
@@ -2727,6 +2769,7 @@ catch {
         message = $message
         hook_failure_code = $script:hookFailureCode
     }
+    Save-HookFailureForensics
     if ($FrozenLifecycleAcceptance -and $script:stage -ceq 'tail-first-open' -and
         $null -ne $script:openSessionRequest -and $null -ne $script:liveMarker -and
         $null -ne $script:sessionProcess -and -not $script:sessionProcess.HasExited -and

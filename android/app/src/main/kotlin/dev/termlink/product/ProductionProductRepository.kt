@@ -508,6 +508,13 @@ internal fun isAuthenticationRefreshRejection(error: Throwable): Boolean =
         NativeOidcFailure.ACCOUNT_SETUP_REQUIRED,
     )
 
+/** Transport failure does not provide an authoritative catalog for retiring live sessions. */
+internal fun isTransportCatalogPollFailure(error: Throwable): Boolean = when (error) {
+    is IOException -> true
+    is NativeOidcException -> error.reason == NativeOidcFailure.NETWORK
+    else -> false
+}
+
 /** An outer refresh catch must not replace the actionable expiry message. */
 internal fun shouldPreserveAuthenticationExpiredFailure(
     snapshot: ProductSnapshot,
@@ -1419,16 +1426,19 @@ internal class ProductionProductRepository(
                 withAuthenticatedApi { api, generation -> pollSessionCatalogWithApi(api, generation) }
             } catch (error: CancellationException) {
                 throw error
-            } catch (_: Throwable) {
-                refreshStateLock.withLock {
-                    authenticationStateMutationLock.withLock {
-                        if (authenticationLifecycle.isCurrent(generation) && !closed) {
-                            closeReadOnlySessionsExcept(emptySet())
-                            closeLiveSessionsExcept(emptySet())
-                            mutableSnapshot.update { current ->
-                                reconcileSessionCatalog(current, current.pcs, emptyList(), deletedSessionIds).copy(
-                                    pcSessionCatalogErrors = current.pcs.associate { it.id to "UNAVAILABLE" },
-                                )
+            } catch (error: Throwable) {
+                // Preserve views and frozen captures during transport loss; a successful poll reconciles removals.
+                if (!isTransportCatalogPollFailure(error)) {
+                    refreshStateLock.withLock {
+                        authenticationStateMutationLock.withLock {
+                            if (authenticationLifecycle.isCurrent(generation) && !closed) {
+                                closeReadOnlySessionsExcept(emptySet())
+                                closeLiveSessionsExcept(emptySet())
+                                mutableSnapshot.update { current ->
+                                    reconcileSessionCatalog(current, current.pcs, emptyList(), deletedSessionIds).copy(
+                                        pcSessionCatalogErrors = current.pcs.associate { it.id to "UNAVAILABLE" },
+                                    )
+                                }
                             }
                         }
                     }
