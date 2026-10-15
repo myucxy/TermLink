@@ -20,7 +20,7 @@ func TestServerDockerfileInjectsReviewedBuildMetadata(t *testing.T) {
 	buildStage := dockerfile[buildStart:buildEnd]
 	for _, expected := range []string{
 		"ARG VERSION", "ARG REVISION", "ARG CREATED",
-		"github.com/termlink/termlink/server/internal/buildinfo.injectedVersion=${VERSION}",
+		"github.com/termlink/termlink/server/internal/buildinfo.injectedVersion=${VERSION%%+*}",
 		"github.com/termlink/termlink/server/internal/buildinfo.injectedRevision=${REVISION}",
 		"github.com/termlink/termlink/server/internal/buildinfo.injectedCreated=${CREATED}",
 	} {
