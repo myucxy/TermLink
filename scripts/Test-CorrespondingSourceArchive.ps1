@@ -49,6 +49,8 @@ function New-Fixture {
     Write-Utf8 (Join-Path $app 'NOTICE') 'TermLink application fixture notice.\n'
     Write-Utf8 (Join-Path $app 'README.md') '# fixture application\n'
     Write-Utf8 (Join-Path $app 'scripts/build.ps1') '# fixture application build\n'
+    # The archive must also accept this test's source while rejecting its generated secret fixtures.
+    Write-Utf8 (Join-Path $app 'scripts/Test-CorrespondingSourceArchive.ps1') (Get-Content -LiteralPath $PSCommandPath -Raw)
     Write-Utf8 (Join-Path $app '.gitignore') "artifacts/`n"
     $native = @(
         @{ Path = 'native/terminal-core/windows-x64/termlink_terminal_ffi.dll'; Bytes = [byte[]](1, 2, 3, 4) },
@@ -309,7 +311,8 @@ try {
     Invoke-Git -Repository $fixture.Application -Arguments @('reset', '--hard', '--quiet', 'HEAD~1')
 
     # 合法模板命中私钥内容时仍被内容扫描拒绝：模板例外不豁免 Test-PrivateBytes。
-    Write-Utf8 (Join-Path $fixture.Application 'server/.env.example') 'DATABASE_URL=placeholder\n-----BEGIN RSA PRIVATE KEY-----\nFAKE-KEY-MATERIAL\n'
+    Write-Utf8 (Join-Path $fixture.Application 'server/.env.example') (
+        'DATABASE_URL=placeholder\n-----BEGIN RSA ' + 'PRIVATE KEY-----\nFAKE-KEY-MATERIAL\n')
     Invoke-Git -Repository $fixture.Application -Arguments @('add', '--all')
     Invoke-Git -Repository $fixture.Application -Arguments @('commit', '--quiet', '-m', 'template private key fixture')
     $templateKeyManifest = $originalManifestText | ConvertFrom-Json
