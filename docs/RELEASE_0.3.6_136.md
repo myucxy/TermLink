@@ -2,7 +2,7 @@
 
 ## 2026-10-18 发布记录
 
-Android、Windows 与完整对应源码已发布到 AppShip stable，均已匿名下载并核对 SHA-256。
+Android、Windows 与完整对应源码已发布到 [GitHub v0.3.6](https://github.com/myucxy/TermLink/releases/tag/v0.3.6) 和 AppShip stable；AppShip 三个制品均已匿名下载并核对 SHA-256，GitHub 七个附件 digest 与本地逐一一致。
 两个客户端的 build 135 返回 `optional`，build 136 返回 `no_update`。
 
 | 制品 | 下载 | SHA-256 |
@@ -14,8 +14,11 @@ Android、Windows 与完整对应源码已发布到 AppShip stable，均已匿�
 - 应用与 Git tag `v0.3.6`：`dfa727c3731e9f14bddc0c4f69ed98ddb44efecd`；core：`1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。
 - Android release：`2aea4156-d43f-41c6-9ef5-ff75b66eb2f3`；Windows release：`c14c0a35-4011-4b5c-b793-454abdf1eb70`；源码 release：`918b218f-f57c-4a1f-a0c7-1ec616b45b3a`。
 - Windows 保持原签名者，RFC3161 和 17 个自有载荷签名通过；APK 版本 0.3.6 / 136、唯一 signer 及 v2 签名通过。
-- GitHub 七个附件已上传并核对 digest，[发布管道](https://github.com/myucxy/TermLink/actions/runs/39061615352)正在进行独立验签，成功前仍保留 draft。
+- GitHub Release ID `415995809`，`draft=false`、`prerelease=false`，七个附件完整；[最终独立验签管道](https://github.com/myucxy/TermLink/actions/runs/39065172252)全部通过后，本机既有授权凭据完成发布。
+- 本轮修复托管 Windows runner 导入自签公钥时的交互等待、新 Build Tools `V2 Signer` 输出兼容，以及 GitHub 自带令牌无法发布含 workflow 差异提交的 403 限制。只在一次性 runner 导入已核对指纹的公钥；发布最终写入留在本机，不新增远端长期令牌 Secret。
 - Docker CI 位于后续 main 提交 `46c8f8006b6573a4c5e6f3a75a1e75d43eb0f7b5`，[双架构构建与 amd64 运行检查通过](https://github.com/myucxy/TermLink/actions/runs/39059735168)。它不改变本批客户端来源，也不发布 Docker 镜像。
+
+后续管道修复与发布结果提交未进入本批已编译客户端；制品、tag 和对应源码始终保持 `dfa727c`，未重编译替换或移动 tag。本批没有执行设备覆盖安装、全量真机回归或服务部署；上一版 AppShip 制品和 Docker 0.3.5 保留。
 
 下方为随客户端源码提交的初始发布说明；实际平台范围补充为 AppShip 与 GitHub，签名与来源保持同一批。
 

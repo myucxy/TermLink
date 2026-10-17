@@ -14,7 +14,7 @@
 
 ## 产品版本与 build 记录
 
-- [0.3.6 / build 136：GitHub 客户端与源码发布说明](../RELEASE_0.3.6_136.md)
+- [0.3.6 / build 136：GitHub、AppShip 客户端及完整对应源码已发布](../RELEASE_0.3.6_136.md)
 - [0.3.5 / build 135：Android、Windows、Docker 已发布](../RELEASE_0.3.5_135.md)
 - [0.3.4 / build 133：候选与验证记录](../RELEASE_0.3.4_133.md)
 
