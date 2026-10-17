@@ -1,4 +1,6 @@
 * text=auto eol=lf
+# Preserve copied upstream license text, including its original trailing whitespace.
+/server/licenses/THIRD_PARTY_NOTICES.txt -whitespace
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
