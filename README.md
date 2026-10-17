@@ -125,6 +125,8 @@ flowchart LR
 
 正式构建、签名及上传遵循[发布运行手册](docs/RELEASE_RUNBOOK.md)和[发布构建说明](docs/RELEASE.md)。客户端支持 AppShip 与 [GitHub 发布管道](docs/development/GITHUB_RELEASE.md)：本地签名，Actions 独立校验后发布。Docker 由本机构建并推送 Docker Hub。
 
+Docker CI 另行验证双架构镜像构建、许可入包和 amd64 容器的数据库迁移、就绪及重启恢复，不推送镜像。
+
 - 改动与问题反馈：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 漏洞报告：[SECURITY.md](SECURITY.md)
 - 项目及第三方授权：[LICENSE-STATUS.md](LICENSE-STATUS.md)

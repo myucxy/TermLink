@@ -1,0 +1,118 @@
+name: Docker server image checks
+
+on:
+  push:
+    branches: [main]
+    paths: ['server/**', 'LICENSE', 'NOTICE', 'scripts/Build-Release.ps1', 'release/Verify-LocalRelease.ps1', '.github/workflows/docker-checks.yml']
+  pull_request:
+    paths: ['server/**', 'LICENSE', 'NOTICE', 'scripts/Build-Release.ps1', 'release/Verify-LocalRelease.ps1', '.github/workflows/docker-checks.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # DEV follows the last published Docker release; CI never allocates a version.
+      CI_VERSION: '0.3.5'
+      CI_BUILD: '135'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and verify the two-architecture OCI image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Build-Release.ps1 -ServerImage -ReleaseMode Development -Version $env:CI_VERSION -BuildNumber ([int]$env:CI_BUILD)
+          $batch = Join-Path $env:GITHUB_WORKSPACE "artifacts/release/$env:CI_VERSION-$env:CI_BUILD"
+          ./release/Verify-LocalRelease.ps1 -ReleaseDirectory $batch -ExpectedReleaseMode Development -RequireSourceIdentity
+      - name: Load amd64 from the same build cache and check image metadata and licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load --tag termlink-ci:smoke \
+            --file server/Dockerfile --build-arg "VERSION=$CI_VERSION+$CI_BUILD" \
+            --build-arg "REVISION=$GITHUB_SHA" --build-arg "CREATED=$(git show -s --format=%cI HEAD)" .
+          docker image inspect termlink-ci:smoke > "$RUNNER_TEMP/termlink-image.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          image = json.loads((Path(os.environ['RUNNER_TEMP'])/'termlink-image.json').read_text())[0]
+          config = image['Config']
+          assert config['User'] == '65532:65532'
+          assert config['Entrypoint'] == ['/termlink-server'] and config['Cmd'] == ['serve']
+          labels = config['Labels']
+          assert labels['org.opencontainers.image.version'] == os.environ['CI_VERSION']+'+'+os.environ['CI_BUILD']
+          assert labels['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA']
+          assert labels['org.opencontainers.image.source'] == 'https://github.com/myucxy/TermLink'
+          assert labels['org.opencontainers.image.licenses'] == 'GPL-3.0-only'
+          PY
+          docker create --name termlink-ci-files termlink-ci:smoke
+          docker cp termlink-ci-files:/LICENSE "$RUNNER_TEMP/image-LICENSE"
+          docker cp termlink-ci-files:/NOTICE "$RUNNER_TEMP/image-NOTICE"
+          docker cp termlink-ci-files:/licenses/THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/image-third-party.txt"
+          cmp LICENSE "$RUNNER_TEMP/image-LICENSE"
+          cmp NOTICE "$RUNNER_TEMP/image-NOTICE"
+          cmp server/licenses/THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/image-third-party.txt"
+      - name: Start isolated PostgreSQL and verify real readiness, OIDC and restart
+        shell: bash
+        run: |
+          set -euo pipefail
+          admin_password=$(openssl rand -hex 24)
+          signing_key=$(openssl rand -hex 32)
+          echo "::add-mask::$admin_password"
+          echo "::add-mask::$signing_key"
+          docker network create termlink-image-ci
+          # No database host port; trust is limited to this disposable CI network.
+          docker run -d --name termlink-ci-postgres --network termlink-image-ci --network-alias postgres \
+            -e POSTGRES_DB=termlink -e POSTGRES_USER=termlink -e POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+          for attempt in $(seq 1 60); do
+            if docker exec termlink-ci-postgres pg_isready -U termlink -d termlink; then break; fi
+            sleep 1
+          done
+          docker exec termlink-ci-postgres pg_isready -U termlink -d termlink
+          docker run -d --name termlink-ci-server --network termlink-image-ci -p 127.0.0.1:18080:8080 \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --cap-drop ALL --security-opt no-new-privileges:true \
+            -e TERMLINK_RUNTIME_MODE=single-node -e TERMLINK_IDENTITY_PROVIDER=embedded \
+            -e TERMLINK_PUBLIC_URL=https://termlink.example.test \
+            -e 'TERMLINK_DATABASE_URL=postgres://termlink@postgres:5432/termlink?sslmode=disable' \
+            -e "TERMLINK_INITIAL_ADMIN_PASSWORD=$admin_password" -e "TERMLINK_TOKEN_SIGNING_KEY=$signing_key" \
+            -e TERMLINK_DIRECT_TRANSPORT_ENABLED=false -e TERMLINK_DIRECT_ROUTING_PERMITTED=false \
+            -e TERMLINK_LOG_FAILURE_REASON=true termlink-ci:smoke
+          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-all-errors --retry-delay 1 --max-time 5 \
+            http://127.0.0.1:18080/readyz > "$RUNNER_TEMP/readiness.json"
+          docker exec termlink-ci-server /termlink-server healthcheck
+          curl --fail --silent --show-error --max-time 10 \
+            http://127.0.0.1:18080/realms/termlink/.well-known/openid-configuration > "$RUNNER_TEMP/oidc.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          assert json.loads((root/'readiness.json').read_text())['status'] == 'ready'
+          assert json.loads((root/'oidc.json').read_text())['issuer'] == 'https://termlink.example.test/realms/termlink'
+          PY
+          docker restart termlink-ci-server
+          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-all-errors --retry-delay 1 --max-time 5 http://127.0.0.1:18080/readyz
+          docker exec termlink-ci-server /termlink-server healthcheck
+      - name: Failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          docker logs --tail 150 termlink-ci-server 2>&1 || true
+          docker logs --tail 60 termlink-ci-postgres 2>&1 || true
+      - name: Remove only this job's containers and network
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f termlink-ci-files termlink-ci-server termlink-ci-postgres || true
+          docker network rm termlink-image-ci || true

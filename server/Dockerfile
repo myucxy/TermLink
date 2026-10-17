@@ -33,7 +33,7 @@ ARG SOURCE_DATE_EPOCH
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=unknown
-ARG SOURCE=https://github.com/termlink/termlink
+ARG SOURCE=https://github.com/myucxy/TermLink
 
 LABEL org.opencontainers.image.title="TermLink Server" \
       org.opencontainers.image.description="TermLink authenticated opaque realtime relay and API" \

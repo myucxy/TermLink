@@ -3,7 +3,13 @@
 GitHub Release 分发同一批正式签名 APK、Windows x64 Setup 和带 core Rust vendor 的完整对应源码。
 构建和签名在维护者本机完成，私钥与口令不上传 Actions；GitHub 托管 Windows runner 下载草稿附件，
 核验哈希、源码、双端原生签名、版本、Windows 载荷及 RFC3161 时间戳，然后发布草稿。
-Docker 仍由本机直接推送 Docker Hub；本管道不发布 Docker、AppShip 或升级现有安装。
+Docker 正式发布仍由本机直接推送 Docker Hub；本管道不发布 Docker、AppShip 或升级现有安装。
+
+独立的 `Docker server image checks` 在 Server/Docker 配置的 push/PR 及手动调度时运行：
+复用现有构建和验证脚本生成 amd64/arm64 OCI，检查架构、版本、revision，再检查 amd64 镜像的
+非 root 用户、入口、许可文件。隔离 PostgreSQL 上实际启动 Server，验证数据库迁移后的 `/readyz`、
+容器内 healthcheck、内嵌 OIDC discovery 和容器重启恢复。arm64 只核验构建及 ELF，不宣称已运行。
+只使用一次性数据库和本地镜像，不登录 Docker Hub、不推送镜像、不触碰正式签名或生产数据。
 
 ## 每轮执行
 

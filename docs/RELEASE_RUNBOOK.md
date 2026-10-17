@@ -5,7 +5,8 @@
 
 ## 当前 Docker 发布入口（2026-10-04）
 
-按用户最新指定，本机编译后直接 push 到 `docker.io/myucxy/termlink`，不使用 GitHub Actions。
+正式 Docker 镜像本机编译后直接 push 到 `docker.io/myucxy/termlink`，不使用 GitHub Actions 发布。
+2026-10-18 新增的 Docker CI 仅构建和验证不发布的 DEV 镜像，覆盖双架构 OCI、amd64 就绪与重启，不推进正式版本。
 旧 Docker 发布工作流已从当前树移除。GitHub 客户端 Release 使用独立的[校验发布管道](development/GITHUB_RELEASE.md)，不构建或发布 Docker。
 本机发布仍固定已提交 revision 和版本/build，保留 BuildKit provenance/SBOM，逐项检查 amd64/arm64、
 版本镜像 digest、源码标签和健康；版本镜像核验后再同步同 digest 的 latest。凭据使用现有 Docker credential helper。
