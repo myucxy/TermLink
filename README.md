@@ -72,6 +72,50 @@ flowchart LR
 | [docs/](docs/README.md) | 使用、开发、架构、发布及历史文档导航 |
 | terminal-reference/、prototypes/、ui-prototypes/ | 独立参考工具和原型；已退役的 Termux 源码迁出应用仓库，详见[归档索引](docs/archive/README.md) |
 
+## 参考项目与致谢
+
+感谢以下开源项目及其维护者。TermLink 的设计和兼容性研究参考了这些项目的公开行为、协议与架构；具体用途和实际使用关系如下。
+
+### AI 对话与远程协作
+
+| 项目 | 参考范围 |
+| --- | --- |
+| [Happier](https://github.com/happier-dev/happier) | Agent 能力目录、按 runtime 区分支持范围、模型/权限/恢复能力描述，以及 ACP 接入边界。 |
+| [HAPI](https://github.com/tiann/hapi) | 移动聊天分块、工具分组、审批、历史翻页与阅读位置、Agent 配置描述，以及 Web/原生客户端共用会话服务的设计。仅参考行为和架构，未移植其产品源码。 |
+| [CC Pocket](https://github.com/K9i-0/ccpocket) | 电脑为会话权威、增量历史、输入回执、断线恢复、简洁聊天投影，以及文件/HTML 预览的隔离边界。 |
+| [Happy](https://github.com/slopus/happy) | 消息 ID 与回执归并、工具结果和审批关联、跨设备加密同步的交互与一致性规则。 |
+| [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) | Agent 初始化、会话、能力协商与动态配置等协议定义；实际支持范围按 TermLink 各适配器实现和已验证能力解释。 |
+| [OpenAI Codex](https://github.com/openai/codex) | Codex 原生协议接入与 Windows 终端颜色查询、输入记录和探测时限等兼容行为；终端适配来源见[显示还原修复记录](docs/TERMINAL_FIDELITY.md)。 |
+
+移动端调研还比较过 [Agmente](https://github.com/rebornix/Agmente)、[AionUi](https://github.com/iOfficeAI/AionUi)、[Lody](https://github.com/LodyAI/Lody)、[CloudCLI / Claude Code UI](https://github.com/siteboon/claudecodeui) 和 [AgentAPI](https://github.com/coder/agentapi)，用于协议、统一入口、项目/会话/文件切换等候选方案评估，不代表全部方案已采用。
+
+详细来源及固定 revision 见[手机客户端调研](docs/AI_MOBILE_CLIENT_RESEARCH_20261003.md)、[聊天功能对照](docs/AI_CHAT_GAP_ANALYSIS_20261004.md)和 [Web/Host 架构评估](docs/AI_WEB_HOST_ARCHITECTURE_FEASIBILITY_20261004.md)。这些记录不等于运行过参考项目的全部功能，也不将其支持声明直接作为 TermLink 的实测结果。TermLink 保留自己的 Windows 执行权威、E2EE Relay、会话和文件协议及聊天 UI。
+
+### 终端与移动端交互
+
+| 项目 | 参考范围与当前关系 |
+| --- | --- |
+| [Microsoft Windows Terminal](https://github.com/microsoft/terminal) | Windows 终端宿主、ConPTY、窗口尺寸、颜色、查询回复和输入行为对照。应用实际随包使用微软 ConPTY 原生组件，保留其[许可声明](win-agent/src/SessionHost/ConPTY-NOTICE.txt)。terminal-core 中固定字符映射数据的来源另见[许可文本](docs/licenses/Legacy-Charsets-MIT-LICENSE.txt)。 |
+| [Termux](https://github.com/termux/termux-app) | 早期 Android 终端引擎、IME、触控选择、键盘和滚动交互研究。旧派生模块已退役并迁出，当前 Android 产品与测试使用自有 native core/JNI/View；Windows 旧快照兼容路径仍保留有来源记录的字宽数据，详见[迁出与保留边界](docs/archive/TERMUX_CLEANUP_20261008.md)。 |
+| [xterm.js](https://github.com/xtermjs/xterm.js) | 早期 WebView 方案、终端能力与主题对照。仓库保留独立[离线参考 Harness](terminal-reference/xterm-harness/README.md)及其[第三方声明](terminal-reference/xterm-harness/THIRD_PARTY_NOTICES.md)，不作为当前 Android 产品的终端引擎。 |
+| [ConnectBot termlib](https://github.com/connectbot/termlib) | 早期 Android 原生终端与 libvterm 适配方案评估，未接入当前 native core 主链。 |
+| [xterm](https://invisible-island.net/xterm/) / [kitty](https://github.com/kovidgoyal/kitty) | [xterm 控制序列](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)、[Kitty 键盘](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)与[图形协议](https://sw.kovidgoyal.net/kitty/graphics-protocol/)用于终端语义参考；具体实现和限制由自有 core 的 profile 与资源契约定义。 |
+
+早期选型还比较过 [xterm.dart](https://github.com/TerminalStudio/xterm.dart)、[hterm](https://github.com/libapps/libapps-mirror)、[Android Terminal Emulator](https://github.com/jackpal/Android-Terminal-Emulator) 和 [WezTerm](https://github.com/wezterm/wezterm)。[Android 引擎调研](docs/ANDROID_TERMINAL_ENGINE_RESEARCH.md)保留当时的选型方案，当前实现以[架构说明](docs/architecture/CURRENT.md)和上述迁出记录为准。
+
+### 实际使用的部分组件与资源
+
+| 来源 | 用途与声明 |
+| --- | --- |
+| [Avalonia](https://github.com/AvaloniaUI/Avalonia) | 桌面客户端 UI 框架，见 [PC 客户端说明](pc-client/README.md)。 |
+| [React](https://github.com/facebook/react)、[react-markdown](https://github.com/remarkjs/react-markdown)、[React Virtuoso](https://github.com/petyosi/react-virtuoso) 等 | 自有 AI Web UI 的运行依赖，完整范围、锁定版本及打包规则见 [AI Web 第三方说明](ai-web/THIRD_PARTY.md)与 [package-lock.json](ai-web/package-lock.json)。 |
+| [CommonMark Java](https://github.com/commonmark/commonmark-java) | Android 原生 Markdown 解析依赖，随包保留 [CommonMark 许可](android/app/src/main/assets/licenses/commonmark-LICENSE.txt)。 |
+| [LobeHub Icons](https://github.com/lobehub/lobe-icons) / [ZCode](https://github.com/zai-org/ZCode) | Claude Code 图标来自固定版本的 LobeHub Icons，ZCode 图标来自其上游仓库；来源、哈希、转换方式及许可见 [Agent 图标声明](android/app/src/main/assets/licenses/ai-agent-icons-NOTICE.md)。ZCode 的官方远控网页由其官方加载，不复制或重分发其网页资源。 |
+| [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts) / [Cascadia Code](https://github.com/microsoft/cascadia-code) | Android 终端内置 CaskaydiaCove Nerd Font Mono；固定版本、哈希与 OFL 声明见[字体来源](android/terminal-engine-api/src/main/assets/termlink-fonts/NOTICE.txt)。 |
+| [wcwidth](https://github.com/jquast/wcwidth) | Windows 旧 V1 快照兼容字宽数据的上游来源，经 Termux `WcWidth.java` 引入；保留[固定 revision 与 MIT/原始声明](win-agent/src/Agent/WcWidth-NOTICE.txt)。 |
+
+这不是完整依赖许可证清单。项目参考、协议适配和实际代码/资源引入分别保留来源，完整声明以 [NOTICE](NOTICE)、[授权说明](LICENSE-STATUS.md)及各组件的第三方许可文件为准；项目名和产品图标不表示上游为 TermLink 背书。自有终端核心的更多参考与数据来源见 [terminal-core 致谢](https://github.com/myucxy/terminal-core#参考项目与致谢)。
+
 ## 开发、贡献与发布
 
 请先阅读[开发与构建](docs/development/BUILDING.md)。它说明固定工具链、AI Web 资源生成、Android 原生依赖及 DEV 版本参数，不要求贡献者复用维护者电脑的盘符路径。
