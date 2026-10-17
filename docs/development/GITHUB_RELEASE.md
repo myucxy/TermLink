@@ -38,7 +38,8 @@ Actions 仅在 `main` 上手动调度，串行校验；运行标题绑定 Releas
 本机最终核验成功运行的 workflow 路径、main 分支、dispatch 事件和标题，再复核同源码的 CI、tag 和远端附件 digest，才解除 draft。
 运行的是 dispatch 时固定的 main 管道代码；从 Git 对象读取所选发布 commit 的原生锁和签名策略。
 这样旧版本的校验或重试可以使用修复后的管道，不需要移动 tag、改写对应源码或重编译安装包。
-工作流只使用只读 `GITHUB_TOKEN`，无需另存 GitHub PAT、Android keystore 或 Windows PFX。
+工作流仅进行校验，使用自带 `GITHUB_TOKEN`；读取私有草稿需要 `contents:write`（GitHub 的草稿访问规则），
+代码不执行发布写入，无需另存 GitHub PAT、Android keystore 或 Windows PFX。
 GitHub 自带令牌不能修改 workflow，部分旧提交的 Release 发布会因此返回 403；最终写入使用本机既有授权，不把长期令牌上传为仓库 Secret。
 
 ## 重试和验证

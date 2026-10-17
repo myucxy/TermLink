@@ -18,7 +18,8 @@ on:
         type: string
 
 permissions:
-  contents: read
+  # GitHub requires push access to read unpublished private Release drafts.
+  contents: write
   actions: read
 
 concurrency:
