@@ -420,6 +420,29 @@ Assert-True ($androidEvidence.signer_sha256 -ceq $androidSignerSha256) `
     'The correct Android continuity fingerprint was not accepted.'
 Assert-True (@($androidEvidence.verified_schemes) -contains 2) `
     'The Android verifier did not retain APK Signature Scheme v2 evidence.'
+$schemeSignatureFixture = @(
+    'Verified using v2 scheme (APK Signature Scheme v2): true',
+    'Number of signers: 1',
+    "V2 Signer: certificate SHA-256 digest: $androidSignerSha256"
+)
+$schemeEvidence = Assert-TermLinkAndroidSignerOutput -Output $schemeSignatureFixture -ExpectedSha256 $androidSignerSha256
+Assert-True ($schemeEvidence.signer_sha256 -ceq $androidSignerSha256) 'Current Build Tools V2 signer output was rejected.'
+$multiSchemeEvidence = Assert-TermLinkAndroidSignerOutput -Output @($schemeSignatureFixture + @(
+    'Verified using v3 scheme (APK Signature Scheme v3): true',
+    "V3 Signer: certificate SHA-256 digest: $androidSignerSha256"
+)) -ExpectedSha256 $androidSignerSha256
+Assert-True ($multiSchemeEvidence.signer_sha256 -ceq $androidSignerSha256) 'Identical signer across verified schemes was rejected.'
+foreach ($badEvidence in @(
+    @{ Lines = @($schemeSignatureFixture + "V2 Signer: certificate SHA-256 digest: $androidSignerSha256") },
+    @{ Lines = @($schemeSignatureFixture + 'Verified using v3 scheme (APK Signature Scheme v3): true' + ('V3 Signer: certificate SHA-256 digest: ' + ('0' * 64))) },
+    @{ Lines = @($schemeSignatureFixture + "V3 Signer: certificate SHA-256 digest: $androidSignerSha256") },
+    @{ Lines = @($schemeSignatureFixture + "Signer #1 certificate SHA-256 digest: $androidSignerSha256") }
+)) {
+    $rejected = $false
+    try { $null = Assert-TermLinkAndroidSignerOutput -Output $badEvidence.Lines -ExpectedSha256 $androidSignerSha256 }
+    catch { $rejected = $true }
+    Assert-True $rejected 'Ambiguous, unverified or mismatched scheme signer evidence was accepted.'
+}
 $wrongAndroidRejected = $false
 try {
     $null = Assert-TermLinkAndroidSignerOutput -Output $androidSignatureFixture -ExpectedSha256 ('0' * 64)

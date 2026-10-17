@@ -64,6 +64,19 @@ function Assert-TermLinkAndroidSignerOutput {
         throw "Android APK must contain exactly one signer; apksigner reported $reportedCount."
     }
 
+    # New Build Tools label certificates by scheme instead of using Signer #1.
+    $schemeCertificates = @([regex]::Matches($text,
+        '(?im)^V([2-9][0-9]*(?:\.[0-9]+)?) Signer: certificate SHA-256 digest:[^\r\n]+$'))
+    if ($schemeCertificates.Count -gt 0) {
+        $schemeNames = @($schemeCertificates | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        if ($schemeNames.Count -ne $schemeCertificates.Count -or
+            @($schemeNames | Where-Object { $_ -notmatch '^\d+$' -or [int]$_ -notin $verifiedSchemes }).Count -gt 0 -or
+            $text -match '(?im)^Signer #') {
+            throw 'Android APK has ambiguous signer certificate evidence.'
+        }
+        $text = [regex]::Replace($text, '(?im)^V[2-9][0-9]* Signer: certificate SHA-256 digest:',
+            'Signer #1 certificate SHA-256 digest:')
+    }
     $signerIndexes = @(
         [regex]::Matches(
             $text,
@@ -84,7 +97,9 @@ function Assert-TermLinkAndroidSignerOutput {
                     -Description 'Android signer certificate SHA-256 fingerprint'
             }
     )
-    if ($signerFingerprints.Count -ne 1) {
+    if ($signerFingerprints.Count -eq 0 -or
+        ($schemeCertificates.Count -eq 0 -and $signerFingerprints.Count -ne 1) -or
+        ($schemeCertificates.Count -gt 0 -and @($signerFingerprints | Sort-Object -Unique).Count -ne 1)) {
         throw "Android APK must expose exactly one signer certificate SHA-256 evidence line; found $($signerFingerprints.Count)."
     }
 
