@@ -37,7 +37,7 @@ def write_json(path, value):
 
 
 def git(*arguments):
-    return subprocess.check_output(['git', '-C', str(ROOT), *arguments], text=True).strip()
+    return subprocess.check_output(['git', '-C', str(ROOT), *arguments], encoding='utf-8').strip()
 
 
 def expected_names(version, build):
@@ -59,8 +59,8 @@ def validate_bundle(directory, revision, digest=None):
     version, build = metadata['version'], metadata['build_number']
     require(metadata['schema_version'] == 1 and re.fullmatch(r'\d+\.\d+\.\d+', version), 'Invalid release identity')
     require(type(build) is int and 1 <= build <= 65535, 'Invalid release build')
-    require(metadata['source_revision'] == revision == git('rev-parse', 'HEAD'), 'Release source differs from checkout')
-    require(metadata['signers'] == read_json(ROOT/'release/github-release-policy.json'), 'Unexpected signing identities')
+    require(metadata['source_revision'] == revision == git('rev-parse', '--verify', revision+'^{commit}'), 'Release source commit is unavailable')
+    require(metadata['signers'] == json.loads(git('show', revision+':release/github-release-policy.json')), 'Unexpected signing identities')
     records = metadata['files']
     require(len(records) == len(expected_names(version, build)), 'Unexpected release file count')
     require({row['name'] for row in records} == expected_names(version, build), 'Unexpected release filenames')
@@ -71,7 +71,7 @@ def validate_bundle(directory, revision, digest=None):
     manifest = read_json(directory/'artifact-manifest.json')
     require(manifest['release_mode'] == 'production' and manifest['version'] == version and
             manifest['build_number'] == build and manifest['source_revision'] == revision, 'Client manifest identity mismatch')
-    lock = read_json(ROOT/'terminal-core.lock.json')
+    lock = json.loads(git('show', revision+':terminal-core.lock.json'))
     require(not lock['source_dirty'] and manifest['core_revision'] == metadata['core_revision'] == lock['revision'], 'Core revision mismatch')
     require(len(manifest['artifacts']) == 2 and {row['type'] for row in manifest['artifacts']} == {'apk', 'setup'}, 'Expected one APK and one Windows Setup')
     for row in manifest['artifacts']:
@@ -95,12 +95,23 @@ def validate_bundle(directory, revision, digest=None):
         require(source_manifest['release_artifact_manifest']['sha256'] == sha256(directory/'artifact-manifest.json'), 'Source is bound to a different client manifest')
         require(set(names) == {row['path'] for row in source_manifest['files']} | {'README-SOURCE.md', 'SOURCE-MANIFEST.json'}, 'Source entry inventory mismatch')
         require(len(names) == len(source_manifest['files'])+2, 'Duplicate source inventory records')
+        tree = {}
+        for entry in git('ls-tree', '-r', '-z', revision).split('\0'):
+            if entry:
+                identity, path = entry.split('\t', 1)
+                mode, kind, blob = identity.split()
+                require(kind == 'blob', 'Submodules are not supported in release source')
+                tree['termlink/'+path] = blob
+        require({row['path'] for row in source_manifest['files'] if row['path'].startswith('termlink/')} == set(tree), 'Application source differs from selected Git tree')
         for row in source_manifest['files']:
             info = archive.getinfo(row['path'])
             require(info.file_size == row['size'] and info.file_size < 512*1024*1024, 'Invalid source file size')
             require((info.external_attr >> 16) & 0o170000 == 0o100000, 'Source entries must be regular files')
             content = archive.read(info)
             require(hashlib.sha256(content).hexdigest() == row['sha256'], f'Source content changed: {row["path"]}')
+            if row['path'] in tree:
+                blob = hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
+                require(blob == tree[row['path']], f'Application source is not from the selected commit: {row["path"]}')
         for row in lock['artifacts']:
             require(hashlib.sha256(archive.read('termlink/'+row['path'])).hexdigest() == row['sha256'], 'Archived native library differs from lock')
     return metadata
@@ -165,6 +176,7 @@ def stage(args, api):
     manifest = read_json(directory/'artifact-manifest.json')
     version, build, revision = manifest['version'], manifest['build_number'], manifest['source_revision']
     require(not git('status', '--porcelain'), 'Commit source and documentation before staging a release')
+    require(revision == git('rev-parse', 'HEAD'), 'Stage the clients from their exact build source checkout')
     names = expected_names(version, build)-{'SHA256SUMS'}
     checksum_text = ''.join(f'{sha256(directory/name)}  {name}\n' for name in sorted(names))
     (directory/'SHA256SUMS').write_text(checksum_text, encoding='utf-8')
@@ -249,8 +261,10 @@ def publish(args, api):
         matches = [asset for asset in remote if asset['name'] == row['name']]
         require(len(matches) == 1 and matches[0]['state'] == 'uploaded' and matches[0].get('digest') == 'sha256:'+row['sha256'], 'Remote asset changed during verification')
     if release['draft']:
-        release = api.request(f'/releases/{args.release_id}', 'PATCH', dict(draft=False, make_latest='true'))
-    require(not release['draft'] and not release['prerelease'], 'Release was not published')
+        release = api.request(f'/releases/{args.release_id}', 'PATCH', dict(draft=False, make_latest='true',
+            tag_name='v'+metadata['version'], target_commitish=args.revision))
+    require(not release['draft'] and not release['prerelease'] and release['tag_name'] == 'v'+metadata['version'] and
+            release['target_commitish'] == args.revision, 'Release was not published at the expected tag and source')
     print(json.dumps(dict(published=True, url=release['html_url'], version=metadata['version'], build_number=metadata['build_number'])))
 
 

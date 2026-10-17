@@ -27,6 +27,7 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 ## 下载与开始使用
 
 - Android / Windows：[GitHub Releases](https://github.com/myucxy/TermLink/releases)（APK、Setup、完整对应源码）或 [AppShip](https://appship.kget.cc:8910)，版本及签名说明见[发布记录索引](docs/releases/README.md)。
+- 0.3.6 / 136：[Android APK](https://appship.kget.cc:8910/api/v1/artifacts/ac7eef98-6151-4e1b-b633-7c2ef8ac621d/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/e1860848-5713-4b0f-8975-b0b94805960e/download) · [完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/17695a71-5155-4b90-89e9-0b6534e7d743/download)；[发布记录](docs/RELEASE_0.3.6_136.md)。
 - 服务端：[Docker Hub](https://hub.docker.com/r/myucxy/termlink)，部署方式见 [Server README](server/README.md)。
 - 首次使用：[快速开始](docs/guides/QUICK_START.md)。
 - 修改代码：[开发与构建](docs/development/BUILDING.md)及[贡献指南](CONTRIBUTING.md)。

@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,6 +15,30 @@ import github_release as release
 
 
 class ReleaseChecks(unittest.TestCase):
+    def test_publish_retains_identity_when_api_defaults_omitted_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            release.write_json(directory/'ci-verification.json', dict(verified=True,
+                source_revision='a'*40, version='0.3.6', build_number=136))
+            args = argparse.Namespace(directory=directory, revision='a'*40,
+                                      metadata_sha256='b'*64, release_id=12)
+            api = unittest.mock.Mock()
+            def request(path, method='GET', value=None):
+                if path.endswith('/assets?per_page=100'):
+                    return [dict(name='github-release.json', state='uploaded', digest='sha256:'+'b'*64)]
+                if method == 'PATCH':
+                    tag = value.get('tag_name', 'untagged')
+                    return dict(draft=False, prerelease=False, tag_name=tag,
+                        target_commitish=value.get('target_commitish', 'main'),
+                        html_url='https://github.com/example/repo/releases/tag/'+tag)
+                return dict(draft=True, tag_name='v0.3.6', target_commitish='a'*40)
+            api.request.side_effect = request
+            with patch.object(release, 'validate_bundle', return_value=dict(version='0.3.6', build_number=136, files=[])):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    release.publish(args, api)
+            self.assertTrue(json.loads(output.getvalue())['url'].endswith('/v0.3.6'))
+
     def test_release_filenames_reject_path_traversal_and_invalid_build(self):
         for version, build in [('../escape', 136), ('0.3.6', True), ('0.3.6', 65536)]:
             with self.assertRaises(ValueError):
@@ -80,7 +106,16 @@ class ReleaseChecks(unittest.TestCase):
                             size=(directory/name).stat().st_size, sha256=release.sha256(directory/name))
                             for name in sorted(release.expected_names('0.3.6', 136))])
             release.write_json(directory/'github-release.json', metadata)
-            with patch.object(release, 'ROOT', root), patch.object(release, 'git', return_value='a'*40):
+            def fixture_git(*arguments):
+                if arguments[0] == 'show':
+                    return (root/arguments[1].split(':', 1)[1]).read_text()
+                if arguments[0] == 'ls-tree':
+                    blob = hashlib.sha1(b'blob '+str(len(library)).encode()+b'\0'+library).hexdigest()
+                    return '100644 blob '+blob+'\tnative/library.dll\0'
+                if arguments == ('rev-parse', 'HEAD'):
+                    return 'f'*40
+                return 'a'*40
+            with patch.object(release, 'ROOT', root), patch.object(release, 'git', side_effect=fixture_git):
                 self.assertEqual(release.validate_bundle(directory, 'a'*40)['version'], '0.3.6')
                 digest = release.sha256(directory/'github-release.json')
                 with self.assertRaises(ValueError):

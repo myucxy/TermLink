@@ -1,5 +1,26 @@
 # TermLink 0.3.6 / 136
 
+## 2026-10-18 发布记录
+
+Android、Windows 与完整对应源码已发布到 AppShip stable，均已匿名下载并核对 SHA-256。
+两个客户端的 build 135 返回 `optional`，build 136 返回 `no_update`。
+
+| 制品 | 下载 | SHA-256 |
+| --- | --- | --- |
+| Android APK | [AppShip APK](https://appship.kget.cc:8910/api/v1/artifacts/ac7eef98-6151-4e1b-b633-7c2ef8ac621d/download) | `c0165b43c9de00451266d08ebf16186e6e83ba667ff30f5c76eaecd5511ddb0c` |
+| Windows x64 Setup | [AppShip Setup](https://appship.kget.cc:8910/api/v1/artifacts/e1860848-5713-4b0f-8975-b0b94805960e/download) | `bdca4ffd7355fc4ed93b20f9123dac05c0edcd6271256fe53722d05e54e70ad8` |
+| 完整对应源码 | [匿名源码下载](https://appship.kget.cc:8910/api/v1/artifacts/17695a71-5155-4b90-89e9-0b6534e7d743/download) | `68132b88ea4b3f1f871cf61ffac6b45c1e999071b152d1694e917487d9e49b74` |
+
+- 应用与 Git tag `v0.3.6`：`dfa727c3731e9f14bddc0c4f69ed98ddb44efecd`；core：`1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。
+- Android release：`2aea4156-d43f-41c6-9ef5-ff75b66eb2f3`；Windows release：`c14c0a35-4011-4b5c-b793-454abdf1eb70`；源码 release：`918b218f-f57c-4a1f-a0c7-1ec616b45b3a`。
+- Windows 保持原签名者，RFC3161 和 17 个自有载荷签名通过；APK 版本 0.3.6 / 136、唯一 signer 及 v2 签名通过。
+- GitHub 七个附件已上传并核对 digest，[发布管道](https://github.com/myucxy/TermLink/actions/runs/39061615352)正在进行独立验签，成功前仍保留 draft。
+- Docker CI 位于后续 main 提交 `46c8f8006b6573a4c5e6f3a75a1e75d43eb0f7b5`，[双架构构建与 amd64 运行检查通过](https://github.com/myucxy/TermLink/actions/runs/39059735168)。它不改变本批客户端来源，也不发布 Docker 镜像。
+
+下方为随客户端源码提交的初始发布说明；实际平台范围补充为 AppShip 与 GitHub，签名与来源保持同一批。
+
+## 初始发布说明
+
 本轮发布范围为 GitHub Release：Android APK、Windows x64 安装包和完整对应源码。
 版本依据已核验的 Android、Windows、Docker 0.3.5 / 135 继续递增，固定为 0.3.6 / 136。
 此文件是随源码提交的发布说明；实际发布成功以 GitHub Release 的 published 状态和管道结果为准。

@@ -34,6 +34,8 @@ python scripts/github_release.py stage `
 命令生成 `SHA256SUMS`、`github-release.json`，上传七个附件，再触发 `GitHub client release`。
 `github-release.json` 的 SHA-256、源码 commit 和 Release ID 固定到 dispatch 输入。
 Actions 仅在 `main` 上手动调度，串行发布；再查同提交的最新 CI 和 tag，全部校验通过才解除 draft。
+运行的是 dispatch 时固定的 main 管道代码；从 Git 对象读取所选发布 commit 的原生锁和签名策略。
+这样旧版本的校验或重试可以使用修复后的管道，不需要移动 tag、改写对应源码或重编译安装包。
 工作流自带 `GITHUB_TOKEN`，无需另存 GitHub PAT、Android keystore 或 Windows PFX。
 
 ## 重试和验证

@@ -55,6 +55,7 @@ function Invoke-NativeCapture {
         [Parameter(Mandatory)][string]$Description
     )
 
+    Write-Verbose $Description
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
@@ -668,6 +669,7 @@ if ($setupRecords.Count -eq 1) {
         'ExpectedWindowsSignerSha1 is required to verify a Windows Setup.'
     $setupPath = $resolvedArtifactPaths[[string]$setupRecords[0].path]
     $setupFile = Get-Item -LiteralPath $setupPath
+    Write-Verbose 'Checking Windows Setup Authenticode signature.'
     $setupSignature = Get-AuthenticodeSignature -LiteralPath $setupPath
     Assert-Release ($null -ne $setupSignature.SignerCertificate) 'Windows Setup has no Authenticode signer.'
     $signerSha1 = Assert-TermLinkWindowsSignatureEvidence -Status ([string]$setupSignature.Status) `
@@ -733,6 +735,7 @@ if ($setupRecords.Count -eq 1) {
                 $binaryPath = [IO.Path]::GetFullPath($binary.FullName)
                 Assert-Release ($binaryPath.StartsWith($payloadPrefix, [StringComparison]::OrdinalIgnoreCase)) `
                     'A TermLink-owned payload binary escaped the extraction root.'
+                Write-Verbose "Checking Windows payload signature: $($binary.Name)"
                 $binarySignature = Get-AuthenticodeSignature -LiteralPath $binaryPath
                 Assert-Release ($null -ne $binarySignature.SignerCertificate) `
                     "Windows Setup payload binary has no Authenticode signer: $($binary.Name)"
