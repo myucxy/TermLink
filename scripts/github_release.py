@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import time
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -221,7 +222,20 @@ def stage(args, api):
     inputs = dict(release_id=str(release['id']), revision=revision, metadata_sha256=sha256(directory/'github-release.json'))
     write_json(directory/'github-dispatch.json', inputs)
     api.request('/actions/workflows/github-release.yml/dispatches', 'POST', dict(ref='main', inputs=inputs))
-    print(json.dumps(dict(draft_release_id=release['id'], tag=tag, workflow_dispatched=True)))
+    print('Waiting for the pinned GitHub verification run.', flush=True)
+    deadline = time.monotonic()+1800
+    while time.monotonic() < deadline:
+        runs = api.request('/actions/workflows/github-release.yml/runs?event=workflow_dispatch&per_page=20')['workflow_runs']
+        matches = [run for run in runs if run['display_title'] == f'Verify release {release["id"]} {inputs["metadata_sha256"]}']
+        if matches and matches[0]['status'] == 'completed':
+            require(matches[0]['conclusion'] == 'success', 'GitHub verification failed; preserve the draft and retry after fixing the pipeline')
+            args.release_id, args.revision = release['id'], revision
+            args.metadata_sha256, args.verification_run = inputs['metadata_sha256'], matches[0]['id']
+            args.verify_only = False
+            publish(args, api)
+            return
+        time.sleep(10)
+    raise RuntimeError('GitHub verification is still pending; preserve the draft and use publish --verification-run after it succeeds')
 
 
 def receive(args, api):
@@ -247,9 +261,19 @@ def receive(args, api):
 
 def publish(args, api):
     metadata = validate_bundle(args.directory.resolve(), args.revision, args.metadata_sha256)
-    evidence = read_json(args.directory/'ci-verification.json')
-    require(evidence['verified'] is True and evidence['source_revision'] == args.revision and
-            evidence['version'] == metadata['version'] and evidence['build_number'] == metadata['build_number'], 'Native signature verification has not passed')
+    if args.verify_only:
+        evidence = read_json(args.directory/'ci-verification.json')
+        require(evidence['verified'] is True and evidence['source_revision'] == args.revision and
+                evidence['version'] == metadata['version'] and evidence['build_number'] == metadata['build_number'], 'Native signature verification has not passed')
+        print(json.dumps(dict(native_signatures_verified=True, release_id=args.release_id,
+                              revision=args.revision, metadata_sha256=args.metadata_sha256)))
+        return
+    require(args.verification_run, 'A successful GitHub verification run is required before publication')
+    run = api.request(f'/actions/runs/{args.verification_run}')
+    require(run['status'] == 'completed' and run['conclusion'] == 'success' and
+            run['path'] == '.github/workflows/github-release.yml' and run['event'] == 'workflow_dispatch' and
+            run['head_branch'] == 'main' and
+            run['display_title'] == f'Verify release {args.release_id} {args.metadata_sha256}', 'Verification run does not approve this exact release metadata')
     api.require_checks(args.revision)
     api.require_tag('v'+metadata['version'], args.revision)
     release = api.request(f'/releases/{args.release_id}')
@@ -277,6 +301,8 @@ def main():
     parser.add_argument('--release-id', type=int)
     parser.add_argument('--revision')
     parser.add_argument('--metadata-sha256')
+    parser.add_argument('--verify-only', action='store_true')
+    parser.add_argument('--verification-run', type=int)
     args = parser.parse_args()
     if args.phase == 'stage':
         require(args.notes and args.notes.is_file(), 'Release notes file is required')

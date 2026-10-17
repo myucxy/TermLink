@@ -21,9 +21,12 @@ class ReleaseChecks(unittest.TestCase):
             release.write_json(directory/'ci-verification.json', dict(verified=True,
                 source_revision='a'*40, version='0.3.6', build_number=136))
             args = argparse.Namespace(directory=directory, revision='a'*40,
-                                      metadata_sha256='b'*64, release_id=12)
+                                      metadata_sha256='b'*64, release_id=12, verify_only=False, verification_run=34)
             api = unittest.mock.Mock()
             def request(path, method='GET', value=None):
+                if path == '/actions/runs/34':
+                    return dict(status='completed', conclusion='success', path='.github/workflows/github-release.yml',
+                        event='workflow_dispatch', head_branch='main', display_title='Verify release 12 '+'b'*64)
                 if path.endswith('/assets?per_page=100'):
                     return [dict(name='github-release.json', state='uploaded', digest='sha256:'+'b'*64)]
                 if method == 'PATCH':
@@ -38,6 +41,14 @@ class ReleaseChecks(unittest.TestCase):
                 with redirect_stdout(output):
                     release.publish(args, api)
             self.assertTrue(json.loads(output.getvalue())['url'].endswith('/v0.3.6'))
+            api.request.reset_mock()
+            api.request.side_effect = lambda *args, **kwargs: dict(status='completed', conclusion='success',
+                path='.github/workflows/github-release.yml', event='workflow_dispatch', head_branch='main',
+                display_title='Verify release 12 '+'c'*64)
+            with patch.object(release, 'validate_bundle', return_value=dict(version='0.3.6', build_number=136, files=[])):
+                with self.assertRaises(ValueError):
+                    release.publish(args, api)
+            self.assertEqual(api.request.call_count, 1)
 
     def test_release_filenames_reject_path_traversal_and_invalid_build(self):
         for version, build in [('../escape', 136), ('0.3.6', True), ('0.3.6', 65536)]:
@@ -49,7 +60,7 @@ class ReleaseChecks(unittest.TestCase):
             directory = Path(root)
             (directory/'ci-verification.json').write_text(json.dumps(dict(verified=False)))
             api = unittest.mock.Mock()
-            args = argparse.Namespace(directory=directory, revision='a'*40, metadata_sha256='b'*64)
+            args = argparse.Namespace(directory=directory, revision='a'*40, metadata_sha256='b'*64, verify_only=True)
             with patch.object(release, 'validate_bundle', return_value=dict(version='0.3.6', build_number=136)):
                 with self.assertRaises(ValueError):
                     release.publish(args, api)

@@ -1,4 +1,5 @@
 name: GitHub client release
+run-name: Verify release ${{ inputs.release_id }} ${{ inputs.metadata_sha256 }}
 
 on:
   workflow_dispatch:
@@ -17,7 +18,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 concurrency:
@@ -77,8 +78,8 @@ jobs:
             -ExpectedAndroidSignerSha256 $policy.android_signer_sha256 `
             -ExpectedWindowsSignerSha1 $policy.windows_signer_sha1 -RequireWindowsTimestamp -Verbose
           $result | Set-Content -LiteralPath "$incoming/ci-verification.json" -Encoding utf8
-      - name: Publish only the verified draft
+      - name: Record successful verification of the exact draft
         shell: pwsh
         run: |
-          python scripts/github_release.py publish --directory artifacts/github-incoming --release-id $env:RELEASE_ID --revision $env:RELEASE_REVISION --metadata-sha256 $env:METADATA_SHA256
-          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
+          python scripts/github_release.py publish --verify-only --directory artifacts/github-incoming --release-id $env:RELEASE_ID --revision $env:RELEASE_REVISION --metadata-sha256 $env:METADATA_SHA256
+          if ($LASTEXITCODE -ne 0) { throw 'Release verification failed.' }

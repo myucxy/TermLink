@@ -93,7 +93,7 @@ Project names and product marks do not imply endorsement. This overview is not a
 [Contributing](CONTRIBUTING.md) · [Security reports](SECURITY.md) · [Open-source readiness](docs/development/OPEN_SOURCE_READINESS.md)
 
 GitHub checks documentation, committed-source secrets, Server/Web tests and source packaging. The separate
-[client release pipeline](docs/development/GITHUB_RELEASE.md) verifies locally signed clients before publication;
+[client release pipeline](docs/development/GITHUB_RELEASE.md) verifies locally signed clients before the local command publishes them;
 signing keys stay local. AppShip remains available; Docker is built locally and pushed to Docker Hub.
 Separate Docker CI checks both image architectures and amd64 startup, database migrations, readiness and restart without pushing images.
 Follow the [release runbook](docs/RELEASE_RUNBOOK.md) for signatures, source identity, tests and rollback.
