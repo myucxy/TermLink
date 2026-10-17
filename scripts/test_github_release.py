@@ -15,6 +15,44 @@ import github_release as release
 
 
 class ReleaseChecks(unittest.TestCase):
+    def test_stage_waits_for_new_run_instead_of_reusing_failed_history(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            for name in release.expected_names('0.3.7', 137):
+                (directory/name).write_bytes(b'fixture')
+            release.write_json(directory/'artifact-manifest.json', dict(version='0.3.7', build_number=137,
+                source_revision='a'*40, core_revision='e'*40))
+            notes = directory/'notes.md'
+            notes.write_text('fixture release notes')
+            args = argparse.Namespace(directory=directory, notes=notes)
+            api = unittest.mock.Mock()
+            polls = 0
+            def request(path, method='GET', value=None):
+                nonlocal polls
+                if path.startswith('/actions/workflows/github-release.yml/runs?'):
+                    polls += 1
+                    title = 'Verify release 12 '+release.sha256(directory/'github-release.json')
+                    old = dict(id=17, display_title=title, status='completed', conclusion='failure')
+                    if polls < 3:
+                        return dict(workflow_runs=[old])
+                    return dict(workflow_runs=[dict(id=18, display_title=title, status='completed', conclusion='success'), old])
+                if path == '/releases?per_page=100':
+                    return [dict(id=12, tag_name='v0.3.7', target_commitish='a'*40, draft=True, body=notes.read_text())]
+                if path == '/releases/12/assets?per_page=100':
+                    return [dict(name=name, size=(directory/name).stat().st_size, digest='sha256:'+release.sha256(directory/name))
+                            for name in release.expected_names('0.3.7', 137) | {'github-release.json'}]
+                if path.endswith('/dispatches'):
+                    return None
+                self.fail('Unexpected API operation: '+path)
+            api.request.side_effect = request
+            with patch.object(release, 'git', side_effect=lambda *args: '' if args[0] == 'status' else 'a'*40), \
+                    patch.object(release, 'validate_bundle'), patch.object(release.time, 'sleep') as sleep, \
+                    patch.object(release, 'publish') as publish, redirect_stdout(io.StringIO()):
+                release.stage(args, api)
+            sleep.assert_called_once_with(10)
+            self.assertEqual(args.verification_run, 18)
+            publish.assert_called_once_with(args, api)
+
     def test_publish_retains_identity_when_api_defaults_omitted_fields(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
