@@ -2,7 +2,7 @@
   "bridgeVersion": 1,
   "sources": {
     "index.html": "e570c263f990ac8d2ecae9296e8a57e5321731288428b1922b2e1b20f66f115a",
-    "package-lock.json": "1474d0894fafa9715b98b9dc77cc9d9fcd645bc8b2a71060b18c1b3ef49b525e",
+    "package-lock.json": "5c1d59cc801f4d3c19795e7d3de857055b33f0deb41eaff9832146772a17ca4a",
     "package.json": "533e0e9750162fdb656b532738867507dbef4b56f14d462acd4ebe2bb3ecca3c",
     "scripts/assets.mjs": "447d5203bc011bccc3f9c5320e9fe369ec9df4a6d0a386a398c1217bbec81e6e",
     "src/CodeBlock.tsx": "2f640cb3242900b222c31d36abba754c7fb1a28db244bdb143f4c6af6384378b",

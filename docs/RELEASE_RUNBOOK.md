@@ -6,7 +6,7 @@
 ## 当前 Docker 发布入口（2026-10-04）
 
 按用户最新指定，本机编译后直接 push 到 `docker.io/myucxy/termlink`，不使用 GitHub Actions。
-历史工作流保留为手动入口，Git tag 不再自动触发镜像发布。下文 GitHub keyless 工作流步骤只作历史参考。
+旧 Docker 发布工作流已从当前树移除，GitHub Actions 只运行源码与测试检查。
 本机发布仍固定已提交 revision 和版本/build，保留 BuildKit provenance/SBOM，逐项检查 amd64/arm64、
 版本镜像 digest、源码标签和健康；版本镜像核验后再同步同 digest 的 latest。凭据使用现有 Docker credential helper。
 本机没有 GitHub OIDC 身份，不能声称本地镜像通过 GitHub keyless 签名；本地签名资料未就绪时先完成
@@ -120,7 +120,7 @@ core 仓库后续公开与本次许可变更分开执行。匹配的源码交付
 | Android APK/AAB | `D:\Dev\Env\Android\keystores\nuanya-release.jks`，alias `nuanya-release`；Credential Manager `TermLink-Android-Keystore`；SHA-256 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b` | 用既有 keystore 和 SecureString；APK 至少 v2、唯一 signer；AAB 校验同一批准指纹。禁止生成新签名密钥或卸载旧 App 规避签名不兼容。 |
 | Windows Setup | `win-agent/secrets/TermLink.Development.CodeSigning.pfx`（本机 Git ignored）或同一证书的 `Cert:\CurrentUser\My` 私钥；SHA-1 `91AE60BC06D866628B8EB2C62F32BDE9DAB56466` | 二选一：PFX+SecureString 或 `-WindowsCertificateThumbprint`；RFC 3161 `http://timestamp.acs.microsoft.com` 须显式 `-AllowHttpWindowsTimestamp`，并验证时间戳。当前是自签名开发证书，只能声明现有更新连续性，不能声称公开 CA 信任；公开 GA 换证须先设计旧客户端信任迁移。 |
 | AppShip | 受保护的 Credential Manager Generic 项 `TermLink-AppShip-release-manager`，地址 `https://appship.kget.cc:8910` | 运行时在内存构造 `PSCredential`，以实际凭据中的用户名/角色为准；不要把凭据 blob、口令放进脚本或输出。 |
-| Docker Hub/Cosign | 本机 Docker credential helper；本地镜像签名密钥及保护口令（若已配置） | 本机直接 push Hub；不读取/打印 Docker 凭据，不使用 GitHub OIDC 冒充本机身份；缺少签名资料时记录门禁未完成。历史 Actions secret 只适用于存档工作流。 |
+| Docker Hub/Cosign | 本机 Docker credential helper；本地镜像签名密钥及保护口令 | 本机直接 push Hub；不读取/打印 Docker 凭据，不使用 GitHub OIDC 冒充本机身份；缺少签名资料时记录门禁未完成。 |
 | 公网 HTTPS | 宿主机/云端外部反向代理管理的域名证书及私钥 | 核对证书链、域名、有效期和自动续期；TLS 私钥不打进 APK、Setup、Docker 镜像或仓库，保留 Host、`X-Forwarded-Proto: https`、WebSocket Upgrade。 |
 | 服务端备份 | 独立 age identity 的 public recipient `age1...` | 只把 recipient 配给 Server；私钥异机离线保管，升级前生成备份并演练恢复，不能复用发布签名或 TLS 私钥。 |
 
@@ -187,8 +187,8 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 - 不通过卸载 Android App 解决签名不一致，否则会删除登录、设备身份和 Android Keystore 数据。
 - 不使用旧 `Start-ProductionAcceptance.ps1` 或它的 `-Reset` 路径做版本升级；当前
   `termlink-deploy` 不暴露 reset，禁止用 `docker compose down --volumes` 自行模拟。
-- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。`.github/workflows/release.yml`
-  先发布版本镜像，通过签名与证明校验后再把相同 digest 同步到 `latest`；构建阶段的
+- 不移动已经发布的 Git tag，不用同一版本号覆盖另一个提交。本机先发布版本镜像，
+  通过签名与证明校验后再把相同 digest 同步到 `latest`；构建阶段的
   `latest=false` 只用于防止提前更新别名。生产/共享部署仍引用 `TAG@sha256:DIGEST`。
 - 密码、Token、PFX/keystore 密码只能从 Credential Manager、`SecureString` 或受保护的进程环境读取，
   不进入命令参数、日志、manifest 或文档。
@@ -213,8 +213,7 @@ AppShip 当前支持 beta/stable 原子频道指针和服务端回滚，但已�
 
 Production APK 必须来自统一 manifest，并由连续性证书签名。发布前至少确认：
 
-本机验证固定使用 `D:\Dev\Env\gradle\gradle-8.13-clean\bin\gradle.bat`，并把
-`GRADLE_USER_HOME` 指向 `D:\Dev\Env\gradle\user-home`。不要使用
+使用项目 `android/gradlew.bat`，由锁定 SHA-256 的 Wrapper 选择 Gradle 8.13。不要直接使用
 `D:\Dev\Env\gradle\gradle-8.13`：该目录的全局 `init.d` 会注入不安全的 HTTP `Bstek` 仓库，Gradle 会在
 依赖解析前拒绝构建。所需进程环境为：
 
@@ -222,8 +221,7 @@ Production APK 必须来自统一 manifest，并由连续性证书签名。发�
 $env:JAVA_HOME = 'D:\Dev\Env\Jdk\jdk-21'
 $env:ANDROID_HOME = 'D:\Dev\Env\Android\Sdk'
 $env:ANDROID_SDK_ROOT = 'D:\Dev\Env\Android\Sdk'
-$env:GRADLE_USER_HOME = 'D:\Dev\Env\gradle\user-home'
-$gradle = 'D:\Dev\Env\gradle\gradle-8.13-clean\bin\gradle.bat'
+$gradle = (Resolve-Path '.\android\gradlew.bat').Path
 ```
 
 ```powershell
@@ -353,13 +351,13 @@ GET /api/v1/apps/termlink-win64/updates?platform=windows&arch=x64&channel=stable
 
 上一 build 应返回 `status=optional` 和当前 version/build；当前 build 应返回 `status=no_update`。
 
-## 6. Docker Hub 历史 GitHub 路径（当前不使用）
+## 6. Docker Hub 本机发布与标签核验
 
-以下为历史流程；当前使用页首规定的本机编译直推。`.github/workflows/release.yml` 登录 `docker.io/myucxy/termlink`，发布 amd64/arm64，生成
-BuildKit provenance、SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 签名 digest 与三类 attestation。
-校验通过后自动更新 Docker Hub `latest`，并复核其 digest 与版本镜像一致；发布任务串行执行。
-`latest` 是可更新别名，版本标签保持不可变。重跑旧版本任务也会更新 `latest`，因此不要通过
-重跑旧 tag 回滚；回滚部署应指定历史版本的不可变 digest。
+按页首规则从已提交源码本机构建并推送 `docker.io/myucxy/termlink`，固定 amd64/arm64、
+版本/build 和 OCI revision，保留 BuildKit provenance 与 SBOM。使用现有 Cosign 密钥对精确
+digest 签名，并用发布公钥独立验证；[0.3.5 记录](RELEASE_0.3.5_135.md)提供已使用的公钥与证据。
+其他证明是否生成、是否签名需分别记录，不能由镜像签名推断全部证明已签名。
+`latest` 是可更新别名，版本标签保持不可变；回滚部署指定历史版本的不可变 digest。
 
 仅同步现有已发布版本到 `latest` 时，无需重新编译或修改版本标签。先检查源 manifest 的
 digest、架构与 OCI revision，再使用 `docker buildx imagetools create --prefer-index=false`
@@ -367,11 +365,10 @@ digest、架构与 OCI revision，再使用 `docker buildx imagetools create --p
 最后复核两标签摘要相同。此操作保留源镜像原有架构与签名状态，不会补齐缺失的架构或证明；
 必须在发布记录中注明现有制品的限制。不要用单架构本地 `docker tag/push` 覆盖多架构索引。
 
-推 tag 前先确认仓库 Actions secrets 中 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 可用。若 workflow 在
-`docker/login-action` 失败，后续 build/sign/attest 都没有发生；不要移动 tag、不要重复创建同版本 tag，
-先修复 secrets。源码仓库无法通过代码变更恢复一个缺失或过期的 GitHub secret。
+推送前只读确认本机 Docker credential helper 的登录状态。认证失败时先修复凭据或网络，
+保留相同版本和源码 revision 重试，不移动已发布 tag，也不打印 helper 返回值。
 
-## 7. Docker Hub DNS 受限网络降级路径
+## 7. Docker Hub DNS 受限网络排查
 
 2026-08-25 现场确认经典 DNS 把 `auth.docker.io` 解析到 `31.13.*`、`173.252.*`、`199.59.*` 等无关网段，
 导致 buildx 在 token 请求处等待约 42 秒后失败。DoH 对照返回 Cloudflare CDN 地址。判断方法：
@@ -386,7 +383,7 @@ Invoke-RestMethod `
 不要连续重跑普通 buildx，也不要只关闭 SBOM：认证 token 和最终 push 同样会失败。不要未经授权修改
 Windows hosts、系统 DNS 或 Docker Desktop 全局代理。
 
-已验证的无系统改动降级方案是一次性官方 BuildKit 容器：
+已验证的无系统改动方案是一次性官方 BuildKit 容器：
 
 1. 固定本机已有 `moby/buildkit:buildx-stable-1` 的精确 digest。
 2. 容器使用唯一名称和 `dev.termlink.release-temp=true` label；仓库以只读 bind mount 提供。
@@ -401,8 +398,8 @@ Windows hosts、系统 DNS 或 Docker Desktop 全局代理。
 6. 从 `--metadata-file` 读取 index digest；在 `finally` 中先检查 ownership label，再删除精确容器。容器删除后
    tmpfs 凭据随之消失。
 
-该路径保留 BuildKit SLSA provenance 与 SPDX SBOM，但没有 GitHub OIDC/Cosign keyless signature，也不自动
-生成独立 CycloneDX attestation。最终报告必须明确为“降级发布”，不能写成与首选 workflow 等价。
+该构建路径保留 BuildKit SLSA provenance 与 SPDX SBOM，不自动生成独立 CycloneDX attestation。
+构建完成后仍须执行上一节的本地 Cosign 签名和独立验证；缺失的签名或证明逐项如实记录。
 
 远端验证不能只看标签存在。用 registry API 或 `docker buildx imagetools inspect` 确认：
 

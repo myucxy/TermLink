@@ -35,6 +35,8 @@
 
 ## 提交前的公开内容检查
 
+以下脚本需要 Python ≥ 3.10；本机旧版 `python` 入口不满足时，显式选择已安装的解释器。
+
 ```powershell
 python scripts/check_public_docs.py --self-test
 python scripts/check_secrets.py --self-test --gitleaks <已有的Gitleaks可执行文件>

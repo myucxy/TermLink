@@ -1,7 +1,7 @@
 # 统一发布构建
 
 2026-10-04 当前 Docker 发布方式：用户指定本机编译后直接 push Docker Hub，不走 GitHub Actions；
-历史 tag 工作流已改为手动入口。镜像版本、源码 revision、架构、digest 和签名/证明证据仍须核验，
+旧 Docker 发布工作流已移除，GitHub Actions 只运行源码与测试检查。镜像版本、源码 revision、架构、digest 和签名/证明证据仍须核验，
 不把 BuildKit 生成的未签名 SBOM/provenance 宣称为 Cosign 已验证。详见运行手册的当前 Docker 发布入口。
 
 仓库根入口为 `scripts/Build-Release.ps1`。它只编排已有的组件构建器并把产物集中到
@@ -142,13 +142,9 @@ Server 使用 `docker buildx build --output type=oci,dest=...` 生成本地多�
 本地验证器按镜像层的覆盖/删除顺序查找 `/termlink-server`，不能假定程序在最后一层，
 因为许可证等后续 `COPY` 会生成新层。双仓库拆分后的实际入包核验见[打包验证记录](development/PACKAGING_SPLIT_VALIDATION.md)。
 
-以下为历史 Server registry 工作流说明，当前按页首规则本机直推；`.github/workflows/release.yml` 已取消 tag 自动触发。
-历史工作流曾在严格的 `vX.Y.Z` tag 上执行，
-目标固定为 `docker.io/myucxy/termlink`。工作流使用受保护的 `DOCKERHUB_USERNAME` 与
-`DOCKERHUB_TOKEN` secrets 登录 Docker Hub，构建 `linux/amd64`/`linux/arm64` manifest，生成
-BuildKit provenance 和 SPDX/CycloneDX SBOM，并通过 GitHub OIDC/Cosign 对 immutable digest
-及三类 attestation 签名和就地复核。校验通过后，将同一 digest 同步到 `latest` 标签并复核；
-发布任务串行执行，版本标签保持不可变。部署仍使用明确的版本及 digest。
+Docker Hub 发布、网络故障恢复、本地 Cosign 签名和 `latest` 同步统一遵循
+[运行手册](RELEASE_RUNBOOK.md#6-docker-hub-本机发布与标签核验)。构建、镜像签名和各类证明
+分别核验；不能将 BuildKit 输出或普通 Git tag 当成 GitHub OIDC 签名。部署使用明确版本和不可变 digest。
 
 ## AppShip Production 包装门禁
 

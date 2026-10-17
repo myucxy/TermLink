@@ -88,7 +88,8 @@ def collect(go):
         version = re.search(r'(?m)^version = "([^"]+)"', package)
         checksum = re.search(r'(?m)^checksum = "([^"]+)"', package)
         if name and version and checksum:
-            rust[name[1]] = dict(version=version[1], checksum=checksum[1])
+            rust[f'{name[1]}@{version[1]}'] = dict(version=version[1], checksum=checksum[1])
+    assert len(rust) == len(re.findall(r'(?m)^checksum = ', lock_text)), 'Every locked registry crate must be recorded, including multiple versions'
     data = dict(schema_version=1,
                 scope='Go linked modules and copied notices; locked AI Web runtime packages; declared Android/.NET dependencies; network-core Rust lock. Declaration inventories are not a completed transitive license audit.',
                 inputs={p: digest((ROOT/p).read_bytes()) for p in

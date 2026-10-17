@@ -8,7 +8,8 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY_POINTS = [
     'README.md', 'README.en.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE-STATUS.md',
-    'docs/README.md', 'docs/architecture/CURRENT.md', 'docs/guides/QUICK_START.md',
+    'docs/README.md', 'docs/RELEASE.md', 'docs/RELEASE_RUNBOOK.md',
+    'docs/architecture/CURRENT.md', 'docs/guides/QUICK_START.md',
     'docs/development/BUILDING.md', 'docs/development/REPOSITORY_LAYOUT.md',
     'docs/development/OPEN_SOURCE_READINESS.md', 'docs/releases/README.md',
     'docs/archive/README.md', 'docs/media/README.md',

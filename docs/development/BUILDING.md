@@ -1,6 +1,6 @@
 # 开发、构建与测试
 
-本文依据 2026-10-05 仓库配置整理，面向 Windows 开发环境。它给出源码构建入口，不代表本轮已在干净机器上完成全量构建。产品使用见[快速开始](../guides/QUICK_START.md)，正式制品按[发布运行手册](../RELEASE_RUNBOOK.md)和[发布构建规则](../RELEASE.md)执行。
+本文依据 2026-10-18 仓库配置整理，面向 Windows 开发环境。独立检出验证与缓存使用情况见[开源准备记录](OPEN_SOURCE_READINESS.md#本轮验证记录)，不把本机新目录构建描述为全新机器验证。产品使用见[快速开始](../guides/QUICK_START.md)，正式制品按[发布运行手册](../RELEASE_RUNBOOK.md)和[发布构建规则](../RELEASE.md)执行。
 
 ## 工具与环境
 
@@ -12,6 +12,7 @@
 | Go | `server/go.mod` 声明 Go 1.26 |
 | Rust | 应用的 `network-core/` 固定 `1.97.1`；终端 DLL/SO 已预编译 |
 | Node.js/npm | Vite 锁定依赖要求 Node.js `^20.19.0 \|\| >=22.12.0`，选择满足条件的现有 LTS |
+| Python | 检查与依赖清单脚本使用 Python ≥ 3.10；CI 使用 3.12 |
 | JDK | 本指南使用 JDK 21；Android Java/Kotlin 字节码目标为 17 |
 | Android SDK | compile/target SDK 36、min SDK 26，NDK `27.0.12077973` |
 | Gradle/插件 | Wrapper 8.13（附 SHA 校验）、AGP 8.11.1、Kotlin 2.1.21，以仓库配置为准 |
@@ -141,6 +142,11 @@ Android 的 Cargo 配置应指向实际 1.97.1 工具链；CMake 会从同目录
 
 AI Web 资源准备好后，在仓库根目录执行：
 
+Windows 检出路径应尽量短：原生网络模块的 Cargo/链接器会生成很深的目录，超过传统 260 字符
+限制时可能报 `LNK1104`。先缩短检出路径，不为构建自动修改系统长路径策略。
+使用下面的项目 Wrapper；工作站全局 Gradle 安装可能含有注入旧 HTTP 镜像的 `init.d`，
+若仍出现该错误，再检查 `GRADLE_USER_HOME/init.d` 和显式指定的初始化脚本。
+
 ```powershell
 Push-Location android
 .\gradlew.bat --version
@@ -184,6 +190,6 @@ Rust 核心在同级独立仓库中测试，采用 GPLv3、计划后续公开，
 
 ## 构建限制与对外发布
 
-当前尚未在新的干净环境中验证本文全部步骤。已知可移植性问题、许可审计和 CI 缺口见[开源准备清单](OPEN_SOURCE_READINESS.md)。
+独立检出与现有缓存的验证不覆盖全新机器的全部工具安装。已知可移植性问题与许可审核边界见[开源准备清单](OPEN_SOURCE_READINESS.md)。
 
 普通贡献不需要上传 AppShip、Docker Hub 或接触正式签名私钥。完整发布须另行固定源码 revision、版本/build、签名者、测试及回滚证据，并提供 GPLv3 要求的对应源码和构建资料；所有平台的运行手册门禁仍适用。应用可以不检出 core 而构建，不代表对外分发时可以省略 core 的对应源码。
