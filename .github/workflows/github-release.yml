@@ -57,14 +57,18 @@ jobs:
           $policy = Get-Content release/github-release-policy.json -Raw | ConvertFrom-Json
           $batch = Join-Path $env:GITHUB_WORKSPACE "artifacts/release/$($manifest.version)-$($manifest.build_number)"
           New-Item -ItemType Directory -Path $batch -Force | Out-Null
+          Write-Host 'Preparing the verified release files.'
           Copy-Item "$incoming/*" -Destination $batch
           $setup = Get-ChildItem $batch -Filter '*.exe'
-          $signature = Get-AuthenticodeSignature -LiteralPath $setup.FullName
-          if ($signature.SignerCertificate.Thumbprint -ine $policy.windows_signer_sha1) { throw 'Unexpected Windows signer.' }
+          Write-Host 'Extracting the publisher certificate without an online trust check.'
+          $publisher = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($setup.FullName))
+          if ($publisher.Thumbprint -ine $policy.windows_signer_sha1) { throw 'Unexpected Windows signer.' }
           # Trust only the pinned public certificate inside this disposable runner.
           $certificate = Join-Path $env:RUNNER_TEMP 'termlink-publisher.cer'
-          Export-Certificate -Cert $signature.SignerCertificate -FilePath $certificate | Out-Null
+          Export-Certificate -Cert $publisher -FilePath $certificate | Out-Null
           Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Write-Host 'Verifying native signatures and timestamp with the pinned publisher trusted.'
           $result = ./release/Verify-LocalRelease.ps1 -ReleaseDirectory $batch -RequireSourceIdentity `
             -AndroidSdkPath $env:ANDROID_HOME -ExpectedReleaseMode Production `
             -ExpectedAndroidSignerSha256 $policy.android_signer_sha256 `
