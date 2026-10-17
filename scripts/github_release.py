@@ -221,12 +221,14 @@ def stage(args, api):
         print('Uploaded '+name, flush=True)
     inputs = dict(release_id=str(release['id']), revision=revision, metadata_sha256=sha256(directory/'github-release.json'))
     write_json(directory/'github-dispatch.json', inputs)
+    previous_runs = {run['id'] for run in api.request('/actions/workflows/github-release.yml/runs?event=workflow_dispatch&per_page=20')['workflow_runs']}
     api.request('/actions/workflows/github-release.yml/dispatches', 'POST', dict(ref='main', inputs=inputs))
     print('Waiting for the pinned GitHub verification run.', flush=True)
     deadline = time.monotonic()+1800
     while time.monotonic() < deadline:
         runs = api.request('/actions/workflows/github-release.yml/runs?event=workflow_dispatch&per_page=20')['workflow_runs']
-        matches = [run for run in runs if run['display_title'] == f'Verify release {release["id"]} {inputs["metadata_sha256"]}']
+        matches = [run for run in runs if run['id'] not in previous_runs and
+                   run['display_title'] == f'Verify release {release["id"]} {inputs["metadata_sha256"]}']
         if matches and matches[0]['status'] == 'completed':
             require(matches[0]['conclusion'] == 'success', 'GitHub verification failed; preserve the draft and retry after fixing the pipeline')
             args.release_id, args.revision = release['id'], revision
