@@ -39,6 +39,7 @@ function New-Fixture {
     Write-Utf8 (Join-Path $core 'NOTICE') 'TermLink core fixture notice.\n'
     Write-Utf8 (Join-Path $core 'scripts/Build-ToTermLink.ps1') '# fixture build script\n'
     Write-Utf8 (Join-Path $core 'Cargo.toml') '[workspace]\nmembers = []\n'
+    Write-Utf8 (Join-Path $core '.cargo/config.toml') "[target.'cfg(all(target_os = `"windows`", target_env = `"msvc`"))']`nrustflags = [`"-C`", `"target-feature=+crt-static`"]`n"
     Write-Utf8 (Join-Path $core 'src/core.rs') 'pub fn fixture() {}\n'
     Invoke-Git -Repository $core -Arguments @('add', '--all')
     Invoke-Git -Repository $core -Arguments @('update-index', '--chmod=+x', 'scripts/Build-ToTermLink.ps1')
@@ -178,6 +179,60 @@ try {
     }
     finally { $zip.Dispose() }
     Write-Host 'PASS clean archive bytes, layout, sidecar hash, and mode'
+
+    # Subsequent documentation commits must not change a past binary's source identity.
+    Write-Utf8 (Join-Path $fixture.Core 'later-documentation.md') '# later core documentation'
+    Invoke-Git -Repository $fixture.Core -Arguments @('add','--all')
+    Invoke-Git -Repository $fixture.Core -Arguments @('commit','--quiet','-m','later core docs')
+    Write-Utf8 (Join-Path $fixture.Application 'later-documentation.md') '# later application documentation'
+    Invoke-Git -Repository $fixture.Application -Arguments @('add','--all')
+    Invoke-Git -Repository $fixture.Application -Arguments @('commit','--quiet','-m','later app docs')
+    $pinned=@{};foreach($key in $archiveArguments.Keys){$pinned[$key]=$archiveArguments[$key]}
+    $pinned.ApplicationRevision=$fixture.ApplicationRevision
+    $pinned.CoreRevision=$fixture.CoreRevision
+    $pinned.OutputPath=Join-Path $root 'pinned-old-release.zip'
+    & $script:NewScript @pinned | Out-Null
+    $pinnedZip=[IO.Compression.ZipFile]::OpenRead($pinned.OutputPath)
+    try {
+        Assert-Condition ($null -eq $pinnedZip.GetEntry('termlink/later-documentation.md') -and
+            $null -eq $pinnedZip.GetEntry('terminal-core/later-documentation.md')) 'Pinned archive included later checkout files.'
+        $r=[IO.StreamReader]::new($pinnedZip.GetEntry('SOURCE-MANIFEST.json').Open())
+        try{$pinnedManifest=$r.ReadToEnd()|ConvertFrom-Json}finally{$r.Dispose()}
+        Assert-Condition ($pinnedManifest.application_revision -ceq $fixture.ApplicationRevision -and
+            $pinnedManifest.core_revision -ceq $fixture.CoreRevision) 'Pinned archive provenance changed.'
+    } finally { $pinnedZip.Dispose() }
+    $pinned.CoreRevision='f'*40
+    $pinned.OutputPath=Join-Path $root 'missing-revision.zip'
+    Invoke-ArchiveExpectFailure -Arguments $pinned -Name 'unknown pinned commit'
+    Invoke-Git -Repository $fixture.Application -Arguments @('reset','--hard','--quiet','HEAD~1')
+    Invoke-Git -Repository $fixture.Core -Arguments @('reset','--hard','--quiet','HEAD~1')
+    Write-Host 'PASS pinned application/core revisions are independent of later HEADs'
+
+    $mockCargo=Join-Path $root 'mock-cargo.ps1'
+    Write-Utf8 $mockCargo @'
+param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Remaining)
+$destination=$Remaining[-1]
+New-Item -ItemType Directory -Path (Join-Path $destination 'fixture-1.0.0') -Force|Out-Null
+[IO.File]::WriteAllText((Join-Path $destination 'fixture-1.0.0/LICENSE'),'MIT fixture notice.')
+Write-Output '[source.crates-io]'
+Write-Output 'replace-with = "vendored-sources"'
+Write-Output '[source.vendored-sources]'
+Write-Output ('directory = "'+$destination.Replace('\','/')+'"')
+$global:LASTEXITCODE=0
+'@
+    $vendorArgs=@{};foreach($key in $archiveArguments.Keys){$vendorArgs[$key]=$archiveArguments[$key]}
+    $vendorArgs.IncludeCoreVendor=$true;$vendorArgs.CargoPath=$mockCargo
+    $vendorArgs.OutputPath=Join-Path $root 'vendored-source.zip'
+    & $script:NewScript @vendorArgs | Out-Null
+    $vendorZip=[IO.Compression.ZipFile]::OpenRead($vendorArgs.OutputPath)
+    try {
+        Assert-Condition ($null -ne $vendorZip.GetEntry('terminal-core/vendor/fixture-1.0.0/LICENSE')) 'Vendored source notice missing.'
+        $r=[IO.StreamReader]::new($vendorZip.GetEntry('terminal-core/.cargo/config.toml').Open())
+        try{$config=$r.ReadToEnd()}finally{$r.Dispose()}
+        Assert-Condition ($config.Contains('+crt-static') -and $config.Contains('directory = "vendor"') -and
+            -not $config.Contains($root)) 'Vendor configuration lost static CRT or leaked an absolute path.'
+    } finally { $vendorZip.Dispose() }
+    Write-Host 'PASS vendored source and relative Cargo config preserve static CRT'
 
     $extract = Join-Path $root 'rebuild'
     Expand-Archive -LiteralPath $archive -DestinationPath $extract

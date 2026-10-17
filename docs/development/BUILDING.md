@@ -66,6 +66,10 @@ Pop-Location
 
 输出为 `android/app/src/main/assets/ai-web/`，包括哈希清单和第三方许可。Gradle 验证资源存在且与源码相符。不要手工改产物来绕过检查；本机更改源文件或锁文件后重新生成。
 
+锁文件下载 URL 使用 npm 官方 registry，版本与 integrity 保持固定。需要本地镜像时使用 npm 的
+进程级 `--registry`/网络代理设置，不顺便升级包或删掉 integrity。依赖缓存可以复用；公开前的
+独立检出验证应注明是否使用空缓存，不能把新目录构建描述为全新机器验证。
+
 运行 Web 行为测试时，在上述构建完成后执行：
 
 ```powershell

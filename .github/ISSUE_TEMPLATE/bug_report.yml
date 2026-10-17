@@ -1,0 +1,25 @@
+name: Bug report / 问题报告
+description: Report a reproducible product problem. Security issues go to SECURITY.md.
+body:
+  - type: markdown
+    attributes:
+      value: 请使用示例数据，勿发送密码、令牌、私钥、完整终端记录或用户文件。漏洞请私密报告。
+  - type: input
+    id: version
+    attributes:
+      label: Version and platform / 版本与平台
+      placeholder: Android 0.3.5/135, Windows 0.3.5.135, server image digest
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction / 复现步骤
+      description: Include expected and actual behavior using a minimal example.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence / 脱敏证据
+      description: Relevant error code and a redacted screenshot or short log excerpt.

@@ -45,6 +45,7 @@ LABEL org.opencontainers.image.title="TermLink Server" \
 
 COPY --from=build /out/termlink-server /termlink-server
 COPY server/THIRD_PARTY_NOTICES.md /THIRD_PARTY_NOTICES.md
+COPY server/licenses/THIRD_PARTY_NOTICES.txt /licenses/THIRD_PARTY_NOTICES.txt
 COPY LICENSE NOTICE /
 
 USER 65532:65532

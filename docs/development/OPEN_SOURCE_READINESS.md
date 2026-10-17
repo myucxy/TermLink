@@ -1,86 +1,46 @@
 # 仓库整理与开源准备
 
-更新日期：2026-10-09。本文汇总当前准备状态；双仓库拆分见[双仓库说明](REPOSITORY_LAYOUT.md)，已有双端发布见 [0.3.3 / 132 记录](../RELEASE_0.3.3_132.md)。维护者已决定应用与 core 自有代码统一采用 GPLv3；本轮仅更新本地授权及随包声明，不改变仓库可见性、旧历史、线上包或部署。
+更新日期：2026-10-18。应用与 core 自有代码采用 GPL-3.0-only，代码已上传现有 GitHub 私有仓库。本文记录准备进度，不改变仓库可见性、签名身份或已发布产物。
 
-## 已完成的整理范围
+## 本轮已完成
 
-- 根 README 补齐 CLI、AI、文件、自部署和真实组件职责，保留中文入口。
-- 文档按使用、开发、当前架构、发布与历史材料提供入口。
-- Android/Windows 旧 README 转为同目录 HISTORY.md，新的 README 面向当前开发者。
-- 开发说明补齐工具版本、AI Web 前置构建、Android 原生路径和 DEV 版本规则。
-- 补齐贡献指南及安全报告说明；维护者指定安全邮箱为 myucxy@gmail.com。
-- 对旧总体设计、交接、知识库和源码归档添加状态说明；许可证及原始证据不被覆盖。
-- 应用与独立 terminal-core 已拆为同级仓库；应用只消费锁定 DLL/SO，无核心源码检出打包已有[验证记录](BINARY_CORE_VALIDATION.md)。
-- README 已提供当前产品的中文实录、字幕及配乐，见[演示说明](../media/README.md)。
-- 退役 Termux 模块、上游源码、补丁和同步脚本已从应用工作树迁出；xterm Harness 解除旧导出依赖。来源和剩余 Windows V1 边界见[清理记录](../archive/TERMUX_CLEANUP_20261008.md)。
-- 两仓库补齐完整 GPLv3 LICENSE 与 NOTICE，自有代码元数据统一为 `GPL-3.0-only`；移除当前非商业/Proprietary 意向，保留第三方原有条款。授权范围见[许可证说明](../../LICENSE-STATUS.md)。
+- 删除被当前指南取代的旧总体设计、八月会话交接、九月会话知识库和 AI V3 设计图；删除前已在仓库外备份。当前工作树不再包含这些开发对话截图，Git 历史仍保留原内容。
+- 4 个本机发布脚本/审核状态文件停止 Git 跟踪，本机副本仍保留并由现有 artifacts 忽略规则保护。
+- 更新 [0.3.5 / 135 发布结果](../RELEASE_0.3.5_135.md)与[发布索引](../releases/README.md)，根 README 提供匹配二进制的匿名对应源码下载入口。
+- 中英文演示和此前产品短片归入 [feature-demos](../media/feature-demos/README.md)，保留最终视频、字幕、封面及 README 预览。
+- 应用 README 补充参考项目、实际组件/资源与来源声明；core 有中英文 README、独立签名依赖包和对应源码 Release。
+- 源码归档支持按显式应用/core revision 导出，使用该 commit 的锁文件和原生库 Git 对象；不要求最新文档 HEAD 与旧二进制来源相同。IncludeCoreVendor 可附完整锁定 Rust 依赖和离线配置。
+- [依赖清单](../licenses/dependency-inventory.json)记录 Linux 双架构 Server 实际链接模块、AI Web runtime、Android/.NET 声明与 network-core Rust 锁。Server 的 Go runtime 和 71 个链接模块的原始许可文本已汇总到随镜像复制的许可包；AI Web 保留 108 份运行依赖声明。
+- 新增文档链接、精确测试向量秘密扫描、Server/Web 和源码打包检查，以及 Issue/PR 模板。旧 Docker 发布 workflow 已移除，GitHub 检查不发布镜像或客户端。
 
-## 仍需完成的事项
+## 保留的边界与剩余事项
 
-| 事项 | 当前状态与下一步 |
+| 事项 | 状态与下一步 |
 | --- | --- |
-| core 公开与对应源码交付 | GPLv3 已选定，core 计划后续公开。新版二进制分发前仍需提供接收者可取得的完整对应源码、构建资料及实际版本映射；当前私有仓库链接不能代替交付 |
-| 旧 core 历史 | 主仓库旧提交/标签仍含 core 源码。现已计划开源，无需仅为闭源目标清除历史；仍保留原历史，并完成敏感内容、版权与第三方审计，不擅自重写远端 |
-| 第三方授权总审计 | Windows V1 字宽表已核对固定 wcwidth 数据并补齐随包许可；其他来源代码、资源、历史包及全部传递依赖仍需逐项审计，不能仅靠移除归档宣称完成 |
-| Git 历史中的敏感内容 | 当前文件扫描与历史路径盘点结果见下方复核；不等于全部历史 blob、截图 OCR 或完整秘密检测通过 |
-| 干净环境复现 | 本轮依据源码校对命令及依赖，没有在新机器/干净 CI 中重新完整构建全部组件 |
-| GitHub Actions | 当前仅保留手动 Docker 历史工作流；Windows/Android CI、签名与 AppShip 自动上传尚未接入 |
-| Windows 公开信任 | 仍使用既有自签名发布者；SignPath 资格/接入和新旧签名者迁移未完成 |
-| 文档截图 | 首页已有中文实录和封面；设计图仍明确标为原型/历史材料，新增对外媒体继续做隐私复核 |
-| GitHub 安全功能 | 私密报告邮箱已指定；Private vulnerability reporting、分支保护和发布环境权限未现场核验 |
-| 对外发布验证 | 0.3.3/132 已有成功发布记录；后续发版仍须现场核对。HT-LPC-1326 的更新完整性/签名报错尚未在本次目录清理中修复，不能据本机成功升级宣布解决 |
+| 公开历史范围 | 用户明确保留旧 Git 历史。删除当前文件不会清除旧 blob；公开前仍需确认历史开发对话/工作站信息的可见范围，本轮不重写历史 |
+| GitHub 可见性和保护 | 两仓库维持私有。当前 main 未保护；规则接口因私有仓库套餐限制返回 403，私密漏洞报告接口不可核验。公开或升级套餐后再配置分支保护和安全功能，不为开启规则自动公开 |
+| 第三方授权审核 | 已提供来源与可追溯清单；Android/.NET 的完整传递依赖以及商标、历史分发仍需逐项人工审核，清单不能当作全部权属审计通过 |
+| 干净检出构建 | 复现步骤与本轮实际验证结果见下方；Linux/macOS 客户端及 Android Linux 原生工具适配尚未验收，不作通用平台承诺 |
+| 公开签名信任 | Windows 仍使用既有签名者，自签信任、SmartScreen 信誉与签名完整性不同；未自动更换证书 |
+| 产品功能门禁 | core RC、设备 JNI 冒烟和源码构建不代替完整图形/OEM/混版本/性能/长稳验收；MI 6 实际发声按维护者要求不测 |
 
-## 构建可移植性发现
+## 扫描与源码交付
 
-- 应用的终端核心已改为锁定的预编译 DLL/SO；network-core 原生构建仍有 Windows 工具默认路径，新环境应显式配置工具。不能声称 Linux runner 的 Android 全链路已验证。
-- AI Web 的浏览器测试默认使用 Windows Edge，外部环境要配置 `PLAYWRIGHT_CHROMIUM_EXECUTABLE`。
-- npm 锁文件包含既有镜像源；应在未来依赖维护中单独核验可达性和供应链，不为整理文档而改写锁文件。
-- 一些旧测试脚本自带早期固定版本或机器路径。历史 README 中保留这些记录；运行前需查看脚本参数，不能复制旧命令直接作为新的正式构建。
-- 终端 JNI 已改为预编译 SO；应用内 network-core 即使在 Relay Only 策略下仍需要编译。停用直连测试不等于可以删除网络模块的构建依赖。
+2026-10-18 的只读复扫覆盖两仓库当前跟踪文件与可达历史。应用当前 23、历史 27 条 Gitleaks 候选与前次已复核的固定协议向量、测试夹具和公开指纹完全一致，当前候选 Git blob 逐字节不变；core 无候选。应用 11 次 Actions 运行已核对：10 份非空日志无 Gitleaks 命中，另 1 份为有效空 ZIP。未确认新增凭据泄露；不把检测器结果解释为任意秘密都不存在。
 
-## 整理边界
+新增检查对合法测试数据采用规则、路径、行列和整个文件 SHA-256 的精确基线。文件内容变化必须重新复核，不整目录豁免、不删除有价值的协议测试向量。扫描与本机备份位于仓库外，不随 Git 上传。
 
-保留产品源码、协议、生产脚本和已有发布记录路径；退役 Termux 档案按授权迁到仓库外并保留哈希校验。自有代码的 GPLv3 授权已确定；自动发布、公开仓库设置及证书/凭据配置仍需独立执行，不通过改名或删除许可文件声称完成第三方审计。
+[0.3.5 / 135 完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/ca7763b8-ae84-4a24-9c78-d0e5698bbca6/download)绑定应用 8503acb、core 1c907c5，不能用另一 core RC 的源码代替。后续带 vendor 的补充源码包必须保留真实制品 revision，不覆盖已有发布附件。详细规则见[发布运行手册](../RELEASE_RUNBOOK.md)。
 
-## 2026-10-09 GPLv3 变更复核
+## 本轮验证记录
 
-- 两仓库 LICENSE 与 [GNU 官方 GPLv3 文本](https://www.gnu.org/licenses/gpl-3.0.txt) 内容一致，SHA-256 均为 `3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986`；NOTICE 明确选用 `GPL-3.0-only`，不修改官方全文中的示例或第三方许可。
-- Cargo 离线 metadata 确认两仓库共 8 个自有 crate 均为 GPL-3.0-only；两个 npm 项目及锁文件根包声明一致，第三方锁定依赖未调整。
-- AI Web 重新构建和资源清单验证通过，保留 108 份运行依赖许可汇总；仅元数据变更，不修改聊天功能。
-- Android `mergeDebugAssets`、`mergeReleaseAssets` 通过，合并输出中的 LICENSE/NOTICE 与根文件哈希一致；没有生成、签名或安装新的 APK。
-- Windows Agent 与 Desktop 的 DEV `dotnet publish` 通过，两份输出的 LICENSE/NOTICE 均与根文件哈希一致。参数沿用 0.3.3/132 发布记录；没有生成、签名或安装新的 Setup。
-- Server 的 OCI 标签、许可 COPY 与 Docker 上下文白名单通过静态核对；未重编译或推送镜像。
-- 五个 terminal-core DLL/SO 的锁定哈希验证通过，未重编译 core 或修改来源 revision；13 份相关文档的 97 个本地链接目标存在（排除代码块，不包含全部锚点检查）。
+完成后以实际命令和结果更新本节。基础检查可在本地运行：
 
-本轮未重复产品全链路、模拟器或 LAN/NAT 测试，未完成全量第三方/历史分发审计，也未提交、推送或更改远端可见性。以上验证覆盖许可声明与构建输出，不等于已完成对应源码公开交付。
+```powershell
+python scripts/check_public_docs.py --self-test
+python scripts/check_secrets.py --self-test --gitleaks <已有可执行文件>
+python scripts/update_dependency_inventory.py --verify
+./scripts/Test-CorrespondingSourceArchive.ps1
+```
 
-## 2026-10-08 清理复核
-
-源码基线为 `6d58975a462d68f1e504624f9397b49bc58e238d` 加本轮未提交修改。当前范围为目录清理、独立 xterm 工具和许可随包输出，未改变产品终端逻辑或协议。按 ponytail 的最小修改原则保留有回归价值的测试数据、既有比较辅助函数以及 Windows V1 兼容分支，不为清理目录重新实现终端。
-
-| 核验 | 结果与边界 |
-| --- | --- |
-| Termux 档案 | 67 个受跟踪文件退出工作树；仓库外 1,094 个不同文件的 SHA-256 全部匹配，可恢复 |
-| Android 依赖 | `debugRuntimeClasspath`、`releaseRuntimeClasspath` 均无 Termux；本轮没有生成或发布新 APK |
-| Android 单元测试 | app 383 项执行通过；native 126 项既有测试结果为 Gradle `UP-TO-DATE`，合计报告 0 failure/error/skipped；不是新一轮模拟器端到端测试 |
-| xterm 单元测试 | 16 项通过，保留校验失败、旧网格、不匹配 capture、样式覆盖等检查 |
-| xterm 浏览器 | 10 个 Golden Bundle 回放及 JSON 导出通过；失败后禁止导出旧网格、再次回放恢复通过；无 Termux 网络请求或页面异常 |
-| 核心二进制 | 五个库哈希通过，锁定 revision 仍为 `e6e849172c6fca0de01ae0799eae97ad9483e687`，无 core 修改 |
-| Windows 许可输出 | Agent DEV `dotnet publish` 成功，`WcWidth-NOTICE.txt` 与源码文件哈希一致；原生库及运行逻辑未变，不代表重新生成或签名了正式 Setup |
-| wcwidth 来源 | Unicode 15.0.0 的 343 + 121 个区间逐项数值与顺序一致，固定上游完整 LICENSE 文本核对一致；原 Termux 许可声明也逐字保留 |
-| 文档 | 18 个当前入口/相关文档的 144 个本地链接目标存在；不包含锚点验证或所有历史正文链接 |
-| 当前源码扫描 | 1,567 个当前受跟踪及非忽略新文件中扫描 1,543 个文本文件，PEM 私钥及 GitHub/AWS/Slack 高置信度模式零命中；不等于任意密码、全部 API 密钥或图像内容已排除 |
-| 历史路径盘点 | 339 个可达提交的对象路径中，选定的私钥/密钥库文件名规则零命中；仍有 70 个 `terminal-core/crates`、`include` 等路径对象，目录拆分没有移除核心历史。未扫描全部历史 blob 正文 |
-| 差异检查 | `git diff --check` 通过；发布版本、签名材料、Server、在线客户端均未修改 |
-
-本机证据在 `artifacts/validation/termux-cleanup-*`，不将报告中的私有机器环境或产物上传。首次 Android 调用将未加引号的版本参数误拆成任务，修正为显式字符串参数数组后通过；失败日志保留，不记作产品缺陷或测试通过。DEV 参数沿用最近成功发布记录 0.3.3/132，不递增版本。
-
-以上为 2026-10-08 清理时的结果。2026-10-09 许可决定后，公开前优先事项调整为匹配二进制的源码交付、core 公开准备及完整历史秘密/第三方审核。CI、公开签名和新环境构建仍按上表跟踪；本轮没有提交、推送、公开仓库或部署。
-
-## 文档整理阶段复核（双仓库拆分前）
-
-- 当前入口文档的 166 个本地 Markdown 链接目标存在；历史正文中的旧产物/证据链接不作为当前指南验收。
-- 12 段当前 PowerShell 示例通过语法解析；没有执行其中的编译、安装或测试命令，语法通过不等于干净环境构建通过。
-- Android 和 Windows HISTORY 去掉新增的归档提示后，与整理前 HEAD 中各自 README 正文一致（忽略行尾格式）。
-- 变更范围仅为 Markdown 文档；未修改应用源码、构建脚本、协议、版本、签名材料或许可证正文。
-- Git 差异空白检查通过；本轮没有提交、推送、上传或部署。
+应用普通构建继续只消费已锁定的 DLL/SO；不要求 checkout core，不更改现有二进制或锁文件。维护者本机工具遵循 D:\Dev 清单，其他贡献者通过参数设置已有工具路径，见[构建指南](BUILDING.md)。

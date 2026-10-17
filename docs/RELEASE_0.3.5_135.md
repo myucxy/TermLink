@@ -1,6 +1,60 @@
-# TermLink 0.3.5 / 135 发布候选
+# TermLink 0.3.5 / 135 发布结果
 
-用户于 2026-10-16 授权测试完成、复核代码后发布新版本。版本根据 AppShip 当前 Android 0.3.4/133、Windows 0.3.4/134、next build 134/135 选择；构建前仍须确认未被占用。平台候选使用同一 0.3.5/135，失败重试不换号、不覆盖已发布制品。
+2026-10-16：Android、Windows 和 Docker Server 已发布。源码固定为应用 `8503acb3fed355a6d53571504873588de54438ae`，core `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。客户端与镜像发布没有修改本批产品源码或重建候选。
+
+| 平台 | 发布结果 | 下载 / 引用 |
+| --- | --- | --- |
+| Android | AppShip stable，published / ready，0.3.5 / 135 | [APK](https://appship.kget.cc:8910/api/v1/artifacts/691a03fd-87ff-43a2-8d0a-eda1f9ede70f/download) |
+| Windows x64 | AppShip stable，published / ready，0.3.5 / 135 | [Setup](https://appship.kget.cc:8910/api/v1/artifacts/663a0cea-cd3c-4365-9234-d3a8882810f0/download) |
+| Docker Server | 本机打包后直接推送 Docker Hub，amd64 / arm64 | `docker.io/myucxy/termlink:0.3.5-build.135`；`0.3.5`、`latest` 同 digest |
+| 对应源码 | AppShip unlisted，匿名下载哈希核验通过 | [完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/ca7763b8-ae84-4a24-9c78-d0e5698bbca6/download) |
+
+客户端两个下载均实际匿名下载并核对 SHA-256。公开更新接口：Android build133、Windows build134 返回 `optional`，新 build135 均返回 `no_update`。签名保持既有 Android signer 和 Windows 证书，Windows RFC3161 及 17 个载荷签名通过。
+
+- APK SHA-256：`c472c1616e75c76f1805ed1acdcd30f768fe47c15b61ec083705124010a2c92d`
+- Setup SHA-256：`f3f45230bdab5968b0fb4b3766c7b83d6e2dbedf643010326fe7d0dd67eada8c`
+- Android 唯一签名者证书 SHA-256：`f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`。
+- Windows Authenticode 签名者 SHA-1：`91AE60BC06D866628B8EB2C62F32BDE9DAB56466`；本机验签为 Valid，不等于公开 CA 信任。
+- 对应源码 ZIP SHA-256：`a8ad2d74e415f427704368f494b0535b720a37473f9b569e5c7b87c79f028e84`
+- Android release：`09fa9c38-76a4-428d-821f-3708cf48477e`；Windows release：`995d71d8-6fad-4bb6-b20f-debe1ac6fd54`。
+
+## Docker 构建与签名
+
+从固定 commit 导出仅包含 server、LICENSE、NOTICE 的构建上下文，使用仓库原 Dockerfile 和固定基础镜像，在已有本机 BuildKit 构建器构建双架构 OCI，保留 BuildKit SLSA v1 provenance 与 SPDX SBOM。通过代理直接上传同一份 OCI 内容，未使用 GitHub Actions、GHCR 或 GitHub Release，也没有重新编译后替换本地已验证镜像。
+
+```text
+index  sha256:3660cd6252c21acdd93286ebf4f6e9176d3b0b798705a4613aaec503f0044104
+amd64  sha256:9b93c1caebe7b120a6bea3a749ad5eaa7a8ea51b7021fb71772fb346f8585b7c
+arm64  sha256:b74ce09e9e89064a2b67683431117c05f5d18737bbe843f2da43e719d0fdea63
+```
+
+Docker 使用独立 Cosign 签名身份；Android/Windows 继续使用既有签名者。私钥、密码和本机凭据不随源码分发。
+
+- [Docker 签名公钥](../release/keys/termlink-server-20261016.pub)随仓库提供；只含公钥，指纹见下方。
+- 公钥 SPKI SHA-256：`ccc091b13fe0ec349e233a3bef829734fb47a5839fb77a1bc59679ce0c90fd92`。
+- Cosign 3.1.3 官方 Linux 包及可执行文件 SHA-256 均已核验，使用固定 Docker 工具镜像运行。ORAS 1.3.4 同样固定版本并核验官方哈希；工具记录于维护者清单，无系统 PATH 修改。
+
+本地 OCI 归档签名通过；远端 index、amd64、arm64 的镜像签名，以及每种架构的 SLSA v1 / SPDX 签名，共 7 项验证通过，包含透明日志验证。没有跳过签名或透明日志检查，不冒称 GitHub OIDC 身份。版本验证后才同步 `latest`，旧 latest digest `dd39557370f80d62ca560aaa9f5f73eaaf9bc6729668377ae812eec7a027a2c1` 保留为记录。
+
+网络使用现有 `127.0.0.1:7897` 代理；容器访问为 `host.docker.internal:7897`。Sigstore 配置站点采用可达路径，Docker Hub 的签名访问采用实际 `registry-1.docker.io` 入口；未更改系统代理、DNS 或 Docker 服务设置。历史下载/连接失败保留在本机记录，不计为成功。
+
+使用 Cosign 3.1.3 和上述公钥，可验证：
+
+```powershell
+cosign verify --key termlink-server-20261016.pub registry-1.docker.io/myucxy/termlink@sha256:3660cd6252c21acdd93286ebf4f6e9176d3b0b798705a4613aaec503f0044104
+```
+
+## 安装与边界
+
+MI 6 已从正式 0.3.3/132 覆盖升级到正式 0.3.5/135，UID 和首次安装时间不变，保留登录，设备目录可见。Windows 从已装 0.3.4/134 覆盖升级到正式 0.3.5/135，升级前无活动 SessionHost；升级后客户端恢复隐藏启动，Agent 版本与 Relay Connected、账户关联检查通过，连接仍为 termlink2。
+
+正式包本轮只做覆盖升级与上述冒烟；完整终端输入、控制、通知等证据仍按维护者本机测试汇总中的受测包身份解释，不冒充正式包全矩阵复验。MI 6 实际发声按用户要求排除。
+
+Docker 已发布到 Hub，本轮未升级运行中的服务器或执行数据库迁移。SINGLE/TAKEOVER、Shell 命令定位、Kitty shared-s、多端主题、完整 OEM / 省电及性能等剩余范围仍保留。
+
+详细发布证据：维护者本机受限发布记录（不进入 Git）。本页保留可公开的下载地址、源码 revision、产物哈希与签名结论。
+
+## 原候选验证记录
 
 ## 修复内容
 
@@ -24,11 +78,3 @@
 | 发布/源码/验收脚本 | Build-Release、CorrespondingSourceArchive、TailFirst、Broker、WAL 自检通过；原生锁五库与 core revision 均通过。 |
 
 本机完整证据：工作区 `.workspace-validation/device-validation-20261015/` 与 `.workspace-validation/frozen-relay-20261016/`。本轮测试使用 termlink2、本地 Docker Relay 与独立账号；仅 Relay，不安排 LAN/NAT。
-
-## 发布状态与边界
-
-当前为候选，尚未构建/上传新正式制品。签名、精确源码 revision、对应源码下载 URL、制品哈希和最终 AppShip/Docker 状态必须在实际执行后记录，不能将本文件视为已发布证明。
-
-Windows 普通客户端/Agent 未被测试进程替换。完整 H02–H04 通知、音频、剪贴板、触摸/OEM 矩阵，Shell 命令定位、Kitty shared-s 和多 recipient 主题仍有既存验收缺口；发布说明不宣称这些整组已关闭。旧 r412 inspect 静默未复现，本轮 WAL 成功不改写旧失败结论。
-
-Server 生产构建要求现有 Cosign 工具及批准密钥；当前检查未找到，旧镜像未签名不能作为本次豁免。Docker Hub 当前直连也超时；这些门禁未满足时保留服务端本地验证并停止该平台外部发布，不绕过签名要求。

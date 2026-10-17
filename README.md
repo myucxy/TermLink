@@ -1,5 +1,7 @@
 # TermLink
 
+**简体中文** · [English](README.en.md)
+
 TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、AI Agent 对话和文件**。任务在电脑上执行，手机负责交互；你可以部署自己的服务端连接两端。
 
 当前主要交付 Android 客户端、Windows x64 客户端和 Docker 服务端。Linux/macOS 桌面代码仍有待验收的能力，不等同于已正式支持的完整产品。
@@ -28,6 +30,7 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 - 服务端：[Docker Hub](https://hub.docker.com/r/myucxy/termlink)，部署方式见 [Server README](server/README.md)。
 - 首次使用：[快速开始](docs/guides/QUICK_START.md)。
 - 修改代码：[开发与构建](docs/development/BUILDING.md)及[贡献指南](CONTRIBUTING.md)。
+- 0.3.5 / 135 对应源码：[下载源码包](https://appship.kget.cc:8910/api/v1/artifacts/ca7763b8-ae84-4a24-9c78-d0e5698bbca6/download)，应用 `8503acb`、core `1c907c5`；哈希与签名记录见[发布结果](docs/RELEASE_0.3.5_135.md)。
 
 下载包有独立的签名要求。当前 Windows 发布记录仍使用自签名开发证书，不能把“GitHub 构建”或“签名校验通过”理解为已经获得公开 CA 的信任。
 
@@ -70,7 +73,7 @@ flowchart LR
 | scripts/、release/ | 构建、制品验证和发布脚本 |
 | testdata/、technical-validation/ | 测试向量、协议和跨端验收工具 |
 | [docs/](docs/README.md) | 使用、开发、架构、发布及历史文档导航 |
-| terminal-reference/、prototypes/、ui-prototypes/ | 独立参考工具和原型；已退役的 Termux 源码迁出应用仓库，详见[归档索引](docs/archive/README.md) |
+| terminal-reference/、prototypes/、ui-prototypes/ | 仍保留的独立参考工具和原型；过时设计与会话知识库已清理，第三方来源见[归档索引](docs/archive/README.md) |
 
 ## 参考项目与致谢
 
@@ -120,7 +123,7 @@ flowchart LR
 
 请先阅读[开发与构建](docs/development/BUILDING.md)。它说明固定工具链、AI Web 资源生成、Android 原生依赖及 DEV 版本参数，不要求贡献者复用维护者电脑的盘符路径。
 
-正式构建、签名及上传遵循[发布运行手册](docs/RELEASE_RUNBOOK.md)和[发布构建说明](docs/RELEASE.md)。客户端分发使用 AppShip；Docker 按当前规则由本机构建并推送 Docker Hub。Windows/Android 的 GitHub Actions 构建尚未接入。
+正式构建、签名及上传遵循[发布运行手册](docs/RELEASE_RUNBOOK.md)和[发布构建说明](docs/RELEASE.md)。客户端分发使用 AppShip；Docker 由本机构建并推送 Docker Hub。GitHub Actions 仅做源码与测试检查，不发布客户端或镜像。
 
 - 改动与问题反馈：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 漏洞报告：[SECURITY.md](SECURITY.md)

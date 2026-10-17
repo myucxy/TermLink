@@ -8,11 +8,14 @@
 
 - Android/Windows 客户端使用 AppShip。
 - Docker 由本机从固定的已提交源码构建，直接推送 Docker Hub；核验版本镜像后再同步 latest。
-- GitHub 的旧 Docker 手动工作流仅保留为历史入口，不是当前默认发布方式；Windows/Android 的 GitHub Actions 自动构建尚未接入。
+- GitHub 仅运行源码和测试检查；旧 Docker 发布工作流已从当前树移除。客户端与 Docker 发布仍按本机运行手册执行。
 - DEV 沿用对应平台最后一次成功正式发布的版本/build，不能把本索引最上面的文件直接当 DEV 基线。
 - CLI 与 AI 使用及验收范围为 Relay Only。历史 LAN/NAT 结果仅按其记录时间阅读。
 
 ## 产品版本与 build 记录
+
+- [0.3.5 / build 135：Android、Windows、Docker 已发布](../RELEASE_0.3.5_135.md)
+- [0.3.4 / build 133：候选与验证记录](../RELEASE_0.3.4_133.md)
 
 - [0.3.3 / build 132](../RELEASE_0.3.3_132.md)
 - [0.3.2 / build 131](../RELEASE_0.3.2_131.md)

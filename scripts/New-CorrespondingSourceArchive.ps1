@@ -18,7 +18,17 @@ param(
     [string]$OutputPath,
 
     [Parameter(Mandatory)]
-    [string]$ArtifactManifestPath
+    [string]$ArtifactManifestPath,
+
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$ApplicationRevision,
+
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$CoreRevision,
+
+    [switch]$IncludeCoreVendor,
+
+    [string]$CargoPath = 'D:/Dev/Env/Rust/cargo/bin/cargo.exe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -91,8 +101,8 @@ function Invoke-GitText {
 }
 
 function Get-GitRevision {
-    param([Parameter(Mandatory)][string]$Repository)
-    $revision = Invoke-GitText -Repository $Repository -Arguments @('rev-parse', '--verify', 'HEAD^{commit}')
+    param([Parameter(Mandatory)][string]$Repository, [string]$Revision = 'HEAD')
+    $revision = Invoke-GitText -Repository $Repository -Arguments @('rev-parse', '--verify', ($Revision+'^{commit}'))
     Assert-Condition ($revision -match '^[0-9a-fA-F]{40}$') "Repository HEAD is not a commit: $Repository"
     return $revision.ToLowerInvariant()
 }
@@ -283,9 +293,9 @@ function Read-LockAndVerifyNative {
         [Parameter(Mandatory)][string]$Application,
         [Parameter(Mandatory)][hashtable]$ApplicationTree
     )
-    $lockPath = Join-Path $Application 'terminal-core.lock.json'
     Assert-Condition $ApplicationTree.ContainsKey('terminal-core.lock.json') 'Application Git tree must track terminal-core.lock.json.'
-    $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+    $lockBytes = Invoke-GitBytes -Repository $Application -Arguments @('cat-file','blob',$ApplicationTree['terminal-core.lock.json'].Blob)
+    $lock = [Text.Encoding]::UTF8.GetString($lockBytes) | ConvertFrom-Json
     Assert-Condition ($lock.schema_version -eq 2 -and $lock.revision -match '^[0-9a-f]{40}$' -and $lock.source_dirty -is [bool]) `
         'Invalid terminal-core.lock.json.'
     Assert-Condition (-not $lock.source_dirty) 'Corresponding source requires source_dirty=false in terminal-core.lock.json.'
@@ -304,12 +314,11 @@ function Read-LockAndVerifyNative {
         $matches = @($records | Where-Object { $_.path -ceq $relative })
         Assert-Condition ($matches.Count -eq 1) "Missing or duplicate native lock entry: $relative"
         $record = $matches[0]
-        $path = Join-Path $Application $relative
-        $file = Get-Item -LiteralPath $path -ErrorAction Stop
-        $hash = Get-Sha256File -Path $path
-        Assert-Condition ($record.sha256 -match '^[0-9a-f]{64}$' -and [int64]$record.size -eq $file.Length -and $record.sha256 -ceq $hash) `
+        $bytes = Invoke-GitBytes -Repository $Application -Arguments @('cat-file','blob',$ApplicationTree[$relative].Blob)
+        $hash = Get-Sha256Bytes -Bytes $bytes
+        Assert-Condition ($record.sha256 -match '^[0-9a-f]{64}$' -and [int64]$record.size -eq $bytes.Length -and $record.sha256 -ceq $hash) `
             "Native library SHA-256/size mismatch: $relative"
-        $verified.Add([ordered]@{ path = $relative; size = [int64]$file.Length; sha256 = $hash })
+        $verified.Add([ordered]@{ path = $relative; size = [int64]$bytes.Length; sha256 = $hash })
     }
     return [pscustomobject]@{ Lock = $lock; Native = $verified.ToArray() }
 }
@@ -432,8 +441,8 @@ Assert-Condition (Test-Path -LiteralPath $application -PathType Container) "Appl
 Assert-Condition (Test-Path -LiteralPath $core -PathType Container) "Core repository not found: $core"
 Assert-CleanRepository -Repository $application -Name 'Application'
 Assert-CleanRepository -Repository $core -Name 'Core'
-$applicationRevision = Get-GitRevision -Repository $application
-$coreRevision = Get-GitRevision -Repository $core
+$applicationRevision = if ($ApplicationRevision) { Get-GitRevision -Repository $application -Revision $ApplicationRevision } else { Get-GitRevision -Repository $application }
+$coreRevision = if ($CoreRevision) { Get-GitRevision -Repository $core -Revision $CoreRevision } else { Get-GitRevision -Repository $core }
 $applicationEntries = @(Get-GitTree -Repository $application -Revision $applicationRevision)
 $coreEntries = @(Get-GitTree -Repository $core -Revision $coreRevision)
 $applicationTree = @{}
@@ -448,7 +457,7 @@ Assert-Condition (@($coreEntries | Where-Object { $_.Path -like 'scripts/*' -and
     'Core Git tree must track a build/export script under scripts/.'
 $nativeInfo = Read-LockAndVerifyNative -Application $application -ApplicationTree $applicationTree
 Assert-Condition ($nativeInfo.Lock.revision -ceq $coreRevision) `
-    "terminal-core.lock.json revision $($nativeInfo.Lock.revision) does not match clean core HEAD $coreRevision."
+    "terminal-core.lock.json revision $($nativeInfo.Lock.revision) does not match selected core revision $coreRevision."
 $manifestInput = $ArtifactManifestPath
 if (-not [IO.Path]::IsPathRooted($manifestInput)) {
     # A relative manifest is resolved against the application checkout. This
@@ -471,7 +480,9 @@ $archive = $null
 $movedZip = $false
 $movedSidecar = $false
 $completed = $false
+$vendorStage = if ($IncludeCoreVendor) { Join-Path $parent ('.core-vendor-'+[Guid]::NewGuid().ToString('N')) } else { $null }
 try {
+    if ($vendorStage) { $null = New-Item -ItemType Directory -Path $vendorStage }
     $stream = [IO.File]::Open($tempZip, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $false)
     $manifestFiles = New-Object 'System.Collections.Generic.List[object]'
@@ -484,6 +495,14 @@ try {
             Test-PrivateBytes -Path "$($repoSpec.Name)/$($entry.Path)" -Bytes $blob.Bytes
             if (Test-PrivatePath -Path $entry.Path) { throw "Tracked private credential path found: $($repoSpec.Name)/$($entry.Path)" }
             $archiveName = "$($repoSpec.Name)/$($entry.Path)"
+            if ($vendorStage -and $repoSpec.Name -ceq 'terminal-core') {
+                Assert-Condition ($entry.ModeText -ne '120000') 'Dependency vendoring does not accept core symlinks.'
+                $mirror = Join-Path $vendorStage $entry.Path
+                Assert-Condition (Test-StrictChildPath -Root $vendorStage -Candidate $mirror) 'Vendor staging path escaped its root.'
+                $null = New-Item -ItemType Directory -Path (Split-Path -Parent $mirror) -Force
+                [IO.File]::WriteAllBytes($mirror,$blob.Bytes)
+                if ($entry.Path -ceq '.cargo/config.toml') { continue }
+            }
             Assert-Condition (-not $seenNames.ContainsKey($archiveName)) "Duplicate archive path: $archiveName"
             $seenNames[$archiveName] = $true
             Add-ZipBytes -Archive $archive -Name $archiveName -Bytes $blob.Bytes -Mode $entry.Mode
@@ -496,6 +515,34 @@ try {
                 size = [int64]$blob.Bytes.Length
                 sha256 = Get-Sha256Bytes -Bytes $blob.Bytes
             })
+        }
+    }
+    if ($vendorStage) {
+        Assert-Condition (Test-Path -LiteralPath $CargoPath -PathType Leaf) 'Pinned Cargo is required for dependency vendoring.'
+        $vendorPath = Join-Path $vendorStage 'vendor'
+        Push-Location $vendorStage
+        try {
+            $sourceConfig = @(& $CargoPath '+1.97.1' vendor --locked --offline --versioned-dirs $vendorPath)
+            Assert-Condition ($LASTEXITCODE -eq 0) 'Locked core dependency vendoring failed.'
+        } finally { Pop-Location }
+        $portableConfig = ($sourceConfig -join "`n") -replace '(?m)^directory\s*=\s*"[^"]+"\s*$','directory = "vendor"'
+        Assert-Condition ($portableConfig -match 'directory = "vendor"') 'Missing portable vendor source configuration.'
+        $configPath = Join-Path $vendorStage '.cargo/config.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $configPath) -Force
+        $existingConfig = if (Test-Path -LiteralPath $configPath) { Get-Content -LiteralPath $configPath -Raw } else { '' }
+        [IO.File]::WriteAllText($configPath,$existingConfig+"`n"+$portableConfig+"`n",[Text.UTF8Encoding]::new($false))
+        $generated = @(Get-ChildItem -LiteralPath $vendorPath -Recurse -File) + @(Get-Item -LiteralPath $configPath)
+        foreach ($file in $generated) {
+            Assert-Condition (-not ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Vendor input cannot be a reparse point.'
+            $relative = [IO.Path]::GetRelativePath($vendorStage,$file.FullName).Replace('\','/')
+            $name = 'terminal-core/'+$relative
+            Assert-Condition (-not $seenNames.ContainsKey($name)) "Duplicate vendored path: $name"
+            $bytes = [IO.File]::ReadAllBytes($file.FullName)
+            Test-PrivateBytes -Path $name -Bytes $bytes
+            $seenNames[$name] = $true
+            Add-ZipBytes -Archive $archive -Name $name -Bytes $bytes -Mode 33188
+            $manifestFiles.Add([ordered]@{path=$name;repository='terminal-core';source_path=$relative;git_blob=$null;
+                mode='100644';size=[int64]$bytes.Length;sha256=(Get-Sha256Bytes -Bytes $bytes);generated='locked dependency source/config'})
         }
     }
     $artifactLines = @($artifactManifest.Artifacts | ForEach-Object {
@@ -524,11 +571,14 @@ The release artifact manifest was verified before this archive was created.
 Its artifact records are:
 $artifactLines
 
-The archive contains every tracked blob at both clean Git HEADs, including
+The archive contains the tracked source at the two selected, verified Git revisions, including
 build scripts, lock files, LICENSE and NOTICE. Git metadata, credentials,
 private keys, ignored build output and user files are deliberately excluded.
 Build dependencies are resolved using the pinned files and instructions in
 termlink/docs/RELEASE_RUNBOOK.md and the repository build documentation.
+Core Rust dependencies vendored: $([bool]$IncludeCoreVendor). When enabled, the
+core .cargo/config.toml retains its original settings and adds relative vendor
+source replacement, allowing offline rebuilds without a populated Cargo cache.
 
 ## Rebuild from this archive
 
@@ -591,6 +641,7 @@ SOURCE-MANIFEST.json, which avoids a circular archive hash.
         application_revision = $applicationRevision
         core_revision = $coreRevision
         core_lock_revision = $nativeInfo.Lock.revision
+        core_dependencies_vendored = [bool]$IncludeCoreVendor
         native_artifacts = [array]$nativeInfo.Native
         release_artifact_manifest = [ordered]@{
             path = Split-Path -Leaf $artifactManifest.Path
@@ -638,6 +689,11 @@ SOURCE-MANIFEST.json, which avoids a circular archive hash.
     }
 }
 finally {
+    if ($vendorStage -and (Test-Path -LiteralPath $vendorStage)) {
+        Assert-Condition (Test-StrictChildPath -Root $parent -Candidate $vendorStage) 'Refusing unsafe vendor staging cleanup.'
+        Assert-Condition ((Split-Path -Leaf $vendorStage) -like '.core-vendor-*') 'Unexpected vendor cleanup directory.'
+        Remove-Item -LiteralPath $vendorStage -Recurse -Force
+    }
     if ($null -ne $archive) { $archive.Dispose() }
     if ($null -ne $stream) { $stream.Dispose() }
     if (-not $completed) {

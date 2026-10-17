@@ -1,8 +1,15 @@
 # TermLink Server third-party notices
 
 The complete dependency versions are recorded in `go.mod` and `go.sum`.
-This notice supplements, and does not replace, the license files published by
-each dependency.
+The original notice texts for Go runtime and the modules linked into the Linux
+amd64/arm64 server are in [licenses/THIRD_PARTY_NOTICES.txt](licenses/THIRD_PARTY_NOTICES.txt).
+The Docker image copies that bundle to `/licenses/THIRD_PARTY_NOTICES.txt`.
+This document highlights several components; it is not the complete dependency list.
+
+Versions, notice hashes and source links are recorded in
+[dependency-inventory.json](../docs/licenses/dependency-inventory.json). Regenerate with
+`python scripts/update_dependency_inventory.py` from the application repository root,
+using the pinned Go toolchain; CI verifies the generated content against locked inputs.
 
 ## ORY Fosite
 

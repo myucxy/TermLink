@@ -1,0 +1,186 @@
+[
+  {
+    "rule": "generic-api-key",
+    "path": "docs/validation/pc-avalonia-p8-preview-acceptance.json",
+    "line": 18,
+    "column": 7,
+    "sha256": "3c5e11477a6dbe3e55dee6a62d611a2fbf7abbe4e88cb084f3315a87ef17489c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/broker-capture-sealed-v1.json",
+    "line": 13,
+    "column": 5,
+    "sha256": "d8ae9f979b9994aded157dabe8cfebb5e676b2827f205472f15a9f92506872d2",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/state-delta-sealed-v1.json",
+    "line": 20,
+    "column": 5,
+    "sha256": "235087fbbd7972a5a369a41faba89e6746b2384462217c0e3dbca9a813b85140",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/frozen-history-v1.json",
+    "line": 7,
+    "column": 5,
+    "sha256": "1cf7690d4509315281682e36d68740c9aa7d0216daba3515e91a5951edae47b1",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/terminal-core-graphics-snapshot-v1.json",
+    "line": 4,
+    "column": 5,
+    "sha256": "70f928817092327f511f9e376e8429f6e1a76486f3bea698e7adf140f22c8fb3",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/terminal-core-graphics-snapshot-v1.json",
+    "line": 17,
+    "column": 5,
+    "sha256": "70f928817092327f511f9e376e8429f6e1a76486f3bea698e7adf140f22c8fb3",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/terminal-core-snapshot-v2.json",
+    "line": 4,
+    "column": 5,
+    "sha256": "31bb10efbbf6cce28b669f39e5ce3504692d87969e99868f45b7d709cc0ce768",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/terminal-core-snapshot-v2.json",
+    "line": 17,
+    "column": 5,
+    "sha256": "31bb10efbbf6cce28b669f39e5ce3504692d87969e99868f45b7d709cc0ce768",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/e2ee-session-v1.json",
+    "line": 16,
+    "column": 5,
+    "sha256": "0725a182c6f5b89621fb033b0e2783328d8f71e7188e3d4ae695058e1ed5a4c3",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/e2ee-session-v1.json",
+    "line": 17,
+    "column": 5,
+    "sha256": "0725a182c6f5b89621fb033b0e2783328d8f71e7188e3d4ae695058e1ed5a4c3",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/direct-transport-crypto-v1.json",
+    "line": 25,
+    "column": 7,
+    "sha256": "e2e8eab03747e23557cfd559cb237907ff0074e2340b6990920dad2b28b5d226",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/direct-transport-crypto-v1.json",
+    "line": 42,
+    "column": 7,
+    "sha256": "e2e8eab03747e23557cfd559cb237907ff0074e2340b6990920dad2b28b5d226",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/direct-transport-crypto-v1.json",
+    "line": 45,
+    "column": 7,
+    "sha256": "e2e8eab03747e23557cfd559cb237907ff0074e2340b6990920dad2b28b5d226",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/terminal-snapshot-v1.json",
+    "line": 4,
+    "column": 5,
+    "sha256": "9e032e6cb2afce0f766a74596ff73b8b4a0e27b28496c037d942c2d61d71e2bf",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/terminal-snapshot-v1.json",
+    "line": 18,
+    "column": 5,
+    "sha256": "9e032e6cb2afce0f766a74596ff73b8b4a0e27b28496c037d942c2d61d71e2bf",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/direct-transport-multipair-v2.json",
+    "line": 23,
+    "column": 5,
+    "sha256": "bc61bec698a8e91345c23eed7242c396cdc06b3d5e9a708dbb52e1843736b7ad",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "protocol/test-vectors/direct-transport-multipair-v2.json",
+    "line": 24,
+    "column": 5,
+    "sha256": "bc61bec698a8e91345c23eed7242c396cdc06b3d5e9a708dbb52e1843736b7ad",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "server/ops/Test-ProductionDeployment.Tests.ps1",
+    "line": 339,
+    "column": 7,
+    "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "server/ops/Test-ProductionDeployment.Tests.ps1",
+    "line": 340,
+    "column": 7,
+    "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "server/ops/Test-ProductionDeployment.Tests.ps1",
+    "line": 347,
+    "column": 11,
+    "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "server/ops/Test-ProductionDeployment.Tests.ps1",
+    "line": 355,
+    "column": 11,
+    "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "server/ops/Test-ProductionDeployment.Tests.ps1",
+    "line": 356,
+    "column": 11,
+    "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "server/ops/Test-ProductionDeployment.Tests.ps1",
+    "line": 357,
+    "column": 11,
+    "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
+    "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  }
+]

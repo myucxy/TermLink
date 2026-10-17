@@ -32,3 +32,19 @@
 项目自有代码采用 [GPL-3.0-only](LICENSE)。提交自有代码贡献时，请确保你有权按该许可提供贡献；不要求转让版权。引入第三方代码或资源前，应说明来源、原许可、兼容性与分发条件，并保留署名及例外，详见[授权说明](LICENSE-STATUS.md)。
 
 提交 PR 不会自动发布客户端或镜像。正式发布按[运行手册](docs/RELEASE_RUNBOOK.md)执行，并核对源码 revision、版本、测试、签名、回滚及分发结果。
+
+## 提交前的公开内容检查
+
+```powershell
+python scripts/check_public_docs.py --self-test
+python scripts/check_secrets.py --self-test --gitleaks <已有的Gitleaks可执行文件>
+python scripts/update_dependency_inventory.py --verify
+```
+
+秘密检查扫描提交中的文件，不读取 `.appship/`、本机签名目录或忽略的构建输出。
+`.gitleaks-fixtures.json` 仅记录已复核测试向量/测试夹具的准确位置与完整文件 SHA-256；
+内容变化会重新触发复核，不允许整目录豁免或将真实凭据加入基线。
+
+依赖变更后运行 `update_dependency_inventory.py` 更新清单和 Go 原始许可文本，再人工审核差异。
+清单覆盖范围在 JSON 中说明；声明清单不等于 Android/.NET 全部传递依赖已完成许可审核。
+GitHub `Repository checks` 只执行文档、秘密扫描、Server/Web 测试和源码打包自检，不发布客户端或 Docker。

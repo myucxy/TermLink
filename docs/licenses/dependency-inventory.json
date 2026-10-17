@@ -1,0 +1,1870 @@
+{
+  "schema_version": 1,
+  "scope": "Go linked modules and copied notices; locked AI Web runtime packages; declared Android/.NET dependencies; network-core Rust lock. Declaration inventories are not a completed transitive license audit.",
+  "inputs": {
+    "server/go.mod": "eef6cc40b1314e7e7d54c47097dde5c028393960ab30e1b17405e7e7fbf9ea14",
+    "server/go.sum": "daaa956d2b54124ff91f4faf0f557032f5457c471310df949280604ed3744d06",
+    "ai-web/package-lock.json": "5c1d59cc801f4d3c19795e7d3de857055b33f0deb41eaff9832146772a17ca4a",
+    "network-core/Cargo.lock": "cfd7622e54773ecbf311379839e3a6d5472531a9dac9f857eb7f9524f27ab71d"
+  },
+  "go_runtime": "go1.26.2",
+  "go_targets": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "go_server": [
+    {
+      "module": "github.com/asaskevich/govalidator",
+      "version": "v0.0.0-20230301143203-a9d515a09cc2",
+      "source": "https://pkg.go.dev/github.com/asaskevich/govalidator@v0.0.0-20230301143203-a9d515a09cc2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "e1a36eac3f3109d06869f57127cc32683f70a170dcefe5f143ee378ff313ddfe"
+        }
+      ]
+    },
+    {
+      "module": "github.com/beorn7/perks",
+      "version": "v1.0.1",
+      "source": "https://pkg.go.dev/github.com/beorn7/perks@v1.0.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "0db7c9ebb3717e526f34f87dd1ee8bc77d36846e29cb0cec9246f7138fbe962b"
+        }
+      ]
+    },
+    {
+      "module": "github.com/boombuler/barcode",
+      "version": "v1.0.1-0.20190219062509-6c824513bacc",
+      "source": "https://pkg.go.dev/github.com/boombuler/barcode@v1.0.1-0.20190219062509-6c824513bacc",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "36d2e94c565d51a5146d729e6be6a3d26168d473d97c94011b13700e82c622e4"
+        }
+      ]
+    },
+    {
+      "module": "github.com/cenkalti/backoff/v4",
+      "version": "v4.3.0",
+      "source": "https://pkg.go.dev/github.com/cenkalti/backoff/v4@v4.3.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "5c0476add4c38b55d0ed5ac11b85e00c38f26e1caee20dfe3ab58190103d1fbc"
+        }
+      ]
+    },
+    {
+      "module": "github.com/cespare/xxhash/v2",
+      "version": "v2.3.0",
+      "source": "https://pkg.go.dev/github.com/cespare/xxhash/v2@v2.3.0",
+      "notices": [
+        {
+          "name": "LICENSE.txt",
+          "sha256": "f566a9f97bacdaf00d9f21dd991e81dc11201c4e016c86b470799429a1c9a79c"
+        }
+      ]
+    },
+    {
+      "module": "github.com/coreos/go-oidc/v3",
+      "version": "v3.16.0",
+      "source": "https://pkg.go.dev/github.com/coreos/go-oidc/v3@v3.16.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cb5e8e7e5f4a3988e1063c142c60dc2df75605f4c46515e776e3aca6df976e14"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "dccd26c6fd9c296daf44d0bc56bb4efc566edd4880381b3331c9a63e6e471338"
+        }
+      ]
+    },
+    {
+      "module": "github.com/cristalhq/jwt/v4",
+      "version": "v4.0.2",
+      "source": "https://pkg.go.dev/github.com/cristalhq/jwt/v4@v4.0.2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "77c5f954aca36ffa2fa0823f55aaa876280bf1314e43a9036d4764d56d160408"
+        }
+      ]
+    },
+    {
+      "module": "github.com/davecgh/go-spew",
+      "version": "v1.1.1",
+      "source": "https://pkg.go.dev/github.com/davecgh/go-spew@v1.1.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "1b93a317849ee09d3d7e4f1d20c2b78ddb230b4becb12d7c224c927b9d470251"
+        }
+      ]
+    },
+    {
+      "module": "github.com/dgraph-io/ristretto",
+      "version": "v1.0.0",
+      "source": "https://pkg.go.dev/github.com/dgraph-io/ristretto@v1.0.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+        }
+      ]
+    },
+    {
+      "module": "github.com/dgryski/go-rendezvous",
+      "version": "v0.0.0-20200823014737-9f7001d12a5f",
+      "source": "https://pkg.go.dev/github.com/dgryski/go-rendezvous@v0.0.0-20200823014737-9f7001d12a5f",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "11f46ac1bc076fc405c06fd087226e5dd87b9c2e6b8dfda5153c79b5b6f01362"
+        }
+      ]
+    },
+    {
+      "module": "github.com/dustin/go-humanize",
+      "version": "v1.0.1",
+      "source": "https://pkg.go.dev/github.com/dustin/go-humanize@v1.0.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "a973b4498c13eb74baa2a8e5c351426a6826f2fcdd909916dbe53ee2e755fd71"
+        }
+      ]
+    },
+    {
+      "module": "github.com/felixge/httpsnoop",
+      "version": "v1.0.4",
+      "source": "https://pkg.go.dev/github.com/felixge/httpsnoop@v1.0.4",
+      "notices": [
+        {
+          "name": "LICENSE.txt",
+          "sha256": "8108e14b5cb2b6bcd51583d3849ef0c2b5c4de61758256c20308bc70d1775dbb"
+        }
+      ]
+    },
+    {
+      "module": "github.com/go-jose/go-jose/v3",
+      "version": "v3.0.3",
+      "source": "https://pkg.go.dev/github.com/go-jose/go-jose/v3@v3.0.3",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "module": "github.com/go-jose/go-jose/v4",
+      "version": "v4.1.3",
+      "source": "https://pkg.go.dev/github.com/go-jose/go-jose/v4@v4.1.3",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "module": "github.com/go-logr/logr",
+      "version": "v1.3.0",
+      "source": "https://pkg.go.dev/github.com/go-logr/logr@v1.3.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
+        }
+      ]
+    },
+    {
+      "module": "github.com/go-logr/stdr",
+      "version": "v1.2.2",
+      "source": "https://pkg.go.dev/github.com/go-logr/stdr@v1.2.2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "github.com/gobuffalo/pop/v6",
+      "version": "v6.1.1",
+      "source": "https://pkg.go.dev/github.com/gobuffalo/pop/v6@v6.1.1",
+      "notices": [
+        {
+          "name": "LICENSE.txt",
+          "sha256": "692e24554548f7b323c6ecdc05fdbd30a7de1c9865cb478626c32183794fea4b"
+        }
+      ]
+    },
+    {
+      "module": "github.com/gogo/protobuf",
+      "version": "v1.3.2",
+      "source": "https://pkg.go.dev/github.com/gogo/protobuf@v1.3.2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "3f571768c0ba2f330e5fee90de89bfe5141f48c1939be8008fa61461c30ca07f"
+        }
+      ]
+    },
+    {
+      "module": "github.com/golang/mock",
+      "version": "v1.6.0",
+      "source": "https://pkg.go.dev/github.com/golang/mock@v1.6.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "module": "github.com/golang/protobuf",
+      "version": "v1.5.3",
+      "source": "https://pkg.go.dev/github.com/golang/protobuf@v1.5.3",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "8778a9fc1eaffb03ab873caae251df2d224f6b5502be8777d3cd573a4dd43903"
+        }
+      ]
+    },
+    {
+      "module": "github.com/google/uuid",
+      "version": "v1.6.0",
+      "source": "https://pkg.go.dev/github.com/google/uuid@v1.6.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "0a8d61ed3cbfd5312326e8126c31ce9c627a283adc99131b56896d29ada04b2d"
+        }
+      ]
+    },
+    {
+      "module": "github.com/gorilla/websocket",
+      "version": "v1.5.3",
+      "source": "https://pkg.go.dev/github.com/gorilla/websocket@v1.5.3",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "2be1b548b0387ca8948e1bb9434e709126904d15f622cc2d0d8e7f186e4d122d"
+        }
+      ]
+    },
+    {
+      "module": "github.com/grpc-ecosystem/grpc-gateway/v2",
+      "version": "v2.18.1",
+      "source": "https://pkg.go.dev/github.com/grpc-ecosystem/grpc-gateway/v2@v2.18.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "a15b1d1b168954c92ff7fb1620382418f7c72f4f4d251ee791d1098ad68ab0c4"
+        }
+      ]
+    },
+    {
+      "module": "github.com/hashicorp/go-cleanhttp",
+      "version": "v0.5.2",
+      "source": "https://pkg.go.dev/github.com/hashicorp/go-cleanhttp@v0.5.2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "60222c28c1a7f6a92c7df98e5c5f4459e624e6e285e0b9b94467af5f6ab3343d"
+        }
+      ]
+    },
+    {
+      "module": "github.com/hashicorp/go-retryablehttp",
+      "version": "v0.7.7",
+      "source": "https://pkg.go.dev/github.com/hashicorp/go-retryablehttp@v0.7.7",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "d6b1a865f1c8c697d343bd4e0ce61025f91898486a1f00d727f32e8644af77d3"
+        }
+      ]
+    },
+    {
+      "module": "github.com/jackc/pgpassfile",
+      "version": "v1.0.0",
+      "source": "https://pkg.go.dev/github.com/jackc/pgpassfile@v1.0.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "adb1663fda031df8f4344aa68f299fd87d80353e31339406742ded21dae65702"
+        }
+      ]
+    },
+    {
+      "module": "github.com/jackc/pgservicefile",
+      "version": "v0.0.0-20240606120523-5a60cdf6a761",
+      "source": "https://pkg.go.dev/github.com/jackc/pgservicefile@v0.0.0-20240606120523-5a60cdf6a761",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "fc505773403fe869ed64cc2235cdd13988a427bb7e3a7e7004a3f4b27420f8fc"
+        }
+      ]
+    },
+    {
+      "module": "github.com/jackc/pgx/v5",
+      "version": "v5.7.5",
+      "source": "https://pkg.go.dev/github.com/jackc/pgx/v5@v5.7.5",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "467f95e074fe23079a5623ed652619682692041b8551da27e3c2ddb9659a1507"
+        }
+      ]
+    },
+    {
+      "module": "github.com/jackc/puddle/v2",
+      "version": "v2.2.2",
+      "source": "https://pkg.go.dev/github.com/jackc/puddle/v2@v2.2.2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "2d50e98a4900b4d6457a38d39c1432fdc156fc2f7b365f2e33ec9344acbb0057"
+        }
+      ]
+    },
+    {
+      "module": "github.com/mohae/deepcopy",
+      "version": "v0.0.0-20170929034955-c48cc78d4826",
+      "source": "https://pkg.go.dev/github.com/mohae/deepcopy@v0.0.0-20170929034955-c48cc78d4826",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "f10ae61f1256dcd24b2d826590b90662da5d8b3af10e1b8c19ebcf5f046217ff"
+        }
+      ]
+    },
+    {
+      "module": "github.com/munnerz/goautoneg",
+      "version": "v0.0.0-20191010083416-a7dc8b61c822",
+      "source": "https://pkg.go.dev/github.com/munnerz/goautoneg@v0.0.0-20191010083416-a7dc8b61c822",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "aa1376b9bc5dea6f30cdefde40c176a254f247d2814d0a9929395138631b2ae0"
+        }
+      ]
+    },
+    {
+      "module": "github.com/openzipkin/zipkin-go",
+      "version": "v0.4.2",
+      "source": "https://pkg.go.dev/github.com/openzipkin/zipkin-go@v0.4.2",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "b6e1c0e0078b720f92237bb3c5bfd21742cb78da8fe9759515b9d84ea0e96595"
+        }
+      ]
+    },
+    {
+      "module": "github.com/ory/fosite",
+      "version": "v0.49.0",
+      "source": "https://pkg.go.dev/github.com/ory/fosite@v0.49.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "github.com/ory/go-convenience",
+      "version": "v0.1.0",
+      "source": "https://pkg.go.dev/github.com/ory/go-convenience@v0.1.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "dcc411d98b4d19cbfdcf830d44e3c062969e517a7dbd8a2b18c68a32ca20ee89"
+        }
+      ]
+    },
+    {
+      "module": "github.com/ory/x",
+      "version": "v0.0.665",
+      "source": "https://pkg.go.dev/github.com/ory/x@v0.0.665",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "github.com/pkg/errors",
+      "version": "v0.9.1",
+      "source": "https://pkg.go.dev/github.com/pkg/errors@v0.9.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "8d427fd87bc9579ea368fde3d49f9ca22eac857f91a9dec7e3004bdfab7dee86"
+        }
+      ]
+    },
+    {
+      "module": "github.com/pmezard/go-difflib",
+      "version": "v1.0.0",
+      "source": "https://pkg.go.dev/github.com/pmezard/go-difflib@v1.0.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "2eb550be6801c1ea434feba53bf6d12e7c71c90253e0a9de4a4f46cf88b56477"
+        }
+      ]
+    },
+    {
+      "module": "github.com/pquerna/otp",
+      "version": "v1.5.0",
+      "source": "https://pkg.go.dev/github.com/pquerna/otp@v1.5.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "6aa75b508da9d9d1686352aa5f36bb5f926958c826cfccdf64ad721de4d125c1"
+        }
+      ]
+    },
+    {
+      "module": "github.com/prometheus/client_golang",
+      "version": "v1.22.0",
+      "source": "https://pkg.go.dev/github.com/prometheus/client_golang@v1.22.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "8548bfb2bc1913396df38c548a6ec60b8dbcac3b0800485a40569c8bdd184471"
+        }
+      ]
+    },
+    {
+      "module": "github.com/prometheus/client_model",
+      "version": "v0.6.1",
+      "source": "https://pkg.go.dev/github.com/prometheus/client_model@v0.6.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "6c79faa15168885fb88a316ae0df18f486deafddefdc16826cdc56dfbd421e24"
+        }
+      ]
+    },
+    {
+      "module": "github.com/prometheus/common",
+      "version": "v0.62.0",
+      "source": "https://pkg.go.dev/github.com/prometheus/common@v0.62.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "600244c8052c8c1d307043fafacbc83b429c171dd8e08f5a537c0a54014585ee"
+        }
+      ]
+    },
+    {
+      "module": "github.com/prometheus/procfs",
+      "version": "v0.15.1",
+      "source": "https://pkg.go.dev/github.com/prometheus/procfs@v0.15.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "497fcdb9fae55924c12f55f05cbe83a096662e5c591d79b74e4a8f23bab5ffee"
+        }
+      ]
+    },
+    {
+      "module": "github.com/redis/go-redis/v9",
+      "version": "v9.12.1",
+      "source": "https://pkg.go.dev/github.com/redis/go-redis/v9@v9.12.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "a3a7dff87da3927db65cb4c87b1cfbc96ca2755704461a485d457be7ae300a86"
+        }
+      ]
+    },
+    {
+      "module": "github.com/seatgeek/logrus-gelf-formatter",
+      "version": "v0.0.0-20210414080842-5b05eb8ff761",
+      "source": "https://pkg.go.dev/github.com/seatgeek/logrus-gelf-formatter@v0.0.0-20210414080842-5b05eb8ff761",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "27eff290da703b56bbdd046a8d45e3710b4ff68b08f761a890264618401971db"
+        }
+      ]
+    },
+    {
+      "module": "github.com/sirupsen/logrus",
+      "version": "v1.9.3",
+      "source": "https://pkg.go.dev/github.com/sirupsen/logrus@v1.9.3",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "51a0c9ec7f8b7634181b8d4c03e5b5d204ac21d6e72f46c313973424664b2e6b"
+        }
+      ]
+    },
+    {
+      "module": "github.com/stretchr/testify",
+      "version": "v1.10.0",
+      "source": "https://pkg.go.dev/github.com/stretchr/testify@v1.10.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "f8e536c1c7b695810427095dc85f5f80d44ff7c10535e8a9486cf393e2599189"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace",
+      "version": "v0.46.1",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace@v0.46.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp",
+      "version": "v0.46.1",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.46.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/contrib/propagators/b3",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/contrib/propagators/b3@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/contrib/propagators/jaeger",
+      "version": "v1.21.1",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/contrib/propagators/jaeger@v1.21.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/contrib/samplers/jaegerremote",
+      "version": "v0.15.1",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/contrib/samplers/jaegerremote@v0.15.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/exporters/jaeger",
+      "version": "v1.17.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/exporters/jaeger@v1.17.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/exporters/otlp/otlptrace",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/exporters/zipkin",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/exporters/zipkin@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/metric",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/metric@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/sdk",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/sdk@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/otel/trace",
+      "version": "v1.21.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/otel/trace@v1.21.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "go.opentelemetry.io/proto/otlp",
+      "version": "v1.0.0",
+      "source": "https://pkg.go.dev/go.opentelemetry.io/proto/otlp@v1.0.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ]
+    },
+    {
+      "module": "golang.org/x/crypto",
+      "version": "v0.48.0",
+      "source": "https://pkg.go.dev/golang.org/x/crypto@v0.48.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+        }
+      ]
+    },
+    {
+      "module": "golang.org/x/net",
+      "version": "v0.49.0",
+      "source": "https://pkg.go.dev/golang.org/x/net@v0.49.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+        }
+      ]
+    },
+    {
+      "module": "golang.org/x/oauth2",
+      "version": "v0.28.0",
+      "source": "https://pkg.go.dev/golang.org/x/oauth2@v0.28.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+        }
+      ]
+    },
+    {
+      "module": "golang.org/x/sync",
+      "version": "v0.19.0",
+      "source": "https://pkg.go.dev/golang.org/x/sync@v0.19.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+        }
+      ]
+    },
+    {
+      "module": "golang.org/x/sys",
+      "version": "v0.41.0",
+      "source": "https://pkg.go.dev/golang.org/x/sys@v0.41.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+        }
+      ]
+    },
+    {
+      "module": "golang.org/x/text",
+      "version": "v0.34.0",
+      "source": "https://pkg.go.dev/golang.org/x/text@v0.34.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+        }
+      ]
+    },
+    {
+      "module": "google.golang.org/genproto/googleapis/api",
+      "version": "v0.0.0-20231106174013-bbf56f31fb17",
+      "source": "https://pkg.go.dev/google.golang.org/genproto/googleapis/api@v0.0.0-20231106174013-bbf56f31fb17",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "module": "google.golang.org/genproto/googleapis/rpc",
+      "version": "v0.0.0-20231106174013-bbf56f31fb17",
+      "source": "https://pkg.go.dev/google.golang.org/genproto/googleapis/rpc@v0.0.0-20231106174013-bbf56f31fb17",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "module": "google.golang.org/grpc",
+      "version": "v1.59.0",
+      "source": "https://pkg.go.dev/google.golang.org/grpc@v1.59.0",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "name": "NOTICE.txt",
+          "sha256": "693ff28ec216d5112ac1bbfe64ef539005867d1c7bd427b57d579683293b947f"
+        }
+      ]
+    },
+    {
+      "module": "google.golang.org/protobuf",
+      "version": "v1.36.11",
+      "source": "https://pkg.go.dev/google.golang.org/protobuf@v1.36.11",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "4835612df0098ca95f8e7d9e3bffcb02358d435dbb38057c844c99d7f725eb20"
+        }
+      ]
+    },
+    {
+      "module": "gopkg.in/yaml.v3",
+      "version": "v3.0.1",
+      "source": "https://pkg.go.dev/gopkg.in/yaml.v3@v3.0.1",
+      "notices": [
+        {
+          "name": "LICENSE",
+          "sha256": "d18f6323b71b0b768bb5e9616e36da390fbd39369a81807cca352de4e4e6aa0b"
+        },
+        {
+          "name": "NOTICE",
+          "sha256": "f6c2dd3a67b576eafb89b80200b8b1627230bf3821a0c14cb99a22ac19107d00"
+        }
+      ]
+    }
+  ],
+  "ai_web_runtime": [
+    {
+      "package": "@types/debug",
+      "version": "4.1.13",
+      "license": "MIT",
+      "integrity": "sha512-KSVgmQmzMwPlmtljOomayoR89W4FynCAi3E8PPs7vmDVPe84hT+vGPKkJfThkmXs0x0jAaa9U8uW8bbfyS2fWw=="
+    },
+    {
+      "package": "@types/estree",
+      "version": "1.0.9",
+      "license": "MIT",
+      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg=="
+    },
+    {
+      "package": "@types/estree-jsx",
+      "version": "1.0.5",
+      "license": "MIT",
+      "integrity": "sha512-52CcUVNFyfb1A2ALocQw/Dd1BQFNmSdkuC3BkZ6iqhdMfQz7JWOFRuJFloOzjk+6WijU56m9oKXFAXc7o3Towg=="
+    },
+    {
+      "package": "@types/hast",
+      "version": "3.0.5",
+      "license": "MIT",
+      "integrity": "sha512-rp/ezSWaD1m44dPKICGhiskI13nVr7qTloFwDa/IYkhhf5nzwP+zIQcIJh3WIFSBOy/H1PzB40jPjMDksN4F+g=="
+    },
+    {
+      "package": "@types/mdast",
+      "version": "4.0.4",
+      "license": "MIT",
+      "integrity": "sha512-kGaNbPh1k7AFzgpud/gMdvIm5xuECykRR+JnWKQno9TAXVa6WIVCGTPvYGekIDL4uwCZQSYbUxNBSb1aUo79oA=="
+    },
+    {
+      "package": "@types/ms",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA=="
+    },
+    {
+      "package": "@types/react",
+      "version": "19.3.0",
+      "license": "MIT",
+      "integrity": "sha512-N0rFCuH9YoxG9/m61l9MfpJKfmLOVU0em7ipIz6TRgSSkvReLB9vL85GB+yr8Bs5leqpvg96JSwF4ZS1s4viQg=="
+    },
+    {
+      "package": "@types/unist",
+      "version": "3.0.3",
+      "license": "MIT",
+      "integrity": "sha512-ko/gIFJRv177XgZsZcBwnqJN5x/Gien8qNOn0D5bQU/zAzVf9Zt3BlcUiLqhV9y4ARk0GbT3tnUiPNgnTXzc/Q=="
+    },
+    {
+      "package": "@ungap/structured-clone",
+      "version": "1.4.0",
+      "license": "ISC",
+      "integrity": "sha512-1mEZtMKPM09vDmQt5y7YvmN2+DFTP7Tg0EWXdic8/C6VRnpb33e4ghisCIE3WZjsE2N8mf+QV1Zqh7ZFYLWInQ=="
+    },
+    {
+      "package": "bail",
+      "version": "2.0.2",
+      "license": "MIT",
+      "integrity": "sha512-0xO6mYd7JB2YesxDKplafRpsiOzPt9V02ddPCLbY1xYGPOX24NTyN50qnUxgCPcSoYMhKpAuBTjQoRZCAkUDRw=="
+    },
+    {
+      "package": "ccount",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-eyrF0jiFpY+3drT6383f1qhkbGsLSifNAjA61IUjZjmLCWjItY6LB9ft9YhoDgwfmclB2zhu51Lc7+95b8NRAg=="
+    },
+    {
+      "package": "character-entities",
+      "version": "2.0.2",
+      "license": "MIT",
+      "integrity": "sha512-shx7oQ0Awen/BRIdkjkvz54PnEEI/EjwXDSIZp86/KKdbafHh1Df/RYGBhn4hbe2+uKC9FnT5UCEdyPz3ai9hQ=="
+    },
+    {
+      "package": "character-entities-html4",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-1v7fgQRj6hnSwFpq1Eu0ynr/CDEw0rXo2B61qXrLNdHZmPKgb7fqS1a2JwF0rISo9q77jDI8VMEHoApn8qDoZA=="
+    },
+    {
+      "package": "character-entities-legacy",
+      "version": "3.0.0",
+      "license": "MIT",
+      "integrity": "sha512-RpPp0asT/6ufRm//AJVwpViZbGM/MkjQFxJccQRHmISF/22NBtsHqAWmL+/pmkPWoIUJdWyeVleTl1wydHATVQ=="
+    },
+    {
+      "package": "character-reference-invalid",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-iBZ4F4wRbyORVsu0jPV7gXkOsGYjGHPmAyv+HiHG8gi5PtC9KI2j1+v8/tlibRvjoWX027ypmG/n0HtO5t7unw=="
+    },
+    {
+      "package": "comma-separated-tokens",
+      "version": "2.0.3",
+      "license": "MIT",
+      "integrity": "sha512-Fu4hJdvzeylCfQPp9SGWidpzrMs7tTrlu6Vb8XGaRGck8QSNZJJp538Wrb60Lax4fPwR64ViY468OIUTbRlGZg=="
+    },
+    {
+      "package": "csstype",
+      "version": "3.2.3",
+      "license": "MIT",
+      "integrity": "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ=="
+    },
+    {
+      "package": "debug",
+      "version": "4.4.3",
+      "license": "MIT",
+      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA=="
+    },
+    {
+      "package": "decode-named-character-reference",
+      "version": "1.3.0",
+      "license": "MIT",
+      "integrity": "sha512-GtpQYB283KrPp6nRw50q3U9/VfOutZOe103qlN7BPP6Ad27xYnOIWv4lPzo8HCAL+mMZofJ9KEy30fq6MfaK6Q=="
+    },
+    {
+      "package": "dequal",
+      "version": "2.0.3",
+      "license": "MIT",
+      "integrity": "sha512-0je+qPKHEMohvfRTCEo3CrPG6cAzAYgmzKyxRiYSSDkS6eGJdyVJm7WaYA5ECaAD9wLB2T4EEeymA5aFVcYXCA=="
+    },
+    {
+      "package": "devlop",
+      "version": "1.1.0",
+      "license": "MIT",
+      "integrity": "sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA=="
+    },
+    {
+      "package": "escape-string-regexp",
+      "version": "5.0.0",
+      "license": "MIT",
+      "integrity": "sha512-/veY75JbMK4j1yjvuUxuVsiS/hr/4iHs9FTT6cgTexxdE0Ly/glccBAkloH/DofkjRbZU3bnoj38mOmhkZ0lHw=="
+    },
+    {
+      "package": "estree-util-is-identifier-name",
+      "version": "3.0.0",
+      "license": "MIT",
+      "integrity": "sha512-hFtqIDZTIUZ9BXLb8y4pYGyk6+wekIivNVTcmvk8NoOh+VeRn5y6cEHzbURrWbfp1fIqdVipilzj+lfaadNZmg=="
+    },
+    {
+      "package": "extend",
+      "version": "3.0.2",
+      "license": "MIT",
+      "integrity": "sha512-fjquC59cD7CyW6urNXK0FBufkZcoiGG80wTuPujX590cB5Ttln20E2UB4S/WARVqhXffZl2LNgS+gQdPIIim/g=="
+    },
+    {
+      "package": "hast-util-to-jsx-runtime",
+      "version": "2.3.6",
+      "license": "MIT",
+      "integrity": "sha512-zl6s8LwNyo1P9uw+XJGvZtdFF1GdAkOg8ujOw+4Pyb76874fLps4ueHXDhXWdk6YHQ6OgUtinliG7RsYvCbbBg=="
+    },
+    {
+      "package": "hast-util-whitespace",
+      "version": "3.0.0",
+      "license": "MIT",
+      "integrity": "sha512-88JUN06ipLwsnv+dVn+OIYOvAuvBMy/Qoi6O7mQHxdPXpjy+Cd6xRkWwux7DKO+4sYILtLBRIKgsdpS2gQc7qw=="
+    },
+    {
+      "package": "highlight.js",
+      "version": "11.11.1",
+      "license": "BSD-3-Clause",
+      "integrity": "sha512-Xwwo44whKBVCYoliBQwaPvtd/2tYFkRQtXDWj1nackaV2JPXx3L0+Jvd8/qCJ2p+ML0/XVkJ2q+Mr+UVdpJK5w=="
+    },
+    {
+      "package": "html-url-attributes",
+      "version": "3.0.1",
+      "license": "MIT",
+      "integrity": "sha512-ol6UPyBWqsrO6EJySPz2O7ZSr856WDrEzM5zMqp+FJJLGMW35cLYmmZnl0vztAZxRUoNZJFTCohfjuIJ8I4QBQ=="
+    },
+    {
+      "package": "inline-style-parser",
+      "version": "0.2.7",
+      "license": "MIT",
+      "integrity": "sha512-Nb2ctOyNR8DqQoR0OwRG95uNWIC0C1lCgf5Naz5H6Ji72KZ8OcFZLz2P5sNgwlyoJ8Yif11oMuYs5pBQa86csA=="
+    },
+    {
+      "package": "is-alphabetical",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-FWyyY60MeTNyeSRpkM2Iry0G9hpr7/9kD40mD/cGQEuilcZYS4okz8SN2Q6rLCJ8gbCt6fN+rC+6tMGS99LaxQ=="
+    },
+    {
+      "package": "is-alphanumerical",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-hmbYhX/9MUMF5uh7tOXyK/n0ZvWpad5caBA17GsC6vyuCqaWliRG5K1qS9inmUhEMaOBIW7/whAnSwveW/LtZw=="
+    },
+    {
+      "package": "is-decimal",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-AAB9hiomQs5DXWcRB1rqsxGUstbRroFOPPVAomNk/3XHR5JyEZChOyTWe2oayKnsSsr/kcGqF+z6yuH6HHpN0A=="
+    },
+    {
+      "package": "is-hexadecimal",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-DgZQp241c8oO6cA1SbTEWiXeoxV42vlcJxgH+B3hi1AiqqKruZR3ZGF8In3fj4+/y/7rHvlOZLZtgJ/4ttYGZg=="
+    },
+    {
+      "package": "is-plain-obj",
+      "version": "4.1.0",
+      "license": "MIT",
+      "integrity": "sha512-+Pgi+vMuUNkJyExiMBt5IlFoMyKnr5zhJ4Uspz58WOhBF5QoIZkFyNHIbBAtHwzVAgk5RtndVNsDRN61/mmDqg=="
+    },
+    {
+      "package": "longest-streak",
+      "version": "3.1.0",
+      "license": "MIT",
+      "integrity": "sha512-9Ri+o0JYgehTaVBBDoMqIl8GXtbWg711O3srftcHhZ0dqnETqLaoIK0x17fUw9rFSlK/0NlsKe0Ahhyl5pXE2g=="
+    },
+    {
+      "package": "markdown-table",
+      "version": "3.0.4",
+      "license": "MIT",
+      "integrity": "sha512-wiYz4+JrLyb/DqW2hkFJxP7Vd7JuTDm77fvbM8VfEQdmSMqcImWeeRbHwZjBjIFki/VaMK2BhFi7oUUZeM5bqw=="
+    },
+    {
+      "package": "mdast-util-find-and-replace",
+      "version": "3.0.2",
+      "license": "MIT",
+      "integrity": "sha512-Tmd1Vg/m3Xz43afeNxDIhWRtFZgM2VLyaf4vSTYwudTyeuTneoL3qtWMA5jeLyz/O1vDJmmV4QuScFCA2tBPwg=="
+    },
+    {
+      "package": "mdast-util-from-markdown",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-KRLgmPaP2H1ul2bpoJkOS+9pAcDAAj9Nu1mqLnh8NLeJG5tlvj42TH80PIGBpROWlRXLk0lDrWNuZCFy/tsB4A=="
+    },
+    {
+      "package": "mdast-util-gfm",
+      "version": "3.1.0",
+      "license": "MIT",
+      "integrity": "sha512-0ulfdQOM3ysHhCJ1p06l0b0VKlhU0wuQs3thxZQagjcjPrlFRqY215uZGHHJan9GEAXd9MbfPjFJz+qMkVR6zQ=="
+    },
+    {
+      "package": "mdast-util-gfm-autolink-literal",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-5HVP2MKaP6L+G6YaxPNjuL0BPrq9orG3TsrZ9YXbA3vDw/ACI4MEsnoDpn6ZNm7GnZgtAcONJyPhOP8tNJQavQ=="
+    },
+    {
+      "package": "mdast-util-gfm-footnote",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-sqpDWlsHn7Ac9GNZQMeUzPQSMzR6Wv0WKRNvQRg0KqHh02fpTz69Qc1QSseNX29bhz1ROIyNyxExfawVKTm1GQ=="
+    },
+    {
+      "package": "mdast-util-gfm-strikethrough",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-OuJHqvr455pwu2OaOrir7dbzqs4jlWKOtlu9L6GjcIjjQwNyw02VntQsr/Ek6/A13vgnXfUhBekWRUP1OkNivw=="
+    },
+    {
+      "package": "mdast-util-gfm-table",
+      "version": "2.0.0",
+      "license": "MIT",
+      "integrity": "sha512-78UEvebzz/rJIxLvE7ZtDd/vIQ0RHv+3Mh5DR96p7cS7HsBhYIICDBCu8csTNWNO6tBWfqXPWekRuj2FNOGOZg=="
+    },
+    {
+      "package": "mdast-util-gfm-task-list-item",
+      "version": "2.0.0",
+      "license": "MIT",
+      "integrity": "sha512-IrtvNvjxC1o06taBAVJznEnkiHxLFTzgonUdy8hzFVeDun0uTjxxrRGVaNFqkU1wJR3RBPEfsxmU6jDWPofrTQ=="
+    },
+    {
+      "package": "mdast-util-mdx-expression",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-J6f+9hUp+ldTZqKRSg7Vw5V6MqjATc+3E4gf3CFNcuZNWD8XdyI6zQ8GqH7f8169MM6P7hMBRDVGnn7oHB9kXQ=="
+    },
+    {
+      "package": "mdast-util-mdx-jsx",
+      "version": "3.2.0",
+      "license": "MIT",
+      "integrity": "sha512-lj/z8v0r6ZtsN/cGNNtemmmfoLAFZnjMbNyLzBafjzikOM+glrjNHPlf6lQDOTccj9n5b0PPihEBbhneMyGs1Q=="
+    },
+    {
+      "package": "mdast-util-mdxjs-esm",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-EcmOpxsZ96CvlP03NghtH1EsLtr0n9Tm4lPUJUBccV9RwUOneqSycg19n5HGzCf+10LozMRSObtVr3ee1WoHtg=="
+    },
+    {
+      "package": "mdast-util-phrasing",
+      "version": "4.1.0",
+      "license": "MIT",
+      "integrity": "sha512-TqICwyvJJpBwvGAMZjj4J2n0X8QWp21b9l0o7eXyVJ25YNWYbJDVIyD1bZXE6WtV6RmKJVYmQAKWa0zWOABz2w=="
+    },
+    {
+      "package": "mdast-util-to-hast",
+      "version": "13.2.1",
+      "license": "MIT",
+      "integrity": "sha512-cctsq2wp5vTsLIcaymblUriiTcZd0CwWtCbLvrOzYCDZoWyMNV8sZ7krj09FSnsiJi3WVsHLM4k6Dq/yaPyCXA=="
+    },
+    {
+      "package": "mdast-util-to-markdown",
+      "version": "2.2.0",
+      "license": "MIT",
+      "integrity": "sha512-2Jn/ADrHFFyyniBMi0bncTbJqU78K3/TEYvzvwrWWzD9MYPUa/Gm4r3nOeKFQg/PDM5BsbDYdc8ackW4NTY6NA=="
+    },
+    {
+      "package": "mdast-util-to-string",
+      "version": "4.0.0",
+      "license": "MIT",
+      "integrity": "sha512-0H44vDimn51F0YwvxSJSm0eCDOJTRlmN0R1yBh4HLj9wiV1Dn0QoXGbvFAWj2hSItVTlCmBF1hqKlIyUBVFLPg=="
+    },
+    {
+      "package": "micromark",
+      "version": "4.0.3",
+      "license": "MIT",
+      "integrity": "sha512-oGYfQzHSG5dOMovQcJ3fyTmZlWAWpi0XA0sJwJs+i6OT88o1+Jtw/8z0CmdowSLxGhhFK89rQ/oXph/wN02PNw=="
+    },
+    {
+      "package": "micromark-core-commonmark",
+      "version": "2.0.4",
+      "license": "MIT",
+      "integrity": "sha512-wxEeE8v8XVvOrxn1TZj74qYhAtTQsSqufHVS3uNVyT1MupXxhyaHk8/9xDNPh9BmL77QNDgWTkZ3RsYHB2ry7w=="
+    },
+    {
+      "package": "micromark-extension-gfm",
+      "version": "3.0.0",
+      "license": "MIT",
+      "integrity": "sha512-vsKArQsicm7t0z2GugkCKtZehqUm31oeGBV/KVSorWSy8ZlNAv7ytjFhvaryUiCUJYqs+NoE6AFhpQvBTM6Q4w=="
+    },
+    {
+      "package": "micromark-extension-gfm-autolink-literal",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-oOg7knzhicgQ3t4QCjCWgTmfNhvQbDDnJeVu9v81r7NltNCVmhPy1fJRX27pISafdjL+SVc4d3l48Gb6pbRypw=="
+    },
+    {
+      "package": "micromark-extension-gfm-footnote",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-/yPhxI1ntnDNsiHtzLKYnE3vf9JZ6cAisqVDauhp4CEHxlb4uoOTxOCJ+9s51bIB8U1N1FJ1RXOKTIlD5B/gqw=="
+    },
+    {
+      "package": "micromark-extension-gfm-strikethrough",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-ADVjpOOkjz1hhkZLlBiYA9cR2Anf8F4HqZUO6e5eDcPQd0Txw5fxLzzxnEkSkfnD0wziSGiv7sYhk/ktvbf1uw=="
+    },
+    {
+      "package": "micromark-extension-gfm-table",
+      "version": "2.1.2",
+      "license": "MIT",
+      "integrity": "sha512-pRzm4kDTu0MjlmBkxmS9yYhw60nncfcEwu9NNdPFSQEFXS95ZKyIIyTSHu/o3ReBUrLKYEq+7YaXCRn/bPB4MA=="
+    },
+    {
+      "package": "micromark-extension-gfm-tagfilter",
+      "version": "2.0.0",
+      "license": "MIT",
+      "integrity": "sha512-xHlTOmuCSotIA8TW1mDIM6X2O1SiX5P9IuDtqGonFhEK0qgRI4yeC6vMxEV2dgyr2TiD+2PQ10o+cOhdVAcwfg=="
+    },
+    {
+      "package": "micromark-extension-gfm-task-list-item",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-qIBZhqxqI6fjLDYFTBIa4eivDMnP+OZqsNwmQ3xNLE4Cxwc+zfQEfbs6tzAo2Hjq+bh6q5F+Z8/cksrLFYWQQw=="
+    },
+    {
+      "package": "micromark-factory-destination",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-Xe6rDdJlkmbFRExpTOmRj9N3MaWmbAgdpSrBQvCFqhezUn4AHqJHbaEnfbVYYiexVSs//tqOdY/DxhjdCiJnIA=="
+    },
+    {
+      "package": "micromark-factory-label",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-VFMekyQExqIW7xIChcXn4ok29YE3rnuyveW3wZQWWqF4Nv9Wk5rgJ99KzPvHjkmPXF93FXIbBp6YdW3t71/7Vg=="
+    },
+    {
+      "package": "micromark-factory-space",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-fS8hnLIjnjvdQIj39Geug8wWsR0HrYZ43KShKxNfwT7t2LOHo/LbWZEzEaSOjwtjdCsjoE6syHhonEzW0zv0+Q=="
+    },
+    {
+      "package": "micromark-factory-title",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-5bZ+3CjhAd9eChYTHsjy6TGxpOFSKgKKJPJxr293jTbfry2KDoWkhBb6TcPVB4NmzaPhMs1Frm9AZH7OD4Cjzw=="
+    },
+    {
+      "package": "micromark-factory-whitespace",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-Ob0nuZ3PKt/n0hORHyvoD9uZhr+Za8sFoP+OnMcnWK5lngSzALgQYKMr9RJVOWLqQYuyn6ulqGWSXdwf6F80lQ=="
+    },
+    {
+      "package": "micromark-util-character",
+      "version": "2.1.1",
+      "license": "MIT",
+      "integrity": "sha512-wv8tdUTJ3thSFFFJKtpYKOYiGP2+v96Hvk4Tu8KpCAsTMs6yi+nVmGh1syvSCsaxz45J6Jbw+9DD6g97+NV67Q=="
+    },
+    {
+      "package": "micromark-util-chunked",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-QUNFEOPELfmvv+4xiNg2sRYeS/P84pTW0TCgP5zc9FpXetHY0ab7SxKyAQCNCc1eK0459uoLI1y5oO5Vc1dbhA=="
+    },
+    {
+      "package": "micromark-util-classify-character",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-K0kHzM6afW/MbeWYWLjoHQv1sgg2Q9EccHEDzSkxiP/EaagNzCm7T/WMKZ3rjMbvIpvBiZgwR3dKMygtA4mG1Q=="
+    },
+    {
+      "package": "micromark-util-combine-extensions",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-OnAnH8Ujmy59JcyZw8JSbK9cGpdVY44NKgSM7E9Eh7DiLS2E9RNQf0dONaGDzEG9yjEl5hcqeIsj4hfRkLH/Bg=="
+    },
+    {
+      "package": "micromark-util-decode-numeric-character-reference",
+      "version": "2.0.2",
+      "license": "MIT",
+      "integrity": "sha512-ccUbYk6CwVdkmCQMyr64dXz42EfHGkPQlBj5p7YVGzq8I7CtjXZJrubAYezf7Rp+bjPseiROqe7G6foFd+lEuw=="
+    },
+    {
+      "package": "micromark-util-decode-string",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-nDV/77Fj6eH1ynwscYTOsbK7rR//Uj0bZXBwJZRfaLEJ1iGBR6kIfNmlNqaqJf649EP0F3NWNdeJi03elllNUQ=="
+    },
+    {
+      "package": "micromark-util-edit-map",
+      "version": "1.0.0",
+      "license": "MIT",
+      "integrity": "sha512-Pa2ljlsEL6sVwFaYeyrOLSYbQt73JvGbPOYFq+9AElXiSnfI5Q4465RRZ1sHv7lDjDOnGRDDaqPXqClqWK/q1Q=="
+    },
+    {
+      "package": "micromark-util-encode",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-c3cVx2y4KqUnwopcO9b/SCdo2O67LwJJ/UyqGfbigahfegL9myoEFoDYZgkT7f36T0bLrM9hZTAaAyH+PCAXjw=="
+    },
+    {
+      "package": "micromark-util-html-tag-name",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-2cNEiYDhCWKI+Gs9T0Tiysk136SnR13hhO8yW6BGNyhOC4qYFnwF1nKfD3HFAIXA5c45RrIG1ub11GiXeYd1xA=="
+    },
+    {
+      "package": "micromark-util-normalize-identifier",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-sxPqmo70LyARJs0w2UclACPUUEqltCkJ6PhKdMIDuJ3gSf/Q+/GIe3WKl0Ijb/GyH9lOpUkRAO2wp0GVkLvS9Q=="
+    },
+    {
+      "package": "micromark-util-resolve-all",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-VdQyxFWFT2/FGJgwQnJYbe1jjQoNTS4RjglmSjTUlpUMa95Htx9NHeYW4rGDJzbjvCsl9eLjMQwGeElsqmzcHg=="
+    },
+    {
+      "package": "micromark-util-sanitize-uri",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-9N9IomZ/YuGGZZmQec1MbgxtlgougxTodVwDzzEouPKo3qFWvymFHWcnDi2vzV1ff6kas9ucW+o3yzJK9YB1AQ=="
+    },
+    {
+      "package": "micromark-util-subtokenize",
+      "version": "2.1.0",
+      "license": "MIT",
+      "integrity": "sha512-XQLu552iSctvnEcgXw6+Sx75GflAPNED1qx7eBJ+wydBb2KCbRZe+NwvIEEMM83uml1+2WSXpBAcp9IUCgCYWA=="
+    },
+    {
+      "package": "micromark-util-symbol",
+      "version": "2.0.1",
+      "license": "MIT",
+      "integrity": "sha512-vs5t8Apaud9N28kgCrRUdEed4UJ+wWNvicHLPxCa9ENlYuAY31M0ETy5y1vA33YoNPDFTghEbnh6efaE8h4x0Q=="
+    },
+    {
+      "package": "micromark-util-types",
+      "version": "2.0.3",
+      "license": "MIT",
+      "integrity": "sha512-oxB2Ik03hI0gv+VNn9tnh1t1YEe9MDPptViAEgfdf3YQHsn0pzGTgCdlSCJXcwhqm8phaEuM7zeEu3QQzVBrPg=="
+    },
+    {
+      "package": "ms",
+      "version": "2.1.3",
+      "license": "MIT",
+      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="
+    },
+    {
+      "package": "parse-entities",
+      "version": "4.0.2",
+      "license": "MIT",
+      "integrity": "sha512-GG2AQYWoLgL877gQIKeRPGO1xF9+eG1ujIb5soS5gPvLQ1y2o8FL90w2QWNdf9I361Mpp7726c+lj3U0qK1uGw=="
+    },
+    {
+      "package": "parse-entities/node_modules/@types/unist",
+      "version": "2.0.11",
+      "license": "MIT",
+      "integrity": "sha512-CmBKiL6NNo/OqgmMn95Fk9Whlp2mtvIv+KNpQKN2F4SjvrEesubTRWGYSg+BnWZOnlCaSTU1sMpsBOzgbYhnsA=="
+    },
+    {
+      "package": "property-information",
+      "version": "7.2.0",
+      "license": "MIT",
+      "integrity": "sha512-IAtzIB6sUiWaJYrX9smp3V46pBGbBeLFRGdh25kg1334VcBlD8HzhPeNIWQH9zhGmo2itIe25EHt9dQP7G5hmg=="
+    },
+    {
+      "package": "react",
+      "version": "19.3.0",
+      "license": "MIT",
+      "integrity": "sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog=="
+    },
+    {
+      "package": "react-dom",
+      "version": "19.3.0",
+      "license": "MIT",
+      "integrity": "sha512-JDk8dgif51OjFoDE70+OT9ICyYr+69HlmihNwp1+Nsfbna3t5sIiCa9ZJktDmQ4/1b/rn26hIAR2uYXDMr5r0Q=="
+    },
+    {
+      "package": "react-markdown",
+      "version": "10.1.0",
+      "license": "MIT",
+      "integrity": "sha512-qKxVopLT/TyA6BX3Ue5NwabOsAzm0Q7kAPwq6L+wWDwisYs7R8vZ0nRXqq6rkueboxpkjvLGU9fWifiX/ZZFxQ=="
+    },
+    {
+      "package": "react-virtuoso",
+      "version": "4.18.16",
+      "license": "MIT",
+      "integrity": "sha512-BumVOhd0mNKlBkqeHojlLP8IRlJ2oYU7haU92GvBSlSzcdlWUAxIu1gphKm5gLQm07gMzmoQRXdVQeiG4TKSeQ=="
+    },
+    {
+      "package": "remark-gfm",
+      "version": "4.0.1",
+      "license": "MIT",
+      "integrity": "sha512-1quofZ2RQ9EWdeN34S79+KExV1764+wCUGop5CPL1WGdD0ocPpu91lzPGbwWMECpEpd42kJGQwzRfyov9j4yNg=="
+    },
+    {
+      "package": "remark-parse",
+      "version": "11.0.0",
+      "license": "MIT",
+      "integrity": "sha512-FCxlKLNGknS5ba/1lmpYijMUzX2esxW5xQqjWxw2eHFfS2MSdaHVINFmhjo+qN1WhZhNimq0dZATN9pH0IDrpA=="
+    },
+    {
+      "package": "remark-rehype",
+      "version": "11.1.2",
+      "license": "MIT",
+      "integrity": "sha512-Dh7l57ianaEoIpzbp0PC9UKAdCSVklD8E5Rpw7ETfbTl3FqcOOgq5q2LVDhgGCkaBv7p24JXikPdvhhmHvKMsw=="
+    },
+    {
+      "package": "remark-stringify",
+      "version": "11.0.0",
+      "license": "MIT",
+      "integrity": "sha512-1OSmLd3awB/t8qdoEOMazZkNsfVTeY4fTsgzcQFdXNq8ToTN4ZGwrMnlda4K6smTFKD+GRV6O48i6Z4iKgPPpw=="
+    },
+    {
+      "package": "scheduler",
+      "version": "0.28.0",
+      "license": "MIT",
+      "integrity": "sha512-juorfCmIkIw8tT+p5BXSm6PJjQF/ycEYmKyzURCIt/RaZIhL+PulbQ9Yu2z1HdOJDdqDTlxA1+xKBmHXJsczAw=="
+    },
+    {
+      "package": "space-separated-tokens",
+      "version": "2.0.2",
+      "license": "MIT",
+      "integrity": "sha512-PEGlAwrG8yXGXRjW32fGbg66JAlOAwbObuqVoJpv/mRgoWDQfgH1wDPvtzWyUSNAXBGSk8h755YDbbcEy3SH2Q=="
+    },
+    {
+      "package": "stringify-entities",
+      "version": "4.0.4",
+      "license": "MIT",
+      "integrity": "sha512-IwfBptatlO+QCJUo19AqvrPNqlVMpW9YEL2LIVY+Rpv2qsjCGxaDLNRgeGsQWJhfItebuJhsGSLjaBbNSQ+ieg=="
+    },
+    {
+      "package": "style-to-js",
+      "version": "1.1.21",
+      "license": "MIT",
+      "integrity": "sha512-RjQetxJrrUJLQPHbLku6U/ocGtzyjbJMP9lCNK7Ag0CNh690nSH8woqWH9u16nMjYBAok+i7JO1NP2pOy8IsPQ=="
+    },
+    {
+      "package": "style-to-object",
+      "version": "1.0.14",
+      "license": "MIT",
+      "integrity": "sha512-LIN7rULI0jBscWQYaSswptyderlarFkjQ+t79nzty8tcIAceVomEVlLzH5VP4Cmsv6MtKhs7qaAiwlcp+Mgaxw=="
+    },
+    {
+      "package": "trim-lines",
+      "version": "3.0.1",
+      "license": "MIT",
+      "integrity": "sha512-kRj8B+YHZCc9kQYdWfJB2/oUl9rA99qbowYYBtr4ui4mZyAQ2JpvVBd/6U2YloATfqBhBTSMhTpgBHtU0Mf3Rg=="
+    },
+    {
+      "package": "trough",
+      "version": "2.2.0",
+      "license": "MIT",
+      "integrity": "sha512-tmMpK00BjZiUyVyvrBK7knerNgmgvcV/KLVyuma/SC+TQN167GrMRciANTz09+k3zW8L8t60jWO1GpfkZdjTaw=="
+    },
+    {
+      "package": "unified",
+      "version": "11.0.5",
+      "license": "MIT",
+      "integrity": "sha512-xKvGhPWw3k84Qjh8bI3ZeJjqnyadK+GEFtazSfZv/rKeTkTjOJho6mFqh2SM96iIcZokxiOpg78GazTSg8+KHA=="
+    },
+    {
+      "package": "unist-util-is",
+      "version": "6.0.1",
+      "license": "MIT",
+      "integrity": "sha512-LsiILbtBETkDz8I9p1dQ0uyRUWuaQzd/cuEeS1hoRSyW5E5XGmTzlwY1OrNzzakGowI9Dr/I8HVaw4hTtnxy8g=="
+    },
+    {
+      "package": "unist-util-position",
+      "version": "5.0.0",
+      "license": "MIT",
+      "integrity": "sha512-fucsC7HjXvkB5R3kTCO7kUjRdrS0BJt3M/FPxmHMBOm8JQi2BsHAHFsy27E0EolP8rp0NzXsJ+jNPyDWvOJZPA=="
+    },
+    {
+      "package": "unist-util-stringify-position",
+      "version": "4.0.0",
+      "license": "MIT",
+      "integrity": "sha512-0ASV06AAoKCDkS2+xw5RXJywruurpbC4JZSm7nr7MOt1ojAzvyyaO+UxZf18j8FCF6kmzCZKcAgN/yu2gm2XgQ=="
+    },
+    {
+      "package": "unist-util-visit",
+      "version": "5.1.0",
+      "license": "MIT",
+      "integrity": "sha512-m+vIdyeCOpdr/QeQCu2EzxX/ohgS8KbnPDgFni4dQsfSCtpz8UqDyY5GjRru8PDKuYn7Fq19j1CQ+nJSsGKOzg=="
+    },
+    {
+      "package": "unist-util-visit-parents",
+      "version": "6.0.2",
+      "license": "MIT",
+      "integrity": "sha512-goh1s1TBrqSqukSc8wrjwWhL0hiJxgA8m4kFxGlQ+8FYQ3C/m11FcTs4YYem7V664AhHVvgoQLk890Ssdsr2IQ=="
+    },
+    {
+      "package": "vfile",
+      "version": "6.0.3",
+      "license": "MIT",
+      "integrity": "sha512-KzIbH/9tXat2u30jf+smMwFCsno4wHVdNmzFyL+T/L3UGqqk6JKfVqOFOZEpZSHADH1k40ab6NUIXZq422ov3Q=="
+    },
+    {
+      "package": "vfile-message",
+      "version": "4.0.3",
+      "license": "MIT",
+      "integrity": "sha512-QTHzsGd1EhbZs4AsQ20JX1rC3cOlt/IWJruk893DfLRr57lcnOeMaWG4K0JrRta4mIJZKth2Au3mM3u03/JWKw=="
+    },
+    {
+      "package": "zwitch",
+      "version": "2.0.4",
+      "license": "MIT",
+      "integrity": "sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A=="
+    }
+  ],
+  "android_declared_runtime": [
+    "androidx.activity:activity-compose:1.10.1",
+    "androidx.compose:compose-bom:2025.06.01",
+    "androidx.core:core-ktx:1.16.0",
+    "androidx.room:room-ktx:2.7.2",
+    "androidx.room:room-runtime:2.7.2",
+    "androidx.webkit:webkit:1.14.0",
+    "com.android.billingclient:billing-ktx:7.1.1",
+    "com.google.protobuf:protobuf-javalite:4.31.1",
+    "com.squareup.okhttp3:okhttp:4.12.0",
+    "net.openid:appauth:0.11.1",
+    "org.bouncycastle:bcprov-jdk18on:1.80",
+    "org.commonmark:commonmark-ext-gfm-tables:0.24.0",
+    "org.commonmark:commonmark:0.24.0",
+    "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2",
+    "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2",
+    "org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1"
+  ],
+  "dotnet_declared_packages": [
+    {
+      "package": "Avalonia",
+      "version": "12.1.1"
+    },
+    {
+      "package": "Avalonia.Desktop",
+      "version": "12.1.1"
+    },
+    {
+      "package": "Avalonia.Fonts.Inter",
+      "version": "12.1.1"
+    },
+    {
+      "package": "Avalonia.Themes.Fluent",
+      "version": "12.1.1"
+    },
+    {
+      "package": "BouncyCastle.Cryptography",
+      "version": "2.5.1"
+    },
+    {
+      "package": "Google.Protobuf",
+      "version": "3.31.1"
+    },
+    {
+      "package": "Grpc.Tools",
+      "version": "2.72.0"
+    },
+    {
+      "package": "Microsoft.Windows.Console.ConPTY",
+      "version": "[1.24.260710001]"
+    },
+    {
+      "package": "System.IO.Pipes.AccessControl",
+      "version": "5.0.0"
+    },
+    {
+      "package": "System.Security.Cryptography.ProtectedData",
+      "version": "8.0.0"
+    }
+  ],
+  "network_core_registry_crates": {
+    "base64": {
+      "version": "0.22.1",
+      "checksum": "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+    },
+    "bumpalo": {
+      "version": "3.20.3",
+      "checksum": "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+    },
+    "bytes": {
+      "version": "1.12.1",
+      "checksum": "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+    },
+    "cc": {
+      "version": "1.4.0",
+      "checksum": "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
+    },
+    "cfg-if": {
+      "version": "1.0.4",
+      "checksum": "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+    },
+    "cfg_aliases": {
+      "version": "0.2.2",
+      "checksum": "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+    },
+    "chacha20": {
+      "version": "0.10.1",
+      "checksum": "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+    },
+    "cpufeatures": {
+      "version": "0.3.0",
+      "checksum": "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
+    },
+    "deranged": {
+      "version": "0.5.8",
+      "checksum": "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+    },
+    "find-msvc-tools": {
+      "version": "0.1.9",
+      "checksum": "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+    },
+    "futures-core": {
+      "version": "0.3.33",
+      "checksum": "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
+    },
+    "futures-task": {
+      "version": "0.3.33",
+      "checksum": "b231ed28831efb4a61a08580c4bc233ec56bc009f4cd8f52da2c3cb97df0c109"
+    },
+    "futures-util": {
+      "version": "0.3.33",
+      "checksum": "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
+    },
+    "getrandom": {
+      "version": "0.4.3",
+      "checksum": "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+    },
+    "itoa": {
+      "version": "1.0.18",
+      "checksum": "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+    },
+    "js-sys": {
+      "version": "0.3.103",
+      "checksum": "53b44bfcdb3f8d5837a46dae1ca9660a837176eee74a28b229bc626816589102"
+    },
+    "libc": {
+      "version": "0.2.189",
+      "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+    },
+    "lru-slab": {
+      "version": "0.1.2",
+      "checksum": "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+    },
+    "memchr": {
+      "version": "2.8.3",
+      "checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+    },
+    "mio": {
+      "version": "1.2.2",
+      "checksum": "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
+    },
+    "num-conv": {
+      "version": "0.2.2",
+      "checksum": "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+    },
+    "once_cell": {
+      "version": "1.21.4",
+      "checksum": "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+    },
+    "pem": {
+      "version": "3.0.6",
+      "checksum": "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+    },
+    "pin-project-lite": {
+      "version": "0.2.17",
+      "checksum": "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+    },
+    "powerfmt": {
+      "version": "0.2.0",
+      "checksum": "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
+    },
+    "proc-macro2": {
+      "version": "1.0.107",
+      "checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+    },
+    "quinn": {
+      "version": "0.11.11",
+      "checksum": "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
+    },
+    "quinn-proto": {
+      "version": "0.11.16",
+      "checksum": "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+    },
+    "quinn-udp": {
+      "version": "0.5.15",
+      "checksum": "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+    },
+    "quote": {
+      "version": "1.0.47",
+      "checksum": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+    },
+    "r-efi": {
+      "version": "6.0.0",
+      "checksum": "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+    },
+    "rand": {
+      "version": "0.10.2",
+      "checksum": "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+    },
+    "rand_core": {
+      "version": "0.10.1",
+      "checksum": "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+    },
+    "rand_pcg": {
+      "version": "0.10.2",
+      "checksum": "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+    },
+    "rcgen": {
+      "version": "0.13.2",
+      "checksum": "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+    },
+    "ring": {
+      "version": "0.17.14",
+      "checksum": "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+    },
+    "rustc-hash": {
+      "version": "2.1.3",
+      "checksum": "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+    },
+    "rustls": {
+      "version": "0.23.43",
+      "checksum": "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+    },
+    "rustls-pki-types": {
+      "version": "1.15.1",
+      "checksum": "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
+    },
+    "rustls-webpki": {
+      "version": "0.103.13",
+      "checksum": "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+    },
+    "rustversion": {
+      "version": "1.0.23",
+      "checksum": "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+    },
+    "serde": {
+      "version": "1.0.229",
+      "checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+    },
+    "serde_core": {
+      "version": "1.0.229",
+      "checksum": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
+    },
+    "serde_derive": {
+      "version": "1.0.229",
+      "checksum": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+    },
+    "serde_json": {
+      "version": "1.0.151",
+      "checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+    },
+    "shlex": {
+      "version": "2.0.1",
+      "checksum": "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+    },
+    "slab": {
+      "version": "0.4.12",
+      "checksum": "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+    },
+    "socket2": {
+      "version": "0.6.5",
+      "checksum": "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+    },
+    "subtle": {
+      "version": "2.6.1",
+      "checksum": "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+    },
+    "syn": {
+      "version": "3.0.3",
+      "checksum": "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+    },
+    "thiserror": {
+      "version": "2.0.19",
+      "checksum": "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+    },
+    "thiserror-impl": {
+      "version": "2.0.19",
+      "checksum": "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+    },
+    "time": {
+      "version": "0.3.54",
+      "checksum": "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
+    },
+    "time-core": {
+      "version": "0.1.9",
+      "checksum": "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+    },
+    "tinyvec": {
+      "version": "1.12.0",
+      "checksum": "bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f"
+    },
+    "tinyvec_macros": {
+      "version": "0.1.1",
+      "checksum": "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+    },
+    "tokio": {
+      "version": "1.53.1",
+      "checksum": "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+    },
+    "tokio-macros": {
+      "version": "2.7.2",
+      "checksum": "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+    },
+    "tracing": {
+      "version": "0.1.44",
+      "checksum": "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+    },
+    "tracing-core": {
+      "version": "0.1.36",
+      "checksum": "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+    },
+    "unicode-ident": {
+      "version": "1.0.24",
+      "checksum": "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+    },
+    "untrusted": {
+      "version": "0.9.0",
+      "checksum": "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+    },
+    "wasi": {
+      "version": "0.11.1+wasi-snapshot-preview1",
+      "checksum": "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+    },
+    "wasm-bindgen": {
+      "version": "0.2.126",
+      "checksum": "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4"
+    },
+    "wasm-bindgen-macro": {
+      "version": "0.2.126",
+      "checksum": "167ce5e579f6bcf889c4f7175a8a5a585de84e8ff93976ce393efa5f2837aab1"
+    },
+    "wasm-bindgen-macro-support": {
+      "version": "0.2.126",
+      "checksum": "f3997c7839262f4ef12cf90b818d6340c18e80f263f1a94bf157d0ec4420380e"
+    },
+    "wasm-bindgen-shared": {
+      "version": "0.2.126",
+      "checksum": "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
+    },
+    "web-time": {
+      "version": "1.1.0",
+      "checksum": "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+    },
+    "windows-link": {
+      "version": "0.2.1",
+      "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+    },
+    "windows-sys": {
+      "version": "0.61.2",
+      "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+    },
+    "windows-targets": {
+      "version": "0.52.6",
+      "checksum": "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
+    },
+    "windows_aarch64_gnullvm": {
+      "version": "0.52.6",
+      "checksum": "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
+    },
+    "windows_aarch64_msvc": {
+      "version": "0.52.6",
+      "checksum": "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
+    },
+    "windows_i686_gnu": {
+      "version": "0.52.6",
+      "checksum": "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
+    },
+    "windows_i686_gnullvm": {
+      "version": "0.52.6",
+      "checksum": "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
+    },
+    "windows_i686_msvc": {
+      "version": "0.52.6",
+      "checksum": "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
+    },
+    "windows_x86_64_gnu": {
+      "version": "0.52.6",
+      "checksum": "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
+    },
+    "windows_x86_64_gnullvm": {
+      "version": "0.52.6",
+      "checksum": "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
+    },
+    "windows_x86_64_msvc": {
+      "version": "0.52.6",
+      "checksum": "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+    },
+    "yasna": {
+      "version": "0.5.2",
+      "checksum": "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+    },
+    "zeroize": {
+      "version": "1.9.0",
+      "checksum": "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+    },
+    "zmij": {
+      "version": "1.0.23",
+      "checksum": "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+    }
+  }
+}

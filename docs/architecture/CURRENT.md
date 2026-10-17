@@ -48,6 +48,6 @@ Windows 动态分发完整 Web 资源、小米/FCM 真机后台推送等仍有�
 
 ## 历史材料
 
-[旧总体设计](../COMPLETE_SYSTEM_DESIGN.md)中的 Termux、terminal-main、Redis/Valkey、早期商业功能和阶段完成矩阵不能作为当前部署清单。历史参考仍保留来源与版权。
+早期总体设计和会话交接已从当前树删除，其 Termux、terminal-main、Redis/Valkey 和旧阶段矩阵不作为部署依据。当前职责以本页和组件 README 为准，历史参考的来源与版权声明继续保留。
 
 应用代码保留原模块目录，Rust 终端核心已移到同级独立仓库，详见[双仓库说明](../development/REPOSITORY_LAYOUT.md)。当前文档入口放在 `guides/`、`development/`、`architecture/`，发布和历史材料通过[发布索引](../releases/README.md)与[归档索引](../archive/README.md)查阅。

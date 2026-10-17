@@ -29,6 +29,8 @@ artifacts/
 **/.codex/
 .tmp-*
 *.log
+**/__pycache__/
+*.py[cod]
 Thumbs.db
 .DS_Store
 # Local build artifacts not covered by generic rules

@@ -51,9 +51,14 @@ core 仓库后续公开与本次许可变更分开执行。匹配的源码交付
   -RequireWindowsTimestamp
 & ./scripts/New-CorrespondingSourceArchive.ps1 -ApplicationRepository . `
   -CoreRepository ../terminal-core -Version $version -BuildNumber $build `
+  -ApplicationRevision $applicationRevision -CoreRevision $coreRevision -IncludeCoreVendor `
   -ArtifactManifestPath "$releaseDirectory/artifact-manifest.json" `
   -OutputPath "$releaseDirectory/TermLink-$version-$build-source.zip"
 ```
+
+版本参数来自实际制品发布清单，而不是当前分支 HEAD；两个选定 commit 必须已经存在且各自工作区干净。
+脚本从 Git 对象读取该版本的锁文件和五库，不修改工作区、不重置分支。`-IncludeCoreVendor`
+包含锁定的 Rust 依赖源码，并在保留静态 CRT 配置的前提下追加可移植的 vendor 配置。
 
 归档和 `.sha256.json` 均不覆盖已有文件。ZIP 内 `SOURCE-MANIFEST.json` 绑定发布清单哈希、
 应用/core revision 和各制品哈希；ZIP 自身哈希只保存在外部 sidecar。
