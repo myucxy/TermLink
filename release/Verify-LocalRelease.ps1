@@ -633,6 +633,7 @@ if ($apkRecords.Count -eq 1) {
     $signatureOutput = Invoke-NativeCapture -FilePath $apksigner `
         -Arguments @('verify', '--verbose', '--print-certs', $apkPath) `
         -Description 'APK signature verification'
+    Write-Verbose ("APK signer certificate evidence:`n" + ($signatureOutput -join "`n"))
     $signerEvidence = Assert-TermLinkAndroidSignerOutput -Output $signatureOutput `
         -ExpectedSha256 $ExpectedAndroidSignerSha256
     $androidResult = [pscustomobject][ordered]@{
