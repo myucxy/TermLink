@@ -1,0 +1,8 @@
+1
+00:00:00,400 --> 00:00:03,415
+Choose New AI Chat from the folder menu.
+
+2
+00:00:03,425 --> 00:00:09,430
+The current path is filled in automatically, so your next conversation starts in that
+directory.

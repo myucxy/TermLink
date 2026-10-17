@@ -1,54 +1,31 @@
-# TermLink 中文功能演示
+# TermLink 产品与功能视频
 
-[![观看 TermLink 中文功能演示](termlink-demo-zh.png)](termlink-demo-zh.mp4)
+最终成片统一存放在本仓库的 [`feature-demos/`](feature-demos/README.md)，中文和英文分别按功能分类。
 
-- [观看或下载 MP4](termlink-demo-zh.mp4)
-- [封面原图](termlink-demo-zh.png) · [中文字幕 SRT](termlink-demo-zh.srt)
-- 时长：1 分 54 秒；1600 × 1800，30 fps；H.264 / yuv420p，AAC 双声道 48 kHz。
-- 内容：简体中文界面、中文合成旁白、同步字幕、轻电子背景音乐。
+- [中文目录](feature-demos/中文/README.md) · [English catalogue](feature-demos/English/README.md)
+- [产品视频（中文）](feature-demos/中文/06_产品视频/README.md) · [Product videos (English)](feature-demos/English/06_Product_videos/README.md)
+- [网页目录](feature-demos/index.html)：下载仓库后用浏览器打开；GitHub 阅读请使用上面的 Markdown 目录。
+- [原速成片存档](feature-demos/archive/README.md)
 
-点击 README 封面进入视频文件。如果当前 Markdown 阅读器不支持播放，请下载 MP4。演示保存在仓库中，不依赖外部视频平台。
+## 完整演示
 
-## 章节
+| 视频 | 中文 | English |
+| --- | --- | --- |
+| Windows Terminal + 安卓 TUI | [约 1 分 27 秒](feature-demos/中文/00_完整演示/01_TUI双端同步.mp4) | [约 1 分 22 秒](feature-demos/English/00_Full_demos/01_TUI_on_Windows_and_Android.mp4) |
+| CLI、AI、文件与外观总览 | [约 1 分 40 秒](feature-demos/中文/00_完整演示/02_功能总览.mp4) | [约 1 分 40 秒](feature-demos/English/00_Full_demos/02_Feature_overview.mp4) |
 
-| 时间 | 操作 |
-| --- | --- |
-| 00:00 | 查看在线电脑与 CLI、AI 聊天、文件入口 |
-| 00:11 | 新建独立 CLI，会自动创建工作目录 |
-| 00:20 | 输入命令、展开和收起键盘、查看电脑输出 |
-| 00:31 | 从云朵菜单按手机窗口调整终端行列 |
-| 00:41 | 选择电脑可用的 AI Agent 和工作目录 |
-| 00:51 | 分别选择模型、推理强度与授权方式 |
-| 01:05 | 查看生成状态及真实中文回复 |
-| 01:17 | 打开 AI 工作目录文件、预览并进入所在目录 |
-| 01:31 | 从目录菜单新建 AI 聊天，自动填入工作路径 |
-| 01:43 | 切换深色主题 |
+## 此前产品视频
 
-时间为近似章节起点。字幕已烧录到视频中，SRT 可用于阅读、翻译或重新剪辑。
+之前的竖屏产品介绍、精简短片、原比例产品介绍、原比例精简版、原比例功能总览，以及 CLI 双向同步实录都已重剪并收进中英文目录。每种语言有 2 部完整演示、15 段功能介绍和 5 部产品视频。
 
-## 录制与制作
+操作画面为 2 倍速；旁白和字幕保持正常速度，关键结果适当停留。TUI 和 CLI 双向同步的两端共用同一加速时间轴。中文沿用此前旁白音频；英文提供新的英文标题、旁白与字幕，实录界面和真实模型回复保留原语言。
 
-录制日期为 2026-10-06。画面来自 Android 模拟器中的 TermLink DEV（0.3.2 / 130）和 Windows 客户端（0.3.2.131），采用服务器中转。模拟器及应用界面切换为简体中文，录制后保留深色主题。
+## 录制说明
 
-CLI 命令与 Codex 回复均在连接电脑后实际执行。演示使用独立的 CLI / AI 工作目录，文件内容为演示任务生成的示例。镜头裁去系统状态栏，等待和操作停顿经过压缩，部分画面延长停留以便阅读；不展示登录凭据。画面中的 DEV 版本与功能菜单可能不同于当前正式版，各 Agent 的选项也可能不同。
+- TUI 双端演示：2026-10-17，独立 Windows Terminal 窗口，PowerShell 7.6.6；Windows 客户端 0.3.5.135，安卓模拟器 DEV 0.3.4/133（包含当前已复核修复）。Codex、Claude Code 和 OpenCode 均实际输入 hi 并收到回复。
+- 功能总览与产品短片：2026-10-06 的 DEV 界面。部分菜单与当前正式版本可能不同。
+- CLI 双向同步：2026-10-08，Windows Terminal / PowerShell 7，同一会话在手机与电脑分别输入命令，使用服务器中转。
+- 录制中使用已有 CLI 服务配置；Claude Code 使用 glm-5.3，Codex / OpenCode 使用 gpt-6.1-sol，CLI 名称不代表同名厂商模型。OpenCode 仅对本次进程切换模型，未改写全局配置。
+- 中文为已有 XiaoxiaoNeural 旁白；英文为正常语速的 JennyNeural 合成旁白。音乐由本地脚本原创合成，未使用第三方歌曲或采样。
 
-旁白使用 Microsoft Edge TTS 的 `zh-CN-XiaoxiaoNeural` 合成。背景音乐由本地脚本合成和弦、琶音与轻节奏，未使用第三方歌曲或采样；人声出现时降低配乐音量，片头、片尾淡入淡出。该视频展示所列操作，不作为全部产品功能或全部 Agent 的回归测试结论。
-
-## 本地剪辑工程
-
-本次制作使用 jianying-editor 技能和 FFmpeg。可编辑的剪映草稿名称为 `TermLink_中文功能演示_20261006_完成版`，位于本机默认草稿目录：
-
-```text
-%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft\TermLink_中文功能演示_20261006_完成版
-```
-
-工程包含 10 段画面、10 段中文旁白、同步字幕和独立 BGM 音轨；素材复制到草稿目录中。章节版式已合成到画面素材，可直接调整片段、声音和字幕；修改版式需重新运行制作脚本。
-
-原始录屏、界面检查、合成音频与制作脚本保留在本机被 Git 忽略的 `artifacts/demo-20261005/`，不纳入公开素材：
-
-- `make_voice.py`：生成旁白及句子时间信息。
-- `render_demo.py`：剪辑、混音、字幕、封面及剪映工程生成。
-- `review_demo.py`：逐章节画面检查。
-- `edit/timeline.json`、`edit/draft-result.json`、`edit/audio-qc.log`：时间轴、工程保存及音量检查记录。
-
-历史的 [12 秒深色主题片段](termlink-dark-theme.mp4) 保留归档，README 主入口已改为上面的中文功能演示。
+本目录只包含最终视频、封面、字幕、预览、目录和校验信息，不含中间录屏或剪映临时素材。设备名已获维护者允许公开。视频是所列真实操作的展示，不替代全部能力的回归验收。详见[中英文制作说明](feature-demos/README.md)。

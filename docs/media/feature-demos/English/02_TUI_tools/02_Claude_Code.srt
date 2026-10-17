@@ -1,0 +1,11 @@
+1
+00:00:00,400 --> 00:00:04,428
+Next, launch Claude Code in the same PowerShell session.
+
+2
+00:00:04,438 --> 00:00:07,652
+Send hi and watch the real reply arrive.
+
+3
+00:00:07,662 --> 00:00:12,218
+TermLink keeps its interactive terminal interface visible on Android.

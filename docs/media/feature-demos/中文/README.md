@@ -1,0 +1,85 @@
+# TermLink · 中文
+
+操作画面 2×，原速旁白与字幕。
+
+[返回总目录](../README.md)
+
+## 完整演示
+
+| 视频 | 时长 | 字幕 |
+| --- | --- | --- |
+| [TUI 双端同步](00_%E5%AE%8C%E6%95%B4%E6%BC%94%E7%A4%BA/01_TUI%E5%8F%8C%E7%AB%AF%E5%90%8C%E6%AD%A5.mp4) | 01:26 | [SRT](00_%E5%AE%8C%E6%95%B4%E6%BC%94%E7%A4%BA/01_TUI%E5%8F%8C%E7%AB%AF%E5%90%8C%E6%AD%A5.srt) |
+| [功能总览](00_%E5%AE%8C%E6%95%B4%E6%BC%94%E7%A4%BA/02_%E5%8A%9F%E8%83%BD%E6%80%BB%E8%A7%88.mp4) | 01:39 | [SRT](00_%E5%AE%8C%E6%95%B4%E6%BC%94%E7%A4%BA/02_%E5%8A%9F%E8%83%BD%E6%80%BB%E8%A7%88.srt) |
+
+### TUI 双端同步
+
+| 时间 | 内容 |
+| --- | --- |
+| 00:00 | 真实 TUI，双端同步 |
+| 00:10 | Windows Terminal · pwsh 7 |
+| 00:20 | Codex · 输入 hi |
+| 00:35 | Claude Code · 输入 hi |
+| 00:49 | OpenCode · 输入 hi |
+| 01:03 | 按手机窗口调整会话 |
+| 01:16 | 让电脑工作，随手机同行 |
+
+### 功能总览
+
+| 时间 | 内容 |
+| --- | --- |
+| 00:00 | 让电脑工作 随手机同行 |
+| 00:11 | 新建独立 CLI 会话 |
+| 00:19 | 手机输入 电脑执行 |
+| 00:30 | 窗口大小 适配手机 |
+| 00:40 | 选择电脑上的 AI Agent |
+| 00:50 | 模型、强度 授权分别设置 |
+| 00:58 | 用自然语言 继续对话 |
+| 01:09 | 查看 AI 生成的文件 |
+| 01:19 | 从当前目录 开始 AI 对话 |
+| 01:28 | 深色界面 专注工作内容 |
+
+## 单项功能介绍
+
+### 01 · CLI终端
+
+- [新建CLI会话](01_CLI%E7%BB%88%E7%AB%AF/01_%E6%96%B0%E5%BB%BACLI%E4%BC%9A%E8%AF%9D.mp4) · 8.6s · [SRT](01_CLI%E7%BB%88%E7%AB%AF/01_%E6%96%B0%E5%BB%BACLI%E4%BC%9A%E8%AF%9D.srt)
+- [手机输入与快捷键](01_CLI%E7%BB%88%E7%AB%AF/02_%E6%89%8B%E6%9C%BA%E8%BE%93%E5%85%A5%E4%B8%8E%E5%BF%AB%E6%8D%B7%E9%94%AE.mp4) · 10.8s · [SRT](01_CLI%E7%BB%88%E7%AB%AF/02_%E6%89%8B%E6%9C%BA%E8%BE%93%E5%85%A5%E4%B8%8E%E5%BF%AB%E6%8D%B7%E9%94%AE.srt)
+- [按手机窗口调整](01_CLI%E7%BB%88%E7%AB%AF/03_%E6%8C%89%E6%89%8B%E6%9C%BA%E7%AA%97%E5%8F%A3%E8%B0%83%E6%95%B4.mp4) · 9.9s · [SRT](01_CLI%E7%BB%88%E7%AB%AF/03_%E6%8C%89%E6%89%8B%E6%9C%BA%E7%AA%97%E5%8F%A3%E8%B0%83%E6%95%B4.srt)
+- [WindowsTerminal与pwsh](01_CLI%E7%BB%88%E7%AB%AF/04_WindowsTerminal%E4%B8%8Epwsh.mp4) · 9.4s · [SRT](01_CLI%E7%BB%88%E7%AB%AF/04_WindowsTerminal%E4%B8%8Epwsh.srt)
+
+### 02 · TUI工具
+
+- [Codex](02_TUI%E5%B7%A5%E5%85%B7/01_Codex.mp4) · 15.7s · [SRT](02_TUI%E5%B7%A5%E5%85%B7/01_Codex.srt)
+- [ClaudeCode](02_TUI%E5%B7%A5%E5%85%B7/02_ClaudeCode.mp4) · 13.8s · [SRT](02_TUI%E5%B7%A5%E5%85%B7/02_ClaudeCode.srt)
+- [OpenCode](02_TUI%E5%B7%A5%E5%85%B7/03_OpenCode.mp4) · 14.3s · [SRT](02_TUI%E5%B7%A5%E5%85%B7/03_OpenCode.srt)
+
+### 03 · AI对话
+
+- [选择Agent与工作目录](03_AI%E5%AF%B9%E8%AF%9D/01_%E9%80%89%E6%8B%A9Agent%E4%B8%8E%E5%B7%A5%E4%BD%9C%E7%9B%AE%E5%BD%95.mp4) · 9.7s · [SRT](03_AI%E5%AF%B9%E8%AF%9D/01_%E9%80%89%E6%8B%A9Agent%E4%B8%8E%E5%B7%A5%E4%BD%9C%E7%9B%AE%E5%BD%95.srt)
+- [模型推理强度与授权](03_AI%E5%AF%B9%E8%AF%9D/02_%E6%A8%A1%E5%9E%8B%E6%8E%A8%E7%90%86%E5%BC%BA%E5%BA%A6%E4%B8%8E%E6%8E%88%E6%9D%83.mp4) · 8.8s · [SRT](03_AI%E5%AF%B9%E8%AF%9D/02_%E6%A8%A1%E5%9E%8B%E6%8E%A8%E7%90%86%E5%BC%BA%E5%BA%A6%E4%B8%8E%E6%8E%88%E6%9D%83.srt)
+- [查看真实回复](03_AI%E5%AF%B9%E8%AF%9D/03_%E6%9F%A5%E7%9C%8B%E7%9C%9F%E5%AE%9E%E5%9B%9E%E5%A4%8D.mp4) · 10.9s · [SRT](03_AI%E5%AF%B9%E8%AF%9D/03_%E6%9F%A5%E7%9C%8B%E7%9C%9F%E5%AE%9E%E5%9B%9E%E5%A4%8D.srt)
+
+### 04 · 文件操作
+
+- [预览生成文件](04_%E6%96%87%E4%BB%B6%E6%93%8D%E4%BD%9C/01_%E9%A2%84%E8%A7%88%E7%94%9F%E6%88%90%E6%96%87%E4%BB%B6.mp4) · 9.3s · [SRT](04_%E6%96%87%E4%BB%B6%E6%93%8D%E4%BD%9C/01_%E9%A2%84%E8%A7%88%E7%94%9F%E6%88%90%E6%96%87%E4%BB%B6.srt)
+- [从目录继续AI对话](04_%E6%96%87%E4%BB%B6%E6%93%8D%E4%BD%9C/02_%E4%BB%8E%E7%9B%AE%E5%BD%95%E7%BB%A7%E7%BB%ADAI%E5%AF%B9%E8%AF%9D.mp4) · 9.8s · [SRT](04_%E6%96%87%E4%BB%B6%E6%93%8D%E4%BD%9C/02_%E4%BB%8E%E7%9B%AE%E5%BD%95%E7%BB%A7%E7%BB%ADAI%E5%AF%B9%E8%AF%9D.srt)
+
+### 05 · 界面外观
+
+- [深色主题](05_%E7%95%8C%E9%9D%A2%E5%A4%96%E8%A7%82/01_%E6%B7%B1%E8%89%B2%E4%B8%BB%E9%A2%98.mp4) · 10.8s · [SRT](05_%E7%95%8C%E9%9D%A2%E5%A4%96%E8%A7%82/01_%E6%B7%B1%E8%89%B2%E4%B8%BB%E9%A2%98.srt)
+
+
+## 此前产品视频
+
+- [竖屏产品介绍](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/01_%E7%AB%96%E5%B1%8F%E4%BA%A7%E5%93%81%E4%BB%8B%E7%BB%8D.mp4) · 37.2s · [SRT](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/01_%E7%AB%96%E5%B1%8F%E4%BA%A7%E5%93%81%E4%BB%8B%E7%BB%8D.srt)
+- [竖屏精简介绍](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/02_%E7%AB%96%E5%B1%8F%E7%B2%BE%E7%AE%80%E4%BB%8B%E7%BB%8D.mp4) · 13.1s · [SRT](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/02_%E7%AB%96%E5%B1%8F%E7%B2%BE%E7%AE%80%E4%BB%8B%E7%BB%8D.srt)
+- [原比例产品介绍](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/03_%E5%8E%9F%E6%AF%94%E4%BE%8B%E4%BA%A7%E5%93%81%E4%BB%8B%E7%BB%8D.mp4) · 24.5s · [SRT](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/03_%E5%8E%9F%E6%AF%94%E4%BE%8B%E4%BA%A7%E5%93%81%E4%BB%8B%E7%BB%8D.srt)
+- [原比例精简介绍](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/04_%E5%8E%9F%E6%AF%94%E4%BE%8B%E7%B2%BE%E7%AE%80%E4%BB%8B%E7%BB%8D.mp4) · 13.1s · [SRT](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/04_%E5%8E%9F%E6%AF%94%E4%BE%8B%E7%B2%BE%E7%AE%80%E4%BB%8B%E7%BB%8D.srt)
+- [原比例完整功能总览](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/05_%E5%8E%9F%E6%AF%94%E4%BE%8B%E5%AE%8C%E6%95%B4%E5%8A%9F%E8%83%BD%E6%80%BB%E8%A7%88.mp4) · 99.8s · [SRT](06_%E4%BA%A7%E5%93%81%E8%A7%86%E9%A2%91/05_%E5%8E%9F%E6%AF%94%E4%BE%8B%E5%AE%8C%E6%95%B4%E5%8A%9F%E8%83%BD%E6%80%BB%E8%A7%88.srt)
+
+### CLI 双向同步（旧实录重剪）
+
+- [CLI双向同步](01_CLI%E7%BB%88%E7%AB%AF/05_CLI%E5%8F%8C%E5%90%91%E5%90%8C%E6%AD%A5.mp4) · 28.2s · [SRT](01_CLI%E7%BB%88%E7%AB%AF/05_CLI%E5%8F%8C%E5%90%91%E5%90%8C%E6%AD%A5.srt)
+- [CLI双向同步 竖屏居中](01_CLI%E7%BB%88%E7%AB%AF/06_CLI%E5%8F%8C%E5%90%91%E5%90%8C%E6%AD%A5_%E7%AB%96%E5%B1%8F%E5%B1%85%E4%B8%AD.mp4) · 28.2s · [SRT](01_CLI%E7%BB%88%E7%AB%AF/06_CLI%E5%8F%8C%E5%90%91%E5%90%8C%E6%AD%A5_%E7%AB%96%E5%B1%8F%E5%B1%85%E4%B8%AD.srt)
+
+CLI 双向同步为 2026-10-08 的 Windows Terminal / PowerShell 7 实录；两端共用同一加速时间轴。旧版菜单与当前产品可能不同。

@@ -1,0 +1,15 @@
+1
+00:00:00,400 --> 00:00:02,578
+First, Codex.
+
+2
+00:00:02,588 --> 00:00:04,615
+Type hi on Android.
+
+3
+00:00:04,625 --> 00:00:10,115
+The CLI sends the request from Windows, and the reply appears on both screens.
+
+4
+00:00:10,125 --> 00:00:15,680
+This is the running terminal interface, including its input box and Chinese text.

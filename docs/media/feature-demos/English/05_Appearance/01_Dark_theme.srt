@@ -1,0 +1,7 @@
+1
+00:00:00,400 --> 00:00:05,365
+Choose the dark theme in Settings for a clear view of terminals and conversations.
+
+2
+00:00:05,375 --> 00:00:09,480
+With TermLink, continue your computer work from your phone.

@@ -1,0 +1,7 @@
+1
+00:00:00,400 --> 00:00:04,315
+Windows Terminal is running PowerShell 7 on the PC.
+
+2
+00:00:04,325 --> 00:00:08,780
+Android connects to that same session for remote input and output.

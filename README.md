@@ -6,13 +6,21 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 
 > 自有代码采用 [GNU GPLv3，仅第 3 版](LICENSE)（`GPL-3.0-only`），允许商用。terminal-core 同样采用 GPLv3，仓库计划后续公开；第三方材料保留各自条款。详见[授权范围与源码交付说明](LICENSE-STATUS.md)。
 
-## 界面演示
+## 产品与功能演示
 
-[![TermLink 中文功能演示：CLI、AI 对话与文件](docs/media/termlink-demo-zh.png)](docs/media/termlink-demo-zh.mp4)
+| 产品介绍 | Windows Terminal 与安卓 TUI | CLI、AI、文件功能总览 |
+| --- | --- | --- |
+| <a href="docs/media/feature-demos/中文/06_产品视频/01_竖屏产品介绍.mp4"><img src="docs/media/feature-demos/中文/06_产品视频/01_竖屏产品介绍.png" width="180" alt="TermLink 产品介绍，点击观看视频"></a> | <a href="docs/media/feature-demos/中文/00_完整演示/01_TUI双端同步.mp4"><img src="docs/media/feature-demos/previews/tui.gif" width="285" alt="Windows Terminal 与安卓同屏动态预览，点击观看视频"></a> | <a href="docs/media/feature-demos/中文/00_完整演示/02_功能总览.mp4"><img src="docs/media/feature-demos/中文/00_完整演示/02_功能总览.png" width="285" alt="CLI、AI 对话与文件操作，点击观看视频"></a> |
+| [中文产品视频](docs/media/feature-demos/中文/06_产品视频/README.md) · [English product videos](docs/media/feature-demos/English/06_Product_videos/README.md) | [中文 TUI 演示](docs/media/feature-demos/中文/00_完整演示/01_TUI双端同步.mp4) · [English TUI demo](docs/media/feature-demos/English/00_Full_demos/01_TUI_on_Windows_and_Android.mp4) | [中文功能总览](docs/media/feature-demos/中文/00_完整演示/02_功能总览.mp4) · [English overview](docs/media/feature-demos/English/00_Full_demos/02_Feature_overview.mp4) |
 
-[观看或下载视频（1 分 54 秒，MP4，约 5.3 MiB）](docs/media/termlink-demo-zh.mp4) · 简体中文界面、中文旁白、同步字幕与轻电子配乐。
+[中文目录](docs/media/feature-demos/中文/README.md) · [English catalogue](docs/media/feature-demos/English/README.md) · [网页目录](docs/media/feature-demos/index.html)
 
-模拟器与 Windows 通过服务器中转实录：从设备新建 CLI、输入命令、调整窗口，到选择 AI Agent／模型／推理强度／授权、查看真实回复、预览文件及从目录继续 AI 对话，最后切换深色主题。等待片段经剪辑压缩。[章节与制作说明](docs/media/README.md) · [中文字幕](docs/media/termlink-demo-zh.srt)
+- TUI 双端同步：[中文（约 1 分 27 秒）](docs/media/feature-demos/中文/00_完整演示/01_TUI双端同步.mp4) · [English（约 1 分 22 秒）](docs/media/feature-demos/English/00_Full_demos/01_TUI_on_Windows_and_Android.mp4)。在 Windows Terminal 的 `pwsh 7.6.6` 中运行 Codex、Claude Code 和 OpenCode，由安卓输入 `hi` 并查看真实回复。
+- 功能总览：[中文（约 1 分 40 秒）](docs/media/feature-demos/中文/00_完整演示/02_功能总览.mp4) · [English（约 1 分 40 秒）](docs/media/feature-demos/English/00_Full_demos/02_Feature_overview.mp4)。展示 CLI、AI 对话、模型与授权、文件操作和深色主题。
+
+操作画面按 2 倍速剪辑，旁白和字幕保持正常速度；两端使用同一加速时间轴。每种语言包含 2 部完整演示、15 段功能介绍和 5 部此前产品视频，按 CLI、TUI、AI、文件、外观和产品视频分类。英文版翻译标题、旁白与字幕，实录界面及真实回复保留原语言。全部最终视频、封面和字幕均在本仓库的 `docs/media/feature-demos/`，无需桌面文件或外部视频平台。[录制与制作说明](docs/media/feature-demos/README.md)
+
+点击封面或文字链接可打开或下载 MP4；动态预览没有声音。网页目录需下载仓库后在浏览器打开。
 
 ## 下载与开始使用
 

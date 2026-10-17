@@ -1,0 +1,35 @@
+1
+00:00:00,220 --> 00:00:02,260
+Away from your PC?
+
+2
+00:00:02,270 --> 00:00:04,638
+Keep working from your phone.
+
+3
+00:00:05,153 --> 00:00:08,383
+Your remote terminal, ready for commands.
+
+4
+00:00:08,887 --> 00:00:12,254
+Chat with AI on your PC, from your phone.
+
+5
+00:00:12,787 --> 00:00:15,979
+Choose the model and reasoning effort separately.
+
+6
+00:00:16,487 --> 00:00:19,979
+Follow progress and keep the conversation going.
+
+7
+00:00:20,487 --> 00:00:23,929
+Preview generated files and open their folder.
+
+8
+00:00:24,453 --> 00:00:25,918
+TermLink.
+
+9
+00:00:25,928 --> 00:00:28,458
+Take your computer work with you.

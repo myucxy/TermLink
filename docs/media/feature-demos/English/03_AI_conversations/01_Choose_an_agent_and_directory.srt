@@ -1,0 +1,7 @@
+1
+00:00:00,400 --> 00:00:05,665
+When creating an AI conversation, choose from agents available on this computer.
+
+2
+00:00:05,675 --> 00:00:10,205
+Create a working directory automatically or select one yourself.

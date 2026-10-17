@@ -1,0 +1,27 @@
+1
+00:00:00,220 --> 00:00:03,573
+Use the cloud menu to fit the session to your phone.
+
+2
+00:00:03,582 --> 00:00:07,800
+Both screens now use forty-nine columns and thirty-eight rows.
+
+3
+00:00:08,320 --> 00:00:10,610
+Enter commands on the phone.
+
+4
+00:00:10,620 --> 00:00:15,712
+They appear on the computer, and continuous output updates on both screens.
+
+5
+00:00:16,220 --> 00:00:18,398
+Now type on the computer.
+
+6
+00:00:18,408 --> 00:00:21,485
+The phone shows the commands and their results.
+
+7
+00:00:21,495 --> 00:00:25,662
+One PowerShell 7 session, with input from either end.

@@ -1,0 +1,7 @@
+1
+00:00:00,400 --> 00:00:05,240
+After the AI creates a file, open the file entry in the conversation.
+
+2
+00:00:05,250 --> 00:00:09,880
+Preview its contents, then navigate to its folder on the computer.

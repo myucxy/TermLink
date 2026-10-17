@@ -1,0 +1,809 @@
+{
+  "date": "2026-10-17",
+  "screen_speed": 2,
+  "narration_speed": 1,
+  "languages": [
+    "zh",
+    "en"
+  ],
+  "full_demos": 4,
+  "feature_clips": 30,
+  "product_edits": 10,
+  "archived_originals": 2,
+  "video_checks": [
+    {
+      "path": "archive/zh-CN/termlink-demo-zh.mp4",
+      "seconds": 114.266667,
+      "frames": 3428,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 5592350,
+      "sha256": "ad2295bad6c38f1644247e1055b8c03cf0a1c8cb1368d40e35584c3e70f623c3",
+      "captions": 21,
+      "decode": "passed"
+    },
+    {
+      "path": "archive/zh-CN/termlink-tui-demo-zh.mp4",
+      "seconds": 128.0,
+      "frames": 3840,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 6488130,
+      "sha256": "8705b244f8835646b214be73b719a51d0993207a70a10086df76390ec1388fff",
+      "captions": 17,
+      "decode": "passed"
+    },
+    {
+      "path": "English/00_Full_demos/01_TUI_on_Windows_and_Android.mp4",
+      "seconds": 82.2,
+      "frames": 2466,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 4464776,
+      "sha256": "02b05357171fecce6e76190c6a5e5a026ded31e34f4f91bfdf4746f0ae87b40c",
+      "captions": 18,
+      "decode": "passed"
+    },
+    {
+      "path": "English/00_Full_demos/02_Feature_overview.mp4",
+      "seconds": 100.333333,
+      "frames": 3010,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 5262184,
+      "sha256": "1bf177f601d636b072f93a278c9756a94018f020baf653d3502e75b47d2ed9ba",
+      "captions": 22,
+      "decode": "passed"
+    },
+    {
+      "path": "English/01_CLI_terminals/01_Create_a_CLI_session.mp4",
+      "seconds": 9.233333,
+      "frames": 277,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 471495,
+      "sha256": "5c7dffe7f1c5db7f90c66df916a3406407bd2a70080ba5482d4b79fceb2e7f6c",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/01_CLI_terminals/02_Mobile_input_and_shortcuts.mp4",
+      "seconds": 11.333333,
+      "frames": 340,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 557789,
+      "sha256": "593b9fa8fa1c5abdd941c9ad1572b0dd1da3b2ac976f397dd66f3790ba278947",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/01_CLI_terminals/03_Fit_to_the_phone_window.mp4",
+      "seconds": 8.833333,
+      "frames": 265,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 481550,
+      "sha256": "214d88089437ba8a9bb3360d088fba74e7934e7532ed93c92438a29bdaf60393",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/01_CLI_terminals/04_Windows_Terminal_and_pwsh.mp4",
+      "seconds": 9.133333,
+      "frames": 274,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 532949,
+      "sha256": "4b358e7b43acb2f4ea687edbebef46a65b358eb56a8e6f0547936459786f89f1",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/01_CLI_terminals/05_Bidirectional_CLI_sync.mp4",
+      "seconds": 25.966667,
+      "frames": 779,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 1158734,
+      "sha256": "f4f841215bbf92150877158fd4daf800cd7b424895cc6494c00567ee09f986b2",
+      "captions": 7,
+      "decode": "passed"
+    },
+    {
+      "path": "English/01_CLI_terminals/06_Bidirectional_CLI_sync_portrait.mp4",
+      "seconds": 25.966667,
+      "frames": 779,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 977705,
+      "sha256": "f024489d77cc515e447d223c9e7b8a5b5cf86e2f21e6cc62553a53cf3137885f",
+      "captions": 7,
+      "decode": "passed"
+    },
+    {
+      "path": "English/02_TUI_tools/01_Codex.mp4",
+      "seconds": 16.033333,
+      "frames": 481,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 875562,
+      "sha256": "cc93e1fb0400a74e3ec519ad22ab613cbd05323574c0c85e5046b8cd08e5c0e8",
+      "captions": 4,
+      "decode": "passed"
+    },
+    {
+      "path": "English/02_TUI_tools/02_Claude_Code.mp4",
+      "seconds": 13.766667,
+      "frames": 413,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 799435,
+      "sha256": "a8a0aef58af487ec7efc7ae7d6c499b9f0338b818a8be13f61c730525033830e",
+      "captions": 3,
+      "decode": "passed"
+    },
+    {
+      "path": "English/02_TUI_tools/03_OpenCode.mp4",
+      "seconds": 14.266667,
+      "frames": 428,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 749311,
+      "sha256": "4ca4798dfd7591911dbd18d6582c34d2ad07579cfd819d275eee4c6f125d655d",
+      "captions": 3,
+      "decode": "passed"
+    },
+    {
+      "path": "English/03_AI_conversations/01_Choose_an_agent_and_directory.mp4",
+      "seconds": 10.566667,
+      "frames": 317,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 530192,
+      "sha256": "045257ed831a3867f6451310cd4c18b21a0ca9ee3f0ed7da0f2c1b4be1e796ef",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/03_AI_conversations/02_Model_reasoning_and_permissions.mp4",
+      "seconds": 10.033333,
+      "frames": 301,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 555772,
+      "sha256": "4a88c96f5f216e0b8e2c05acb187cf73fd1a0f423d0aa2d24c6785b4b5b48914",
+      "captions": 3,
+      "decode": "passed"
+    },
+    {
+      "path": "English/03_AI_conversations/03_Follow_a_real_response.mp4",
+      "seconds": 9.2,
+      "frames": 276,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 601044,
+      "sha256": "9d8833e8b3a9d7ab53cba45a483401be160b9b52fca9e5b93dc505a3de14e001",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/04_Files/01_Preview_generated_files.mp4",
+      "seconds": 10.233333,
+      "frames": 307,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 601220,
+      "sha256": "bad6ed1be990e6b8146079b1b269de110128734ea4142d2962932e1ac754ad33",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/04_Files/02_Start_AI_chat_from_a_folder.mp4",
+      "seconds": 9.8,
+      "frames": 294,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 582459,
+      "sha256": "611077c5ad489f2cb154e9b78f43bc909e14f8469309e1105e0b29505c698f8f",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/05_Appearance/01_Dark_theme.mp4",
+      "seconds": 9.833333,
+      "frames": 295,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 623258,
+      "sha256": "c8c65c47b89750dbd65bf16c286ad787498df7c296f792de0a42f5bea3ee5269",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "English/06_Product_videos/01_Portrait_product_demo.mp4",
+      "seconds": 42.4,
+      "frames": 1272,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 2006459,
+      "sha256": "ca7f31d772bb85b70341200b3891d7f1666b2fb3ad2cfcc84cdd4f788e745c25",
+      "captions": 12,
+      "decode": "passed"
+    },
+    {
+      "path": "English/06_Product_videos/02_Portrait_short_demo.mp4",
+      "seconds": 17.3,
+      "frames": 519,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 924646,
+      "sha256": "1630c59707ee92446494759ad6b390894b2cd508b6f476007a3c2c9f05c92045",
+      "captions": 6,
+      "decode": "passed"
+    },
+    {
+      "path": "English/06_Product_videos/03_Original_aspect_product_demo.mp4",
+      "seconds": 28.766667,
+      "frames": 863,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 1361815,
+      "sha256": "4d3e1134ecb07aed6eb35173578b709b67c55ff5be1b186e1b012c06ab71b1bd",
+      "captions": 9,
+      "decode": "passed"
+    },
+    {
+      "path": "English/06_Product_videos/04_Original_aspect_short_demo.mp4",
+      "seconds": 17.3,
+      "frames": 519,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 842189,
+      "sha256": "86fe9d3678b2541dbff183e86b4ce67c8b342fe1f15dcbd30d7a7ce107eb5182",
+      "captions": 6,
+      "decode": "passed"
+    },
+    {
+      "path": "English/06_Product_videos/05_Original_aspect_feature_overview.mp4",
+      "seconds": 100.333333,
+      "frames": 3010,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 4295864,
+      "sha256": "f7d59864e2d410e44f61d1b136846837e8984b6c2e5e00e0ff6b076459011919",
+      "captions": 22,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/00_完整演示/01_TUI双端同步.mp4",
+      "seconds": 86.566667,
+      "frames": 2597,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 4522884,
+      "sha256": "1058f282f9ea8532a0d91c3840a33000de92cdfbf97d81035862946e8fbce5dc",
+      "captions": 17,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/00_完整演示/02_功能总览.mp4",
+      "seconds": 99.833333,
+      "frames": 2995,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 5286563,
+      "sha256": "0488957d7494f2e6eee22855f7c2a359073b4fcca21468f613aedbeae006df8e",
+      "captions": 21,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/01_CLI终端/01_新建CLI会话.mp4",
+      "seconds": 8.6,
+      "frames": 258,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 419215,
+      "sha256": "ff014da038921d340dc3760c9b0389414041d5e0b3f10d37f806b31d7ed7ceb9",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/01_CLI终端/02_手机输入与快捷键.mp4",
+      "seconds": 10.833333,
+      "frames": 325,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 536595,
+      "sha256": "1ac50baa23fa8873459204afc41bc04f17af7c964f86033e0435cf7c8894222c",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/01_CLI终端/03_按手机窗口调整.mp4",
+      "seconds": 9.9,
+      "frames": 297,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 522066,
+      "sha256": "0bb309112946554daa116a2cc85a04d79df960521df42de85324f9f6f42200be",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/01_CLI终端/04_WindowsTerminal与pwsh.mp4",
+      "seconds": 9.433333,
+      "frames": 283,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 546623,
+      "sha256": "007f2b2d07acbb8fe8c5bf1a6061779959ce313a2754dbde46f0dc24d923ad12",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/01_CLI终端/05_CLI双向同步.mp4",
+      "seconds": 28.233333,
+      "frames": 847,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 1190114,
+      "sha256": "d95be6159ff9222706c4f75e2aec3b205f5a7731e35aeffe0506f56d8b3745c8",
+      "captions": 7,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/01_CLI终端/06_CLI双向同步_竖屏居中.mp4",
+      "seconds": 28.233333,
+      "frames": 847,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 997597,
+      "sha256": "72c2a4ebfbc2a7c4e06c0b5853d5bdd3a37723682d0205097f1bb03c4ad644f3",
+      "captions": 7,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/02_TUI工具/01_Codex.mp4",
+      "seconds": 15.666667,
+      "frames": 470,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 872635,
+      "sha256": "d9c5212d5cdda6479945ce84fb824b172e0951096741dbfe65a0d08333077d53",
+      "captions": 4,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/02_TUI工具/02_ClaudeCode.mp4",
+      "seconds": 13.766667,
+      "frames": 413,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 792681,
+      "sha256": "8b24a9c86049bef7aa4f13bc4a4245d89eb3549cc73806c07726b8a2ca03b506",
+      "captions": 3,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/02_TUI工具/03_OpenCode.mp4",
+      "seconds": 14.266667,
+      "frames": 428,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 750989,
+      "sha256": "6fedceaccc9555716aa8913fae740c5777c6cfc25c278a6a66a86fc3e8d11c92",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/03_AI对话/01_选择Agent与工作目录.mp4",
+      "seconds": 9.7,
+      "frames": 291,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 524113,
+      "sha256": "a491f852f9dcd946d61b26b2934c555a01fc04e586eabe86b1b578b432e5fd53",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/03_AI对话/02_模型推理强度与授权.mp4",
+      "seconds": 8.833333,
+      "frames": 265,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 519790,
+      "sha256": "becee52818ff6bba3fb7fb5862499be7940a19f183b4e251467d48c98f3d53be",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/03_AI对话/03_查看真实回复.mp4",
+      "seconds": 10.9,
+      "frames": 327,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 689849,
+      "sha256": "b6c0df6cedb57d57e7b678f4d2de15749dce76b3900c974eca39a8eae1618fc4",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/04_文件操作/01_预览生成文件.mp4",
+      "seconds": 9.3,
+      "frames": 279,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 560784,
+      "sha256": "a4bd83fcdb3c71230b79e7145127da4c7e2961a1b40b144a3dc26ffc0fb07291",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/04_文件操作/02_从目录继续AI对话.mp4",
+      "seconds": 9.833333,
+      "frames": 295,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 576119,
+      "sha256": "72496f17d6b65ab43a182521b406670ddccc618b82d9f0147053366599c294a8",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/05_界面外观/01_深色主题.mp4",
+      "seconds": 10.833333,
+      "frames": 325,
+      "resolution": [
+        1600,
+        1800
+      ],
+      "bytes": 638351,
+      "sha256": "a0ecb288ca83ffd9dbacc74612ce007959698d4a577164ca894b3644bb690c49",
+      "captions": 2,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/06_产品视频/01_竖屏产品介绍.mp4",
+      "seconds": 37.2,
+      "frames": 1116,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 1910428,
+      "sha256": "06467a0565c9aea4dc417d9e1648a2d3fc1fa6fa3a53d19661d4ae84365f1bcf",
+      "captions": 12,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/06_产品视频/02_竖屏精简介绍.mp4",
+      "seconds": 13.066667,
+      "frames": 392,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 766061,
+      "sha256": "53f775eb90da044cb2c1a21c5d0f69d896009af7c0d7e4022392b8d71ac63b73",
+      "captions": 5,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/06_产品视频/03_原比例产品介绍.mp4",
+      "seconds": 24.466667,
+      "frames": 734,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 1226555,
+      "sha256": "26569f323d8025899827468d1a5a66988cf3fd7c0304e0bacb7e17f09c45d901",
+      "captions": 8,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/06_产品视频/04_原比例精简介绍.mp4",
+      "seconds": 13.066667,
+      "frames": 392,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 703093,
+      "sha256": "8da1d6de85059ea950795fa26cd4cef639ea4e5fb1354c061a3b1a1b8595572f",
+      "captions": 5,
+      "decode": "passed"
+    },
+    {
+      "path": "中文/06_产品视频/05_原比例完整功能总览.mp4",
+      "seconds": 99.833333,
+      "frames": 2995,
+      "resolution": [
+        1080,
+        1920
+      ],
+      "bytes": 4205452,
+      "sha256": "dc334efd4f42b7801ca89dc5896fed5b4dd145f2e8a2c6c0ca6f3407e0dd2245",
+      "captions": 21,
+      "decode": "passed"
+    }
+  ],
+  "previous_audio_measurements": [
+    {
+      "path": "中文\\00_完整演示\\01_TUI双端同步.mp4",
+      "integrated_lufs": -16.14,
+      "true_peak_dbtp": -2.42
+    },
+    {
+      "path": "中文\\00_完整演示\\02_功能总览.mp4",
+      "integrated_lufs": -15.71,
+      "true_peak_dbtp": -2.14
+    },
+    {
+      "path": "English\\00_Full_demos\\01_TUI_on_Windows_and_Android.mp4",
+      "integrated_lufs": -16.21,
+      "true_peak_dbtp": -1.93
+    },
+    {
+      "path": "English\\00_Full_demos\\02_Feature_overview.mp4",
+      "integrated_lufs": -16.17,
+      "true_peak_dbtp": -1.4
+    }
+  ],
+  "visual_review": "All 10 legacy contact sheets reviewed; all 34 previous chapter samples reviewed. English and Chinese titles and caption placement checked.",
+  "scope": "Only final videos, subtitles, covers, preview GIFs, catalogues and verification; no private captures, credentials or core source",
+  "new_audio_measurements": [
+    {
+      "path": "中文/06_产品视频/01_竖屏产品介绍.mp4",
+      "integrated_lufs": -16.08,
+      "true_peak_dbtp": -2.8
+    },
+    {
+      "path": "中文/06_产品视频/02_竖屏精简介绍.mp4",
+      "integrated_lufs": -15.91,
+      "true_peak_dbtp": -3.11
+    },
+    {
+      "path": "中文/06_产品视频/03_原比例产品介绍.mp4",
+      "integrated_lufs": -15.71,
+      "true_peak_dbtp": -2.61
+    },
+    {
+      "path": "中文/06_产品视频/04_原比例精简介绍.mp4",
+      "integrated_lufs": -15.91,
+      "true_peak_dbtp": -3.11
+    },
+    {
+      "path": "中文/06_产品视频/05_原比例完整功能总览.mp4",
+      "integrated_lufs": -15.71,
+      "true_peak_dbtp": -2.14
+    },
+    {
+      "path": "English/06_Product_videos/01_Portrait_product_demo.mp4",
+      "integrated_lufs": -16.03,
+      "true_peak_dbtp": -2.45
+    },
+    {
+      "path": "English/06_Product_videos/02_Portrait_short_demo.mp4",
+      "integrated_lufs": -15.89,
+      "true_peak_dbtp": -2.32
+    },
+    {
+      "path": "English/06_Product_videos/03_Original_aspect_product_demo.mp4",
+      "integrated_lufs": -15.96,
+      "true_peak_dbtp": -2.32
+    },
+    {
+      "path": "English/06_Product_videos/04_Original_aspect_short_demo.mp4",
+      "integrated_lufs": -15.89,
+      "true_peak_dbtp": -2.32
+    },
+    {
+      "path": "English/06_Product_videos/05_Original_aspect_feature_overview.mp4",
+      "integrated_lufs": -16.17,
+      "true_peak_dbtp": -1.4
+    },
+    {
+      "path": "中文/01_CLI终端/05_CLI双向同步.mp4",
+      "integrated_lufs": -16.09,
+      "true_peak_dbtp": -3.91
+    },
+    {
+      "path": "中文/01_CLI终端/06_CLI双向同步_竖屏居中.mp4",
+      "integrated_lufs": -16.09,
+      "true_peak_dbtp": -3.91
+    },
+    {
+      "path": "English/01_CLI_terminals/05_Bidirectional_CLI_sync.mp4",
+      "integrated_lufs": -16.21,
+      "true_peak_dbtp": -2.3
+    },
+    {
+      "path": "English/01_CLI_terminals/06_Bidirectional_CLI_sync_portrait.mp4",
+      "integrated_lufs": -16.21,
+      "true_peak_dbtp": -2.3
+    }
+  ],
+  "text_secret_scan": "Gitleaks 8.30.1: no leaks in final media directory",
+  "legacy_draft_checks": [
+    {
+      "name": "TermLink_legacy_center-full_en_20261017",
+      "tracks": {
+        "video": 7,
+        "audio": 8,
+        "text": 9
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_center-full_zh_20261017",
+      "tracks": {
+        "video": 7,
+        "audio": 7,
+        "text": 8
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_center-short_en_20261017",
+      "tracks": {
+        "video": 4,
+        "audio": 5,
+        "text": 6
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_center-short_zh_20261017",
+      "tracks": {
+        "video": 4,
+        "audio": 4,
+        "text": 5
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_cli-sync_en_20261017",
+      "tracks": {
+        "video": 3,
+        "audio": 4,
+        "text": 7
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_cli-sync_zh_20261017",
+      "tracks": {
+        "video": 3,
+        "audio": 3,
+        "text": 7
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_portrait-full_en_20261017",
+      "tracks": {
+        "video": 7,
+        "audio": 8,
+        "text": 12
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_portrait-full_zh_20261017",
+      "tracks": {
+        "video": 7,
+        "audio": 7,
+        "text": 12
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_portrait-short_en_20261017",
+      "tracks": {
+        "video": 4,
+        "audio": 5,
+        "text": 6
+      },
+      "saved": true
+    },
+    {
+      "name": "TermLink_legacy_portrait-short_zh_20261017",
+      "tracks": {
+        "video": 4,
+        "audio": 4,
+        "text": 5
+      },
+      "saved": true
+    }
+  ],
+  "ocr_privacy_check": {
+    "frames": 77,
+    "failures": 0,
+    "credential_labels": 0,
+    "provider_key_shapes": 0,
+    "private_text_uploaded": false
+  }
+}

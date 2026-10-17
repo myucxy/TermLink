@@ -1,0 +1,23 @@
+1
+00:00:00,220 --> 00:00:02,260
+Away from your PC?
+
+2
+00:00:02,270 --> 00:00:04,638
+Keep working from your phone.
+
+3
+00:00:05,153 --> 00:00:08,383
+Your remote terminal, ready for commands.
+
+4
+00:00:08,887 --> 00:00:12,479
+AI conversations and files, within reach.
+
+5
+00:00:12,987 --> 00:00:14,452
+TermLink.
+
+6
+00:00:14,462 --> 00:00:16,992
+Take your computer work with you.

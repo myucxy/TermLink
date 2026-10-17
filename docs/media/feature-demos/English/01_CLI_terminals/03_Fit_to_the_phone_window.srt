@@ -1,0 +1,7 @@
+1
+00:00:00,400 --> 00:00:04,215
+Open the cloud menu and fit the session to your phone window.
+
+2
+00:00:04,225 --> 00:00:08,468
+The terminal adjusts its rows and columns to the space available.

@@ -1,0 +1,11 @@
+1
+00:00:00,400 --> 00:00:04,752
+Now switch to OpenCode and send hi in its terminal interface.
+
+2
+00:00:04,762 --> 00:00:07,778
+All three tools run on the Windows PC.
+
+3
+00:00:07,788 --> 00:00:10,830
+Android provides remote input and viewing.

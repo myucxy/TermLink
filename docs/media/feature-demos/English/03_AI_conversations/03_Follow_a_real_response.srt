@@ -1,0 +1,8 @@
+1
+00:00:00,400 --> 00:00:03,802
+Send a task and follow its progress and reply.
+
+2
+00:00:03,812 --> 00:00:08,842
+This is a real Chinese response returned through the server from the connected
+computer.

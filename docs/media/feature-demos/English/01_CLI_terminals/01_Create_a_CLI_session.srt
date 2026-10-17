@@ -1,0 +1,8 @@
+1
+00:00:00,400 --> 00:00:03,278
+Choose CLI and select a terminal.
+
+2
+00:00:03,288 --> 00:00:08,880
+The computer creates a separate working directory, then opens your remote
+command line.

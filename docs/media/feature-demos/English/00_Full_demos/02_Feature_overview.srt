@@ -1,0 +1,92 @@
+1
+00:00:00,400 --> 00:00:02,278
+This is TermLink.
+
+2
+00:00:02,288 --> 00:00:07,902
+Connect your phone to command-line sessions, AI conversations, and files on
+Windows.
+
+3
+00:00:07,912 --> 00:00:10,905
+Start by choosing an online computer.
+
+4
+00:00:11,667 --> 00:00:14,544
+Choose CLI and select a terminal.
+
+5
+00:00:14,554 --> 00:00:20,147
+The computer creates a separate working directory, then opens your remote
+command line.
+
+6
+00:00:20,900 --> 00:00:25,478
+Open the keyboard and enter a command to see the computer return its output.
+
+7
+00:00:25,488 --> 00:00:31,468
+Shortcut keys make Enter, arrow keys, and common key combinations easy to
+reach.
+
+8
+00:00:32,233 --> 00:00:36,048
+Open the cloud menu and fit the session to your phone window.
+
+9
+00:00:36,058 --> 00:00:40,301
+The terminal adjusts its rows and columns to the space available.
+
+10
+00:00:41,067 --> 00:00:46,332
+When creating an AI conversation, choose from agents available on this computer.
+
+11
+00:00:46,342 --> 00:00:50,872
+Create a working directory automatically or select one yourself.
+
+12
+00:00:51,633 --> 00:00:54,736
+Choose the model and reasoning effort separately.
+
+13
+00:00:54,746 --> 00:00:57,673
+Permission options depend on the agent.
+
+14
+00:00:57,683 --> 00:01:00,913
+This example keeps approval on request.
+
+15
+00:01:01,667 --> 00:01:05,069
+Send a task and follow its progress and reply.
+
+16
+00:01:05,079 --> 00:01:10,109
+This is a real Chinese response returned through the server from the connected
+computer.
+
+17
+00:01:10,867 --> 00:01:15,707
+After the AI creates a file, open the file entry in the conversation.
+
+18
+00:01:15,717 --> 00:01:20,347
+Preview its contents, then navigate to its folder on the computer.
+
+19
+00:01:21,100 --> 00:01:24,115
+Choose New AI Chat from the folder menu.
+
+20
+00:01:24,125 --> 00:01:30,130
+The current path is filled in automatically, so your next conversation starts in that
+directory.
+
+21
+00:01:30,900 --> 00:01:35,865
+Choose the dark theme in Settings for a clear view of terminals and conversations.
+
+22
+00:01:35,875 --> 00:01:39,980
+With TermLink, continue your computer work from your phone.

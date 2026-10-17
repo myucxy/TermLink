@@ -1,0 +1,72 @@
+1
+00:00:00,400 --> 00:00:04,552
+Continue your Windows command-line work from Android with TermLink.
+
+2
+00:00:04,562 --> 00:00:08,255
+Both screens show a real, shared terminal session.
+
+3
+00:00:09,033 --> 00:00:12,948
+Windows Terminal is running PowerShell 7 on the PC.
+
+4
+00:00:12,958 --> 00:00:17,413
+Android connects to that same session for remote input and output.
+
+5
+00:00:18,167 --> 00:00:20,344
+First, Codex.
+
+6
+00:00:20,354 --> 00:00:22,382
+Type hi on Android.
+
+7
+00:00:22,392 --> 00:00:27,882
+The CLI sends the request from Windows, and the reply appears on both screens.
+
+8
+00:00:27,892 --> 00:00:33,447
+This is the running terminal interface, including its input box and Chinese text.
+
+9
+00:00:34,200 --> 00:00:38,228
+Next, launch Claude Code in the same PowerShell session.
+
+10
+00:00:38,238 --> 00:00:41,452
+Send hi and watch the real reply arrive.
+
+11
+00:00:41,462 --> 00:00:46,018
+TermLink keeps its interactive terminal interface visible on Android.
+
+12
+00:00:47,967 --> 00:00:52,319
+Now switch to OpenCode and send hi in its terminal interface.
+
+13
+00:00:52,329 --> 00:00:55,344
+All three tools run on the Windows PC.
+
+14
+00:00:55,354 --> 00:00:58,397
+Android provides remote input and viewing.
+
+15
+00:01:02,233 --> 00:01:05,973
+Open the session menu to fit the terminal to the phone window.
+
+16
+00:01:05,983 --> 00:01:12,188
+The keyboard, Enter key, and arrow keys are grouped at the bottom for interactive
+command-line work.
+
+17
+00:01:12,967 --> 00:01:17,057
+The computer keeps running while you check and control it from your phone.
+
+18
+00:01:17,067 --> 00:01:21,822
+TermLink puts your remote command line and interactive tools in your pocket.

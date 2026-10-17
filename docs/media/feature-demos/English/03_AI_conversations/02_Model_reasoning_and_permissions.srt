@@ -1,0 +1,11 @@
+1
+00:00:00,400 --> 00:00:03,503
+Choose the model and reasoning effort separately.
+
+2
+00:00:03,512 --> 00:00:06,440
+Permission options depend on the agent.
+
+3
+00:00:06,450 --> 00:00:09,680
+This example keeps approval on request.
