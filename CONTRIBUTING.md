@@ -50,3 +50,4 @@ python scripts/update_dependency_inventory.py --verify
 依赖变更后运行 `update_dependency_inventory.py` 更新清单和 Go 原始许可文本，再人工审核差异。
 清单覆盖范围在 JSON 中说明；声明清单不等于 Android/.NET 全部传递依赖已完成许可审核。
 GitHub `Repository checks` 只执行文档、秘密扫描、Server/Web 测试和源码打包自检，不发布客户端或 Docker。
+独立的手动 [GitHub 客户端发布管道](docs/development/GITHUB_RELEASE.md)由维护者在本地签名后调度，校验草稿附件后发布；PR 不触发它。

@@ -1,0 +1,76 @@
+name: GitHub client release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Existing draft Release ID from the local staging command
+        required: true
+        type: string
+      revision:
+        description: Full application commit used to build the signed clients
+        required: true
+        type: string
+      metadata_sha256:
+        description: SHA-256 of the locally verified github-release.json
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: github-client-release
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      RELEASE_REVISION: ${{ inputs.revision }}
+      METADATA_SHA256: ${{ inputs.metadata_sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Download the pinned draft and verify source and file hashes
+        shell: pwsh
+        run: |
+          python scripts/github_release.py receive --directory artifacts/github-incoming --release-id $env:RELEASE_ID --revision $env:RELEASE_REVISION --metadata-sha256 $env:METADATA_SHA256
+          if ($LASTEXITCODE -ne 0) { throw 'Draft verification failed.' }
+      - name: Verify Android and Windows signatures, versions, payloads and timestamp
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $incoming = 'artifacts/github-incoming'
+          $manifest = Get-Content "$incoming/artifact-manifest.json" -Raw | ConvertFrom-Json
+          $policy = Get-Content release/github-release-policy.json -Raw | ConvertFrom-Json
+          $batch = "artifacts/release/$($manifest.version)-$($manifest.build_number)"
+          New-Item -ItemType Directory -Path $batch -Force | Out-Null
+          Copy-Item "$incoming/*" -Destination $batch
+          $setup = Get-ChildItem $batch -Filter '*.exe'
+          $signature = Get-AuthenticodeSignature -LiteralPath $setup.FullName
+          if ($signature.SignerCertificate.Thumbprint -ine $policy.windows_signer_sha1) { throw 'Unexpected Windows signer.' }
+          # Trust only the pinned public certificate inside this disposable runner.
+          $certificate = Join-Path $env:RUNNER_TEMP 'termlink-publisher.cer'
+          Export-Certificate -Cert $signature.SignerCertificate -FilePath $certificate | Out-Null
+          Import-Certificate -FilePath $certificate -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          $result = ./release/Verify-LocalRelease.ps1 -ReleaseDirectory $batch -RequireSourceIdentity `
+            -AndroidSdkPath $env:ANDROID_HOME -ExpectedReleaseMode Production `
+            -ExpectedAndroidSignerSha256 $policy.android_signer_sha256 `
+            -ExpectedWindowsSignerSha1 $policy.windows_signer_sha1 -RequireWindowsTimestamp
+          $result | Set-Content -LiteralPath "$incoming/ci-verification.json" -Encoding utf8
+      - name: Publish only the verified draft
+        shell: pwsh
+        run: |
+          python scripts/github_release.py publish --directory artifacts/github-incoming --release-id $env:RELEASE_ID --revision $env:RELEASE_REVISION --metadata-sha256 $env:METADATA_SHA256
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

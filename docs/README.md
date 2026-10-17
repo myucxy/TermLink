@@ -29,6 +29,7 @@
 ## 发布与验收
 
 - [发布运行手册](RELEASE_RUNBOOK.md)、[构建及签名规则](RELEASE.md)。
+- [GitHub 客户端发布管道](development/GITHUB_RELEASE.md)：本地签名构建、草稿附件校验与正式发布。
 - [发布记录索引](releases/README.md)、[远程 Agent 升级](REMOTE_AGENT_UPDATE.md)。
 - [跨端验证工具](../technical-validation/e2e/README.md)、[终端测试向量](../testdata/terminal-golden-streams/README.md)。
 

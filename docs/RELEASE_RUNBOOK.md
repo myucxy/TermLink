@@ -6,7 +6,7 @@
 ## 当前 Docker 发布入口（2026-10-04）
 
 按用户最新指定，本机编译后直接 push 到 `docker.io/myucxy/termlink`，不使用 GitHub Actions。
-旧 Docker 发布工作流已从当前树移除，GitHub Actions 只运行源码与测试检查。
+旧 Docker 发布工作流已从当前树移除。GitHub 客户端 Release 使用独立的[校验发布管道](development/GITHUB_RELEASE.md)，不构建或发布 Docker。
 本机发布仍固定已提交 revision 和版本/build，保留 BuildKit provenance/SBOM，逐项检查 amd64/arm64、
 版本镜像 digest、源码标签和健康；版本镜像核验后再同步同 digest 的 latest。凭据使用现有 Docker credential helper。
 本机没有 GitHub OIDC 身份，不能声称本地镜像通过 GitHub keyless 签名；本地签名资料未就绪时先完成
@@ -99,11 +99,13 @@ core 仓库后续公开与本次许可变更分开执行。匹配的源码交付
    核验清单中的现有工具；从固定源码构建 Production APK/Setup（如需商店才加 AAB），独立运行
    `release/Verify-LocalRelease.ps1` 验证 manifest、哈希、版本、证书连续性和 Windows RFC 3161 时间戳。
    Production MSIX 尚不支持；`Build-Release.ps1 -ServerImage` 只产生本地 OCI tar，不是 Docker Hub 发布命令。
-5. **发布并验证**：Android/Windows 仅通过 `scripts/Publish-AppShipProduction.ps1` 顺序发布；每端必须有
+5. **发布并验证**：AppShip 的 Android/Windows 通过 `scripts/Publish-AppShipProduction.ps1` 顺序发布；每端必须有
    已人工审核的签名、`published` release 和 `ready` artifact。Docker 本机编译、直接 push Hub，
    不走 GitHub Actions，不创建 GitHub Release/GHCR 镜像。核对 amd64/arm64、OCI index digest、
    revision、签名及 provenance/SBOM；通过后将同一 digest 同步到 `latest`。签名未验证需明确记录和处理，
    不把本机 BuildKit attestation 当成已有 GitHub keyless 签名。失败时保留原 AppShip 状态/版本镜像 tag，恢复同一操作。
+   若本轮指定 GitHub Release，改用[GitHub 管道](development/GITHUB_RELEASE.md)发布同批正式签名客户端和完整对应源码；
+   未指定的平台不跟随上线。GitHub 自动源码 ZIP 不能替代包含同级 core 的专用源码包。
 6. **部署与回归**：只有用户明确要求部署时，先做 age 加密备份，再以不可变 `tag@sha256:index-digest`
    无损升级单节点 Server；核对两个健康常驻容器、数据卷、migration、OIDC 和公网 `/readyz`。
    对客户端做原地覆盖安装与登录、历史/会话/输入全链路验证；AppShip 旧 build 应为 `optional`，

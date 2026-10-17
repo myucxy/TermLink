@@ -1,7 +1,7 @@
 # 统一发布构建
 
 2026-10-04 当前 Docker 发布方式：用户指定本机编译后直接 push Docker Hub，不走 GitHub Actions；
-旧 Docker 发布工作流已移除，GitHub Actions 只运行源码与测试检查。镜像版本、源码 revision、架构、digest 和签名/证明证据仍须核验，
+旧 Docker 发布工作流已移除；GitHub 的[客户端发布管道](development/GITHUB_RELEASE.md)只验证并发布本地正式签名产物。镜像版本、源码 revision、架构、digest 和签名/证明证据仍须核验，
 不把 BuildKit 生成的未签名 SBOM/provenance 宣称为 Cosign 已验证。详见运行手册的当前 Docker 发布入口。
 
 仓库根入口为 `scripts/Build-Release.ps1`。它只编排已有的组件构建器并把产物集中到

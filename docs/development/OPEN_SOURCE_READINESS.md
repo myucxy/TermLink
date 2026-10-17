@@ -11,7 +11,7 @@
 - 应用 README 补充参考项目、实际组件/资源与来源声明；core 有中英文 README、独立签名依赖包和对应源码 Release。
 - 源码归档支持按显式应用/core revision 导出，使用该 commit 的锁文件和原生库 Git 对象；不要求最新文档 HEAD 与旧二进制来源相同。IncludeCoreVendor 可附完整锁定 Rust 依赖和离线配置。
 - [依赖清单](../licenses/dependency-inventory.json)记录 Linux 双架构 Server 实际链接模块、AI Web runtime、Android/.NET 声明与 network-core Rust 锁。Server 的 Go runtime 和 71 个链接模块的原始许可文本已汇总到随镜像复制的许可包；AI Web 保留 108 份运行依赖声明。
-- 新增文档链接、精确测试向量秘密扫描、Server/Web 和源码打包检查，以及 Issue/PR 模板。旧 Docker 发布 workflow 已移除，GitHub 检查不发布镜像或客户端。
+- 新增文档链接、精确测试向量秘密扫描、Server/Web 和源码打包检查，以及 Issue/PR 模板。旧 Docker workflow 已移除；独立的[GitHub 客户端发布管道](GITHUB_RELEASE.md)核验本地签名产物后发布，不上传签名私钥。
 
 ## 保留的边界与剩余事项
 

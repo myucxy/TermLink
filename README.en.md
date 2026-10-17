@@ -27,7 +27,7 @@ All final assets live in this repository. [Recording notes](docs/media/feature-d
 
 ## Download and start
 
-- Android / Windows: [AppShip](https://appship.kget.cc:8910), with [release records](docs/releases/README.md).
+- Android / Windows: [GitHub Releases](https://github.com/myucxy/TermLink/releases) (APK, Setup and full corresponding source) or [AppShip](https://appship.kget.cc:8910), with [release records](docs/releases/README.md).
 - Server: [Docker Hub](https://hub.docker.com/r/myucxy/termlink), with [deployment instructions](server/README.md).
 - [Quick start](docs/guides/QUICK_START.md) · [Build guide](docs/development/BUILDING.md).
 - [Matching source for 0.3.5 / build 135](https://appship.kget.cc:8910/api/v1/artifacts/ca7763b8-ae84-4a24-9c78-d0e5698bbca6/download):
@@ -91,6 +91,7 @@ Project names and product marks do not imply endorsement. This overview is not a
 
 [Contributing](CONTRIBUTING.md) · [Security reports](SECURITY.md) · [Open-source readiness](docs/development/OPEN_SOURCE_READINESS.md)
 
-GitHub checks documentation, committed-source secrets, Server/Web tests and source packaging. It does not
-publish applications or images. Client releases use AppShip; Docker is built locally and pushed to Docker Hub.
+GitHub checks documentation, committed-source secrets, Server/Web tests and source packaging. The separate
+[client release pipeline](docs/development/GITHUB_RELEASE.md) verifies locally signed clients before publication;
+signing keys stay local. AppShip remains available; Docker is built locally and pushed to Docker Hub.
 Follow the [release runbook](docs/RELEASE_RUNBOOK.md) for signatures, source identity, tests and rollback.
