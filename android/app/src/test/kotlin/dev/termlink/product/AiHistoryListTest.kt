@@ -14,6 +14,16 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
 class AiHistoryListTest {
+    @Test fun nativeHistoryAcceptsOnlyEachAgentsOwnIdentifierFormat() {
+        assertEquals("ses_history_123", aiNativeHistoryId("opencode", "ses_history_123"))
+        val uuid = UUID.randomUUID().toString()
+        assertEquals(uuid, aiNativeHistoryId("codex", uuid))
+        assertEquals(uuid, aiNativeHistoryId("claude", uuid))
+        for ((agent, id) in listOf("opencode" to "ses_../secret", "opencode" to "ses_", "opencode" to uuid, "codex" to "ses_history_123")) {
+            assertTrue(runCatching { aiNativeHistoryId(agent, id) }.isFailure)
+        }
+        assertEquals("OpenCode", aiAgentName("opencode"))
+    }
     @Test fun deviceGroupsLocateCorrectPcAndKeepCatalogBrowsingSeparateFromOpenedViews() {
         val pc = UUID.randomUUID(); val other = UUID.randomUUID()
         fun session(device: UUID, agent: String, name: String = agent) = parseConversation(device, JSONObject()

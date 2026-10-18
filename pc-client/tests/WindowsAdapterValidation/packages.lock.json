@@ -10,7 +10,8 @@
       "termlink.agentcontrol": {
         "type": "Project",
         "dependencies": {
-          "System.Security.Cryptography.ProtectedData": "[8.0.0, )"
+          "System.Security.Cryptography.ProtectedData": "[8.0.0, )",
+          "TermLink.UpdateCore": "[1.0.0, )"
         }
       },
       "termlink.pc.contracts": {

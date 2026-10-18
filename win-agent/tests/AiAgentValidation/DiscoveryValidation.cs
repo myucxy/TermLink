@@ -33,6 +33,9 @@ internal static class DiscoveryValidation
             var cli = candidates[0] with { Name = "Codex CLI" };
             found = await AiAgentDiscovery.ProbeCandidatesAsync(desktopOnly, new[] { cli }.Concat(candidates), default);
             Check(found.Name == "Codex CLI", "A usable explicit CLI was not preferred.");
+            var openCode = new AiAgentInstallation("opencode", "OpenCode", Environment.ProcessPath!, "", "", "acp", "missing");
+            found = await AiAgentDiscovery.ProbeCandidatesAsync(openCode, new[] { openCode }, default);
+            Check(found.Status == "available", "OpenCode help on stderr was ignored.");
         } finally { Environment.SetEnvironmentVariable("TERMLINK_AI_DISCOVERY_FIXTURE", previous); }
 
         var claudeRoot = Path.Combine(root, "Claude");
@@ -48,6 +51,9 @@ internal static class DiscoveryValidation
         var claudeCandidates = AiAgentDiscovery.DesktopCandidates("claude", new[] { claudeRoot }, cache).ToArray();
         Check(claudeCandidates.Length == 2 && claudeCandidates[0].Path.Contains("2.10.0"), "Claude downloaded engines did not use numeric version ordering.");
         Check(claudeCandidates.All(a => a.Path != Path.Combine(claudeRoot, "Claude.exe")), "Claude GUI was offered as stream-json CLI.");
+        Directory.CreateDirectory(Path.Combine(cache, "2.11.0", "f0584be0fbaf"));
+        File.WriteAllText(Path.Combine(cache, "2.11.0", "f0584be0fbaf", "claude.exe"), "desktop hash engine");
+        Check(AiAgentDiscovery.DesktopCandidates("claude", new[] { claudeRoot }, cache).First().Path.Contains("f0584be0fbaf"), "Hashed Claude-3p engine layout was not discovered.");
         using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         try { await AiAgentDiscovery.ProbeCandidatesAsync(fallback, candidates, cancellation.Token); throw new Exception("Cancellation ignored."); }
         catch (OperationCanceledException) { }
@@ -60,7 +66,7 @@ internal static class DiscoveryValidation
             var roots = AiAgentDiscovery.InstalledDesktopRoots(id).ToArray();
             var fallback = new AiAgentInstallation(id, id, "", "", "", id, "missing");
             var detected = await AiAgentDiscovery.ProbeCandidatesAsync(AiAgentDiscovery.DesktopFallback(fallback, roots),
-                AiAgentDiscovery.DesktopCandidates(id, roots), default);
+                AiAgentDiscovery.DesktopCandidates(id, roots), default, "D:/Dev/Env/TermLink-AiRuntimeValidation/cache");
             Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { desktopOnlyProbe = true, detected.Id, detected.Name, detected.Path, detected.Version, detected.Status }));
         }
     }

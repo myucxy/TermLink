@@ -36,9 +36,30 @@ AI Agent 检测优先使用可用 CLI，也检查 Codex / ChatGPT 与 Claude 的
 卸载注册、运行进程和常见安装位置。桌面内置的编码引擎通过帮助与版本探测后才标为可用；
 仅安装图形程序或系统阻止启动时分别显示明确状态。检测不启动桌面窗口、不安装 CLI 或修改 WindowsApps 权限。
 
-Codex 原生历史要求可用的 app-server 引擎与桌面版使用相同的 Windows 用户／CODEX_HOME。
-商店包内引擎被系统阻止时，可使用独立 CLI。Claude 当前读取 `CLAUDE_CONFIG_DIR/projects`
-或 `~/.claude/projects` 中的 Code 历史；普通聊天和桌面独立会话目录不在导入范围内。
+以下桌面历史续聊与 OpenCode 接入自 0.3.9 提供。
+Codex 原生历史与续聊使用桌面版同一 Windows 用户／CODEX_HOME。商店包阻止直接启动时，
+TermLink 校验已安装引擎的受信任 OpenAI 签名，将引擎及所需已签名助手按内容哈希缓存至
+`%LOCALAPPDATA%/TermLink/Agent/CodexDesktopRuntime/`，再运行原生协议，无需另装 CLI。
+缓存目录只允许当前用户、SYSTEM 和管理员访问；文件哈希不符、签名失败或目录重定向时拒绝启动。
+桌面升级使用新的哈希目录，保留正在使用的旧版本；不会复制账号凭据或历史数据、修改 WindowsApps 权限或下载引擎。
+选择“Codex 原生历史”后打开会话，保留原生会话 ID、上下文及授权并继续发送；应先停止原桌面窗口的并发生成。
+桌面历史恢复可等待 90 秒，Android 导入／恢复请求可等待 120 秒；普通输入和查询保留原超时。
+Claude Code 历史同时覆盖 `CLAUDE_CONFIG_DIR/projects`／`~/.claude/projects` 和桌面数据中的
+`claude-code-sessions/<account>/<organization>/[local_<session>/].claude/projects/`。
+检测包含 `Claude-3p`、`Claude-Data`、常规 Roaming 目录及商店虚拟目录，支持版本／哈希双层引擎路径。
+继续时通过原生 `--resume <transcript.jsonl>` 加载已验证路径，保留会话 ID、上下文与历史权限；
+沿用当前编码引擎可用的认证配置，不复制桌面凭据。Transcript 路径随 TermLink 的 DPAPI 归档保留。
+普通 Claude Chat、Cowork、SSH／WSL 和云端独立会话不在本轮范围。
+
+OpenCode 使用本机 `opencode acp`，支持创建、文本流、审批、中断、原生历史列表及同会话续聊。
+原生历史使用不透明的 `ses_…` ID；加载时回放历史正文，TermLink 归档恢复时避免重复正文。
+沿用 OpenCode 的模型、登录及原生权限规则，不注入 Grok 自动批准参数、不改变用户全局设置。
+当前只接本机 CLI；未验证 OpenCode 桌面版、接管仍运行的 TUI 或外部 HTTP Server。
+
+2026-10-18 已使用 Android 模拟器和已安装的 Windows 开发版完成 Relay 联测：Codex、Claude Code
+桌面引擎和 OpenCode 均能加载原生历史并按原会话上下文继续对话。Agent 重启后可恢复加密归档；
+Codex 在仅排除测试进程中的独立 CLI 后，仍能使用已验证签名的桌面引擎续聊。
+ACP 模型选项以会话加载响应为准，避免在初始化阶段误报模型能力不可用。
 
 Linux/macOS 有独立 Host 与认证 Unix-domain IPC；当前真实远程 Relay 仍存在 `PORTABLE_RELAY_NOT_CONFIGURED` 限制，不能按 Windows 的功能和发布状态宣传。AppImage/PKG 需要目标平台、签名材料及专项验收，交叉编译成功不等于可发布。
 

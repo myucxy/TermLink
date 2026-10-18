@@ -27,6 +27,15 @@ internal static class NativeHistoryValidation
         for (var n = 0; n < 31; n++) File.Copy(path, Path.Combine(project, Guid.NewGuid() + ".jsonl"));
         var first = ClaudeNativeHistory.List("", CancellationToken.None, root);
         Check(first.NextCursor == "30", "Bounded history paging");
+        var desktopRoot = Path.Combine(directory, "Claude-3p");
+        var profile = Path.Combine(desktopRoot, "claude-code-sessions", Guid.NewGuid().ToString(), Guid.NewGuid().ToString());
+        var desktopProjects = Path.Combine(profile, "local_" + Guid.NewGuid(), ".claude", "projects");
+        var desktopProject = Path.Combine(desktopProjects, "project"); Directory.CreateDirectory(desktopProject);
+        var desktopTranscript = Path.Combine(desktopProject, id + ".jsonl"); File.Copy(path, desktopTranscript);
+        Check(ClaudeNativeHistory.HistoryRoots(new[] { desktopRoot }).Contains(desktopProjects), "Desktop Code transcript root was not discovered.");
+        var desktopRead = ClaudeNativeHistory.Read(desktopTranscript, id, true, desktopProjects);
+        Check(desktopRead.Entry.SourcePath == desktopTranscript && desktopRead.Messages.Length == 3, "Desktop transcript location or content lost.");
+        Check(!ClaudeNativeHistory.SafeFile(Path.Combine(profile, "outside.jsonl"), desktopProjects), "Desktop transcript boundary escaped.");
         try { ClaudeNativeHistory.List("../bad", CancellationToken.None, root); throw new Exception("Bad cursor accepted"); } catch (AiOperationException e) when (e.Code == "INVALID_CURSOR") { }
         var previousRoot = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
         try {
@@ -45,6 +54,7 @@ internal static class NativeHistoryValidation
         try {
             var agent = new AiAgentInstallation("codex", "Codex", Environment.ProcessPath, "", "0.160.0", "codex", "available");
             var caller = Guid.NewGuid();
+            await AiAgentSession.NativeHistoryAsync(agent, "", CancellationToken.None);
             using var s = AiAgentSession.Import(agent, new(id, "Native title", directory, 0), caller, null);
             await s.StartAsync();
             Check(s.ArchiveRecord().NativePermissions?.Reviewer == "auto_review", "Native reviewer lost");
@@ -52,6 +62,8 @@ internal static class NativeHistoryValidation
             await restored.ResumeAsync();
             await restored.ApplyAsync(caller, new("send", ControlVersion: 1, OperationId: Guid.NewGuid().ToString(), Text: "config test"));
             var frames = File.ReadAllLines(trace).Where(l => l.StartsWith('{')).Select(l => JsonDocument.Parse(l).RootElement.Clone()).ToArray();
+            var sources = frames.Single(f => AiAgentSession.S(f, "method") == "thread/list").GetProperty("params").GetProperty("sourceKinds");
+            Check(sources.EnumerateArray().Select(v => v.GetString()).SequenceEqual(new[] { "cli", "vscode", "appServer" }), "Desktop threads excluded or subagents exposed.");
             Check(frames.Where(f => AiAgentSession.S(f, "method") == "thread/resume").All(f => !f.GetProperty("params").TryGetProperty("approvalPolicy", out _)), "Resume overwrote original permissions");
             var turn = frames.Last(f => AiAgentSession.S(f, "method") == "turn/start").GetProperty("params");
             Check(turn.GetProperty("approvalPolicy").ValueKind == JsonValueKind.Object && turn.GetProperty("sandboxPolicy").GetProperty("networkAccess").GetBoolean(), "Custom permission details lost on next turn");

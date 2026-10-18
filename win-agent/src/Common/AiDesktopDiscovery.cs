@@ -22,12 +22,36 @@ public static partial class AiAgentDiscovery
         }
         if (id == "claude") {
             // Desktop downloads its Code engine separately from the graphical launcher.
-            var cache = claudeCodeRoot ?? System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "claude-code");
-            foreach (var version in VersionDirectories(cache, "*")) {
-                var path = Existing(System.IO.Path.Combine(version, "claude.exe"));
-                if (path != null) yield return new(id, "Claude Code（桌面内置）", path, "", "", id, "missing");
+            var caches = claudeCodeRoot == null ? ClaudeDesktopDataRoots().Select(root => System.IO.Path.Combine(root, "claude-code")) : new[] { claudeCodeRoot };
+            foreach (var cache in caches) foreach (var version in VersionDirectories(cache, "*")) {
+                var paths = new[] { System.IO.Path.Combine(version, "claude.exe") }.Concat(ClaudeEngineHashes(version));
+                foreach (var executable in paths) {
+                    var path = Existing(executable);
+                    if (path != null) yield return new(id, "Claude Code（桌面内置）", path, "", "", id, "missing");
+                }
             }
         }
+    }
+
+    internal static IEnumerable<string> ClaudeDesktopDataRoots()
+    {
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return new[] {
+            System.IO.Path.Combine(roaming, "Claude"), System.IO.Path.Combine(local, "Claude-Data"),
+            System.IO.Path.Combine(local, "Claude-3p"), System.IO.Path.Combine(local, "Claude"),
+            System.IO.Path.Combine(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude"),
+        }.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string[] ClaudeEngineHashes(string version)
+    {
+        try {
+            return Directory.EnumerateDirectories(version).Take(16)
+                .Where(path => System.IO.Path.GetFileName(path) is { Length: 12 } hash && hash.All(Uri.IsHexDigit) &&
+                    (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0)
+                .Select(path => System.IO.Path.Combine(path, "claude.exe")).ToArray();
+        } catch (Exception e) when (e is UnauthorizedAccessException or IOException) { return Array.Empty<string>(); }
     }
 
     internal static AiAgentInstallation DesktopFallback(AiAgentInstallation candidate, IEnumerable<string> roots)

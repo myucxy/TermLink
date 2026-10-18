@@ -33,8 +33,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
+internal fun aiNativeHistoryId(agentId: String, id: String): String {
+    if (agentId == "opencode") {
+        require(id.length in 5..100 && id.startsWith("ses_") && id.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' })
+        return id
+    }
+    return UUID.fromString(id).toString()
+}
 internal fun aiEntryAgent(entry: AiOpened, session: AiConversation?): String = session?.agent?.takeIf { it.isNotBlank() }
-    ?: when (entry.agentId) { "codex" -> "Codex"; "claude" -> "Claude Code"; "zcode" -> "ZCode"; else -> "AI" }
+    ?: when (entry.agentId) { "codex" -> "Codex"; "claude" -> "Claude Code"; "zcode" -> "ZCode"; "opencode" -> "OpenCode"; else -> "AI" }
 
 internal fun aiVisibleEntries(opened: List<AiOpened>, sessions: Map<String, AiConversation>, devices: Map<UUID, String>, query: String, attention: Boolean) =
     opened.filter { entry ->

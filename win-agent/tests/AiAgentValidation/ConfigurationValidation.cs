@@ -170,6 +170,7 @@ internal static class ConfigurationValidation
         if (method == "configRequirements/read") {
             Reply(new { requirements = Environment.GetEnvironmentVariable("TERMLINK_AI_REQUIREMENTS") == "restricted" ? (object)new { allowedApprovalPolicies = new[] { "on-request" }, allowedSandboxModes = new[] { "workspace-write" }, allowedApprovalsReviewers = new[] { "user" } } : null }); return true;
         }
+        if (method == "thread/list") { Reply(new { data = Array.Empty<object>(), nextCursor = (string)null }); return true; }
         if (method == "thread/turns/list") { Reply(new { data = Array.Empty<object>(), nextCursor = (string)null }); return true; }
         if (method == "thread/resume" && Environment.GetEnvironmentVariable("TERMLINK_AI_NATIVE_FIXTURE") == "1") {
             Reply(new { thread = new { id = "native-thread" }, model = "model-a", approvalPolicy = new { granular = new { sandbox_approval = true } },

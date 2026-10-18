@@ -63,8 +63,8 @@ internal sealed partial class AiAgentSession
         var requestedModel = modelId; var requestedEffort = reasoningEffort;
         var loading = threadId.Length > 0;
         if (loading && !acpLoadSession) throw new AiOperationException("RESUME_UNAVAILABLE");
-        var parameters = new Dictionary<string, object> { ["cwd"] = directory, ["mcpServers"] = Array.Empty<object>(),
-            ["_meta"] = new { yoloMode = permissionMode == "full-access", autoMode = false } };
+        var parameters = new Dictionary<string, object> { ["cwd"] = directory, ["mcpServers"] = Array.Empty<object>() };
+        if (agent.Id == "grok") parameters["_meta"] = new { yoloMode = permissionMode == "full-access", autoMode = false };
         if (loading) parameters["sessionId"] = threadId;
         JsonElement response;
         acpLoading = loading;
@@ -245,7 +245,16 @@ internal sealed partial class AiAgentSession
         }
         if (method != "session/update") return;
         lock (sync) {
-            if (acpLoading) return; // Native replay must not duplicate the archived transcript.
+            if (acpLoading) {
+                if (importNative && agent.Id == "opencode" && (kind is "user_message_chunk" or "agent_message_chunk")) {
+                    var content = P(update, "content");
+                    if (S(content, "type") == "text" && S(content, "text").Length > 0) {
+                        if (kind != acpChunkKind) { acpChunkKind = kind; acpChunkId = "acp/native/" + ++acpChunkIndex; }
+                        Put(acpChunkId, kind == "user_message_chunk" ? "user" : "assistant", S(content, "text"), append: true, status: "completed");
+                    }
+                }
+                return;
+            }
             if (kind == "config_option_update") { ReadAcpConfiguration(update); settingsVersion++; SaveArchive(); return; }
             if (kind == "available_commands_update") { ReadAcpCommands(P(update, "availableCommands")); return; }
             if (acpPromptId.Length == 0 || state != "running") return;

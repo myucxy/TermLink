@@ -146,16 +146,17 @@ internal sealed partial class AiAgentSession
             return new { id, offset, text = message.Text.Substring((int)offset, length), nextOffset = offset + length, length = message.Text.Length };
         }
     }
-    internal AiSessionArchive.Record ArchiveRecord() { lock (sync) return new(Id, agent.Id, directory, threadId, title, modelId, providerId, permissionMode, settingsVersion, messages.ToArray(), defaultModelId, reasoningEffort, nativePermissions); }
+    internal AiSessionArchive.Record ArchiveRecord() { lock (sync) return new(Id, agent.Id, directory, threadId, title, modelId, providerId, permissionMode, settingsVersion, messages.ToArray(), defaultModelId, reasoningEffort, nativePermissions, claudeTranscriptPath); }
     internal void AttachArchive(AiSessionArchive store) { lock (sync) { archive = store; SaveArchive(); } }
     internal static AiAgentSession Restore(TermLink.Ai.AiAgentInstallation agent, AiSessionArchive.Record record, AiSessionArchive store, Guid caller = default)
     {
         var session = new AiAgentSession(agent, record.Directory, caller, record.Model, record.Provider) {
             Id = record.Id, threadId = record.NativeId, title = record.Title, permissionMode = record.Mode,
-            settingsVersion = record.Version, state = caller == Guid.Empty ? "suspended" : "starting", archive = store, defaultModelId = record.DefaultModel ?? "", reasoningEffort = record.ReasoningEffort ?? "", nativePermissions = record.NativePermissions
+            settingsVersion = record.Version, state = caller == Guid.Empty ? "suspended" : "starting", archive = store, defaultModelId = record.DefaultModel ?? "", reasoningEffort = record.ReasoningEffort ?? "", nativePermissions = record.NativePermissions,
+            claudeTranscriptPath = record.ClaudeTranscriptPath ?? ""
         };
         // A restored Grok record can attempt load; initialize rechecks the native capability.
-        session.acpLoadSession = agent.Protocol == "acp" && agent.Id == "grok";
+        session.acpLoadSession = agent.Protocol == "acp" && agent.Id is "grok" or "opencode";
         session.settingsNotice = "恢复时沿用历史授权；不支持的授权会明确报错。";
         session.messages.AddRange(record.Messages);
         return session;
@@ -291,7 +292,8 @@ internal sealed partial class AiAgentSession
 internal sealed class AiSessionArchive(string root)
 {
     internal sealed record Record(string Id, string AgentId, string Directory, string NativeId, string Title,
-        string Model, string Provider, string Mode, long Version, AiAgentSession.Message[] Messages, string DefaultModel = "", string ReasoningEffort = "", AiAgentSession.NativePermissions NativePermissions = null);
+        string Model, string Provider, string Mode, long Version, AiAgentSession.Message[] Messages, string DefaultModel = "", string ReasoningEffort = "", AiAgentSession.NativePermissions NativePermissions = null,
+        string ClaudeTranscriptPath = "");
     internal void Delete(string id) {
         if (!Guid.TryParseExact(id, "D", out _)) throw new AiOperationException("SESSION_NOT_FOUND");
         File.Delete(Path.Combine(root, id + ".bin"));

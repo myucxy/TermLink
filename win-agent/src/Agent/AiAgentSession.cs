@@ -102,14 +102,16 @@ internal sealed partial class AiAgentSession : IDisposable
     {
             var args = agent.Protocol == "claude" ? new[] { "-p", "--verbose", "--input-format", "stream-json",
                 "--output-format", "stream-json", "--include-partial-messages", "--permission-prompt-tool", "stdio", "--permission-mode", ClaudeMode(permissionMode),
-                threadId.Length == 0 ? "--session-id" : "--resume", threadId.Length == 0 ? Id : threadId }
+                threadId.Length == 0 ? "--session-id" : "--resume", threadId.Length == 0 ? Id : claudeTranscriptPath.Length > 0 ? claudeTranscriptPath : threadId }
+                : agent.Id == "opencode" ? new[] { "acp" }
                 : agent.Protocol == "acp" ? new[] { "--permission-mode", permissionMode == "full-access" ? "bypassPermissions" : "default", "agent", "--no-leader", "stdio" }
                 : new[] { "app-server" };
             if (agent.Protocol == "claude" && AdvancedConfiguration(agent)) args = args.Concat(new[] { "--allow-dangerously-skip-permissions" }).ToArray();
             if (agent.Protocol == "claude" && reasoningEffort.Length > 0) args = args.Concat(new[] { "--effort", reasoningEffort }).ToArray();
             lock (sync) {
                 if (disposed) throw new AiOperationException("SESSION_ENDED");
-                process = Process.Start(AiAgentDiscovery.StartInfo(agent, directory, args)) ?? throw new IOException();
+                var start = AiAgentDiscovery.StartInfo(agent, directory, args);
+                process = Process.Start(start) ?? throw new IOException();
                 job = new AiProcessJob(process);
             }
             _ = ReadOutputAsync();
@@ -315,7 +317,8 @@ internal sealed partial class AiAgentSession : IDisposable
         try {
             if (agent.Protocol == "acp") await WriteAsync(new { jsonrpc = "2.0", id = sequence, method, @params = parameters });
             else await WriteAsync(new { id, method, @params = parameters });
-            return await completion.Task.WaitAsync(TimeSpan.FromSeconds(30), lifetime.Token).ConfigureAwait(false);
+            // Native history reconstruction and desktop MCP startup can exceed an ordinary command's deadline.
+            return await completion.Task.WaitAsync(TimeSpan.FromSeconds(method == "thread/resume" ? 90 : 30), lifetime.Token).ConfigureAwait(false);
         } catch (TimeoutException) { throw new AiOperationException("AGENT_TIMEOUT"); }
         finally { calls.TryRemove(id, out _); }
     }

@@ -17,6 +17,5 @@
     <Compile Include="../../src/Agent/AiProcessJob.cs" Link="AiProcessJob.cs" />
     <Compile Include="../../src/Agent/AiSessionManager.cs" Link="AiSessionManager.cs" />
     <Compile Include="../../src/Agent/WindowsDirectoryListing.cs" Link="WindowsDirectoryListing.cs" />
-    <Compile Include="../../src/UpdateCore/AiWorkspaceStorage.cs" Link="AiWorkspaceStorage.cs" />
   </ItemGroup>
 </Project>

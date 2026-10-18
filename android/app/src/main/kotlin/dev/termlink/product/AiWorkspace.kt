@@ -526,7 +526,7 @@ internal class AiWorkspace(
         val page = result.getJSONObject("nativeHistory")
         val entries = page.getJSONArray("sessions").objects()
         require(entries.size <= 30)
-        return AiNativePage(entries.map { AiNativeEntry(UUID.fromString(it.getString("nativeId")).toString(),
+        return AiNativePage(entries.map { AiNativeEntry(aiNativeHistoryId(agentId, it.getString("nativeId")),
             it.optString("title").take(160), it.getString("directory").take(4096), it.optLong("updatedAtMs")) },
             page.optString("nextCursor").also { require(it.length <= 4096) }, page.optBoolean("truncated"))
     }

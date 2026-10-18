@@ -22,9 +22,10 @@ internal sealed partial class AiAgentSession
     internal sealed record NativePermissions(JsonElement Approval, JsonElement Sandbox, string Reviewer);
     private NativePermissions nativePermissions;
     private bool importNative;
+    private string claudeTranscriptPath = "";
     internal bool MatchesNative(string agentId, string nativeId) => agent.Id == agentId && threadId == nativeId;
     internal static bool SupportsNativeHistory(AiAgentInstallation installation) => installation.Status == "available" && installation.Strategy == "native" &&
-        installation.Protocol is "codex" or "claude" && AdvancedConfiguration(installation);
+        (installation.Id == "opencode" && installation.Protocol == "acp" || (installation.Protocol is "codex" or "claude") && AdvancedConfiguration(installation));
 
     internal static async Task<AiNativeHistoryPage> NativeHistoryAsync(AiAgentInstallation installation, string cursor, CancellationToken token)
     {
@@ -35,13 +36,27 @@ internal sealed partial class AiAgentSession
         timeout.CancelAfter(TimeSpan.FromSeconds(25));
         using var registration = timeout.Token.Register(probe.Dispose);
         await probe.InitializeAsync();
-        var response = await probe.RpcAsync("thread/list", new { cursor = cursor.Length == 0 ? null : cursor, limit = 30, sortKey = "updated_at", modelProviders = Array.Empty<string>(), useStateDbOnly = true });
+        if (installation.Id == "opencode") {
+            if (!probe.acpLoadSession) throw new AiOperationException("NATIVE_HISTORY_UNSUPPORTED");
+            var offset = 0;
+            if (cursor.Length > 0 && (!int.TryParse(cursor, out offset) || offset is < 0 or > 4096)) throw new AiOperationException("INVALID_CURSOR");
+            var listing = await probe.RpcAsync("session/list", new { });
+            var values = P(listing, "sessions");
+            if (values.ValueKind != JsonValueKind.Array) throw new AiOperationException("NATIVE_HISTORY_UNAVAILABLE");
+            var rows = values.EnumerateArray().Select(t => new AiNativeHistoryEntry(S(t, "sessionId"), Clip(S(t, "title"), 160), S(t, "cwd"),
+                DateTimeOffset.TryParse(S(t, "updatedAt"), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var date) ? date.ToUnixTimeMilliseconds() : 0))
+                .Where(t => ValidOpenCodeSessionId(t.NativeId) && t.Directory.Length is > 0 and <= 4096).DistinctBy(t => t.NativeId).Take(4096).ToArray();
+            return new(rows.Skip(offset).Take(30).ToArray(), offset + 30 < rows.Length ? (offset + 30).ToString(System.Globalization.CultureInfo.InvariantCulture) : "", rows.Length == 4096);
+        }
+        var response = await probe.RpcAsync("thread/list", new { cursor = cursor.Length == 0 ? null : cursor, limit = 30, sortKey = "updated_at", modelProviders = Array.Empty<string>(),
+            sourceKinds = new[] { "cli", "vscode", "appServer" }, useStateDbOnly = true });
         var data = P(response, "data");
         if (data.ValueKind != JsonValueKind.Array) throw new AiOperationException("NATIVE_HISTORY_UNAVAILABLE");
         var entries = data.EnumerateArray().Select(t => new AiNativeHistoryEntry(S(t, "id"), Clip(First(t, "name", "preview"), 160), S(t, "cwd"),
             P(t, "updatedAt").TryGetInt64Safe() * 1000)).Where(t => Guid.TryParse(t.NativeId, out _) && t.Directory.Length is > 0 and <= 4096).Take(30).ToArray();
         return new(entries, S(response, "nextCursor"));
     }
+    internal static bool ValidOpenCodeSessionId(string id) => id != null && id.StartsWith("ses_", StringComparison.Ordinal) && id.Length is > 4 and <= 100 && id.All(c => char.IsAsciiLetterOrDigit(c) || c == '_');
     internal static AiAgentSession Import(AiAgentInstallation installation, AiNativeHistoryEntry source, Guid caller, AiSessionArchive store)
     {
         var session = new AiAgentSession(installation, source.Directory, caller, source.Model, mode: source.PermissionMode.Length == 0 ? "ask" : source.PermissionMode) {
@@ -56,6 +71,7 @@ internal sealed partial class AiAgentSession
             if (!ConfigurationFor(installation).PermissionModes.Any(m => m.Id == loaded.Entry.PermissionMode)) throw new AiOperationException("PERMISSION_MODE_UNAVAILABLE");
             session.permissionMode = loaded.Entry.PermissionMode;
             session.modelId = loaded.Entry.Model;
+            session.claudeTranscriptPath = source.SourcePath;
             session.messages.AddRange(loaded.Messages);
             session.truncated = loaded.Truncated;
         }
@@ -103,6 +119,35 @@ internal static class NativeHistoryJson
 internal static class ClaudeNativeHistory
 {
     internal static string Root => Path.Combine(Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"), "projects");
+    internal static string[] HistoryRoots(System.Collections.Generic.IEnumerable<string> desktopRoots = null)
+    {
+        var roots = new List<string> { Root };
+        foreach (var data in desktopRoots ?? AiAgentDiscovery.ClaudeDesktopDataRoots()) {
+            var storage = Path.Combine(data, "claude-code-sessions");
+            foreach (var account in SafeDirectories(storage)) foreach (var organization in SafeDirectories(account)) {
+                Add(organization);
+                foreach (var session in SafeDirectories(organization, localSessions: true)) Add(session);
+            }
+        }
+        void Add(string folder) {
+            var config = Path.Combine(folder, ".claude");
+            if (Directory.Exists(config) && (File.GetAttributes(config) & FileAttributes.ReparsePoint) == 0)
+                roots.Add(Path.Combine(config, "projects"));
+        }
+        return roots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase).Take(256).ToArray();
+    }
+    private static string[] SafeDirectories(string root, bool localSessions = false)
+    {
+        try {
+            if (!Directory.Exists(root) || (File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0) return Array.Empty<string>();
+            return Directory.EnumerateDirectories(root).Take(256).Where(path =>
+                (Guid.TryParse(Path.GetFileName(path), out _) || localSessions && Path.GetFileName(path).StartsWith("local_", StringComparison.Ordinal) && Guid.TryParse(Path.GetFileName(path)[6..], out _)) &&
+                (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0).ToArray();
+        } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return Array.Empty<string>(); }
+    }
+    private static string RootFor(string path) => HistoryRoots().Where(root =>
+        Path.GetFullPath(path).StartsWith(Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        .OrderByDescending(root => root.Length).FirstOrDefault();
     internal static bool SafeFile(string path, string root)
     {
         var full = Path.GetFullPath(path); var boundary = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
@@ -117,18 +162,18 @@ internal static class ClaudeNativeHistory
     }
     internal static AiNativeHistoryPage List(string cursor, CancellationToken token, string rootOverride = null)
     {
-        var root = rootOverride ?? Root;
-        if (!Directory.Exists(root)) return new(Array.Empty<AiNativeHistoryEntry>(), "");
+        var roots = rootOverride == null ? HistoryRoots() : new[] { rootOverride };
         var offset = 0;
         if (cursor.Length > 0 && (!int.TryParse(cursor, out offset) || offset is < 0 or > 4096)) throw new AiOperationException("INVALID_CURSOR");
-        if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0) throw new AiOperationException("NATIVE_HISTORY_UNAVAILABLE");
-        var files = Directory.EnumerateDirectories(root).Take(256).Where(d => (File.GetAttributes(d) & FileAttributes.ReparsePoint) == 0)
-            .SelectMany(d => Directory.EnumerateFiles(d, "*.jsonl").Take(256)).Take(4096).Where(p => SafeFile(p, root))
-            .OrderByDescending(File.GetLastWriteTimeUtc).ThenBy(p => p, StringComparer.Ordinal).ToArray();
+        var files = roots.Where(Directory.Exists).SelectMany(root => {
+            if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0) throw new AiOperationException("NATIVE_HISTORY_UNAVAILABLE");
+            return Directory.EnumerateDirectories(root).Take(256).Where(d => (File.GetAttributes(d) & FileAttributes.ReparsePoint) == 0)
+                .SelectMany(d => Directory.EnumerateFiles(d, "*.jsonl").Take(256)).Where(p => SafeFile(p, root)).Select(p => (Path: p, Root: root));
+        }).Take(4096).OrderByDescending(p => File.GetLastWriteTimeUtc(p.Path)).ThenBy(p => p.Path, StringComparer.Ordinal).ToArray();
         var entries = new List<AiNativeHistoryEntry>(); var index = offset;
         for (; index < files.Length && index < offset + 30; index++) {
             token.ThrowIfCancellationRequested();
-            try { var record = Read(files[index], Path.GetFileNameWithoutExtension(files[index]), false, root); if (record.Entry.Directory.Length > 0) entries.Add(record.Entry); }
+            try { var record = Read(files[index].Path, Path.GetFileNameWithoutExtension(files[index].Path), false, files[index].Root); if (record.Entry.Directory.Length > 0 && entries.All(e => e.NativeId != record.Entry.NativeId)) entries.Add(record.Entry); }
             catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException or AiOperationException) { }
         }
         return new(entries.ToArray(), index < files.Length ? index.ToString() : "", files.Length == 4096);
@@ -136,7 +181,8 @@ internal static class ClaudeNativeHistory
     internal sealed record ReadResult(AiNativeHistoryEntry Entry, AiAgentSession.Message[] Messages, bool Truncated);
     internal static ReadResult Read(string path, string id, bool content, string rootOverride = null)
     {
-        if (!SafeFile(path, rootOverride ?? Root)) throw new AiOperationException("NATIVE_HISTORY_UNAVAILABLE");
+        var root = rootOverride ?? RootFor(path);
+        if (root == null || !SafeFile(path, root)) throw new AiOperationException("NATIVE_HISTORY_UNAVAILABLE");
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         const int window = 512 * 1024;
         // Prefix for original cwd/title, tail for last saved permission and recent messages.

@@ -39,6 +39,9 @@ internal sealed partial class AiAgentSession
         if (installation.Strategy != "native" || installation.Status != "available")
             return new(false, false, false, false, "", Array.Empty<PermissionOption>());
         var protocol = installation.Protocol;
+        if (protocol == "acp" && installation.Id == "opencode") return new(false, true, false, false, "session", new[] {
+            new PermissionOption("ask", "沿用原生规则", "沿用 OpenCode 已有权限规则；新的审批请求由手机一次性批准或拒绝，不自动扩大授权。"),
+        });
         if (protocol == "acp" && installation.Id == "grok") return new(true, true, true, true, "session", new[] {
             new PermissionOption("ask", "默认审批", "使用 Grok 默认权限规则，需要确认的工具交由手机批准或拒绝。"),
             new PermissionOption("full-access", "完全访问", "使用 Grok 原生 always-approve；拒绝规则和管理员限制仍生效。仅在新建会话时设置。", true),
@@ -118,7 +121,7 @@ internal sealed partial class AiAgentSession
     }
     private async Task InitializeConfigurationAsync(JsonElement initialized)
     {
-        if (agent.Protocol is "codex" or "claude" or "acp") {
+        if (agent.Protocol is "codex" or "claude") {
             try { var listed = await ReadModelsAsync(initialized); lock (sync) modelOptions = listed.Models; }
             catch (AiOperationException) { settingsNotice = "模型能力暂时不可用，可重试读取；未套用其他模型的推理档位。"; }
         }
