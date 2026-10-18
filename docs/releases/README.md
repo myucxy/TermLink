@@ -14,6 +14,9 @@
 
 ## 产品版本与 build 记录
 
+- [0.3.9 / build 139：桌面历史续聊与 OpenCode，GitHub、AppShip 已发布](../RELEASE_0.3.9_139.md)
+- [0.3.8 / build 138：桌面编码引擎检测，GitHub、AppShip 已发布](../RELEASE_0.3.8_138.md)
+- [0.3.7 / build 137：GitHub、AppShip 客户端及完整对应源码已发布](../RELEASE_0.3.7_137.md)
 - [0.3.6 / build 136：GitHub、AppShip 客户端及完整对应源码已发布](../RELEASE_0.3.6_136.md)
 - [0.3.5 / build 135：Android、Windows、Docker 已发布](../RELEASE_0.3.5_135.md)
 - [0.3.4 / build 133：候选与验证记录](../RELEASE_0.3.4_133.md)
