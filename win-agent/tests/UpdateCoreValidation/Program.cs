@@ -1,18 +1,22 @@
 using System;
 using System.IO;
+using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
 using TermLink.UpdateCore;
 
 namespace TermLink.UpdateCore.Validation
 {
     internal static class Program
     {
-        public static int Main()
+        public static int Main(string[] args)
         {
             var updateId = Guid.NewGuid();
             var root = RemoteUpdateTransactionStore.CreateTransactionRoot(updateId);
             try
             {
                 ValidateBuildIdentity();
+                ValidateUpdateSecurity(root);
+                if (args.Length > 0) ValidateSignedUpdate(root, args[0]);
                 ValidateTransactionAndReceipt(updateId, root);
                 ValidatePathBoundary(root);
                 ValidateCliWorkspace(root);
@@ -33,6 +37,103 @@ namespace TermLink.UpdateCore.Validation
                     string.Equals(Path.GetFileName(resolved), "transaction-" + updateId.ToString("N"), StringComparison.Ordinal) &&
                     Directory.Exists(resolved))
                     Directory.Delete(resolved, recursive: true);
+            }
+        }
+
+        private static void ValidateUpdateSecurity(string root)
+        {
+            foreach (var status in new[] { WindowsUpdateSecurity.TrustSuccess,
+                WindowsUpdateSecurity.CertificateUntrustedRoot, WindowsUpdateSecurity.CertificateChaining })
+            {
+                Assert(WindowsUpdateSecurity.IsAcceptableAuthenticodeStatus(status),
+                    "pinned updates must not require system certificate trust");
+                Assert(WindowsUpdateSecurity.IsAcceptableAuthenticodeStatus(status, strict: true) ==
+                    (status == WindowsUpdateSecurity.TrustSuccess), "explicit strict policy must still require system trust");
+            }
+            foreach (var status in new[] { WindowsUpdateSecurity.TrustBadDigest,
+                WindowsUpdateSecurity.TrustNoSignature, WindowsUpdateSecurity.CertRevoked,
+                WindowsUpdateSecurity.CertRevocationFailed, 0x800B0101u, uint.MaxValue })
+                Assert(!WindowsUpdateSecurity.IsAcceptableAuthenticodeStatus(status),
+                    "signature failures must not be accepted as certificate trust failures");
+
+            var signer = new string('a', 40);
+            WindowsUpdateSecurity.ValidateSignerIdentity(signer.ToUpperInvariant(), signer, signer);
+            AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateSignerIdentity(
+                new string('b', 40), signer, signer), "a different publisher was accepted");
+            AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateSignerIdentity(
+                signer, signer, new string('b', 40)), "a mismatched server signer was accepted");
+            AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateSignerIdentity(
+                signer, null, signer), "an update without a pinned publisher was accepted");
+
+            var unsigned = Path.Combine(root, "unsigned-update.exe");
+            File.WriteAllBytes(unsigned, new byte[] { 1, 2, 3 });
+            var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(unsigned)));
+            WindowsUpdateSecurity.ValidateIntegrity(unsigned, 3, hash);
+            AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateIntegrity(
+                unsigned, 3, new string('0', 64)), "an update with the wrong hash was accepted");
+            AssertThrows<InvalidDataException>(() => WindowsUpdateSecurity.ValidateIntegrity(
+                unsigned, 4, hash), "a truncated update was accepted");
+
+            var originalPolicy = Environment.GetEnvironmentVariable("TERMLINK_UPDATE_SIGNATURE_POLICY");
+            var originalSigner = Environment.GetEnvironmentVariable("TERMLINK_UPDATE_SIGNER_THUMBPRINT");
+            try
+            {
+                Environment.SetEnvironmentVariable("TERMLINK_UPDATE_SIGNER_THUMBPRINT", signer);
+                foreach (var policy in new[] { null, "auto", "compat", "strict" })
+                {
+                    Environment.SetEnvironmentVariable("TERMLINK_UPDATE_SIGNATURE_POLICY", policy);
+                    try { WindowsUpdateSecurity.ValidateAuthenticode(unsigned, signer, signer, root); }
+                    catch (CryptographicException error)
+                    {
+                        Assert(error.Message.Contains("policy=" + (policy == "strict" ? "strict" : "compat")),
+                            "default policy unexpectedly requires system trust for an explicitly pinned publisher");
+                        continue;
+                    }
+                    throw new InvalidOperationException("an unsigned update was accepted");
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("TERMLINK_UPDATE_SIGNATURE_POLICY", originalPolicy);
+                Environment.SetEnvironmentVariable("TERMLINK_UPDATE_SIGNER_THUMBPRINT", originalSigner);
+            }
+        }
+
+        private static void ValidateSignedUpdate(string root, string fixture)
+        {
+            var signer = WindowsUpdateSecurity.ReadSignerThumbprint(fixture);
+            var originalPolicy = Environment.GetEnvironmentVariable("TERMLINK_UPDATE_SIGNATURE_POLICY");
+            try
+            {
+                Environment.SetEnvironmentVariable("TERMLINK_UPDATE_SIGNATURE_POLICY", null);
+                Assert(WindowsUpdateSecurity.ValidateAuthenticode(fixture, signer, signer, root) == signer,
+                    "the signed update fixture was rejected");
+                AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateAuthenticode(
+                    fixture, new string('0', 40), signer, root), "a signed update with the wrong publisher was accepted");
+                AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateAuthenticode(
+                    fixture, signer, new string('0', 40), root), "a signed update with the wrong server signer was accepted");
+
+                var tampered = Path.Combine(root, "tampered-update.exe");
+                File.Copy(fixture, tampered);
+                using (var stream = new FileStream(tampered, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    using var reader = new PEReader(stream, PEStreamOptions.LeaveOpen);
+                    var section = reader.PEHeaders.SectionHeaders[0];
+                    Assert(section.SizeOfRawData > 0, "signed fixture has no section data to tamper");
+                    stream.Position = section.PointerToRawData;
+                    var original = stream.ReadByte();
+                    stream.Position--;
+                    stream.WriteByte((byte)(original ^ 1));
+                }
+                Assert(WindowsUpdateSecurity.ReadSignerThumbprint(tampered) == signer,
+                    "tampering must preserve the certificate to test signature verification");
+                AssertThrows<CryptographicException>(() => WindowsUpdateSecurity.ValidateAuthenticode(
+                    tampered, signer, signer, root), "a tampered update with the correct certificate was accepted");
+                Console.WriteLine("Signed update and tampered-signature validation passed.");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("TERMLINK_UPDATE_SIGNATURE_POLICY", originalPolicy);
             }
         }
 

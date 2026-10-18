@@ -28,6 +28,7 @@ SessionHost 管理终端进程；Agent 记录会话状态并参与恢复。桌�
 - 当前生产联测覆盖 Relay Only，不重跑历史 LAN/NAT 验收。
 - 真实 AI 生成需要已安装且可用的 Agent 账号；模拟协议通过不表示账号登录或额度验证通过。
 - 桌面更新目前下载、验签后直接启动 Setup；尚未完成桌面更新统一迁入独立 Updater 的方案，详见[当前架构](../docs/architecture/CURRENT.md)。
+- 更新启动前仍核对安装包大小、SHA-256、数字签名和固定发布者证书指纹。默认 `auto` 与 `compat` 不要求证书链受系统信任；只有显式配置 `TERMLINK_UPDATE_SIGNATURE_POLICY=strict` 才要求系统信任链及吊销检查通过。
 - 老 Tray、阶段 IPC、terminal-main、机器路径和旧安装命令保存在 [HISTORY.md](HISTORY.md)，仅按记录时间阅读。
 
 运行时凭据和发布签名材料不能放入仓库。已有许可证及署名保持不变，见[授权状态](../LICENSE-STATUS.md)。

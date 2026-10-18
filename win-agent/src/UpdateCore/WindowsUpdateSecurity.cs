@@ -23,11 +23,10 @@ namespace TermLink.UpdateCore
 
         /// <summary>
         /// Signature validation policy. Strict requires a trusted root, a full
-        /// healthy chain, and successful revocation checking; Compat preserves
-        /// the legacy acceptance window (untrusted roots and chaining allowed)
-        /// for self-signed internal test builds. Auto picks Strict when the
-        /// publisher identity is explicitly anchored and Compat when the only
-        /// available identity is the local-build fallback.
+        /// healthy chain, and successful revocation checking. Auto and Compat
+        /// verify the signature and pinned publisher identity without requiring
+        /// system certificate trust, allowing the same self-signed publisher
+        /// to update an installed client.
         /// </summary>
         public enum SignaturePolicyMode
         {
@@ -69,9 +68,7 @@ namespace TermLink.UpdateCore
             string applicationDirectory = null)
         {
             var policy = ResolveSignaturePolicy();
-            var anchored = HasExplicitPublisherIdentity(applicationDirectory);
-            var strict = policy == SignaturePolicyMode.Strict ||
-                (policy == SignaturePolicyMode.Auto && anchored);
+            var strict = policy == SignaturePolicyMode.Strict;
             var status = VerifyEmbeddedSignature(path, checkRevocation: strict);
             if (!IsAcceptableAuthenticodeStatus(status, strict))
             {
@@ -82,24 +79,6 @@ namespace TermLink.UpdateCore
             var actual = ReadSignerThumbprint(path);
             ValidateSignerIdentity(actual, expectedThumbprint, reportedThumbprint);
             return actual;
-        }
-
-        // An anchored deployment explicitly configures its publisher identity
-        // (environment) or ships a build-time embedded publisher certificate.
-        // Unanchored local builds can only fall back to the local executable's
-        // own signature and are validated in compatibility mode with a pinned
-        // thumbprint as the sole identity check.
-        private static bool HasExplicitPublisherIdentity(string applicationDirectory)
-        {
-            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TERMLINK_UPDATE_SIGNER_THUMBPRINT")) ||
-                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TERMLINK_UPDATE_PUBLISHER_CERTIFICATE")))
-            {
-                return true;
-            }
-            var root = string.IsNullOrWhiteSpace(applicationDirectory)
-                ? AppContext.BaseDirectory
-                : Path.GetFullPath(applicationDirectory);
-            return File.Exists(Path.Combine(root, PublisherCertificateFileName));
         }
 
         public static bool IsAcceptableAuthenticodeStatus(uint status) =>
