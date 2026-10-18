@@ -28,7 +28,7 @@ All final assets live in this repository. [Recording notes](docs/media/feature-d
 ## Download and start
 
 - Android / Windows: [GitHub Releases](https://github.com/myucxy/TermLink/releases) (APK, Setup and full corresponding source) or [AppShip](https://appship.kget.cc:8910), with [release records](docs/releases/README.md).
-- 0.3.6 / build 136: [Android APK](https://appship.kget.cc:8910/api/v1/artifacts/ac7eef98-6151-4e1b-b633-7c2ef8ac621d/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/e1860848-5713-4b0f-8975-b0b94805960e/download) · [full corresponding source](https://appship.kget.cc:8910/api/v1/artifacts/17695a71-5155-4b90-89e9-0b6534e7d743/download). [Results](docs/RELEASE_0.3.6_136.md).
+- 0.3.7 / build 137: [Android APK](https://appship.kget.cc:8910/api/v1/artifacts/5e56c901-2318-4f6d-b56a-70c62fcd279c/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/2cbe297c-8077-4384-bae2-c70a9abab509/download) · [full corresponding source](https://appship.kget.cc:8910/api/v1/artifacts/deaff480-a534-4b09-b6fd-d25fd6348730/download). [Results](docs/RELEASE_0.3.7_137.md).
 - Server: [Docker Hub](https://hub.docker.com/r/myucxy/termlink), with [deployment instructions](server/README.md).
 - [Quick start](docs/guides/QUICK_START.md) · [Build guide](docs/development/BUILDING.md).
 - [Matching source for 0.3.5 / build 135](https://appship.kget.cc:8910/api/v1/artifacts/ca7763b8-ae84-4a24-9c78-d0e5698bbca6/download):
