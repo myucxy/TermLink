@@ -1,8 +1,25 @@
 # TermLink 0.3.8 / 138
 
-本轮范围为 GitHub Release 与 AppShip stable 的 Android APK、Windows x64 安装包和完整对应源码。
-2026-10-18 现场核对客户端及源码最新版本均为 0.3.7 / 137，固定递增为 0.3.8 / 138。
-本文件随构建源码提交，最终发布结果以渠道状态、下载哈希和独立验签记录为准。
+2026-10-18 已发布至 [GitHub v0.3.8](https://github.com/myucxy/TermLink/releases/tag/v0.3.8) 和 AppShip stable。
+本轮从现场核验的 0.3.7 / 137 递增为 0.3.8 / 138，包含 Android APK、Windows x64 安装包和完整对应源码。
+
+| 制品 | AppShip 下载 | SHA-256 |
+| --- | --- | --- |
+| Android APK | [下载 APK](https://appship.kget.cc:8910/api/v1/artifacts/48ae51aa-bdac-4ea7-a78c-50b1d89ab3ec/download) | `2f0fb179697e045e8cf8a0b59f7bfd367ec90fad313bf7ea3116644cec095170` |
+| Windows x64 Setup | [下载安装包](https://appship.kget.cc:8910/api/v1/artifacts/211d4669-7d2c-4627-b931-ff0e41c2ff52/download) | `2db9f0c551804784faf18685ed8672d8dba8ce88f944a922aa749e0b30183527` |
+| 完整对应源码 | [下载源码](https://appship.kget.cc:8910/api/v1/artifacts/3d32f98e-2d48-4ac2-9c4f-295e66269daa/download) | `8351787dce274267f9be54f70eb5385feb23ab7aeee0e1551ccdc0cc8a6bcc3f` |
+
+三个 AppShip 制品均为 published / ready，匿名下载哈希与本地一致。两个客户端的
+build 137 返回 `optional`，build 138 返回 `no_update`。
+
+- 应用构建与 Git tag `v0.3.8`：`a46a7dadb93aad47c67671bc2555f530e33eca6b`。
+- [源码检查](https://github.com/myucxy/TermLink/actions/runs/39118909333)与[远端独立验签](https://github.com/myucxy/TermLink/actions/runs/39120215168)通过；GitHub Release ID `416382499`，七个附件哈希核对一致。
+- AppShip Android release：`83f5ee6e-0c49-4d37-b039-14eea9c981b9`；Windows release：`6012950a-c6d2-4fc0-805f-c1a05635ea7e`；源码 release：`4fd3b2b3-e9c3-43cc-a289-6dc586e07b45`。
+- APK 唯一 signer、v2 签名及 0.3.8 / 138 版本通过；Windows 发布者身份、RFC3161 和 17 个自有载荷签名通过。
+- 正式 APK 已在专用模拟器覆盖安装并验证启动及横竖屏登录页；没有覆盖 MI 6 或本机 Windows 正式安装。
+- 代理上传中断后通过 HTTP/2 直连恢复相同字节，只清理本轮未完成的源码上传占位记录；已完成附件、构建、tag 和对应源码 revision 保持一致。
+
+本节发布结果在构建后补记，不改变已发布制品及对应源码的来源。
 
 ## 更新内容
 

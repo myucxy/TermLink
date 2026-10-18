@@ -27,7 +27,7 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 ## 下载与开始使用
 
 - Android / Windows：[GitHub Releases](https://github.com/myucxy/TermLink/releases)（APK、Setup、完整对应源码）或 [AppShip](https://appship.kget.cc:8910)，版本及签名说明见[发布记录索引](docs/releases/README.md)。
-- 0.3.7 / 137：[Android APK](https://appship.kget.cc:8910/api/v1/artifacts/5e56c901-2318-4f6d-b56a-70c62fcd279c/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/2cbe297c-8077-4384-bae2-c70a9abab509/download) · [完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/deaff480-a534-4b09-b6fd-d25fd6348730/download)；[发布记录](docs/RELEASE_0.3.7_137.md)。
+- 0.3.8 / 138：[Android APK](https://appship.kget.cc:8910/api/v1/artifacts/48ae51aa-bdac-4ea7-a78c-50b1d89ab3ec/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/211d4669-7d2c-4627-b931-ff0e41c2ff52/download) · [完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/3d32f98e-2d48-4ac2-9c4f-295e66269daa/download)；[发布记录](docs/RELEASE_0.3.8_138.md)。
 - 服务端：[Docker Hub](https://hub.docker.com/r/myucxy/termlink)，部署方式见 [Server README](server/README.md)。
 - 首次使用：[快速开始](docs/guides/QUICK_START.md)。
 - 修改代码：[开发与构建](docs/development/BUILDING.md)及[贡献指南](CONTRIBUTING.md)。
