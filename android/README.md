@@ -2,6 +2,9 @@
 
 Android 客户端提供设备、CLI、AI、文件和设置页面。Windows Agent 持有电脑端进程、真实会话状态与历史；手机通过加密桥进行交互。
 
+平板按窗口尺寸切换宽屏布局；折叠屏根据分隔折痕/铰链选择连续可用操作区，保留已有会话与草稿。
+具体行为、模拟器验证和厂商边界见[平板与折叠屏适配](../docs/development/ANDROID_ADAPTIVE_SCREENS.md)。
+
 ## 构建与测试入口
 
 先阅读[统一开发说明](../docs/development/BUILDING.md)。新检出也要先构建 `ai-web/` 资源，再用仓库的 Gradle Wrapper 编译 Android；不能直接沿用 Gradle 中的早期默认版本号。

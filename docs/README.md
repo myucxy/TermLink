@@ -13,6 +13,7 @@
 - [双仓库目录与 Git 边界](development/REPOSITORY_LAYOUT.md)：应用与私有核心同级开发、历史保留和迁移。
 
 - [构建与测试](development/BUILDING.md)：工具版本、原生依赖、AI Web 资源及 DEV 参数。
+- [Android 平板与折叠屏](development/ANDROID_ADAPTIVE_SCREENS.md)：布局、铰链避让与模拟器验收范围。
 - 组件入口：[Android](../android/README.md)、[桌面 UI](../pc-client/README.md)、[Windows Agent](../win-agent/README.md)、[AI Web](../ai-web/README.md)。
 - [贡献指南](../CONTRIBUTING.md)、[开源准备进度](development/OPEN_SOURCE_READINESS.md)。
 

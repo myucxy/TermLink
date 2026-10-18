@@ -7,8 +7,8 @@
         x:DataType="vm:MainWindowViewModel"
         Title="TermLink PC"
         Icon="avares://TermLink/Assets/TermLink.ico"
-        Width="1040"
-        Height="700"
+        Width="820"
+        Height="600"
         MinWidth="820"
         MinHeight="600">
   <Grid ColumnDefinitions="204,*">

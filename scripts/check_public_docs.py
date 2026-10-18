@@ -12,6 +12,7 @@ ENTRY_POINTS = [
     'docs/architecture/CURRENT.md', 'docs/guides/QUICK_START.md',
     'docs/development/BUILDING.md', 'docs/development/REPOSITORY_LAYOUT.md',
     'docs/development/OPEN_SOURCE_READINESS.md', 'docs/development/GITHUB_RELEASE.md',
+    'docs/development/ANDROID_ADAPTIVE_SCREENS.md',
     'docs/RELEASE_0.3.6_136.md', 'docs/releases/README.md',
     'docs/archive/README.md', 'docs/media/README.md',
     'android/README.md', 'pc-client/README.md', 'win-agent/README.md',

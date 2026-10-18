@@ -20,6 +20,7 @@
         <activity
             android:name="dev.termlink.product.ProductActivity"
             android:exported="true"
+            android:resizeableActivity="true"
             android:windowSoftInputMode="adjustNothing">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -1095,6 +1095,30 @@ fun ProductApp(
     onInstallUpdate: (String) -> Unit = {},
     onCreateRemoteDocument: (RemoteFileDownloadSelection) -> Unit = {},
 ) {
+    ProductAdaptiveFrame {
+        ProductAppContent(repository, foreground, foregroundGeneration, themePreference, onThemePreferenceChanged,
+            keepScreenOn, onKeepScreenOnChanged, terminalPreferences, onTerminalPreferencesChanged,
+            shortcutPreferences, onShortcutPreferencesChanged, onInstallUpdate, onCreateRemoteDocument)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ProductAppContent(
+    repository: ProductRepository,
+    foreground: Boolean = true,
+    foregroundGeneration: Long = if (foreground) 1L else 0L,
+    themePreference: ProductThemePreference = ProductThemePreference.SYSTEM,
+    onThemePreferenceChanged: (ProductThemePreference) -> Unit = {},
+    keepScreenOn: Boolean = false,
+    onKeepScreenOnChanged: (Boolean) -> Unit = {},
+    terminalPreferences: TerminalDisplayPreferences = TerminalDisplayPreferences(),
+    onTerminalPreferencesChanged: (TerminalDisplayPreferences) -> Unit = {},
+    shortcutPreferences: TerminalShortcutPreferences = TerminalShortcutPreferences(),
+    onShortcutPreferencesChanged: (TerminalShortcutPreferences) -> Unit = {},
+    onInstallUpdate: (String) -> Unit = {},
+    onCreateRemoteDocument: (RemoteFileDownloadSelection) -> Unit = {},
+) {
     val context = LocalContext.current
     val snapshot by repository.snapshot.collectAsStateCompat()
     val aiScope = rememberCoroutineScope()
@@ -1506,7 +1530,7 @@ fun ProductApp(
         val sessionWide = useWideSessionLayout(
             widthDp = maxWidth.value.roundToInt(),
             heightDp = maxHeight.value.roundToInt(),
-            imeVisible = WindowInsets.ime.getBottom(density) > 0,
+            imeVisible = productImeInsets().getBottom(density) > 0,
         )
         Scaffold(
             topBar = {
@@ -1540,7 +1564,7 @@ fun ProductApp(
                 }
             },
             bottomBar = {
-                if (!wide && !(destination == ProductDestination.AI && WindowInsets.ime.getBottom(density) > 0)) {
+                if (!wide && !(destination == ProductDestination.AI && productImeInsets().getBottom(density) > 0)) {
                     ProductBottomNavigation(destination.primaryDestination(), onDestinationSelected = ::navigateToPrimary)
                 }
             },
@@ -1576,7 +1600,7 @@ fun ProductApp(
             containerColor = MaterialTheme.colorScheme.background,
         ) { innerPadding ->
             val layoutDirection = LocalLayoutDirection.current
-            val imeBottomPixels = WindowInsets.ime.getBottom(density)
+            val imeBottomPixels = productImeInsets().getBottom(density)
             val scaffoldBottomPixels = with(density) { innerPadding.calculateBottomPadding().roundToPx() }
             val imeAvoidance = sessionImeAvoidance(
                 imeBottom = if (destination == ProductDestination.SESSIONS) imeBottomPixels else 0,
@@ -1989,7 +2013,7 @@ private fun ProductSignInPage(
     onRegister: (() -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var username by remember { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var submitting by remember { mutableStateOf(false) }
     var registrationLaunching by remember { mutableStateOf(false) }
@@ -1999,7 +2023,7 @@ private fun ProductSignInPage(
     var serverError by remember { mutableStateOf<String?>(null) }
     var focusedField by remember { mutableStateOf<String?>(null) }
     val scrollState = rememberScrollState()
-    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val imeVisible = productImeInsets().getBottom(LocalDensity.current) > 0
     val editServerDescription = stringResource(R.string.action_edit_server)
     var serverUrl by remember(snapshot.serverUrl) {
         mutableStateOf(snapshot.serverUrl ?: PRODUCT_PUBLIC_SERVER_URL)
@@ -2013,7 +2037,7 @@ private fun ProductSignInPage(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.ime)
+            .windowInsetsPadding(productImeInsets())
             .verticalScroll(scrollState)
             .padding(horizontal = 20.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Top,
@@ -3578,18 +3602,20 @@ private fun ProductNavigationRail(
     destination: ProductPrimaryDestination,
     onDestinationSelected: (ProductPrimaryDestination) -> Unit,
 ) {
-    NavigationRail(
-        modifier = Modifier.width(88.dp),
-        containerColor = MaterialTheme.colorScheme.background,
-    ) {
-        Spacer(Modifier.height(12.dp))
-        ProductPrimaryDestination.entries.forEach { item ->
-            NavigationRailItem(
-                selected = destination == item,
-                onClick = { onDestinationSelected(item) },
-                icon = { Icon(item.icon(), contentDescription = item.localizedLabel()) },
-                label = { Text(item.localizedLabel(), maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            )
+    Box(Modifier.fillMaxHeight().width(88.dp).verticalScroll(rememberScrollState())) {
+        NavigationRail(
+            modifier = Modifier.width(88.dp).testTag("product-navigation-rail"),
+            containerColor = MaterialTheme.colorScheme.background,
+        ) {
+            Spacer(Modifier.height(12.dp))
+            ProductPrimaryDestination.entries.forEach { item ->
+                NavigationRailItem(
+                    selected = destination == item,
+                    onClick = { onDestinationSelected(item) },
+                    icon = { Icon(item.icon(), contentDescription = item.localizedLabel()) },
+                    label = { Text(item.localizedLabel(), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                )
+            }
         }
     }
 }
@@ -3599,7 +3625,7 @@ private fun ProductBottomNavigation(
     destination: ProductPrimaryDestination,
     onDestinationSelected: (ProductPrimaryDestination) -> Unit,
 ) {
-    Surface(color = MaterialTheme.colorScheme.surface) {
+    Surface(modifier = Modifier.testTag("product-bottom-navigation"), color = MaterialTheme.colorScheme.surface) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -4663,6 +4689,7 @@ private fun SessionsPage(
             if (wide) {
                 Row(
                     modifier = Modifier
+                        .testTag("product-session-two-pane")
                         .fillMaxWidth()
                         .fillMaxHeight()
                         .weight(1f),

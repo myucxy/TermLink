@@ -6,6 +6,8 @@
         android:label="TermLink DEV"
         tools:replace="android:label"
         android:usesCleartextTraffic="${termlinkUsesCleartextTraffic}">
+        <activity android:name="dev.termlink.product.debug.AdaptiveLayoutAcceptanceActivity"
+            android:exported="true" android:resizeableActivity="true" android:windowSoftInputMode="adjustNothing" />
         <activity android:name="dev.termlink.product.debug.AiAcceptanceActivity" android:exported="true" android:launchMode="singleTop" android:windowSoftInputMode="adjustResize" />
         <activity
             android:name=".MainActivity"

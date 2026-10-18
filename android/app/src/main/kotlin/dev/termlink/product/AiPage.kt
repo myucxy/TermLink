@@ -126,7 +126,7 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
         }
     }
     BackHandler(enabled = selected != null) { workspace.selected = null }
-    Column(modifier.fillMaxSize().imePadding()) {
+    Column(modifier.fillMaxSize().windowInsetsPadding(productImeInsets())) {
         if (selected == null) AiConversationList(workspace, snapshot, pcs, onOpenDevices, Modifier.weight(1f))
         else if (remote != null) AiRemotePage(workspace, remote, pc?.name ?: "电脑", online, foreground, Modifier.weight(1f))
         else {

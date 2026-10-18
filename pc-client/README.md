@@ -30,6 +30,8 @@ Contracts <- Platform.Abstractions <- Presentation <- Desktop
 
 Windows 正常启动会附着或启动本机 Agent；不要把正在使用的安装目录当测试输出目录。`--preview-fixture` 使用隔离样例，仅适合 UI/Headless 检查，不连接真实业务。
 
+主窗口默认以最小允许尺寸 820×600（逻辑像素）启动，仍可手动缩放和最大化。
+
 Linux/macOS 有独立 Host 与认证 Unix-domain IPC；当前真实远程 Relay 仍存在 `PORTABLE_RELAY_NOT_CONFIGURED` 限制，不能按 Windows 的功能和发布状态宣传。AppImage/PKG 需要目标平台、签名材料及专项验收，交叉编译成功不等于可发布。
 
 当前生产验收为 Relay Only。历史直连测试和机器专属 WSL 命令不作为新开发者的默认入口。
