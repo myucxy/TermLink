@@ -2,6 +2,10 @@ using System.Text.Json;
 using TermLink.Agent;
 using TermLink.Ai;
 
+if (Environment.GetEnvironmentVariable("TERMLINK_AI_DISCOVERY_FIXTURE") == "1" &&
+    (args.Contains("--help") || args.Contains("--version"))) {
+    Console.WriteLine(args.Contains("--help") ? "app-server stream-json" : "codex-cli 0.162.1"); return;
+}
 if (args.Contains("stdio") && args.Contains("agent")) { await AcpValidation.Fixture(); return; }
 if (args.Contains("--fixture")) {
     if (args.Contains("--help")) { Console.WriteLine("app-server stream-json"); return; }
@@ -12,6 +16,8 @@ if (args.Contains("app-server") || args.Contains("-p")) { await Fixture(); retur
 
 var directory = Path.Combine(Path.GetTempPath(), "termlink-ai-validation-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
+if (args.Contains("--discovery-only")) { await DiscoveryValidation.Run(directory); return; }
+if (args.Contains("--installed-desktop-probe")) { await DiscoveryValidation.Installed(); return; }
 if (args.Contains("--acp-only")) { await AcpValidation.Run(directory); return; }
 if (args.Contains("--grok-probe")) { await AcpValidation.ProbeInstalled(); return; }
 if (args.Contains("--real-grok")) { await GrokRealValidation.Run(directory); return; }
@@ -110,6 +116,7 @@ if (args.Contains("--real-smoke")) {
 }
 
 var trace = Path.Combine(directory, "discovery-trace.txt");
+await DiscoveryValidation.Run(directory);
 Environment.SetEnvironmentVariable("TERMLINK_AI_FIXTURE_TRACE", trace);
 foreach (var protocol in new[] { "codex", "claude" }) {
     Environment.SetEnvironmentVariable("TERMLINK_AI_FIXTURE_PROTOCOL", protocol);

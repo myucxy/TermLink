@@ -177,6 +177,8 @@ public sealed record AiAgentCapability(string Id, string Name, string Path, stri
         "available" => "协议可用 · 认证尚未验证",
         "missing" => "未检测到安装",
         "runtime_missing" => "缺少运行时",
+        "desktop_only" => "桌面版已安装，未发现编码接口；请安装对应 CLI",
+        "runtime_blocked" => "已检测到引擎，但系统阻止启动；请修复安装或使用 CLI",
         "incompatible" => "结构化协议未支持",
         _ => "检测失败，可重试"
     });

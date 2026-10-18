@@ -32,6 +32,14 @@ Windows 正常启动会附着或启动本机 Agent；不要把正在使用的安
 
 主窗口默认以最小允许尺寸 820×600（逻辑像素）启动，仍可手动缩放和最大化。
 
+AI Agent 检测优先使用可用 CLI，也检查 Codex / ChatGPT 与 Claude 的当前用户商店注册、
+卸载注册、运行进程和常见安装位置。桌面内置的编码引擎通过帮助与版本探测后才标为可用；
+仅安装图形程序或系统阻止启动时分别显示明确状态。检测不启动桌面窗口、不安装 CLI 或修改 WindowsApps 权限。
+
+Codex 原生历史要求可用的 app-server 引擎与桌面版使用相同的 Windows 用户／CODEX_HOME。
+商店包内引擎被系统阻止时，可使用独立 CLI。Claude 当前读取 `CLAUDE_CONFIG_DIR/projects`
+或 `~/.claude/projects` 中的 Code 历史；普通聊天和桌面独立会话目录不在导入范围内。
+
 Linux/macOS 有独立 Host 与认证 Unix-domain IPC；当前真实远程 Relay 仍存在 `PORTABLE_RELAY_NOT_CONFIGURED` 限制，不能按 Windows 的功能和发布状态宣传。AppImage/PKG 需要目标平台、签名材料及专项验收，交叉编译成功不等于可发布。
 
 当前生产验收为 Relay Only。历史直连测试和机器专属 WSL 命令不作为新开发者的默认入口。

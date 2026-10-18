@@ -819,6 +819,7 @@ private fun AiEmptyState(icon: ImageVector, title: String, detail: String, modif
 
 internal fun aiAgentStatusLabel(status: String): String = when (status) {
     "available" -> "协议可用"; "missing" -> "未安装"; "runtime_missing" -> "缺少运行环境"
+    "desktop_only" -> "桌面版已安装，需兼容 CLI"; "runtime_blocked" -> "系统阻止启动引擎"
     "incompatible" -> "协议不兼容"; "probe_failed" -> "检测失败"; else -> "状态待确认"
 }
 internal fun aiStateLabel(state: String?): String = when (state) {

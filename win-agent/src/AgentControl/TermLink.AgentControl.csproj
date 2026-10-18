@@ -6,6 +6,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\Common\AiAgentDiscovery.cs" Link="Common\AiAgentDiscovery.cs" />
+    <Compile Include="..\Common\AiDesktopDiscovery.cs" Link="Common\AiDesktopDiscovery.cs" />
+    <InternalsVisibleTo Include="TermLink.AiAgent.Validation" />
     <Compile Include="..\Common\ZcodeRemoteAddressStore.cs" Link="Common\ZcodeRemoteAddressStore.cs" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
   </ItemGroup>

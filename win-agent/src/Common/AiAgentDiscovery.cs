@@ -13,7 +13,7 @@ public sealed record AiAgentInstallation(string Id, string Name, string Path, st
     string Version, string Protocol, string Status, string Strategy = "native");
 
 /// <summary>Probes never start a conversation, read model credentials, or install software.</summary>
-public static class AiAgentDiscovery
+public static partial class AiAgentDiscovery
 {
     private static readonly object Sync = new();
     private static Task<AiAgentInstallation[]> detection;
@@ -46,32 +46,60 @@ public static class AiAgentDiscovery
         var zcode = Find("zcode.exe");
         var script = FindZcodeScript();
         var candidates = new[] {
-            new AiAgentInstallation("codex", "Codex", Find("codex.exe") ?? Find("codex.cmd") ?? "", "", "", "codex", "missing"),
+            new AiAgentInstallation("codex", "Codex", Find("codex.exe") ?? Find("codex.cmd") ?? Existing(System.IO.Path.Combine(home, ".local", "bin", "codex.exe")) ?? "", "", "", "codex", "missing"),
             new AiAgentInstallation("claude", "Claude Code", Find("claude.exe") ?? Existing(System.IO.Path.Combine(home, ".local", "bin", "claude.exe")) ?? "", "", "", "claude", "missing"),
             new AiAgentInstallation("grok", "Grok Build", Find("grok.exe") ?? Find("grok.cmd") ?? Existing(System.IO.Path.Combine(home, ".grok", "bin", "grok.exe")) ?? "", "", "", "acp", "missing"),
             new AiAgentInstallation("zcode", "ZCode", script ?? zcode ?? "", script == null ? "" : Find("node.exe") ?? "", "", "zcode", "missing"),
         };
         return await Task.WhenAll(candidates.Select(async candidate => {
-            if (candidate.Path.Length == 0) return candidate;
-            if (candidate.Path.EndsWith(".cjs", StringComparison.OrdinalIgnoreCase) && candidate.RuntimePath.Length == 0)
-                return candidate with { Status = "runtime_missing" };
+            if (candidate.Id is "codex" or "claude") {
+                var roots = InstalledDesktopRoots(candidate.Id).ToArray();
+                var desktop = DesktopCandidates(candidate.Id, roots).ToArray();
+                var fallback = DesktopFallback(candidate, roots);
+                var local = candidate.Path.Length == 0 ? Array.Empty<AiAgentInstallation>() : new[] { candidate };
+                return await ProbeCandidatesAsync(fallback, local.Concat(desktop), token).ConfigureAwait(false);
+            }
+            return await ProbeCandidatesAsync(candidate, new[] { candidate }, token).ConfigureAwait(false);
+        })).ConfigureAwait(false);
+    }
+
+    internal static async Task<AiAgentInstallation> ProbeCandidatesAsync(AiAgentInstallation fallback,
+        IEnumerable<AiAgentInstallation> candidates, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(token);
+        budget.CancelAfter(TimeSpan.FromSeconds(24));
+        AiAgentInstallation failure = null;
+        foreach (var candidate in candidates.DistinctBy(a => a.Path, StringComparer.OrdinalIgnoreCase).Take(4)) {
+            if (budget.IsCancellationRequested) { token.ThrowIfCancellationRequested(); break; }
+            if (candidate.Path.Length == 0) continue;
+            if (candidate.Path.EndsWith(".cjs", StringComparison.OrdinalIgnoreCase) && candidate.RuntimePath.Length == 0) {
+                failure ??= candidate with { Status = "runtime_missing" }; continue;
+            }
             try {
-                var output = await ProbeAsync(candidate, token, candidate.Protocol == "acp" ? new[] { "agent", "--help" } : new[] { "--help" }).ConfigureAwait(false);
+                var output = await ProbeAsync(candidate, budget.Token, candidate.Protocol == "acp" ? new[] { "agent", "--help" } : new[] { "--help" }).ConfigureAwait(false);
                 var supported = candidate.Protocol switch {
                     "codex" or "zcode" => output.Contains("app-server", StringComparison.Ordinal),
                     "claude" => output.Contains("stream-json", StringComparison.Ordinal),
                     "acp" => candidate.Id == "grok" && output.Contains("stdio", StringComparison.Ordinal),
                     _ => false,
                 };
-                var version = await ProbeAsync(candidate, token, "--version").ConfigureAwait(false);
+                var version = await ProbeAsync(candidate, budget.Token, "--version").ConfigureAwait(false);
                 version = version.Trim().Split('\n')[0].Trim();
-                return candidate with { Version = version[..Math.Min(version.Length, 120)],
+                var detected = candidate with { Version = version[..Math.Min(version.Length, 120)],
                     Status = supported ? "available" : "incompatible" };
+                if (supported) return detected;
+                failure ??= detected;
             } catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-            catch (Exception error) when (error is IOException or InvalidOperationException or System.ComponentModel.Win32Exception or OperationCanceledException) {
-                return candidate with { Status = "probe_failed" };
+            catch (System.ComponentModel.Win32Exception error) when (error.NativeErrorCode == 5) {
+                failure ??= candidate with { Status = "runtime_blocked" };
             }
-        })).ConfigureAwait(false);
+            catch (Exception error) when (error is IOException or InvalidOperationException or System.ComponentModel.Win32Exception or OperationCanceledException) {
+                failure ??= candidate with { Status = "probe_failed" };
+            }
+        }
+        token.ThrowIfCancellationRequested();
+        return failure ?? fallback;
     }
 
     public static ProcessStartInfo StartInfo(AiAgentInstallation agent, string directory, params string[] arguments)
