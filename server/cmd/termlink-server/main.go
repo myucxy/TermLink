@@ -23,17 +23,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/accountdeletion"
 	"github.com/termlink/termlink/server/internal/adminroute"
-	"github.com/termlink/termlink/server/internal/agentupdate"
 	"github.com/termlink/termlink/server/internal/api"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/buildinfo"
 	"github.com/termlink/termlink/server/internal/config"
 	"github.com/termlink/termlink/server/internal/fileoperationcleanup"
-	"github.com/termlink/termlink/server/internal/keywrap"
 	"github.com/termlink/termlink/server/internal/filetransfer"
 	"github.com/termlink/termlink/server/internal/humanverification"
 	"github.com/termlink/termlink/server/internal/identity"
 	"github.com/termlink/termlink/server/internal/identityproxy"
+	"github.com/termlink/termlink/server/internal/keywrap"
 	"github.com/termlink/termlink/server/internal/kv"
 	"github.com/termlink/termlink/server/internal/migrate"
 	"github.com/termlink/termlink/server/internal/observability"
@@ -275,15 +274,9 @@ func runProduction() error {
 			return fmt.Errorf("initialize registration recovery runner: %w", err)
 		}
 	}
-	appShipBaseURL := os.Getenv("TERMLINK_APPSHIP_BASE_URL")
-	updateCatalog, err := agentupdate.NewAppShipCatalogWithSignerAnchor(
-		appShipBaseURL,
-		nil,
-		os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
-		os.Getenv("TERMLINK_APPSHIP_SIGNER_FINGERPRINT"),
-	)
+	updateCatalog, publicReleaseSource, err := newAppShipSources()
 	if err != nil {
-		return fmt.Errorf("initialize Agent update catalog: %w", err)
+		return fmt.Errorf("initialize AppShip release sources: %w", err)
 	}
 	var accountDeletionBinder accountdeletion.RequestBinder
 	var accountDeletionRunner *accountdeletion.Runner
@@ -490,31 +483,7 @@ func runProduction() error {
 			slog.Warn("runtime setting direct_stun_servers is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
 		}
 	}
-	// Runtime AppShip overrides must resolve BEFORE the portal is built: the
-	// public downloads page fetches release metadata through its own release
-	// source, and an allowlist resolved only into the update catalog would
-	// leave that source blocked on private AppShip addresses.
-	resolvedAppShipBaseURL := appShipBaseURL
-	resolvedAppShipPrivateIPs := os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS")
-	if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipBaseURL); overrideErr == nil && found {
-		if ipsOverride, ipsFound, ipsErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipAllowedPrivateIPs); ipsErr == nil && ipsFound {
-			resolvedAppShipPrivateIPs = ipsOverride
-		}
-		if err := updateCatalog.UpdateTarget(override, resolvedAppShipPrivateIPs); err == nil {
-			resolvedAppShipBaseURL = override
-		} else {
-			slog.Warn("runtime setting appship_base_url is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
-		}
-	} else if override, found, overrideErr := repository.GetRuntimeSetting(settingCtx, store.RuntimeSettingAppShipAllowedPrivateIPs); overrideErr == nil && found {
-		if err := updateCatalog.UpdateTarget(resolvedAppShipBaseURL, override); err == nil {
-			resolvedAppShipPrivateIPs = override
-		} else {
-			slog.Warn("runtime setting appship_allowed_private_ips is invalid; keeping environment default", "error_class", "runtime_setting_invalid")
-		}
-	}
 	settingCancel()
-	// Portal-owned runtime settings override the environment defaults at
-	// startup; the admin page can change them again while running.
 	hub := realtime.NewHubWithObserverAndOptions(
 		repository,
 		coordinator,
@@ -552,23 +521,22 @@ func runProduction() error {
 		identityMFAStatus = embeddedIdentity.Accounts()
 	}
 	portal, err := webportal.New(ctx, webportal.Config{
-		PublicURL:                 cfg.PublicURL,
-		Issuer:                    cfg.OIDCIssuer,
-		BackchannelIssuer:         cfg.OIDCBackchannelIssuer,
-		ClientID:                  cfg.WebOIDCClientID,
-		WindowsClientID:           cfg.WindowsOIDCClientID,
-		StepUpClientID:            cfg.WebOIDCStepUpClientID,
-		RedirectURI:               cfg.WebOIDCRedirectURI,
-		HumanVerificationProvider: cfg.HumanVerificationProvider,
-		HumanVerificationSiteKey:  cfg.HumanVerificationSiteKey,
-		HumanVerification:         humanVerificationManager,
-		CookieKey:                 cookieKey,
-		SubjectKey:                subjectKey,
-		AppShipBaseURL:            resolvedAppShipBaseURL,
-		AppShipAllowedPrivateIPs:  resolvedAppShipPrivateIPs,
-		BuildInfo:                 buildinfo.Current(),
-		RegistrationCodeKey:       registrationCodeKey,
-		AccountDeletionBinder:     accountDeletionBinder,
+		PublicURL:                   cfg.PublicURL,
+		Issuer:                      cfg.OIDCIssuer,
+		BackchannelIssuer:           cfg.OIDCBackchannelIssuer,
+		ClientID:                    cfg.WebOIDCClientID,
+		WindowsClientID:             cfg.WindowsOIDCClientID,
+		StepUpClientID:              cfg.WebOIDCStepUpClientID,
+		RedirectURI:                 cfg.WebOIDCRedirectURI,
+		HumanVerificationProvider:   cfg.HumanVerificationProvider,
+		HumanVerificationSiteKey:    cfg.HumanVerificationSiteKey,
+		HumanVerification:           humanVerificationManager,
+		CookieKey:                   cookieKey,
+		SubjectKey:                  subjectKey,
+		ReleaseSource:               publicReleaseSource,
+		BuildInfo:                   buildinfo.Current(),
+		RegistrationCodeKey:         registrationCodeKey,
+		AccountDeletionBinder:       accountDeletionBinder,
 		RegistrationRecoveryEnabled: effectiveRegistrationRecovery,
 		AccountDeletionEnabled:      effectiveAccountDeletion,
 		RuntimeSettingStore:         repository,
@@ -576,8 +544,6 @@ func runProduction() error {
 			store.RuntimeSettingRegistrationRecoveryEnabled: strconv.FormatBool(cfg.RegistrationRecoveryEnabled),
 			store.RuntimeSettingAccountDeletionEnabled:      strconv.FormatBool(cfg.AccountDeletionEnabled),
 			store.RuntimeSettingDirectSTUNServers:           os.Getenv("TERMLINK_DIRECT_STUN_SERVERS"),
-			store.RuntimeSettingAppShipBaseURL:              appShipBaseURL,
-			store.RuntimeSettingAppShipAllowedPrivateIPs:    os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS"),
 		},
 		ApplyDirectSTUNServers: func(raw string) error {
 			servers, parseErr := parseDirectSTUNServers(raw)
@@ -586,17 +552,14 @@ func runProduction() error {
 			}
 			return directTickets.SetSTUNServers(servers)
 		},
-		ApplyAppShipTarget: func(baseURL string, allowedPrivateIPs string) error {
-			return updateCatalog.UpdateTarget(baseURL, allowedPrivateIPs)
-		},
-		ServiceEmail:              serviceEmail,
-		AdminRoutes:               adminRoutes,
-		IdentityProfiles:          identityProfiles,
-		IdentityMFAStatus:         identityMFAStatus,
-		OIDCDiscovery:             localDiscovery,
-		OIDCHTTPClient:            localOIDCHTTPClient,
-		Repository:                repository,
-		Presence:                  onlinePresence,
+		ServiceEmail:      serviceEmail,
+		AdminRoutes:       adminRoutes,
+		IdentityProfiles:  identityProfiles,
+		IdentityMFAStatus: identityMFAStatus,
+		OIDCDiscovery:     localDiscovery,
+		OIDCHTTPClient:    localOIDCHTTPClient,
+		Repository:        repository,
+		Presence:          onlinePresence,
 		AccountStatusChanged: func(ctx context.Context, accountID uuid.UUID, status string) error {
 			return coordinator.Publish(ctx, "account-status-changed", accountID)
 		},

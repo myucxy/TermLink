@@ -20,10 +20,12 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/termlink/termlink/server/internal/agentupdate"
 )
 
 const (
-	DefaultPublicAppShipBaseURL = "https://appship.kget.cc:8910"
+	DefaultPublicAppShipBaseURL = agentupdate.DefaultAppShipBaseURL
 	publicReleaseResponseLimit  = 256 * 1024
 	publicReleaseArtifactLimit  = int64(2 * 1024 * 1024 * 1024)
 	publicReleaseRequestTimeout = 5 * time.Second

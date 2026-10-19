@@ -907,7 +907,6 @@ services:
     environment:
       <<: *termlink_environment
       SSL_CERT_FILE: /run/secrets/acceptance-root-ca.crt
-      TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
       TERMLINK_REGISTRATION_RECOVERY_ENABLED: "true"
       TERMLINK_KEYCLOAK_ADMIN_CLIENT_ID: termlink-registration-recovery

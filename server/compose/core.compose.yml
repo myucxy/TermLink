@@ -134,7 +134,6 @@ services:
     image: ${TERMLINK_IMAGE:?TERMLINK_IMAGE immutable tag@sha256 digest is required}
     environment:
       <<: *server-environment
-      TERMLINK_APPSHIP_BASE_URL: ${TERMLINK_APPSHIP_BASE_URL:-https://appship.kget.cc:8910}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
     secrets: *server-secrets
     networks:

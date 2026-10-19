@@ -34,7 +34,7 @@ termlink.kget.cc:8910  ──►  本档案描述的 TLS 网关（192.168.9.250�
 | `appship.kget.cc:8910` | **Windows Agent 自动升级分发**（AppShip） | NAS（192.168.9.11，`app-ship-appship-1`，端口 18080） |
 
 网关宕机影响的不仅是终端连接，**Windows Agent 的升级检查也会失败**（Agent 的
-`TERMLINK_APPSHIP_BASE_URL=https://appship.kget.cc:8910`）。这两件事没有独立兜底。
+分发地址内置为 `https://appship.kget.cc:8910`）。这两件事没有独立兜底。
 
 ## 强制代理要求（server 侧契约，见 server/README-runtime.md）
 

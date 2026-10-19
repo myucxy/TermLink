@@ -17,8 +17,6 @@ const (
 	RuntimeSettingRegistrationRecoveryEnabled = "registration_recovery_enabled"
 	RuntimeSettingAccountDeletionEnabled      = "account_deletion_enabled"
 	RuntimeSettingDirectSTUNServers           = "direct_stun_servers"
-	RuntimeSettingAppShipBaseURL              = "appship_base_url"
-	RuntimeSettingAppShipAllowedPrivateIPs    = "appship_allowed_private_ips"
 )
 
 // RuntimeSettingKeys is the whitelist enforced by SetRuntimeSetting.
@@ -26,8 +24,6 @@ var RuntimeSettingKeys = map[string]struct{}{
 	RuntimeSettingRegistrationRecoveryEnabled: {},
 	RuntimeSettingAccountDeletionEnabled:      {},
 	RuntimeSettingDirectSTUNServers:           {},
-	RuntimeSettingAppShipBaseURL:              {},
-	RuntimeSettingAppShipAllowedPrivateIPs:    {},
 }
 
 // GetRuntimeSetting returns the portal-owned override for key. A missing row

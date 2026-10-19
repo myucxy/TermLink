@@ -23,6 +23,8 @@ Server 不执行 Windows 命令，不创建 Windows ConPTY，不保存完整终�
 也不保存文件对象。命令和终端历史由 Windows Agent 负责，文件字节在 Android
 与 Windows 之间通过实时链路传输。
 
+客户端版本与下载信息固定从 `https://appship.kget.cc:8910` 读取，管理页面不提供分发源配置。
+
 ## 部署
 
 直接使用仓库内的完整 Compose 文件，不需要 `.env` 文件。将部署参数

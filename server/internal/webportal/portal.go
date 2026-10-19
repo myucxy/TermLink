@@ -27,10 +27,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/termlink/termlink/server/internal/accountdeletion"
 	"github.com/termlink/termlink/server/internal/adminroute"
-	"github.com/termlink/termlink/server/internal/localnet"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/buildinfo"
 	"github.com/termlink/termlink/server/internal/humanverification"
+	"github.com/termlink/termlink/server/internal/localnet"
 	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/serviceemail"
 	"github.com/termlink/termlink/server/internal/store"
@@ -48,11 +48,11 @@ const (
 	// Sliding inactivity window: requireAccount re-issues the cookie once
 	// less than half of it remains, so active browsers stay signed in while
 	// abandoned ones age out.
-	webSessionTTL           = 20 * 24 * time.Hour
-	recentLoginTTL          = 10 * time.Minute
-	sensitiveActionTTL      = 20 * time.Minute
-	maximumCookieSize       = 3800
-	themeQueryParameter     = "termlink_theme"
+	webSessionTTL       = 20 * 24 * time.Hour
+	recentLoginTTL      = 10 * time.Minute
+	sensitiveActionTTL  = 20 * time.Minute
+	maximumCookieSize   = 3800
+	themeQueryParameter = "termlink_theme"
 )
 
 //go:embed assets/*.html assets/*.css assets/*.js assets/*.svg
@@ -72,9 +72,6 @@ type Config struct {
 	HumanVerification         *humanverification.Manager
 	CookieKey                 []byte
 	SubjectKey                []byte
-	AppShipBaseURL            string
-	AppShipAllowedPrivateIPs  string
-	AppShipHTTPClient         *http.Client
 	OIDCDiscovery             *auth.OIDCDiscovery
 	OIDCHTTPClient            *http.Client
 	ReleaseSource             PublicReleaseSource
@@ -92,15 +89,14 @@ type Config struct {
 	RuntimeSettingStore    RuntimeSettingStore
 	RuntimeSettingDefaults map[string]string
 	ApplyDirectSTUNServers func(raw string) error
-	ApplyAppShipTarget     func(baseURL string, allowedPrivateIPs string) error
-	ServiceEmail              *serviceemail.Service
-	AdminRoutes               *adminroute.Service
-	IdentityProfiles          identityProfileService
-	IdentityMFAStatus         identityMFAStatusService
-	Repository                portalRepository
-	Presence                  *presence.Registry
-	AccountStatusChanged      func(context.Context, uuid.UUID, string) error
-	Clock                     func() time.Time
+	ServiceEmail           *serviceemail.Service
+	AdminRoutes            *adminroute.Service
+	IdentityProfiles       identityProfileService
+	IdentityMFAStatus      identityMFAStatusService
+	Repository             portalRepository
+	Presence               *presence.Registry
+	AccountStatusChanged   func(context.Context, uuid.UUID, string) error
+	Clock                  func() time.Time
 }
 
 type identityProfileService interface {
@@ -328,7 +324,7 @@ type adminPageData struct {
 	CanConfigureSystem     bool
 	RegistrationNavigation bool
 
-	TransportRoutingPermitted   bool
+	TransportRoutingPermitted  bool
 	TransportRoutingConfigured bool
 
 	RuntimeSettings           []runtimeSettingView
@@ -396,9 +392,7 @@ func New(ctx context.Context, config Config) (*Portal, error) {
 		httpClient:         config.OIDCHTTPClient,
 	}
 	if config.ReleaseSource == nil {
-		releaseSource, sourceErr := NewAppShipPublicReleaseSourceWithAllowedPrivateIPs(
-			config.AppShipBaseURL, config.AppShipHTTPClient, config.AppShipAllowedPrivateIPs,
-		)
+		releaseSource, sourceErr := NewAppShipPublicReleaseSource("", nil)
 		if sourceErr != nil {
 			return nil, fmt.Errorf("configure public AppShip release source: %w", sourceErr)
 		}
@@ -1173,10 +1167,10 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 		AdminRoute:         adminRoute,
 		CanConfigureSystem: account.Role == store.RoleSuperAdmin,
 
-		TransportRoutingPermitted:   transportRoutingPermitted,
-		TransportRoutingConfigured:  transportRoutingConfigured,
+		TransportRoutingPermitted:  transportRoutingPermitted,
+		TransportRoutingConfigured: transportRoutingConfigured,
 
-		RuntimeSettings:          runtimeSettings,
+		RuntimeSettings:           runtimeSettings,
 		RuntimeSettingsConfigured: runtimeSettingsConfigured,
 	})
 }
@@ -1184,15 +1178,13 @@ func (p *Portal) admin(w http.ResponseWriter, r *http.Request) {
 // runtimeSettingDefinitions fixes the admin panel order, labels, and kinds.
 // Keys mirror store.RuntimeSettingKeys; keep the two lists aligned.
 var runtimeSettingDefinitions = []struct {
-	Key   string
-	Label string
+	Key    string
+	Label  string
 	IsBool bool
 }{
 	{store.RuntimeSettingRegistrationRecoveryEnabled, "注册找回（邮箱验证码注册）", true},
 	{store.RuntimeSettingAccountDeletionEnabled, "账号注销", true},
 	{store.RuntimeSettingDirectSTUNServers, "直连 STUN 服务器（逗号分隔）", false},
-	{store.RuntimeSettingAppShipBaseURL, "升级分发源 AppShip 地址", false},
-	{store.RuntimeSettingAppShipAllowedPrivateIPs, "AppShip 内网 IP 白名单（逗号分隔）", false},
 }
 
 func (p *Portal) runtimeSettingViews(ctx context.Context) ([]runtimeSettingView, bool) {
@@ -1287,29 +1279,8 @@ func (p *Portal) applyRuntimeSetting(key, value string) error {
 			return nil
 		}
 		return p.config.ApplyDirectSTUNServers(value)
-	case store.RuntimeSettingAppShipBaseURL, store.RuntimeSettingAppShipAllowedPrivateIPs:
-		if p.config.ApplyAppShipTarget == nil {
-			return nil
-		}
-		baseURL := p.effectiveRuntimeSetting(store.RuntimeSettingAppShipBaseURL, value, key == store.RuntimeSettingAppShipBaseURL)
-		privateIPs := p.effectiveRuntimeSetting(store.RuntimeSettingAppShipAllowedPrivateIPs, value, key == store.RuntimeSettingAppShipAllowedPrivateIPs)
-		return p.config.ApplyAppShipTarget(baseURL, privateIPs)
 	}
 	return nil
-}
-
-// effectiveRuntimeSetting blends the just-saved value with the stored/default
-// value of the sibling key so AppShip URL and allowlist apply as one target.
-func (p *Portal) effectiveRuntimeSetting(key, freshValue string, isFresh bool) string {
-	if isFresh {
-		return freshValue
-	}
-	if settingRepository, ok := p.config.Repository.(RuntimeSettingStore); ok {
-		if override, found, err := settingRepository.GetRuntimeSetting(context.Background(), key); err == nil && found {
-			return override
-		}
-	}
-	return p.config.RuntimeSettingDefaults[key]
 }
 
 func (p *Portal) adminUpdateServiceEmail(w http.ResponseWriter, r *http.Request) {

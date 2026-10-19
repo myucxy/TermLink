@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,5 +103,33 @@ func TestAdminRuntimeSettingsRequireSuperAdmin(t *testing.T) {
 	}
 	if len(repository.values) != 0 {
 		t.Fatalf("rejected role must not persist: %v", repository.values)
+	}
+}
+
+func TestAdminCannotExposeOrOverrideAppShipStartupPolicy(t *testing.T) {
+	portal := newTestPortal(t, &testOIDCFlow{})
+	base := newTestPortalRepository()
+	base.account.Role = store.RoleSuperAdmin
+	repository := &testRuntimeSettingRepository{testPortalRepository: base, values: map[string]string{
+		"appship_base_url":            "https://obsolete.example",
+		"appship_allowed_private_ips": "192.168.9.251",
+	}}
+	portal.config.Repository = repository
+	cookie := portalSessionCookie(t, portal, store.RoleSuperAdmin, "runtime-csrf", time.Minute)
+	page := performRequest(portal.Handler(), http.MethodGet, "/admin?section=deployment", nil, cookie)
+	if page.Code != http.StatusOK {
+		t.Fatalf("deployment page status=%d", page.Code)
+	}
+	for _, key := range []string{"appship_base_url", "appship_allowed_private_ips"} {
+		if strings.Contains(page.Body.String(), key) || strings.Contains(page.Body.String(), repository.values[key]) {
+			t.Fatalf("deployment page exposed retired setting %s", key)
+		}
+		response := performPortalForm(portal.Handler(), "/admin/runtime-settings", url.Values{
+			"csrf": {"runtime-csrf"}, "idempotency_key": {"retired-" + key},
+			"reason": {"test startup policy boundary"}, "setting": {key}, "value": {"replacement"},
+		}, cookie)
+		if response.Code != http.StatusBadRequest || repository.values[key] == "replacement" {
+			t.Fatalf("retired setting %s accepted: HTTP %d", key, response.Code)
+		}
 	}
 }

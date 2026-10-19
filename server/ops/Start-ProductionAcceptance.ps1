@@ -4,9 +4,6 @@ param(
     [string]$LanAddress,
     [string]$LuckyBindAddress = '0.0.0.0',
     [ValidateRange(1, 65535)][int]$LuckyPort = 8080,
-    [ValidatePattern('^https://[^/?#]+(?::[0-9]{1,5})?$')]
-    [string]$AppShipBaseUrl = 'https://appship.kget.cc:8910',
-    [string]$AppShipAllowedPrivateIPs = '192.168.9.250',
     [switch]$SingleNode,
     [switch]$EmbeddedIdentity,
     [switch]$EnableDirectTransportShadow,
@@ -22,13 +19,6 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot 'ProductionAcceptance.Common.psm1') -Force
-
-# appship.kget.cc uses split-horizon DNS in this acceptance environment. Keep
-# the exception explicit and exact so a normal rebuild cannot silently lose it;
-# the server still validates that every configured value is RFC1918/ULA and
-# pins DNS before performing hostname-authenticated TLS.
-$env:TERMLINK_APPSHIP_BASE_URL = $AppShipBaseUrl
-$env:TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS = $AppShipAllowedPrivateIPs
 
 function Set-AcceptanceEndpointEnvironment {
     param(
