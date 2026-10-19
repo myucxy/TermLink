@@ -24,11 +24,28 @@
 - Server 全量 PostgreSQL 集成测试包含登录、MFA、注册恢复及升级租约回归；最终结果记录在本轮发布凭据中。
 - 本轮使用模拟器，未重新测试 MI 6；保持 Relay Only，不安排 LAN/NAT 验收。
 
+## 发布结果（2026-10-19）
+
+已发布 [GitHub v0.3.10](https://github.com/myucxy/TermLink/releases/tag/v0.3.10) 及 AppShip stable。
+
+| 制品 | AppShip 下载 | SHA-256 |
+| --- | --- | --- |
+| Android APK | [下载 APK](https://appship.kget.cc:8910/api/v1/artifacts/d5df40ea-98c8-4ed3-b1bf-5a8265203ec0/download) | `44d7a035a2463d6e0007dd6bc63745567da5d875e1f13ab1a1482cd98f30e272` |
+| Windows x64 Setup | [下载安装包](https://appship.kget.cc:8910/api/v1/artifacts/d34a6cfe-d890-4189-97c0-79db30ae3f90/download) | `16ffa54c8277e43ebf1f6b476c802cc487485fae55120b1e35c1e4845b102d6b` |
+| 完整对应源码 | [下载源码](https://appship.kget.cc:8910/api/v1/artifacts/d77880c4-59ea-42ad-ac17-57fc58c925a9/download) | `d5d840a798a9ffe04bdf40b203ebb4b00fb1c29f420ba4aa335c2f50cf59ffbb` |
+
+- 构建与 tag 源码：`7ab29a391fc4bf1d0bc82ba0097950bd466901e6`；后续文档补记不改变产物或 tag。
+- GitHub 七个附件哈希一致，[独立 Windows 验签管道](https://github.com/myucxy/TermLink/actions/runs/39182834794)通过。
+- AppShip 三个制品为 `published / ready`，匿名下载大小与哈希一致；双端旧 build 139 返回 `optional`，140 返回 `no_update`。
+- Server 全量 PostgreSQL 集成测试及 GitHub 源码检查通过；Android 904 项单测和 lint 通过；签名连续性、Windows RFC 3161、17 个载荷签名及篡改拒绝回归通过。
+- 正式 APK 在专用模拟器原地覆盖安装、冷启动与页面渲染通过，保留应用数据；未重新登录或重跑整套 Relay／MI 6 矩阵。
+- Docker 双架构 OCI、本地签名与 amd64 启动／迁移／OIDC／重启测试通过；Docker Hub 本机凭据缺失，推送被拒绝，版本 tag 和 latest 均未更新。保留本地同一份归档，恢复登录后继续推送；不将其记为发布成功。
+
 ## 制品与来源
 
 - `TermLink-Android-0.3.10-140.apk`
 - `TermLink-Setup-0.3.10.140-x64.exe`
 - `TermLink-0.3.10-140-source.zip` 及 `.sha256.json`，包含匹配应用/core 源码、Rust vendor 和构建资料。
-- Docker Hub `myucxy/termlink:0.3.10-build.140`，包含 amd64 / arm64 与签名、SBOM、provenance；arm64 不宣称真机运行验证。
+- 本地待推送 Docker 镜像 `myucxy/termlink:0.3.10-build.140`，包含 amd64 / arm64、归档签名、SBOM、provenance；Docker Hub 尚未发布，arm64 不宣称真机运行验证。
 
 终端核心沿用锁定 revision `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。Android、Windows 和 Docker 继续使用原签名身份；Windows 为既有自签名证书，不代表公开 CA 或 SmartScreen 信誉。精确源码 revision、SHA-256、制品 ID 与 Docker digest 以随附清单和发布结果为准。

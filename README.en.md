@@ -28,7 +28,7 @@ All final assets live in this repository. [Recording notes](docs/media/feature-d
 ## Download and start
 
 - Android / Windows: [GitHub Releases](https://github.com/myucxy/TermLink/releases) (APK, Setup and full corresponding source) or [AppShip](https://appship.kget.cc:8910), with [release records](docs/releases/README.md).
-- 0.3.9 / build 139: [Android APK](https://appship.kget.cc:8910/api/v1/artifacts/d25686fb-5c4e-4f89-a425-1cc254c906d1/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/c7f7a7b1-0650-488f-9aa4-a18c8d09eb68/download) · [full corresponding source](https://appship.kget.cc:8910/api/v1/artifacts/f6878370-8904-4271-8e67-57f57e561aa6/download). [Results](docs/RELEASE_0.3.9_139.md).
+- 0.3.10 / build 140: [Android APK](https://appship.kget.cc:8910/api/v1/artifacts/d5df40ea-98c8-4ed3-b1bf-5a8265203ec0/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/d34a6cfe-d890-4189-97c0-79db30ae3f90/download) · [full corresponding source](https://appship.kget.cc:8910/api/v1/artifacts/d77880c4-59ea-42ad-ac17-57fc58c925a9/download). [Results](docs/RELEASE_0.3.10_140.md).
 - Server: [Docker Hub](https://hub.docker.com/r/myucxy/termlink), with [deployment instructions](server/README.md).
 - [Quick start](docs/guides/QUICK_START.md) · [Build guide](docs/development/BUILDING.md).
 - [Matching source for 0.3.5 / build 135](https://appship.kget.cc:8910/api/v1/artifacts/ca7763b8-ae84-4a24-9c78-d0e5698bbca6/download):
