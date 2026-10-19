@@ -1059,7 +1059,7 @@ namespace TermLink.Agent
                     () =>
                     {
                         lock (statusSync) return relayState == ProductionRelayState.Connected;
-                    });
+                    }, aiSessions.TryBeginUpdate, aiSessions.EndUpdate, registryControlPipeName);
                 postRegistrationWorkerStartGate = new PostRegistrationWorkerStartGate(
                     fileOperationWorker.Start,
                     agentUpdateWorker.Start);

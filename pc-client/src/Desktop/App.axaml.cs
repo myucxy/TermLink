@@ -110,9 +110,8 @@ public sealed partial class App : Application
                 DesktopProductInfo.Version,
                 DesktopProductInfo.Author);
             mainWindow = new MainWindow { DataContext = mainWindowViewModel };
-            if (Program.StartHidden) mainWindow.Opened += (_, _) => mainWindow.Hide();
             mainWindow.Closing += OnMainWindowClosing;
-            desktop.MainWindow = mainWindow;
+            if (!Program.StartHidden) desktop.MainWindow = mainWindow;
             trayIcon = CreateTrayIcon();
             desktop.Exit += OnExit;
             Program.ActivationRequested += OnActivationRequested;

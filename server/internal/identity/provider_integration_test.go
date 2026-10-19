@@ -181,6 +181,7 @@ func TestEmbeddedProviderPasswordRefreshAndAuthorizationCodeCompatibility(t *tes
 	}
 	windowsForm := url.Values{
 		"termlink_csrf": {windowsCSRF[1]}, "username": {input.Username}, "password": {input.Password},
+		"termlink_csrf_cookie":  {identityHiddenValue(t, windowsStart.Body.String(), "termlink_csrf_cookie")},
 		"cf-turnstile-response": {"valid-login-token"},
 	}
 	windowsFinishRequest := httptest.NewRequest(
@@ -238,6 +239,7 @@ func TestEmbeddedProviderPasswordRefreshAndAuthorizationCodeCompatibility(t *tes
 	}
 	form := url.Values{
 		"termlink_csrf": {csrfMatch[1]}, "username": {input.Username}, "password": {input.Password},
+		"termlink_csrf_cookie":  {identityHiddenValue(t, start.Body.String(), "termlink_csrf_cookie")},
 		"cf-turnstile-response": {"valid-login-token"},
 	}
 	finishRequest := httptest.NewRequest(http.MethodPost, "https://identity.example.test"+authPath, strings.NewReader(form.Encode()))

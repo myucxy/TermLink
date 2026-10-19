@@ -27,6 +27,7 @@ if (args.Contains("--desktop-runtime-only")) { await DesktopHistoryValidation.Se
 if (args.Contains("--real-desktop-history")) { await DesktopHistoryValidation.Real(directory); return; }
 if (args.Contains("--real-claude-desktop")) { await ClaudeDesktopValidation.Real(directory); return; }
 if (args.Contains("--opencode-only")) { await OpenCodeValidation.Run(directory); return; }
+if (args.Contains("--remote-update-only")) { await RemoteUpdateValidation.Run(directory); return; }
 if (args.Contains("--real-opencode")) { await OpenCodeValidation.Real(directory); return; }
 if (args.Contains("--acp-only")) { await AcpValidation.Run(directory); return; }
 if (args.Contains("--grok-probe")) { await AcpValidation.ProbeInstalled(); return; }
@@ -129,6 +130,7 @@ var trace = Path.Combine(directory, "discovery-trace.txt");
 await DiscoveryValidation.Run(directory);
 await DesktopHistoryValidation.Security(directory);
 await OpenCodeValidation.Run(directory);
+await RemoteUpdateValidation.Run(directory);
 Environment.SetEnvironmentVariable("TERMLINK_AI_FIXTURE_TRACE", trace);
 foreach (var protocol in new[] { "codex", "claude" }) {
     Environment.SetEnvironmentVariable("TERMLINK_AI_FIXTURE_PROTOCOL", protocol);

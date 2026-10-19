@@ -5,12 +5,13 @@ Tray 检查更新仍走既有交互流程；远程自动升级只能由已信任
 
 ## 1. 产品与权限边界
 
-- Android 在设备行长按菜单中检查、创建、查看和取消自动升级。
+- Android 在设备卡片长按菜单选择“升级 Windows 客户端”，检查、确认、查看和取消自动升级；只对声明能力的 Windows PC 显示。
 - Server 对检查、创建、查询活动任务、查询任务和取消接口强制要求 `ANDROID` 设备身份。
 - Windows Agent 只能领取和执行其自身 PC 的任务，不能创建远程升级任务。
 - Windows Tray 的手动安装与 Android 自动安装共用同一个签名 Setup。普通安装使用现有交互或
   `--install-dir` 参数；自动安装额外使用内部参数 `--remote-update-transaction`，由外部 Updater 调用。
 - 自动升级会终止该 PC 上的受管终端会话。Android 必须在创建任务前显示明确警告和活动会话数量。
+- Windows 在下载前检查 AI 是否正在启动、生成、等待审批或执行其他修改；存在活动任务时返回 `AI_TASKS_ACTIVE`，不结束会话。检查通过后暂时拦截新的 AI 修改，返回 `HOST_UPDATING`，状态查询仍可用。安装前失败会释放拦截。
 
 ## 2. Bootstrap 与版本语义
 
@@ -85,17 +86,20 @@ Agent 下载时禁止自动跨协议重定向，只允许最多三次无凭据 H
 
 执行前后均校验 Setup Authenticode。期望发布者绑定到当前安装根中已签名 Tray 的证书；AppShip 提供指纹时
 还必须与之相同。事务目录固定在 `%LOCALAPPDATA%\TermLink\remote-updates\transaction-{updateId}`，Setup、
-Updater、journal 和 receipt 都必须位于该目录。备份只能是授权安装根同级的 `.termlink-backup-*` 目录。
+Updater、journal 和 receipt 都必须位于该目录。备份只能是授权安装根同级的 `.termlink-backup-*` 目录；失败版本隔离在安装根同级的 `.termlink-failed-{updateId}`，避免安装盘与用户数据盘不同导致目录移动失败。
 
 ## 6. 安装、健康确认与提交
 
 1. Agent 下载和验证 Setup，关闭所有受管终端会话，写入 `Prepared` journal。
-2. 事务目录中的外部 Updater 注册当前用户启动恢复项，停止旧 Tray，并调用同一 Setup 的自动事务参数。
+2. 事务目录中的外部 Updater 注册当前用户启动恢复项，停止旧 Tray，通过认证控制管道和进程身份核对请求旧 Agent 正常退出，再调用同一 Setup 的自动事务参数。强制退出兜底仅停止当前进程，不能终止包含外部 Updater 的整棵进程树。
 3. Setup 验证 journal、安装根和自身 assembly build，原子替换安装目录并保留旧版本备份。
-4. 新 Tray 启动后，Agent 先完成设备注册和 PC upsert，再建立 Relay 连接。
+4. 新 Tray 以 `--start-hidden` 后台启动，不显示主窗口；旧 Updater 未传该参数时，新版桌面也会识别待验证的安装事务。Agent 先完成设备注册和 PC upsert，再建立 Relay 连接。
 5. 新 Agent 只有在 Relay 已连接后才提交 `SUCCEEDED`。Server 还会在同一数据库事务中确认：
    observed version/build 一致、build 等于目标 build，且 `pcs.agent_version` 已经是该 observed version。
 6. Server 接受成功后，Agent 写入本地 receipt；外部 Updater 看到 receipt 后才删除旧版本备份并清除启动恢复项。
+
+已领取且目标 build 相同的任务不会因 PC 注册而提前成功或清除 lease；新 Agent 必须继续领取并完成连接验证。
+独立手动安装更高 build，或任务尚未领取时已安装目标 build，仍可由注册版本对账完成。
 
 因此仅“进程启动”或“WebSocket 建立”都不足以提交升级成功。
 
@@ -106,7 +110,7 @@ Updater、journal 和 receipt 都必须位于该目录。备份只能是授权�
   交给正常处理，遗留日志不会吞掉新 lease。
 - Updater 在写启动恢复项前中断：仍在旧 build 的 Agent 会重新拉起一次事务目录中的监督器。
 - Setup 中断：监督器按已安装 build 和唯一备份恢复到 `AwaitingNewAgent`，否则进入回滚。
-- 新 Agent 未在期限内确认 Server 与 Relay：监督器停止目标进程、隔离失败版本、恢复旧目录并启动旧 Tray。
+- 新 Agent 未在期限内确认 Server 与 Relay：监督器停止授权安装根的目标 Tray 和 Agent 进程、在同盘隔离失败版本、恢复旧目录并启动旧 Tray。
 - 旧 Agent 重新连接后提交 `ROLLED_BACK`，Server 同样要求 `pcs.agent_version` 已恢复为 observed version。
 - 自动回滚本身失败时 journal 记录 `ROLLBACK_FAILED`。只要任一受信 Agent 仍能运行，它会把详细稳定错误码和
   安全截断后的诊断回报 Server；已回报的失败 journal 不再阻塞后续任务。
@@ -117,8 +121,17 @@ Updater、journal 和 receipt 都必须位于该目录。备份只能是授权�
 ## 8. 发布要求
 
 - 远程升级 bootstrap 版本必须先用常规本机安装方式部署；更老版本不会显示为可远程升级。
+- 2026-10-19 实测发现旧 0.3.8 / 138 的 Updater 在停止其父 Agent 进程树时会一起结束，任务停在安装阶段。已有此问题的安装必须先在 Windows 本地安装包含本次修复的客户端，不能仅更新 Android 就假定第一跳可用。开发联测通过替换隔离安装副本中的同发布者签名 Updater 验证修复路径，不更换正式 AppShip 制品。
 - AppShip Windows artifact 的 `buildNumber`、Setup/Agent/Tray assembly revision 和发布 manifest build 必须一致。
 - Setup SHA-256、大小、Authenticode 状态、发布者连续性指纹和 RFC 3161 时间戳必须通过本地发布门禁。
 - migration 22 必须先于 Android 入口启用；Server、Android 和 Windows 应来自同一已复核源码提交。
 - 发布前执行 Server 全量测试、Windows Release solution 和验证项目、Android unit/lint/assemble，并遵循
   [发布与部署运行手册](RELEASE_RUNBOOK.md)。
+
+## 9. 2026-10-19 本地验证
+
+- 模拟器通过 `termlink2` 长按设备、确认后实际下载 AppShip 已发布的 0.3.9 / 139 Setup，从隔离的 0.3.8 / 138 安装升级；旧 Agent 保持原样，先替换同发布者签名的修复版 Updater。Android 100%、Server `SUCCEEDED`、本地 receipt `SUCCEEDED`、journal `Succeeded`、备份删除及同 PC 重连均已核对。
+- 修复版签名 DEV 0.3.9 / 139 单独启动验证：主窗口句柄为 0，Agent 在后台连接同一 PC 和本地服务器。
+- Updater 验证覆盖父 UI 停止后子监督器存活，以及日志在 C 盘、安装在 D 盘时实际目录回滚和凭据提交。后者使用专用测试程序提供健康凭据，不等同于真实离线故障演练。
+- Android 入口与确认仪器测试 2 项通过，480 项应用单元测试通过；Windows AI、更新、认证管道、UpdateCore 与 Setup 验证通过。Server 全量非数据库测试、升级相关真实 PostgreSQL 集成测试通过。
+- 初次全量数据库集成测试发现登录/注册夹具缺少当前注册策略、受控恢复字段及每表单 CSRF cookie。0.3.10 发布准备已补齐夹具并通过全量 PostgreSQL 测试，未放宽生产安全校验。实际发布状态见 [0.3.10 / 140 记录](RELEASE_0.3.10_140.md)。

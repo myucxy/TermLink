@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\UpdateCore\TermLink.UpdateCore.csproj" />
+    <ProjectReference Include="..\AgentControl\TermLink.AgentControl.csproj" />
   </ItemGroup>
 </Project>

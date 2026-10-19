@@ -253,6 +253,9 @@ namespace TermLink.Agent
         private readonly Func<IList<Guid>> activeSessionIds;
         private readonly Func<Guid, bool> terminateSession;
         private readonly Func<bool> relayConnected;
+        private readonly Func<bool> beginUpdate;
+        private readonly Action endUpdate;
+        private readonly string controlPipeName;
         private readonly HashSet<string> launchedSupervisors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly CancellationTokenSource cancellation;
         private Task worker;
@@ -266,7 +269,10 @@ namespace TermLink.Agent
             CancellationToken parentToken,
             Func<IList<Guid>> activeSessionIds,
             Func<Guid, bool> terminateSession,
-            Func<bool> relayConnected)
+            Func<bool> relayConnected,
+            Func<bool> beginUpdate,
+            Action endUpdate,
+            string controlPipeName)
         {
             this.api = api ?? throw new ArgumentNullException(nameof(api));
             this.pcId = pcId;
@@ -276,6 +282,9 @@ namespace TermLink.Agent
             this.activeSessionIds = activeSessionIds ?? throw new ArgumentNullException(nameof(activeSessionIds));
             this.terminateSession = terminateSession ?? throw new ArgumentNullException(nameof(terminateSession));
             this.relayConnected = relayConnected ?? throw new ArgumentNullException(nameof(relayConnected));
+            this.beginUpdate = beginUpdate ?? throw new ArgumentNullException(nameof(beginUpdate));
+            this.endUpdate = endUpdate ?? throw new ArgumentNullException(nameof(endUpdate));
+            this.controlPipeName = controlPipeName ?? throw new ArgumentNullException(nameof(controlPipeName));
             cancellation = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
             downloadClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
             {
@@ -323,16 +332,20 @@ namespace TermLink.Agent
             }
         }
 
-        private async Task ProcessAsync(ClaimedAgentUpdate update, CancellationToken token)
+        internal async Task ProcessAsync(ClaimedAgentUpdate update, CancellationToken token)
         {
             using var monitorCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
             var monitor = RenewLeaseAsync(update, monitorCancellation.Token);
             var phase = "PRECHECKING";
             string journalPath = null;
+            var prepared = false;
+            var handedOff = false;
             try
             {
                 await api.ProgressAsync(update, phase, 2, activeSessionIds().Count, token).ConfigureAwait(false);
                 EnsureNewerTarget(update, agentBuild);
+                if (!beginUpdate()) throw new AiOperationException("AI_TASKS_ACTIVE");
+                prepared = true;
                 phase = "DOWNLOADING";
                 await api.ProgressAsync(update, phase, 5, null, token).ConfigureAwait(false);
                 var transactionRoot = RemoteUpdateTransactionStore.CreateTransactionRoot(update.Id);
@@ -377,6 +390,7 @@ namespace TermLink.Agent
                     InstallRoot = Path.GetFullPath(AppContext.BaseDirectory),
                     ExpectedSignerFingerprint = signer,
                     PreviousProcessId = Environment.ProcessId,
+                    ControlPipeName = controlPipeName,
                     HealthDeadlineUtc = DateTimeOffset.UtcNow.AddMinutes(3)
                 };
                 journalPath = RemoteUpdateTransactionStore.JournalPath(transactionRoot);
@@ -384,6 +398,7 @@ namespace TermLink.Agent
                 await api.ProgressAsync(update, "INSTALLING", 85, 0, token).ConfigureAwait(false);
                 phase = "INSTALLING";
                 LaunchExternalUpdater(transactionRoot, journalPath, "remote-execute");
+                handedOff = true;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception error)
@@ -422,13 +437,14 @@ namespace TermLink.Agent
             }
             finally
             {
+                if (prepared && !handedOff) endUpdate();
                 monitorCancellation.Cancel();
                 try { await monitor.ConfigureAwait(false); }
                 catch (OperationCanceledException) when (monitorCancellation.IsCancellationRequested) { }
             }
         }
 
-        private async Task<(bool Handled, ClaimedAgentUpdate Pending)> ResumeInstalledTransactionAsync(
+        internal async Task<(bool Handled, ClaimedAgentUpdate Pending)> ResumeInstalledTransactionAsync(
             CancellationToken token)
         {
             var journalPath = RemoteUpdateTransactionStore.FindActiveJournal(pcId);
@@ -749,6 +765,7 @@ namespace TermLink.Agent
 
         private static string StableErrorCode(Exception error)
         {
+            if (error is AiOperationException { Code: "AI_TASKS_ACTIVE" }) return "AI_TASKS_ACTIVE";
             if (error is CryptographicException) return "UPDATE_VERIFICATION_FAILED";
             if (error is UnauthorizedAccessException) return "UPDATE_PERMISSION_DENIED";
             if (error is HttpRequestException) return "UPDATE_DOWNLOAD_FAILED";

@@ -447,10 +447,20 @@ static void ValidateClientWireVersions()
                 RegistryControlAuthentication.PrepareResponse(response, request, secret);
                 RegistryControlCodec.WriteResponse(server, response, request.ProtocolVersion);
             });
-            Require(RegistryControlClient.Send(pipeName, new RegistryRequest { Command = command }, 5000).Success,
+            Require(RegistryControlClient.Send(pipeName, new RegistryRequest { Command = command }, 5000, Environment.ProcessId).Success,
                 "Client rejected authenticated version-compatible response.");
             serve.GetAwaiter().GetResult();
         }
+        using var otherServer = new System.IO.Pipes.NamedPipeServerStream("termlink-wrong-owner-"+Environment.ProcessId);
+        var connected = otherServer.WaitForConnectionAsync();
+        try {
+            RegistryControlClient.Send("termlink-wrong-owner-"+Environment.ProcessId, new RegistryRequest { Command=RegistryCommand.RestartAgent }, 5000, Environment.ProcessId+1);
+            throw new Exception("A different Agent process received the shutdown request.");
+        } catch (InvalidDataException) { }
+        try {
+            connected.GetAwaiter().GetResult();
+            Require(otherServer.ReadByte() == -1, "Shutdown credentials were sent to a mismatched pipe owner.");
+        } catch (IOException) { }
     } finally {
         Array.Clear(secret, 0, secret.Length);
         Environment.SetEnvironmentVariable("TERMLINK_ACCEPTANCE_LOCAL_APP_DATA_ROOT", previousRoot);

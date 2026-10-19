@@ -1266,9 +1266,14 @@ namespace TermLink.Agent
 
     public static class RegistryControlClient
     {
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint processId);
         public const int MaximumTimeoutMilliseconds = 360000;
 
         public static RegistryResponse Send(string pipeName, RegistryRequest request, int timeoutMilliseconds)
+            => Send(pipeName, request, timeoutMilliseconds, 0);
+
+        public static RegistryResponse Send(string pipeName, RegistryRequest request, int timeoutMilliseconds, int expectedServerProcessId)
         {
             if (string.IsNullOrWhiteSpace(pipeName) || pipeName.Length > 200 ||
                 pipeName.IndexOfAny(new[] { '\\', '/' }) >= 0)
@@ -1306,6 +1311,8 @@ namespace TermLink.Agent
             }
             using (pipe)
             {
+                if (expectedServerProcessId != 0 && (!GetNamedPipeServerProcessId(pipe.SafePipeHandle.DangerousGetHandle(), out var actualPid) || actualPid != expectedServerProcessId))
+                    throw new InvalidDataException("The control pipe belongs to a different Agent process.");
                 var secret = RegistryControlSecretStore.LoadDefault();
                 try
                 {

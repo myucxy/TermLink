@@ -1592,26 +1592,11 @@ namespace TermLink.Setup
                     Environment.NewLine + FormatRunningServiceList(remainingServices));
             }
 
-            var tray = Path.Combine(root, "TermLink.exe");
-            if (File.Exists(tray))
+            if (running.Any(p => string.Equals(Path.GetFileName(p.ExecutablePath), "TermLink.Agent.exe", StringComparison.OrdinalIgnoreCase)))
             {
                 try
                 {
-                    using (var shutdown = Process.Start(new ProcessStartInfo
-                    {
-                        FileName = tray,
-                        Arguments = "--shutdown-agent",
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    }))
-                    {
-                        if (shutdown != null)
-                        {
-                            var shutdownDeadline = DateTime.UtcNow.AddSeconds(10);
-                            while (!shutdown.WaitForExit(100) && DateTime.UtcNow < shutdownDeadline)
-                                cancellationToken.ThrowIfCancellationRequested();
-                        }
-                    }
+                    SendHealthRequestToOwnedInstallation(TermLinkControlPipe.DefaultName(), root, 10000, RegistryCommand.RestartAgent);
                 }
                 catch
                 {
@@ -2200,7 +2185,8 @@ namespace TermLink.Setup
         internal static RegistryResponse SendHealthRequestToOwnedInstallation(
             string pipeName,
             string installDirectory,
-            int timeoutMilliseconds)
+            int timeoutMilliseconds,
+            RegistryCommand command = RegistryCommand.List)
         {
             var secret = RegistryControlSecretStore.LoadDefault();
             try
@@ -2209,7 +2195,7 @@ namespace TermLink.Setup
                     pipeName,
                     installDirectory,
                     timeoutMilliseconds,
-                    secret);
+                    secret, command);
             }
             finally
             {
@@ -2221,7 +2207,8 @@ namespace TermLink.Setup
             string pipeName,
             string installDirectory,
             int timeoutMilliseconds,
-            byte[] authenticationSecret)
+            byte[] authenticationSecret,
+            RegistryCommand command = RegistryCommand.List)
         {
             var root = NormalizeInstallRoot(installDirectory);
             return SendAuthenticatedHealthRequest(
@@ -2234,7 +2221,7 @@ namespace TermLink.Setup
                     return IsOwnedLaunchHealthServerPath(
                         TryGetProcessImagePath((int)serverProcessId),
                         root);
-                });
+                }, command);
         }
 
         internal static bool IsOwnedLaunchHealthServerPath(
@@ -2270,7 +2257,8 @@ namespace TermLink.Setup
             string pipeName,
             int timeoutMilliseconds,
             byte[] authenticationSecret,
-            Func<uint, bool> isExpectedServer)
+            Func<uint, bool> isExpectedServer,
+            RegistryCommand command = RegistryCommand.List)
         {
             using (var pipe = new NamedPipeClientStream(
                 ".",
@@ -2283,7 +2271,7 @@ namespace TermLink.Setup
                         pipe.SafePipeHandle.DangerousGetHandle(),
                         out var serverProcessId) ||
                     !isExpectedServer(serverProcessId)) return null;
-                var request = new RegistryRequest { Command = RegistryCommand.List };
+                var request = new RegistryRequest { Command = command };
                 RegistryControlAuthentication.Prepare(request, authenticationSecret, DateTime.UtcNow);
                 RegistryControlCodec.WriteRequest(pipe, request);
                 var response = RegistryControlCodec.ReadResponse(pipe);

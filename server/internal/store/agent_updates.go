@@ -339,13 +339,14 @@ func (s *Postgres) ClaimAgentUpdate(
 
 // reconcileSatisfiedAgentUpdates closes the gap between the transactional
 // Android workflow and an independently completed Windows installation. A
-// manually installed target (or a newer build) is already the desired outcome;
-// leaving the old job in INSTALLING causes Android to display 85% forever and
-// makes every new Agent repeatedly claim a transaction it cannot resume.
+// manually installed target that was never claimed, or an independently installed
+// newer build, already satisfies the job without another installation.
 //
 // The PC version is authoritative only after the authenticated Agent has
 // registered it. Invalid/legacy development versions are ignored rather than
 // breaking normal PC registration and update reads.
+// A claimed exact target must retain its lease until the new Agent verifies
+// Relay and completes the transaction; registration alone leaves no local receipt.
 func reconcileSatisfiedAgentUpdates(
 	ctx context.Context,
 	executor agentUpdateExecutor,
@@ -373,7 +374,7 @@ func reconcileSatisfiedAgentUpdates(
 		    observed_agent_version=$3,observed_agent_build=$4,
 		    started_at=COALESCE(started_at,now()),completed_at=now(),updated_at=now()
 		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING')
-		  AND target_build<=$4`, userID, pcID, advertisedVersion, advertisedBuild)
+		  AND (target_build<$4 OR (target_build=$4 AND status='PENDING'))`, userID, pcID, advertisedVersion, advertisedBuild)
 	return err
 }
 

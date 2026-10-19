@@ -885,6 +885,7 @@ internal fun parseConversation(pcId: UUID, value: JSONObject): AiConversation {
 }
 
 internal fun aiErrorLabel(code: String): String = when (code) {
+    "HOST_UPDATING" -> "电脑正在升级客户端，请等待重新连接后再操作。"
     "HISTORY_GAP" -> "历史保留范围已变化，请重新进入会话读取最新内容。"
     "DIFF_CHANGED" -> "文件变更记录已更新，请重新读取。"
     "ARTIFACT_CHANGED" -> "文件已变化，请重新打开后查看或保存。"

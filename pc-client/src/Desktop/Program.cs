@@ -14,6 +14,21 @@ public static class Program
     [STAThread]
     public static void Main(string[] args)
     {
+#if WINDOWS
+        if (args.Length == 1 && args[0] == "--shutdown-agent") {
+            try {
+                using var owned = System.Diagnostics.Process.GetProcessesByName("TermLink.Agent").FirstOrDefault(p => {
+                    try { return string.Equals(p.MainModule?.FileName, System.IO.Path.Combine(AppContext.BaseDirectory, "TermLink.Agent.exe"), StringComparison.OrdinalIgnoreCase); }
+                    catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { p.Dispose(); return false; }
+                });
+                if (owned == null) { Environment.ExitCode = 1; return; }
+                var response = TermLink.Agent.RegistryControlClient.Send(TermLink.Agent.TermLinkControlPipe.DefaultName(),
+                    new TermLink.Agent.RegistryRequest { Command = TermLink.Agent.RegistryCommand.RestartAgent }, 10000, owned.Id);
+                Environment.ExitCode = response.Success ? 0 : 1;
+            } catch (Exception e) when (e is System.IO.IOException or TimeoutException or UnauthorizedAccessException) { Environment.ExitCode = 1; }
+            return;
+        }
+#endif
         if (args.Length == 3 && args[0] == "--native-terminal")
         {
             if (!OperatingSystem.IsWindows() || !int.TryParse(args[2], out var hostPid) || hostPid <= 0)
@@ -24,6 +39,10 @@ public static class Program
         }
         UsePreviewFixture = args.Contains("--preview-fixture", StringComparer.Ordinal);
         StartHidden = args.Contains("--start-hidden", StringComparer.Ordinal);
+#if WINDOWS
+        // An older Updater starts the new desktop without --start-hidden.
+        StartHidden |= TermLink.UpdateCore.RemoteUpdateTransactionStore.IsVerifyingInstallation(AppContext.BaseDirectory);
+#endif
         using var singleInstance = new SingleInstanceCoordinator(
             UsePreviewFixture ? "preview-fixture" : "control-ui");
         if (!singleInstance.TryAcquire())

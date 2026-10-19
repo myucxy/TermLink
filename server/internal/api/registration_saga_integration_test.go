@@ -31,6 +31,9 @@ func TestRegisterAccountInvitationSagaProviderOutcomes(t *testing.T) {
 	defer cancel()
 	repository, cleanup := newRegistrationSagaRepository(t, ctx, databaseURL)
 	defer cleanup()
+	if _, err := repository.Pool.Exec(ctx, `UPDATE registration_policies SET mode='INVITE_REQUIRED' WHERE singleton`); err != nil {
+		t.Fatal(err)
+	}
 
 	proofKey := bytes.Repeat([]byte{0x51}, 32)
 	registrationCodeKey := bytes.Repeat([]byte{0x61}, 32)
@@ -40,7 +43,7 @@ func TestRegisterAccountInvitationSagaProviderOutcomes(t *testing.T) {
 		case r.URL.Path == "/realms/test/protocol/openid-connect/auth":
 			_, _ = fmt.Fprintf(w, `<a href="/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s">Create</a>`, url.QueryEscape(r.URL.Query().Get("state")))
 		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodGet:
-			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="https://%s/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s" method="post"></form>`, r.Host, url.QueryEscape(r.URL.Query().Get("flow_state")))
+			_, _ = fmt.Fprintf(w, `<form id="kc-register-form" action="https://%s/realms/test/login-actions/registration?session_code=opaque&amp;flow_state=%s" method="post"><input name="user.attributes.%s"/><input name="user.attributes.%s"/></form>`, r.Host, url.QueryEscape(r.URL.Query().Get("flow_state")), auth.RegistrationAttemptIDAttribute, auth.RegistrationAttemptProofAttribute)
 		case r.URL.Path == "/realms/test/login-actions/registration" && r.Method == http.MethodPost:
 			if err := r.ParseForm(); err != nil {
 				t.Error(err)

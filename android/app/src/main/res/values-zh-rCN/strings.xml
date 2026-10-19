@@ -307,7 +307,7 @@
     <string name="confirm_close_inactive_sessions_copy">将永久删除 %1$s 上 %2$d 个已结束或已中断的会话及其保存的历史。运行中的会话会保留，此操作无法撤销。</string>
     <string name="close_inactive_sessions_progress">已处理 %1$d / %2$d 个会话…</string>
     <string name="close_inactive_sessions_result">已删除 %1$d 个，失败 %2$d 个，跳过 %3$d 个。剩余失效会话可刷新后重试。</string>
-    <string name="agent_update_action">自动升级 Agent</string>
+    <string name="agent_update_action">升级 Windows 客户端</string>
     <string name="agent_update_checking">正在检查 Agent 更新</string>
     <string name="agent_update_checking_copy">正在读取 Agent %1$s 对应的签名稳定版更新。</string>
     <string name="agent_update_confirm_title">升级 %1$s？</string>
@@ -321,7 +321,7 @@
     <string name="agent_update_request_failed">无法管理 Agent 升级</string>
     <string name="agent_update_versions">%1$s 升级到 %2$s（构建 %3$d）</string>
     <string name="agent_update_session_warning">将关闭 %1$d 个由 TermLink 管理的活动会话，以及其中的 CLI 子进程。</string>
-    <string name="agent_update_rollback_copy">新 Agent 重新连接 Relay 且服务端接受目标构建前，旧安装会一直保留以便自动回滚。</string>
+    <string name="agent_update_rollback_copy">Windows 将自行下载、验签、静默安装并自动启动，无需操作安装向导；连接成功前保留旧版本以便回滚。请先完成正在运行或等待审批的 AI 任务。</string>
     <string name="agent_update_current_version">当前 Agent：%1$s</string>
     <string name="agent_update_creating_job">正在创建由服务端授权的升级事务。</string>
     <string name="agent_update_progress">%1$s · %2$d%%</string>
@@ -331,7 +331,7 @@
     <string name="agent_update_cannot_cancel">安装已经开始；连接验证或回滚期间不能取消。</string>
     <string name="agent_update_server_error">服务端请求失败：HTTP %1$d · %2$s · trace %3$s</string>
     <string name="agent_update_unknown_error">Agent 升级失败，但没有返回诊断信息。</string>
-    <string name="agent_update_confirm">升级 Agent</string>
+    <string name="agent_update_confirm">升级 Windows 客户端</string>
     <string name="agent_update_reason_offline">该 PC 当前离线。</string>
     <string name="agent_update_reason_routing_disabled">该 PC 已关闭远程路由。</string>
     <string name="agent_update_reason_unsupported">该 Agent 尚未声明事务式远程升级能力。</string>

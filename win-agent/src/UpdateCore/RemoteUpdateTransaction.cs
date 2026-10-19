@@ -34,6 +34,7 @@ namespace TermLink.UpdateCore
         public string BackupPath { get; set; }
         public string ExpectedSignerFingerprint { get; set; }
         public int PreviousProcessId { get; set; }
+        public string ControlPipeName { get; set; } = "";
         public DateTimeOffset HealthDeadlineUtc { get; set; }
         public string LastErrorCode { get; set; }
         public string LastErrorDetail { get; set; }
@@ -155,6 +156,21 @@ namespace TermLink.UpdateCore
             return selectedPath;
         }
 
+        public static bool IsVerifyingInstallation(string installRoot)
+        {
+            if (!Directory.Exists(DefaultRoot)) return false;
+            var fullRoot = Path.GetFullPath(installRoot).TrimEnd(Path.DirectorySeparatorChar);
+            foreach (var folder in Directory.EnumerateDirectories(DefaultRoot, "transaction-*")) {
+                try {
+                    var record = Load(Path.Combine(folder, "remote-update.json"));
+                    if ((record.State == RemoteUpdateTransactionState.AwaitingNewAgent || record.State == RemoteUpdateTransactionState.AwaitingRollbackAgent) &&
+                        record.HealthDeadlineUtc > DateTimeOffset.UtcNow && string.Equals(fullRoot,
+                            Path.GetFullPath(record.InstallRoot).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)) return true;
+                } catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or JsonException) { }
+            }
+            return false;
+        }
+
         public static string RequireTransactionRoot(string value)
         {
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Transaction root is required.");
@@ -190,6 +206,9 @@ namespace TermLink.UpdateCore
 
         private static void ValidateRecord(RemoteUpdateTransactionRecord record, string transactionRoot)
         {
+            if (record.ControlPipeName == null || record.ControlPipeName.Length > 200 ||
+                record.ControlPipeName.IndexOfAny(new[] { '\\', '/' }) >= 0)
+                throw new InvalidDataException("The remote update control pipe is invalid.");
             if (record.SchemaVersion != 1 || record.UpdateId == Guid.Empty || record.PcId == Guid.Empty ||
                 !Enum.IsDefined(typeof(RemoteUpdateTransactionState), record.State) ||
                 string.IsNullOrWhiteSpace(record.CurrentVersion) || string.IsNullOrWhiteSpace(record.TargetVersion) ||

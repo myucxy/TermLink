@@ -6,6 +6,8 @@
     <RootNamespace>TermLink.Updater.Validation</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\..\src\Updater\RemoteSetupTransaction.cs" Link="RemoteSetupTransaction.cs" />
+    <ProjectReference Include="..\..\src\AgentControl\TermLink.AgentControl.csproj" />
     <ProjectReference Include="..\..\src\Updater\TermLink.Updater.csproj" />
   </ItemGroup>
 </Project>

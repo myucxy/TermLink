@@ -19,6 +19,8 @@ internal sealed class AiSessionManager : IDisposable
     private readonly Dictionary<string, AiAgentSession> sessions = new();
     private readonly Dictionary<(Guid, string), (string Body, Task<string> Result)> operations = new();
     private bool disposed;
+    private bool updating;
+    private int activeMutations;
     private long receiptBytes;
     private readonly ZcodeRemoteAddressStore remoteStore;
     private readonly string workspaceRoot;
@@ -26,6 +28,15 @@ internal sealed class AiSessionManager : IDisposable
     private readonly SemaphoreSlim modelQueries = new(2, 2);
     private readonly AiSessionArchive archive;
     private bool archiveLoaded;
+    internal bool TryBeginUpdate() {
+        lock (sync) {
+            if (disposed || updating || activeMutations != 0 || operations.Values.Any(o => !o.Result.IsCompleted) ||
+                sessions.Values.Any(s => s.DesktopSummary().State is "starting" or "running" or "awaiting_input")) return false;
+            updating = true;
+            return true;
+        }
+    }
+    internal void EndUpdate() { lock (sync) updating = false; }
     internal (DesktopAiSessionSummary[] Items, int Active, bool Truncated) DesktopSummaries() {
         lock (sync) {
             var all = sessions.Values.Select(s => s.DesktopSummary()).ToArray();
@@ -246,6 +257,10 @@ internal sealed class AiSessionManager : IDisposable
 
     private async Task<string> MutateAsync(Guid caller, Request request, Func<bool> authorized)
     {
+        lock (sync) {
+            if (updating) return Error("HOST_UPDATING");
+            activeMutations++;
+        }
         AiAgentSession session = null;
         try {
             if (request.Action == "import-native") {
@@ -339,6 +354,7 @@ internal sealed class AiSessionManager : IDisposable
             return Encode(new { hostId = HostId, error = error is AiOperationException known ? known.Code : "AGENT_OPERATION_FAILED",
                 session = session?.Snapshot(caller, true) });
         }
+        finally { lock (sync) activeMutations--; }
     }
 
     private static bool IsLocalDirectory(string path) {

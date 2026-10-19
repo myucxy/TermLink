@@ -14,6 +14,7 @@
 
 ## 产品版本与 build 记录
 
+- [0.3.10 / build 140：恢复 Android 发起 Windows 静默升级与回滚修复](../RELEASE_0.3.10_140.md)
 - [0.3.9 / build 139：桌面历史续聊与 OpenCode，GitHub、AppShip 已发布](../RELEASE_0.3.9_139.md)
 - [0.3.8 / build 138：桌面编码引擎检测，GitHub、AppShip 已发布](../RELEASE_0.3.8_138.md)
 - [0.3.7 / build 137：GitHub、AppShip 客户端及完整对应源码已发布](../RELEASE_0.3.7_137.md)

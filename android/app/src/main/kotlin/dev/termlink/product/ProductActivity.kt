@@ -1736,6 +1736,19 @@ private fun ProductAppContent(
                             repository.browseRemoteDirectory(pc.id, pc.name, "", null)
                         }
                     },
+                    onAgentUpdateRequested = { pc ->
+                        if (agentUpdateDialog == null) {
+                            agentUpdateDialog = AgentUpdateDialogState.Loading(pc)
+                            scope.launch {
+                                try {
+                                    val active = repository.activeAgentUpdate(pc.id)
+                                    if (active != null) monitorAgentUpdate(pc, active)
+                                    else agentUpdateDialog = AgentUpdateDialogState.Offer(pc, repository.agentUpdateEligibility(pc.id))
+                                } catch (error: CancellationException) { throw error }
+                                catch (error: Throwable) { agentUpdateDialog = AgentUpdateDialogState.Failure(pc, error) }
+                            }
+                        }
+                    },
                     onOpenDownloads = {
                         selectedRemotePcId = null
                         selectedRemotePcName = ""
@@ -3739,6 +3752,7 @@ private fun ProductContent(
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
+    onAgentUpdateRequested: (PcSummary) -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
@@ -3805,6 +3819,7 @@ private fun ProductContent(
                     },
                     onOpenDownloads = onOpenDownloads,
                     onBrowsePc = onBrowsePc,
+                    onAgentUpdateRequested = onAgentUpdateRequested,
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                     onDeleteInactiveSessionsRequested = onDeleteInactiveSessionsRequested,
@@ -4056,6 +4071,7 @@ private fun DevicesPage(
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
+    onAgentUpdateRequested: (PcSummary) -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
     onDeleteInactiveSessionsRequested: (PcSummary) -> Unit,
@@ -4104,6 +4120,9 @@ private fun DevicesPage(
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                     onDeleteInactiveSessions = { onDeleteInactiveSessionsRequested(pc) },
+                    onAgentUpdate = if (pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities) {
+                        { onAgentUpdateRequested(pc) }
+                    } else null,
                     inactiveSessionCount = snapshot.inactiveSessionIds(pc.id).size,
                     aiContent = {
                         DeviceSessionActions(aiWorkspace, pc, snapshot.remoteFileBrowser.openingCommandId != null,
@@ -4327,6 +4346,7 @@ private fun PcRow(
     onToggleExpanded: (() -> Unit)? = null,
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
     onBrowseFiles: (() -> Unit)? = null,
+    onAgentUpdate: (() -> Unit)? = null,
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteInactiveSessions: (() -> Unit)? = null,
@@ -4353,7 +4373,7 @@ private fun PcRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .combinedClickable(
-                        enabled = onToggleExpanded != null || onBrowseFiles != null || onDeleteInactiveSessions != null,
+                        enabled = onToggleExpanded != null || onBrowseFiles != null || onDeleteInactiveSessions != null || onAgentUpdate != null,
                         onClick = {
                             if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) onToggleExpanded?.invoke()
                         },
@@ -4426,6 +4446,13 @@ private fun PcRow(
                                 deviceMenuExpanded = false
                                 cleanup()
                             },
+                        )
+                    }
+                    onAgentUpdate?.let { update ->
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.agent_update_action)) },
+                            leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
+                            onClick = { deviceMenuExpanded = false; update() },
                         )
                     }
                 }

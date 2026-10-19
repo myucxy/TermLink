@@ -562,7 +562,7 @@
     <string name="confirm_close_inactive_sessions_copy">Permanently delete %2$d ended or interrupted sessions and their saved history from %1$s. Running sessions are kept. This cannot be undone.</string>
     <string name="close_inactive_sessions_progress">Processed %1$d of %2$d sessions…</string>
     <string name="close_inactive_sessions_result">Deleted: %1$d. Failed: %2$d. Skipped: %3$d. Refresh and retry any remaining inactive sessions.</string>
-    <string name="agent_update_action">Automatically update Agent</string>
+    <string name="agent_update_action">Update Windows client</string>
     <string name="agent_update_checking">Checking Agent update</string>
     <string name="agent_update_checking_copy">Reading the signed stable offer for Agent %1$s.</string>
     <string name="agent_update_confirm_title">Update %1$s?</string>
@@ -576,7 +576,7 @@
     <string name="agent_update_request_failed">Could not manage Agent update</string>
     <string name="agent_update_versions">%1$s to %2$s (build %3$d)</string>
     <string name="agent_update_session_warning">%1$d active TermLink-managed sessions will be closed, including their CLI child processes.</string>
-    <string name="agent_update_rollback_copy">The old installation is retained until the new Agent reconnects to Relay and the Server accepts its target build.</string>
+    <string name="agent_update_rollback_copy">Windows downloads, verifies and installs the update without an installation wizard, then starts automatically. The previous installation is retained until reconnection succeeds. Finish active AI tasks before updating.</string>
     <string name="agent_update_current_version">Current Agent: %1$s</string>
     <string name="agent_update_creating_job">Creating a Server-authorized update transaction.</string>
     <string name="agent_update_progress">%1$s · %2$d%%</string>
@@ -586,7 +586,7 @@
     <string name="agent_update_cannot_cancel">Installation has started. Cancellation is disabled while health verification or rollback is in progress.</string>
     <string name="agent_update_server_error">Server request failed: HTTP %1$d · %2$s · trace %3$s</string>
     <string name="agent_update_unknown_error">The Agent update failed without a diagnostic message.</string>
-    <string name="agent_update_confirm">Update Agent</string>
+    <string name="agent_update_confirm">Update Windows client</string>
     <string name="agent_update_reason_offline">The PC is offline.</string>
     <string name="agent_update_reason_routing_disabled">Remote routing is disabled on this PC.</string>
     <string name="agent_update_reason_unsupported">This Agent does not advertise transactional remote updates.</string>

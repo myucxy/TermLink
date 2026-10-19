@@ -222,6 +222,21 @@ namespace TermLink.UpdateCore.Validation
                 }), "mismatched target build receipt was accepted");
 
             ValidateActiveJournalSelection(record);
+            record.State = RemoteUpdateTransactionState.AwaitingNewAgent;
+            record.HealthDeadlineUtc = DateTimeOffset.UtcNow.AddMinutes(1);
+            RemoteUpdateTransactionStore.Save(RemoteUpdateTransactionStore.JournalPath(root), record);
+            Assert(RemoteUpdateTransactionStore.IsVerifyingInstallation(record.InstallRoot), "Older Updater startup did not select hidden mode.");
+            Assert(!RemoteUpdateTransactionStore.IsVerifyingInstallation(Path.Combine(record.InstallRoot, "other")), "Another install inherited hidden update startup.");
+            record.State = RemoteUpdateTransactionState.Succeeded;
+            RemoteUpdateTransactionStore.Save(RemoteUpdateTransactionStore.JournalPath(root), record);
+            Assert(!RemoteUpdateTransactionStore.IsVerifyingInstallation(record.InstallRoot), "Completed upgrade suppressed normal startup.");
+            foreach (var invalid in new[] { "{", "{\"SchemaVersion\":999}" })
+            {
+                File.WriteAllText(journalPath, invalid);
+                Assert(!RemoteUpdateTransactionStore.IsVerifyingInstallation(record.InstallRoot),
+                    "An unrelated invalid transaction prevented normal desktop startup.");
+            }
+            RemoteUpdateTransactionStore.Save(journalPath, record);
         }
 
         private static void ValidateActiveJournalSelection(RemoteUpdateTransactionRecord first)

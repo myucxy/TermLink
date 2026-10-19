@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"os"
 	"testing"
 	"time"
@@ -91,6 +92,66 @@ func TestClaimAgentUpdateReturnsQualifiedJobColumns(t *testing.T) {
 		t.Fatalf("claim state status=%q attempts=%d lease_present=%t", claimed.Status, claimed.AttemptCount, leaseToken != "")
 	}
 
+	leaseBytes, err := base64.RawURLEncoding.DecodeString(leaseToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseHash := sha256.Sum256(leaseBytes)
+	for index, phase := range []string{AgentUpdatePrechecking, AgentUpdateDownloading,
+		AgentUpdateVerified, AgentUpdateDrainingSessions, AgentUpdateInstalling} {
+		if _, err := repository.ProgressAgentUpdate(ctx, userID, agentID, pcID, created.ID, leaseHash,
+			AgentUpdateProgressInput{Phase: phase, ProgressPercent: (index + 1) * 17}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE pcs SET agent_version='0.2.5.46' WHERE id=$1`, pcID); err != nil {
+		t.Fatal(err)
+	}
+	installing, err := repository.GetAgentUpdate(ctx, userID, androidID, pcID, created.ID)
+	if err != nil || installing.Status != AgentUpdateProcessing || installing.Phase != AgentUpdateInstalling {
+		t.Fatalf("target registration prematurely completed installation: status=%s phase=%s err=%v", installing.Status, installing.Phase, err)
+	}
+	active, err := repository.GetActiveAgentUpdate(ctx, userID, androidID, pcID)
+	if err != nil || active == nil || active.ID != created.ID {
+		t.Fatalf("Android lost the installing transaction: active=%#v err=%v", active, err)
+	}
+	resumed, resumedLease, err := repository.ClaimAgentUpdate(ctx, userID, agentID, pcID, 2*time.Minute)
+	if err != nil || resumed == nil || resumed.ID != created.ID || resumedLease == "" {
+		t.Fatalf("new Agent cannot reclaim installation to verify Relay and write its receipt: err=%v", err)
+	}
+	resumedBytes, err := base64.RawURLEncoding.DecodeString(resumedLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumedHash := sha256.Sum256(resumedBytes)
+	for _, phase := range []string{AgentUpdateStartingNewAgent, AgentUpdateVerifyingConnection} {
+		if _, err := repository.ProgressAgentUpdate(ctx, userID, agentID, pcID, created.ID, resumedHash,
+			AgentUpdateProgressInput{Phase: phase, ProgressPercent: 96}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observedVersion, observedBuild := "0.2.5.46", int64(46)
+	completed, err := repository.CompleteAgentUpdate(ctx, userID, agentID, pcID, created.ID, resumedHash,
+		AgentUpdateCompleteInput{Status: AgentUpdateSucceeded, ObservedAgentVersion: &observedVersion, ObservedAgentBuild: &observedBuild})
+	if err != nil || completed.Status != AgentUpdateSucceeded {
+		t.Fatalf("verified new Agent could not complete its transaction: status=%s err=%v", completed.Status, err)
+	}
+	// A separate task still permits recovery through an independently installed newer build.
+	if _, err := pool.Exec(ctx, `UPDATE pcs SET agent_version=$2 WHERE id=$1`, pcID, currentVersion); err != nil {
+		t.Fatal(err)
+	}
+	created, err = repository.CreateAgentUpdate(ctx, userID, androidID, pcID, AgentUpdateCreateInput{
+		CurrentVersion: currentVersion, CurrentBuild: 45, TargetVersion: "0.2.5", TargetBuild: 46,
+		ArtifactURL: "https://updates.example.test/TermLink-0.2.5.exe", ArtifactFilename: "TermLink-0.2.5.exe",
+		ArtifactSizeBytes: 1, ArtifactSHA256: artifactHash, ExpiresAt: time.Now().UTC().Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.ClaimAgentUpdate(ctx, userID, agentID, pcID, 2*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
 	// A user may finish the same goal with a manually launched, newer Setup while
 	// Android is monitoring INSTALLING. The authenticated Agent registration is
 	// then sufficient evidence to close the stale job without another lease.
@@ -112,7 +173,7 @@ func TestClaimAgentUpdateReturnsQualifiedJobColumns(t *testing.T) {
 		*reconciled.ObservedAgentBuild != 49 {
 		t.Fatalf("manual install was not reconciled: %#v", reconciled)
 	}
-	active, err := repository.GetActiveAgentUpdate(ctx, userID, androidID, pcID)
+	active, err = repository.GetActiveAgentUpdate(ctx, userID, androidID, pcID)
 	if err != nil || active != nil {
 		t.Fatalf("reconciled update remained active: active=%#v err=%v", active, err)
 	}

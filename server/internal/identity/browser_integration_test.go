@@ -419,9 +419,10 @@ func TestEmbeddedIdentityBrowserSecurityFlows(t *testing.T) {
 	login := browser.request(http.MethodGet, authorizePath, nil, false)
 	assertIdentityStatus(t, login, http.StatusOK)
 	loginCSRF := identityHiddenValue(t, login.Body.String(), "termlink_csrf")
-	assertHostCookie(t, login, browserCSRFCookie)
+	loginCookie := identityHiddenValue(t, login.Body.String(), "termlink_csrf_cookie")
+	assertHostCookie(t, login, loginCookie)
 	denied := browser.request(http.MethodPost, authorizePath, url.Values{
-		"termlink_csrf": {loginCSRF}, "username": {input.Username}, "password": {newPassword},
+		"termlink_csrf": {loginCSRF}, "termlink_csrf_cookie": {loginCookie}, "username": {input.Username}, "password": {newPassword},
 	}, false)
 	assertIdentityStatus(t, denied, http.StatusOK)
 	if denied.Header().Get("Location") != "" || !strings.Contains(denied.Body.String(), "sign-in request expired") {
@@ -430,8 +431,9 @@ func TestEmbeddedIdentityBrowserSecurityFlows(t *testing.T) {
 
 	login = browser.request(http.MethodGet, authorizePath, nil, false)
 	loginCSRF = identityHiddenValue(t, login.Body.String(), "termlink_csrf")
+	loginCookie = identityHiddenValue(t, login.Body.String(), "termlink_csrf_cookie")
 	loggedIn := browser.request(http.MethodPost, authorizePath, url.Values{
-		"termlink_csrf": {loginCSRF}, "username": {input.Username}, "password": {newPassword},
+		"termlink_csrf": {loginCSRF}, "termlink_csrf_cookie": {loginCookie}, "username": {input.Username}, "password": {newPassword},
 	}, true)
 	assertIdentityStatus(t, loggedIn, http.StatusSeeOther)
 	if loggedIn.Header().Get("Location") == "" {
@@ -494,16 +496,18 @@ func TestEmbeddedIdentityBrowserSecurityFlows(t *testing.T) {
 		t.Fatalf("initial MFA login did not render only password plus human verification: %s", login.Body.String())
 	}
 	loginCSRF = identityHiddenValue(t, login.Body.String(), "termlink_csrf")
+	loginCookie = identityHiddenValue(t, login.Body.String(), "termlink_csrf_cookie")
 	humanRequired := browser.request(http.MethodPost, authorizePath, url.Values{
-		"termlink_csrf": {loginCSRF}, "username": {input.Username}, "password": {newPassword},
+		"termlink_csrf": {loginCSRF}, "termlink_csrf_cookie": {loginCookie}, "username": {input.Username}, "password": {newPassword},
 	}, true)
 	assertIdentityStatus(t, humanRequired, http.StatusOK)
 	if !strings.Contains(humanRequired.Body.String(), "Complete the human verification first") {
 		t.Fatalf("missing login human verification was not rejected: %s", humanRequired.Body.String())
 	}
 	loginCSRF = identityHiddenValue(t, humanRequired.Body.String(), "termlink_csrf")
+	loginCookie = identityHiddenValue(t, humanRequired.Body.String(), "termlink_csrf_cookie")
 	mfaPrompt := browser.request(http.MethodPost, authorizePath, url.Values{
-		"termlink_csrf": {loginCSRF}, "username": {input.Username}, "password": {newPassword},
+		"termlink_csrf": {loginCSRF}, "termlink_csrf_cookie": {loginCookie}, "username": {input.Username}, "password": {newPassword},
 		"cf-turnstile-response": {"valid-login-token"},
 	}, true)
 	assertIdentityStatus(t, mfaPrompt, http.StatusOK)
@@ -518,12 +522,13 @@ func TestEmbeddedIdentityBrowserSecurityFlows(t *testing.T) {
 		t.Fatalf("login human-verification calls = %+v", humanVerifier.calls)
 	}
 	loginCSRF = identityHiddenValue(t, mfaPrompt.Body.String(), "termlink_csrf")
+	loginCookie = identityHiddenValue(t, mfaPrompt.Body.String(), "termlink_csrf_cookie")
 	loginCode, err := totp.GenerateCode(secretMatch[1], now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mfaLoggedIn := browser.request(http.MethodPost, authorizePath, url.Values{
-		"termlink_csrf": {loginCSRF}, "otp": {loginCode},
+		"termlink_csrf": {loginCSRF}, "termlink_csrf_cookie": {loginCookie}, "otp": {loginCode},
 	}, true)
 	assertIdentityStatus(t, mfaLoggedIn, http.StatusSeeOther)
 	if mfaLoggedIn.Header().Get("Location") == "" {

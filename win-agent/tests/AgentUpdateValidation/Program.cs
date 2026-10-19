@@ -22,6 +22,8 @@ namespace TermLink.AgentUpdate.Validation
         {
             try
             {
+                if (args.Length == 1 && args[0] == "--update-protection") { await UpdateProtectionValidation.Run(); return 0; }
+                await UpdateProtectionValidation.Run();
                 if (args.Length == 1 && args[0] == "--enrollment-loopback")
                 {
                     EnrollmentLoopbackValidation.Run();

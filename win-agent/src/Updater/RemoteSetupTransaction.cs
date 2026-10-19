@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using Microsoft.Win32;
 using TermLink.UpdateCore;
+using TermLink.Agent;
 
 namespace TermLink.Updater
 {
@@ -56,7 +57,7 @@ namespace TermLink.Updater
             record.LastErrorCode = null;
             record.LastErrorDetail = null;
             RemoteUpdateTransactionStore.Save(journalPath, record);
-            StopProcess(record.PreviousProcessId, record.InstallRoot);
+            StopOwnedProcesses(record.InstallRoot, record.ControlPipeName);
             var exitCode = LaunchSetup(record, journalPath);
             record = RemoteUpdateTransactionStore.Load(journalPath);
             if (record.State == RemoteUpdateTransactionState.SetupRunning)
@@ -134,15 +135,13 @@ namespace TermLink.Updater
             RemoteUpdateTransactionStore.Save(journalPath, record);
             try
             {
-                StopOwnedProcesses(record.InstallRoot);
+                StopOwnedProcesses(record.InstallRoot, record.ControlPipeName);
                 if (!string.IsNullOrWhiteSpace(record.BackupPath) && Directory.Exists(record.BackupPath))
                 {
                     var backupPath = RemoteUpdateTransactionStore.RequireBackupPath(
                         record.InstallRoot,
                         record.BackupPath);
-                    var quarantine = Path.Combine(
-                        transactionRoot,
-                        "failed-target-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss"));
+                    var quarantine = FailedTargetPath(record.InstallRoot, record.UpdateId);
                     AiWorkspaceStorage.MoveBetweenInstallRoots(record.InstallRoot, backupPath);
                     if (Directory.Exists(record.InstallRoot)) Directory.Move(record.InstallRoot, quarantine);
                     Directory.Move(backupPath, record.InstallRoot);
@@ -257,25 +256,32 @@ namespace TermLink.Updater
             return null;
         }
 
-        private static void StopProcess(int processId, string installRoot)
+        private static void StopProcess(Process process, string installRoot, string controlPipeName)
         {
             try
             {
-                using var process = Process.GetProcessById(processId);
                 var path = process.MainModule?.FileName;
                 if (!IsUnder(path, installRoot))
                     throw new InvalidDataException("The previous process is not owned by the authorized install root.");
+                try {
+                    var response = RegistryControlClient.Send(
+                        controlPipeName.Length > 0 ? controlPipeName : TermLinkControlPipe.DefaultName(),
+                        new RegistryRequest { Command = RegistryCommand.RestartAgent },
+                        (int)ProcessStopTimeout.TotalMilliseconds, process.Id);
+                    if (response.Success && process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds)) return;
+                } catch (Exception e) when (e is IOException or TimeoutException or UnauthorizedAccessException) { }
                 try { process.CloseMainWindow(); } catch (InvalidOperationException) { }
                 if (!process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds))
                 {
-                    process.Kill(true);
-                    process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds);
+                    process.Kill();
+                    if (!process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds))
+                        throw new IOException("The owned Agent did not stop before installation replacement.");
                 }
             }
-            catch (ArgumentException) { }
+            catch (InvalidOperationException) { }
         }
 
-        private static void StopOwnedProcesses(string installRoot)
+        internal static void StopOwnedProcesses(string installRoot, string controlPipeName = "")
         {
             foreach (var process in Process.GetProcessesByName("TermLink"))
             {
@@ -284,13 +290,31 @@ namespace TermLink.Updater
                     try
                     {
                         if (!IsUnder(process.MainModule?.FileName, installRoot)) continue;
-                        process.Kill(true);
-                        process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds);
+                        // The external updater can descend from this UI through its Agent.
+                        process.Kill();
+                        if (!process.WaitForExit((int)ProcessStopTimeout.TotalMilliseconds))
+                            throw new IOException("The owned UI did not stop before installation replacement.");
+                    }
+                    catch (InvalidOperationException) { }
+                }
+            }
+            foreach (var process in Process.GetProcessesByName("TermLink.Agent"))
+            {
+                using (process)
+                {
+                    try
+                    {
+                        if (IsUnder(process.MainModule?.FileName, installRoot))
+                            StopProcess(process, installRoot, controlPipeName);
                     }
                     catch (InvalidOperationException) { }
                 }
             }
         }
+
+        internal static string FailedTargetPath(string installRoot, Guid updateId) => Path.Combine(
+            Directory.GetParent(Path.GetFullPath(installRoot).TrimEnd(Path.DirectorySeparatorChar))!.FullName,
+            ".termlink-failed-" + updateId.ToString("N"));
 
         private static void StartTray(string installRoot)
         {
@@ -309,7 +333,9 @@ namespace TermLink.Updater
             {
                 FileName = path,
                 WorkingDirectory = installRoot,
-                UseShellExecute = true
+                Arguments = "--start-hidden",
+                UseShellExecute = false,
+                CreateNoWindow = true
             });
             if (started == null) throw new InvalidOperationException("The installed TermLink Tray could not start.");
         }
