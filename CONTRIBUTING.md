@@ -13,6 +13,8 @@
 3. 运行受影响模块的测试。加密、输入、持久化、会话恢复或更新逻辑需要相应的异常路径验证。
 4. 更新用户或开发文档。新增文件应能从组件 README 或文档索引找到。
 
+新增 AI Agent 能力时，图标属于同一改动的必备交付：同步 `AiAgentGroups.kt` 的名称/图标映射和别名、APK 本地图标、来源及许可。新建选择、会话/历史分组和设备入口共用 `AiAgentProductIcon`，验收浅色/深色和选中状态；不能只接入协议后一直显示通用图标。Agent 清单覆盖由下方检查和 CI 把关，详细约束见 [AGENTS.md](AGENTS.md#ai-agent-presentation-contract)。
+
 当前使用和验收为 Relay Only；无需为普通改动准备 LAN/NAT 环境。Android 使用自有 terminal-core、JNI 和 View；Termux 旧模块和工具已迁出仓库，不属于构建或测试前置条件。
 
 安装测试、真实 AI 请求和部署测试可能影响本机程序、账号额度或外部服务，不能当成无副作用的单元测试。测试方法和实际覆盖范围应写清，不能把协议模拟通过描述成真机通过。
@@ -39,6 +41,7 @@
 
 ```powershell
 python scripts/check_public_docs.py --self-test
+python scripts/check_ai_agent_icons.py --self-test
 python scripts/check_secrets.py --self-test --gitleaks <已有的Gitleaks可执行文件>
 python scripts/update_dependency_inventory.py --verify
 ```

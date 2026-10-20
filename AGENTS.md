@@ -18,6 +18,12 @@
 - 引入或复制代码、资源、字体、主题、测试向量前必须核对许可证、署名、签名连续性和分发要求。许可证或架构边界不清楚时，只参考行为并自行实现。
 - 修复完成后以 TermLink 自有协议、输入、渲染和设备回归测试验证行为；参考外部实现时记录来源及适配边界。
 
+## AI Agent presentation contract
+
+- 新增或调整 Agent 能力时，同次修改必须补齐 Android 的 `AiAgentGroups.kt` 中 `aiAgentBrands`（名称及专用图标）、显示名称/别名归一化、随 APK 打包的资源和 `assets/licenses/ai-agent-icons-NOTICE.md` 来源/许可。已支持的 Agent 不得长期落到通用聊天图标。
+- 新建会话选择、会话列表/分组、历史分组和设备内 AI 入口统一复用 `AiAgentProductIcon`；新入口不得再维护独立映射。必须检查浅色/深色、选中/未选中、小尺寸和名称别名。
+- 提交前运行 `python scripts/check_ai_agent_icons.py --self-test`、Android `AiAgentBrandTest` 及受影响 UI 测试；CI 对照主机发现清单检查名称/图标覆盖，新增 Agent 而遗漏映射或资源应直接失败。未知未来 Agent 保留通用图标作为兼容兜底，不伪装成已有品牌。
+
 ## Current transport scope
 
 - 自 2026-10-04 起，按用户要求，当前仅使用服务器转发（Relay Only），适用于 CLI 和 AI 会话；后续开发、联测及发布验收以此策略为准。

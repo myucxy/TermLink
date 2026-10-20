@@ -25,6 +25,8 @@ jobs:
           python-version: '3.12'
       - name: Check public documentation
         run: python scripts/check_public_docs.py --self-test
+      - name: Check Android icons for every discovered AI Agent
+        run: python scripts/check_ai_agent_icons.py --self-test
       - name: Check GitHub release trust boundaries
         run: python scripts/test_github_release.py
       - name: Install checksum-pinned Gitleaks

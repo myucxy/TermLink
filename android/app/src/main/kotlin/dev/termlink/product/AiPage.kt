@@ -39,6 +39,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -755,7 +756,7 @@ private fun AiAgentChoice(id: String, name: String, selected: Boolean, enabled: 
             border = BorderStroke(1.dp, color.copy(alpha = if (selected) .7f else .2f))) {
             Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                AiAgentProductIcon(id, Modifier.size(18.dp))
+                AiAgentProductIcon(id, Modifier.size(18.dp).testTag("ai-agent-choice-icon-${aiAgentId(id)}"))
                 Text(name, Modifier.weight(1f, fill = false), color = color, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.labelMedium)
                 if (selected) Icon(Icons.Default.Check, null, Modifier.size(14.dp), tint = color)

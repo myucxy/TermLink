@@ -1,6 +1,7 @@
 package dev.termlink.product
 
 import androidx.compose.foundation.Image
+import androidx.annotation.DrawableRes
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChatBubbleOutline
@@ -19,18 +20,23 @@ import java.util.UUID
 internal fun aiAgentId(id: String, name: String = id): String =
     when (val value = id.ifBlank { name }.trim().lowercase(Locale.ROOT)) {
         "claude code", "claude-code" -> "claude"
+        "grok build", "grok-build" -> "grok"
+        "open code", "open-code" -> "opencode"
         "" -> "ai"
         else -> value
     }
 
-internal fun aiAgentName(id: String): String = when (id) {
-    "codex" -> "Codex"
-    "claude" -> "Claude Code"
-    "zcode" -> "ZCode"
-    "grok" -> "Grok Build"
-    "opencode" -> "OpenCode"
-    else -> id.ifBlank { "AI" }
-}
+internal data class AiAgentBrand(val name: String, @DrawableRes val icon: Int)
+
+internal val aiAgentBrands = mapOf(
+    "codex" to AiAgentBrand("Codex", R.drawable.ai_agent_openai),
+    "claude" to AiAgentBrand("Claude Code", R.drawable.ai_agent_claude),
+    "zcode" to AiAgentBrand("ZCode", R.drawable.ai_agent_zcode),
+    "grok" to AiAgentBrand("Grok Build", R.drawable.ai_agent_grok),
+    "opencode" to AiAgentBrand("OpenCode", R.drawable.ai_agent_opencode),
+)
+
+internal fun aiAgentName(id: String): String = aiAgentBrands[aiAgentId(id)]?.name ?: id.ifBlank { "AI" }
 
 internal fun aiEntryAgentId(entry: AiOpened, session: AiConversation?): String =
     aiAgentId(entry.agentId.ifBlank { session?.agentId.orEmpty() }, session?.agent.orEmpty())
@@ -78,11 +84,13 @@ internal fun aiListRows(entries: List<AiOpened>, sessions: Map<String, AiConvers
 
 @Composable
 internal fun AiAgentProductIcon(agentId: String, modifier: Modifier = Modifier.size(22.dp)) {
-    when (aiAgentId(agentId)) {
-        "codex" -> Icon(painterResource(R.drawable.ai_agent_openai), null, modifier,
-            tint = if (MaterialTheme.colorScheme.surface.luminance() < .5f) Color.White else Color.Black)
-        "claude" -> Icon(painterResource(R.drawable.ai_agent_claude), null, modifier, tint = Color.Unspecified)
-        "zcode" -> Image(painterResource(R.drawable.ai_agent_zcode), null, modifier)
-        else -> Icon(Icons.Default.ChatBubbleOutline, null, modifier, tint = MaterialTheme.colorScheme.primary)
+    val id = aiAgentId(agentId)
+    val brand = aiAgentBrands[id]
+    when {
+        brand == null -> Icon(Icons.Default.ChatBubbleOutline, null, modifier, tint = MaterialTheme.colorScheme.primary)
+        id == "zcode" -> Image(painterResource(brand.icon), null, modifier)
+        else -> Icon(painterResource(brand.icon), null, modifier,
+            tint = if (id == "claude") Color.Unspecified
+                else if (MaterialTheme.colorScheme.surface.luminance() < .5f) Color.White else Color.Black)
     }
 }
