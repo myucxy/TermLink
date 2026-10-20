@@ -102,7 +102,30 @@ tombstones and terminal EXITED states, and marks omitted RUNNING rows as
 INTERRUPTED. Per-session metadata writes are serialized with snapshot writes.
 Android polls the E2EE catalog every two seconds (an individual request has an
 eight-second deadline); these intervals bound detection, not instantaneous
-knowledge of remote network failure. A failed refresh removes usable content.
+knowledge of remote network failure. A timeout or lost Relay response preserves
+the last catalog only for the same trusted device, exchange key and epoch.
+It does not confirm that a process is running or authorize a new control lease.
+
+## Reconnection recovery (0.3.15 / 145)
+
+Windows session-metadata HTTP timeouts no longer terminate the existing metadata
+worker. The worker retains pending changes, backs off and retries, continues PC
+heartbeats, and still stops on runtime cancellation or rejected account authorization.
+Retry diagnostics contain only the exception type, never response bodies or credentials.
+
+Android preserves existing views on catalog request deadlines, retired Relay
+generations and transient HTTP 408/429/5xx failures. A request deadline does not
+cancel the foreground poller. Invalid catalogs, changed/revoked host identities
+and authorization rejection continue to fail closed. The CLI timeout notice now
+offers **Check again** using the existing device refresh; it is disabled while a
+refresh is running and does not replace the shared device socket. A confirmed
+catalog restores the normal foreground control-acquisition path.
+
+Validation covers the actual Windows worker surviving a session HTTP timeout,
+metadata retry and PC heartbeat continuation, runtime shutdown, and Android
+confirmation/retry without replacing the native engine or granting control early.
+These changes require updated Windows/Android clients; no Server API or schema
+change is needed. Released 0.3.14 / 144 packages do not contain this fix.
 
 Rollout order: server, Windows, then Android. Old Windows/servers without the
 catalog capability fail closed with an upgrade/unavailable message; Android

@@ -583,6 +583,8 @@ namespace TermLink.Agent
         internal const string WslShellType = "wsl";
         internal const string CustomShellType = "custom";
         internal const int DefaultRegistrationTimeoutMilliseconds = 30000;
+        // The always-present TermLink CMD profile owns closeOnExit; the explicit command below replaces its shell.
+        internal const string WindowsTerminalHostProfileId = "{cb3ce4a8-86da-5aa1-a77d-abe62f8b55b2}";
         private readonly WindowsPathService paths;
         private readonly IProcessStarter processes;
         private readonly Func<string> windowsTerminalResolver;
@@ -731,6 +733,10 @@ namespace TermLink.Agent
                 terminalStart.ArgumentList.Add("-w");
                 terminalStart.ArgumentList.Add("new");
                 terminalStart.ArgumentList.Add("new-tab");
+                terminalStart.ArgumentList.Add("--profile");
+                terminalStart.ArgumentList.Add(WindowsTerminalHostProfileId);
+                terminalStart.ArgumentList.Add("--title");
+                terminalStart.ArgumentList.Add(profile.DisplayName);
                 terminalStart.ArgumentList.Add("--elevate");
                 terminalStart.ArgumentList.Add("-d");
                 terminalStart.ArgumentList.Add(directory);

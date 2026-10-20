@@ -66,6 +66,7 @@ $document = [ordered]@{
     termlinkAddNoProfile = $false
     profiles = $profiles
 }
+foreach ($profile in $profiles) { $profile['closeOnExit'] = 'always' }
 $destination = [IO.Path]::GetFullPath($OutputPath)
 $directory = Split-Path -Parent $destination
 [IO.Directory]::CreateDirectory($directory) | Out-Null

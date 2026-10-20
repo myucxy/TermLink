@@ -472,13 +472,13 @@ namespace TermLink.Agent
             {
                 revoked = await IsDeviceRevokedAsync(
                     http, serverUrl, tokens.AccessToken, selection.DeviceId,
-                    existingCredentials.Identity, CancellationToken.None).ConfigureAwait(false);
+                    existingCredentials.Identity, CancellationToken.None, existingConfig?.PcName ?? pcName).ConfigureAwait(false);
             }
             else if (reuseRetainedDevice)
             {
                 revoked = await IsDeviceRevokedAsync(
                     http, serverUrl, tokens.AccessToken, retained.DeviceId,
-                    retained.Identity, CancellationToken.None).ConfigureAwait(false);
+                    retained.Identity, CancellationToken.None, retained.PcName).ConfigureAwait(false);
             }
             if (revoked)
             {
@@ -574,7 +574,8 @@ namespace TermLink.Agent
             string accessToken,
             Guid deviceId,
             DeviceIdentity identity,
-            CancellationToken token)
+            CancellationToken token,
+            string registrationName = null)
         {
             if (http == null || string.IsNullOrWhiteSpace(serverUrl) ||
                 string.IsNullOrWhiteSpace(accessToken) || deviceId == Guid.Empty || identity == null)
@@ -594,14 +595,46 @@ namespace TermLink.Agent
             using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token)
                 .ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.OK) return false;
-            var (revoked, detail) = await ReadDeviceStatusRejectionAsync(response, token).ConfigureAwait(false);
+            var (revoked, serverCode, detail) = await ReadDeviceStatusRejectionAsync(response, token).ConfigureAwait(false);
             if (revoked) return true;
+            if (response.StatusCode == HttpStatusCode.Unauthorized && serverCode == "UNAUTHENTICATED" &&
+                !string.IsNullOrWhiteSpace(registrationName))
+            {
+                // Re-register the same ID and keys; a conflict cannot overwrite a disabled or existing device.
+                await RestoreRetainedDeviceAsync(http, serverUrl, accessToken, deviceId, identity, registrationName, token)
+                    .ConfigureAwait(false);
+                // A successful insert is insufficient: prove the identity again before saving local account files.
+                return await IsDeviceRevokedAsync(http, serverUrl, accessToken, deviceId, identity, token).ConfigureAwait(false);
+            }
             throw new ProductionEnrollmentException(
                 "ACCOUNT_DEVICE_STATUS_UNAVAILABLE",
                 "The existing TermLink device status could not be verified safely." + detail);
         }
 
-        private static async Task<(bool Revoked, string Detail)> ReadDeviceStatusRejectionAsync(
+        private static async Task RestoreRetainedDeviceAsync(
+            HttpClient http, string serverUrl, string accessToken, Guid deviceId,
+            DeviceIdentity identity, string pcName, CancellationToken token)
+        {
+            foreach (var deviceType in new[] { "PC_AGENT", "WINDOWS_PC" })
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, serverUrl + "/v1/devices/register")
+                {
+                    Content = new ByteArrayContent(ProductionAgentRuntime.BuildDeviceRegistrationBody(deviceId, pcName, identity, deviceType))
+                };
+                request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                if (response.StatusCode == HttpStatusCode.Created) return;
+                var (_, code, detail) = await ReadDeviceStatusRejectionAsync(response, token).ConfigureAwait(false);
+                if (deviceType == "PC_AGENT" &&
+                    (response.StatusCode == HttpStatusCode.BadRequest || response.StatusCode == HttpStatusCode.Forbidden) &&
+                    (code == "INVALID_DEVICE_TYPE" || code == "DEVICE_TYPE_NOT_ALLOWED")) continue;
+                throw new ProductionEnrollmentException("ACCOUNT_DEVICE_STATUS_UNAVAILABLE",
+                    "The retained TermLink device could not be registered safely." + detail);
+            }
+        }
+
+        private static async Task<(bool Revoked, string Code, string Detail)> ReadDeviceStatusRejectionAsync(
             HttpResponseMessage response, CancellationToken token)
         {
             // Non-200 device-status rejections are read exactly once with a
@@ -611,7 +644,7 @@ namespace TermLink.Agent
             // http_status/server_code/server_message_key diagnostics; raw
             // bodies and credentials are never retained or logged.
             var detail = " http_status=" + ((int)response.StatusCode);
-            if (response.Content == null) return (false, detail);
+            if (response.Content == null) return (false, null, detail);
             string serverCode = null;
             string serverMessageKey = null;
             var truncated = false;
@@ -650,7 +683,7 @@ namespace TermLink.Agent
             if (serverCode != null) detail += " server_code=" + SanitizeExternalToken(serverCode);
             if (serverMessageKey != null) detail += " server_message_key=" + SanitizeExternalToken(serverMessageKey);
             if (truncated) detail += " server_body=truncated";
-            return (revoked, detail);
+            return (revoked, serverCode, detail);
         }
 
         private static string SanitizeExternalToken(string value)

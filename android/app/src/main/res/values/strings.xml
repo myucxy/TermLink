@@ -255,6 +255,8 @@
     <string name="pc_catalog_unavailable">Windows session list is unavailable. Retrying automatically.</string>
     <string name="pc_catalog_timeout">Session status is temporarily unconfirmed. Retrying automatically; existing connections are kept.</string>
     <string name="session_status_unconfirmed">Unconfirmed</string>
+    <string name="session_catalog_retry">Check again</string>
+    <string name="session_catalog_checking">Checking…</string>
     <string name="session_direct_unavailable">Direct transport is unavailable.</string>
     <string name="terminal_history_gap">History gap</string>
     <string name="terminal_exited">Exited</string>

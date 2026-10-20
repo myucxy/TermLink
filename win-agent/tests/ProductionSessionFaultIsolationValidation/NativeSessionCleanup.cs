@@ -55,6 +55,9 @@ namespace TermLink.ProductionSessionFaultIsolation.Validation
                 runtime = (ProductionAgentRuntime)type.GetConstructor(flags, null,
                     new[] { typeof(ProductionAgentConfig), typeof(ProductionCredentials) }, null).Invoke(new object[] { config, credentials });
                 var store = (ProductionTerminalHistoryStore)type.GetField("terminalHistoryStore", flags).GetValue(runtime);
+                // These synthetic orphan streams have known legacy semantics and no live profile provider.
+                store = new ProductionTerminalHistoryStore(store.RootPath, credentials.DeviceId, _ => TerminalSemanticProfile.Legacy);
+                type.GetField("terminalHistoryStore", flags).SetValue(runtime, store);
                 var sessions = Enumerable.Range(0, 245).Select(_ => Guid.NewGuid()).ToArray();
                 var alive = Guid.NewGuid();
                 using var process = Process.GetCurrentProcess();

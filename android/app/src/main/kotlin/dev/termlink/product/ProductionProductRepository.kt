@@ -511,6 +511,8 @@ internal fun isAuthenticationRefreshRejection(error: Throwable): Boolean =
 /** Transport failure does not provide an authoritative catalog for retiring live sessions. */
 internal fun isTransportCatalogPollFailure(error: Throwable): Boolean = when (error) {
     is IOException -> true
+    is kotlinx.coroutines.TimeoutCancellationException -> true
+    is TermLinkApiException -> error.status == 408 || error.status == 429 || error.status in 500..599
     is NativeOidcException -> error.reason == NativeOidcFailure.NETWORK
     else -> false
 }
@@ -1424,6 +1426,9 @@ internal class ProductionProductRepository(
             val generation = authenticationLifecycle.capture()
             try {
                 withAuthenticatedApi { api, generation -> pollSessionCatalogWithApi(api, generation) }
+            } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+                currentCoroutineContext().ensureActive()
+                // A request deadline is not cancellation of the foreground catalog poller.
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -4435,6 +4440,12 @@ internal class ProductionProductRepository(
                 refreshWithApi(api, generation)
             }
             Log.i("TermLinkProduct", "refresh_completed")
+        } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+            currentCoroutineContext().ensureActive()
+            authenticationLifecycle.runIfCurrent(authenticationGeneration, predicate = { !closed }) {
+                publishFailure(error)
+            }
+            throw error
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -4665,9 +4676,13 @@ internal class ProductionProductRepository(
                 }
                 hostCatalogErrors.remove(pc.id)
             } catch (cancelled: kotlinx.coroutines.TimeoutCancellationException) {
+                currentCoroutineContext().ensureActive()
                 hostCatalogErrors[pc.id] = "TIMEOUT"
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (_: IOException) {
+                // A retired Relay generation or lost response says nothing about the host lifecycle.
+                hostCatalogErrors[pc.id] = "TIMEOUT"
             } catch (_: Exception) {
                 hostCatalogErrors[pc.id] = if (!pc.online) "OFFLINE" else
                     if (PcCapabilityIds.HOST_SESSION_CATALOG_V1 !in pc.capabilities) "UPGRADE_REQUIRED" else "UNAVAILABLE"

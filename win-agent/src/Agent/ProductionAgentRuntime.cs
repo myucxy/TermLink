@@ -2581,17 +2581,25 @@ namespace TermLink.Agent
 
         private async Task<HttpResponseMessage> RegisterDeviceAsync(string deviceType, CancellationToken token)
         {
+            return await SendAsync(HttpMethod.Post, "/v1/devices/register",
+                BuildDeviceRegistrationBody(credentials.DeviceId, config.PcName, credentials.Identity, deviceType),
+                false, null, token).ConfigureAwait(false);
+        }
+
+        internal static byte[] BuildDeviceRegistrationBody(
+            Guid deviceId, string pcName, DeviceIdentity identity, string deviceType)
+        {
             var registration = new Dictionary<string, object>
             {
-                ["id"] = credentials.DeviceId, ["type"] = deviceType, ["name"] = config.PcName,
-                ["signing_public_key"] = Base64Url(credentials.Identity.SigningPublicKey), ["exchange_public_key"] = Base64Url(credentials.Identity.Exchange.PublicKey),
-                ["key_id"] = DeviceKeyId(credentials.DeviceId)
+                ["id"] = deviceId, ["type"] = deviceType, ["name"] = pcName,
+                ["signing_public_key"] = Base64Url(identity.SigningPublicKey), ["exchange_public_key"] = Base64Url(identity.Exchange.PublicKey),
+                ["key_id"] = DeviceKeyId(deviceId)
             };
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(); var nonce = RandomNonce();
-            var canonical = string.Join("\n", "TERMLINK-DEVICE-REGISTER-V1", credentials.DeviceId.ToString("D"), deviceType, config.PcName,
+            var canonical = string.Join("\n", "TERMLINK-DEVICE-REGISTER-V1", deviceId.ToString("D"), deviceType, pcName,
                 registration["signing_public_key"], registration["exchange_public_key"], registration["key_id"], now, nonce);
-            registration["timestamp_ms"] = now; registration["nonce"] = nonce; registration["signature"] = Base64Url(credentials.Identity.Sign(Encoding.UTF8.GetBytes(canonical)));
-            return await SendAsync(HttpMethod.Post, "/v1/devices/register", JsonSerializer.SerializeToUtf8Bytes(registration), false, null, token).ConfigureAwait(false);
+            registration["timestamp_ms"] = now; registration["nonce"] = nonce; registration["signature"] = Base64Url(identity.Sign(Encoding.UTF8.GetBytes(canonical)));
+            return JsonSerializer.SerializeToUtf8Bytes(registration);
         }
 
         internal static byte[] BuildPCUpsertBody(string pcName, string agentVersion, long keyEpoch)
@@ -4746,6 +4754,7 @@ namespace TermLink.Agent
                     return;
                 }
                 catch (Exception error) when (
+                    error is OperationCanceledException ||
                     error is HttpRequestException ||
                     error is IOException ||
                     error is JsonException)
@@ -4753,6 +4762,7 @@ namespace TermLink.Agent
                     // Session discovery is independent from the WebSocket pump.
                     // Retain RestDirty and retry without tearing down a healthy
                     // realtime connection.
+                    WriteHostHistoryDiagnostic("metadata_sync_retry exception=" + error.GetType().Name);
                     await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
                 }
             }

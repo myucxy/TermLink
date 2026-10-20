@@ -22,6 +22,18 @@ Windows 运行时负责受管 CLI、AI Agent 协议、电脑文件和远程加�
 
 SessionHost 管理终端进程；Agent 记录会话状态并参与恢复。桌面窗口是否打开不能代替实际进程状态。CLI 历史与 AI 归档的所有权均在主机端，Server 只承担对应元数据和桥接职责。
 
+## 账号身份恢复
+
+退出账号会清除本地 Token 与当前账号配置，保留按账号、OIDC issuer 和本机标识隔离的设备身份，便于再次登录时沿用原设备。
+
+重新授权遇到旧设备状态 `401 UNAUTHENTICATED` 时，使用新授权的 Token、原设备 ID 和原密钥向现有注册接口证明身份。只有注册返回 `201 Created` 且再次请求 `/v1/devices/self` 成功，才保存新登录；PC 标识、密钥和其他账号缓存保持原有语义，不需要删除整个本地数据目录。
+
+注册冲突不会覆盖已有设备。禁用、普通 401、错误签名、过期证明、无效 Token、网络错误及异常响应均不能直接授权登录；明确撤销仍按原有的账号内稳定 PC 恢复流程处理。旧 Server 拒绝 `PC_AGENT` 类型时仅按既有协议回退 `WINDOWS_PC`，不放宽身份校验。
+
+这项修复只改 Windows 客户端，复用现有 Server API；纳入 [0.3.15 / 145](../docs/RELEASE_0.3.15_145.md)，渠道发布状态以该记录为准。0.3.14 / 144 及更早已发布制品不包含此修复。
+
+验证入口为 `tests/AgentUpdateValidation/`：覆盖当前登录身份、退出后的缓存身份、原密钥证明、旧类型回退、注册拒绝及二次校验失败时的文件保留。Server 的 `TestRetainedDeviceRecoveryCannotOverwriteExistingIdentity` 使用隔离 PostgreSQL 与 Redis/Valkey 核验缺失设备重建、账号隔离、不同密钥冲突和禁用/撤销记录保持。
+
 ## 验证与维护
 
 - 按修改范围选择 `tests/` 中的协议、SessionHost、AI、文件或更新验证，命令示例见开发说明。

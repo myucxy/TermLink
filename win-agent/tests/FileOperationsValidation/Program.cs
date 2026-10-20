@@ -727,6 +727,7 @@ static void ValidateTerminalLaunch(string testRoot)
         "terminal launcher did not fall back after Windows Terminal launch failure");
     Require(starts.Starts[0].ArgumentList.Contains("--elevate"),
         "an administrator-enabled command did not retain the explicit Windows Terminal elevation path");
+    ValidateTerminalCloseProfile(testRoot, starts.Starts[0]);
     var inheritedColorEnvironment = new System.Diagnostics.ProcessStartInfo();
     inheritedColorEnvironment.Environment["NO_COLOR"] = "1";
     inheritedColorEnvironment.Environment["TERM"] = "dumb";
@@ -808,6 +809,7 @@ static void ValidateTerminalLaunch(string testRoot)
                 customFallbackStarts.Starts[0].ArgumentList.Contains("--elevate") &&
                 customFallbackStarts.Starts[1].Verb == "runas",
             "a custom command did not enforce elevation for Windows Terminal and SessionHost fallback");
+        ValidateTerminalCloseProfile(testRoot, customFallbackStarts.Starts[0]);
 
         var detectedOverride = TerminalCommandProfileStore.CreateConfiguredProfile(
             "windows-powershell", "PowerShell hidden", stub, "-NoLogo", "windows-powershell",
@@ -840,6 +842,28 @@ static void ValidateTerminalLaunch(string testRoot)
     {
         AppContext.SetData(TerminalCommandProfileStore.StoragePathAppContextKey, null);
     }
+}
+
+static void ValidateTerminalCloseProfile(string testRoot, System.Diagnostics.ProcessStartInfo start)
+{
+    var install = Path.Combine(testRoot, "terminal-close-profile");
+    Directory.CreateDirectory(install);
+    File.WriteAllBytes(Path.Combine(install, "TermLink.SessionHost.exe"), new byte[] { 0x4d, 0x5a });
+    var fragment = Path.Combine(install, "termlink.json");
+    TermLink.WindowsIntegration.WindowsTerminalIntegration.Reconfigure(install, fragment);
+    using var document = JsonDocument.Parse(File.ReadAllText(fragment));
+    var profileIdIndex = start.ArgumentList.IndexOf("--profile");
+    Require(profileIdIndex >= 0 && start.ArgumentList[profileIdIndex + 1] == ManagedTerminalLauncher.WindowsTerminalHostProfileId,
+        "A remote CLI inherited the user's default terminal profile.");
+    var profile = document.RootElement.GetProperty("profiles").EnumerateArray().Single(item =>
+        item.GetProperty("guid").GetString() == start.ArgumentList[profileIdIndex + 1]);
+    Require(profile.GetProperty("closeOnExit").GetString() == "always",
+        "The selected TermLink profile does not close a force-terminated SessionHost.");
+    var titleIndex = start.ArgumentList.IndexOf("--title");
+    Require(titleIndex >= 0 && !string.IsNullOrWhiteSpace(start.ArgumentList[titleIndex + 1]) &&
+        !start.ArgumentList.Contains("--appendCommandLine") && start.ArgumentList.Contains("--command-base64") &&
+        start.ArgumentList.Take(3).SequenceEqual(new[] { "-w", "new", "new-tab" }),
+        "The close profile changed session isolation or nested its default shell around the explicit SessionHost.");
 }
 
 static async Task ValidateApiContractAsync()

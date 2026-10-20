@@ -14,6 +14,12 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Instant
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -379,11 +385,25 @@ class SessionCatalogReconciliationTest {
         assertTrue(isTransportCatalogPollFailure(NativeOidcException(
             NativeOidcFailure.NETWORK, cause = IOException("no route to host"))))
         assertFalse(isTransportCatalogPollFailure(TermLinkApiException(401, "UNAUTHENTICATED", null)))
-        assertFalse(isTransportCatalogPollFailure(TermLinkApiException(502, "HTTP_502", null)))
+        for (status in listOf(408, 429, 500, 502, 503, 504)) {
+            assertTrue(isTransportCatalogPollFailure(TermLinkApiException(status, "HTTP_$status", null)))
+        }
+        for (status in listOf(400, 401, 403, 404, 409, 426)) {
+            assertFalse(isTransportCatalogPollFailure(TermLinkApiException(status, "HTTP_$status", null)))
+        }
+        assertTrue(isTransportCatalogPollFailure(dev.termlink.network.production.HostDeviceConnectionChangedException()))
         assertFalse(isTransportCatalogPollFailure(
             NativeOidcException(NativeOidcFailure.TOKEN_REQUEST_FAILED)))
         assertFalse(isTransportCatalogPollFailure(
             IllegalStateException("Authentication lifecycle changed")))
+    }
+
+    @Test
+    fun requestDeadlineIsRecoverableWhileOwnerCancellationIsNot() = runBlocking {
+        val deadline = runCatching { withTimeout(1) { awaitCancellation() } }.exceptionOrNull()!!
+        assertTrue(currentCoroutineContext().isActive)
+        assertTrue(isTransportCatalogPollFailure(deadline))
+        assertFalse(isTransportCatalogPollFailure(CancellationException("account runtime stopped")))
     }
 
     private fun pc(online: Boolean) = PcSummary(

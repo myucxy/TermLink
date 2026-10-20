@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Agent\TermLink.Agent.csproj" />
+    <Compile Include="..\..\src\Common\WindowsTerminalIntegration.cs" Link="Common\WindowsTerminalIntegration.cs" />
   </ItemGroup>
 </Project>

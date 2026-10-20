@@ -3841,6 +3841,8 @@ private fun ProductContent(
     }
     if (destination == ProductDestination.SESSIONS) {
         SessionsPage(
+            onRetryCatalog = onRefreshDevices,
+            catalogRefreshing = devicesRefreshing,
             onOpenShellDirectory = onOpenShellDirectory,
             snapshot = snapshot,
             contentBottomPixels = sessionContentBottomPixels,
@@ -4587,6 +4589,8 @@ internal fun sessionDestructiveAction(sessionOnline: Boolean): SessionDestructiv
 
 @Composable
 private fun SessionsPage(
+    onRetryCatalog: () -> Unit,
+    catalogRefreshing: Boolean,
     onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     snapshot: ProductSnapshot,
     contentBottomPixels: Int,
@@ -4683,8 +4687,14 @@ private fun SessionsPage(
             val selected = activeSessions.firstOrNull { it.id.toString() == selectedSessionId }
                 ?: activeSessions.first()
             if (snapshot.pcSessionCatalogErrors[selected.pcId] == "TIMEOUT") {
-                Text(stringResource(R.string.pc_catalog_timeout), style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(stringResource(R.string.pc_catalog_timeout), modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    TextButton(onClick = onRetryCatalog, enabled = !catalogRefreshing,
+                        modifier = Modifier.testTag("session-catalog-retry")) {
+                        Text(stringResource(if (catalogRefreshing) R.string.session_catalog_checking else R.string.session_catalog_retry))
+                    }
+                }
             }
             val selectedEngine = if (selected.id == requestedSelectedId) {
                 requestedSelectedEngine

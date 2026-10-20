@@ -31,6 +31,10 @@ internal static class Program
         internal Exception FailNextPc;
         internal bool FailRecipientRefresh;
         internal int FailSessionResponses;
+        internal Exception FailNextSession;
+        internal TaskCompletionSource<bool> SessionFailureObserved = NewSignal();
+        internal TaskCompletionSource<bool> SessionWriteObserved = NewSignal();
+        internal TaskCompletionSource<bool> PcWriteObserved = NewSignal();
         internal bool RejectNextPCAgentRegistration;
         internal bool RejectNextGenericPCUpsert;
         internal string RejectEnhancedErrorCode;
@@ -52,6 +56,18 @@ internal static class Program
                 request.RequestUri.AbsolutePath,
                 (byte[])body.Clone(),
                 key));
+
+            if (request.Method == HttpMethod.Put && request.RequestUri.AbsolutePath.StartsWith("/v1/sessions/", StringComparison.Ordinal))
+            {
+                if (FailNextSession != null)
+                {
+                    var failure = FailNextSession;
+                    FailNextSession = null;
+                    SessionFailureObserved.TrySetResult(true);
+                    throw failure;
+                }
+                SessionWriteObserved.TrySetResult(true);
+            }
 
             if (request.Method == HttpMethod.Put && request.RequestUri.AbsolutePath.StartsWith("/v1/pcs/", StringComparison.Ordinal) &&
                 RejectEnhancedErrorCode != null)
@@ -129,6 +145,7 @@ internal static class Program
                     FailNextPc = null;
                     throw error;
                 }
+                PcWriteObserved.TrySetResult(true);
             }
 
             return new HttpResponseMessage(
@@ -684,6 +701,7 @@ internal static class Program
                 Directory.Delete(catalogRoot, recursive: true);
             }
 
+            await ValidateMetadataTimeoutRecovery(runtimeType, runtime, handler, publicationStateType, publicationState);
             Console.WriteLine("Production PC heartbeat validation passed.");
             return 0;
         }
@@ -696,6 +714,68 @@ internal static class Program
         {
             if (runtime is IDisposable disposable) disposable.Dispose();
         }
+    }
+
+    private static async Task ValidateMetadataTimeoutRecovery(
+        Type runtimeType, object runtime, RecordingHandler handler, Type stateType, object state)
+    {
+        var cancellation = (CancellationTokenSource)Field(runtimeType, "cancellation").GetValue(runtime);
+        var signal = (SemaphoreSlim)Field(runtimeType, "metadataSignal").GetValue(runtime);
+        var lastAttempt = Field(runtimeType, "lastPCUpsertAttemptUtc");
+        lastAttempt.SetValue(runtime, DateTime.UtcNow);
+        Field(stateType, "LastRestAttemptUtc").SetValue(state, DateTime.MinValue);
+        Field(stateType, "LastRestConfirmedUtc").SetValue(state, DateTime.UtcNow);
+        Field(stateType, "RestDirty").SetValue(state, true);
+        handler.FailNextSession = new TaskCanceledException("metadata timeout must not cancel its owning runtime");
+        handler.SessionFailureObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        handler.SessionWriteObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        handler.PcWriteObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Method(runtimeType, "SetRelayState").Invoke(runtime, new[] {
+            Enum.Parse(Field(runtimeType, "relayState").FieldType, "Connected"), string.Empty });
+        var before = handler.Requests.Count;
+        if (signal.CurrentCount == 0) signal.Release();
+        var loop = (Task)Method(runtimeType, "MetadataUpsertLoopAsync").Invoke(runtime, Array.Empty<object>());
+        try
+        {
+            await handler.SessionFailureObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            // Wake the same worker after its retry backoff, without replacing the runtime or socket.
+            Field(stateType, "LastRestAttemptUtc").SetValue(state, DateTime.MinValue);
+            if (signal.CurrentCount == 0) signal.Release();
+            var completed = await Task.WhenAny(loop, handler.SessionWriteObserved.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            Require(completed != loop, "A session HTTP timeout terminated the metadata worker.");
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while ((bool)Field(stateType, "RestDirty").GetValue(state) && DateTime.UtcNow < deadline)
+                await Task.Delay(10);
+            Require(!(bool)Field(stateType, "RestDirty").GetValue(state) && !loop.IsCompleted &&
+                !cancellation.IsCancellationRequested, "The retried session metadata was not confirmed by the same live worker.");
+            lastAttempt.SetValue(runtime, DateTime.UtcNow.AddSeconds(-16));
+            if (signal.CurrentCount == 0) signal.Release();
+            await handler.PcWriteObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Require(!loop.IsCompleted, "Session timeout recovery left PC heartbeats stopped.");
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { await loop.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        }
+        var writes = handler.Requests.Skip(before).Where(item => item.Path.StartsWith("/v1/sessions/", StringComparison.Ordinal)).ToArray();
+        Require(writes.Length == 2, "The timed-out session metadata was not retried exactly once.");
+        using var first = JsonDocument.Parse(writes[0].Body);
+        using var second = JsonDocument.Parse(writes[1].Body);
+        // A later polling attempt can re-seal title ciphertext with a new nonce.
+        Require(first.RootElement.EnumerateObject().Where(item => item.Name != "title_cipher").Select(item => item.ToString())
+            .SequenceEqual(second.RootElement.EnumerateObject().Where(item => item.Name != "title_cipher").Select(item => item.ToString())),
+            "Timeout recovery changed authoritative session metadata.");
+        foreach (var write in writes)
+            Require(write.IdempotencyKey == (string)Method(runtimeType, "SessionUpsertIdempotencyKey").Invoke(null, new object[] {
+                Guid.Parse(write.Path.Split('/').Last()), Field(stateType, "LastEventSequence").GetValue(state), write.Body }),
+                "Metadata retry did not bind its idempotency key to the exact body.");
+        var stoppedCount = handler.Requests.Count;
+        if (signal.CurrentCount == 0) signal.Release();
+        await Task.Delay(50);
+        Require(handler.Requests.Count == stoppedCount, "Owner cancellation did not stop metadata retries.");
+        Console.WriteLine("Metadata timeout recovery passed: same worker retries unchanged session metadata, continues PC heartbeats and honors shutdown.");
     }
 
     private static void ValidateReconnectPreferences()

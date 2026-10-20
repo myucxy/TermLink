@@ -53,6 +53,16 @@ Detected commands normally have identical IDs and shell types. The sole addition
 
 This double validation means neither Android nor the server can replace a configured command with arbitrary launch text.
 
+Windows Terminal launches explicitly select TermLink's always-present CMD profile
+by GUID to inherit its `closeOnExit: always` policy. The actual command line still
+starts the resolved SessionHost/Shell directly, and the tab title uses the selected
+command's display name; no extra CMD is wrapped around PowerShell, WSL or a custom
+CLI. Android's confirmed termination ends only that SessionHost process tree, so
+Windows Terminal can remove the corresponding tab instead of leaving an exited
+process screen. Other tabs and terminal windows are not terminated. This applies
+to newly launched sessions after installing a Windows build containing this fix;
+it does not rewrite profiles on already-open tabs or the user's default settings.
+
 ## Client capability negotiation
 
 The `GET /v1/pcs` response keeps older Android clients compatible while allowing a
