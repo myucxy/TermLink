@@ -25,3 +25,21 @@
 本轮未升级 HT-LPC-1326，未重新执行 MI 6、故障电脑实际浏览器登录及完整 Android Relay 断线/结束会话联测。受控用例与 Windows 实窗测试不替代这些现场验证。Windows 继续使用现有自签名身份，不代表公开 CA 信任或 SmartScreen 信誉。
 
 Server 没有生产代码变更，不发布 Docker、不部署 NAS；既有 Server 0.3.12 / 142 可配合本次客户端。保持 Relay Only。core 二进制来源继续为 `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。
+
+
+## 发布结果（2026-10-21）
+
+已发布 [GitHub v0.3.15](https://github.com/myucxy/TermLink/releases/tag/v0.3.15) 和 AppShip stable。正式 APK、Windows Setup 与匹配完整源码绑定 `bba534abdbe16da4dab3e3e1216054b975d06e81`，标签保持在该提交；后续文档补记不改变制品字节。
+
+| 制品 | 下载 | SHA-256 |
+| --- | --- | --- |
+| Android APK | [下载 APK](https://appship.kget.cc:8910/api/v1/artifacts/9a10d550-a595-45b9-987f-d652f7b9a9af/download) | `7bdea0fa7972459602d904b0f91d713c0c997705844220c0a3e86629443a255d` |
+| Windows x64 Setup | [下载安装包](https://appship.kget.cc:8910/api/v1/artifacts/59e4ce1d-745b-41e1-ac1c-7f4a3fca0fca/download) | `5d0942e06b977d630574d25b97b523f98cd7d0119263321f28836a7558dd7f0c` |
+| 完整对应源码 | [下载源码](https://appship.kget.cc:8910/api/v1/artifacts/f1b79258-ce08-4e96-a3cc-1bc4ca3e110a/download) | `c3daa77c37639f69408687e18c2bd792e57dce8cd50315e3000866be64775dac` |
+
+- GitHub 七个附件的大小与哈希一致，[独立 Windows 验签管道](https://github.com/myucxy/TermLink/actions/runs/39468015782)及固定源码仓库 CI 通过。
+- AppShip 三个 release 为 `published`、制品为 `ready`，匿名完整下载 SHA-256 和大小一致；客户端 build 144 返回 `optional`，145 返回 `no_update`。
+- APK 单一 signer、v2 签名、包名和版本正确；Windows Authenticode、RFC 3161 时间戳及自有载荷签名通过，沿用既有指纹。core 库哈希和来源没有改变。
+- 手机和平板模拟器原地升级正式 APK 至 0.3.15 / 145，保留 appId、首次安装时间和应用数据，冷启动及产品界面检查通过；此前 492 项应用单测、目录协议和手机受控恢复场景通过。
+
+本轮未覆盖日常 Windows 安装、未升级 HT-LPC-1326，未复测 MI 6、故障电脑真实浏览器授权或完整 Android Relay 断线/强制结束链路。需要安装新版 Windows/Android 才能获得对应修复；窗口退出规则只适用于升级后新建会话。Server/Docker latest 保持 0.3.12 / 142，NAS 未改动。
