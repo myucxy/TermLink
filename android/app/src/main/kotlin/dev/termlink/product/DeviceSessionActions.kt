@@ -29,11 +29,11 @@ internal fun cliWorkspacePath(root: String, time: Date = Date(), id: UUID = UUID
 }
 
 @Composable
-internal fun DeviceSessionActions(workspace: AiWorkspace, pc: PcSummary, opening: Boolean,
+internal fun DeviceSessionActions(workspace: AiWorkspace, pc: PcSummary, opening: Boolean, available: Boolean = true,
     onFiles: () -> Unit, onAi: () -> Unit, onLaunch: (UUID, String, TerminalCommandCapability) -> Unit) {
     var create by rememberSaveable(pc.id.toString()) { mutableStateOf(false) }
     var aiUpgradeRequired by rememberSaveable(pc.id.toString()) { mutableStateOf(false) }
-    val online = pc.online && pc.remoteRoutingEnabled
+    val online = available && pc.online && pc.remoteRoutingEnabled
     val commands = supportedRemoteTerminalCommands(pc)
     Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         if (commands.isNotEmpty() && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) AiAction(if (opening) "启动中…" else "CLI", Icons.Default.Terminal, online && !opening, filled = true, onClick = { create = true })

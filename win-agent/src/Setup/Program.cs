@@ -877,6 +877,7 @@ namespace TermLink.Setup
             // This keeps a rejected old/unsupported machine completely unchanged.
             var prerequisites = SetupPrerequisites.EnsureSupported();
             var root = NormalizeInstallRoot(installDirectory);
+            using var installLock = InstallRootLock.Acquire(root);
             // A cross-directory upgrade would leave the authoritative old root
             // installed and its global Tray/Agent identity could make the new
             // executable exit immediately. Reject it before creating even the
@@ -886,6 +887,10 @@ namespace TermLink.Setup
             Directory.CreateDirectory(parent);
             var previous = ReadMarkerIfPresent(root);
             ValidateExistingDirectory(root, previous);
+            if (preserveBackupForExternalCommit && previous != null &&
+                Version.TryParse(previous.Version, out var installedVersion) &&
+                WindowsUpdateVersion.GetBuild(installedVersion) >= WindowsUpdateVersion.GetBuild(typeof(Installer).Assembly.GetName().Version))
+                throw new InvalidDataException("The remote installer target is already satisfied by the installed build.");
 
             var staging = Path.Combine(parent, ".termlink-install-" + Guid.NewGuid().ToString("N"));
             var backup = Path.Combine(parent, ".termlink-backup-" + Guid.NewGuid().ToString("N"));

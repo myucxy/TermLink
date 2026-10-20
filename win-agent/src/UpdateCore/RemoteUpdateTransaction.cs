@@ -256,7 +256,9 @@ namespace TermLink.UpdateCore
                 throw new InvalidDataException("The remote update receipt is invalid.");
             var record = Load(JournalPath(transactionRoot));
             var expectedBuild = receipt.Outcome == "SUCCEEDED" ? record.TargetBuild : record.CurrentBuild;
-            if (receipt.UpdateId != record.UpdateId || receipt.ObservedAgentBuild != expectedBuild)
+            if (receipt.UpdateId != record.UpdateId ||
+                (receipt.Outcome == "SUCCEEDED" ? receipt.ObservedAgentBuild < expectedBuild : receipt.ObservedAgentBuild != expectedBuild) ||
+                !Version.TryParse(receipt.ObservedAgentVersion, out var version) || WindowsUpdateVersion.GetBuild(version) != receipt.ObservedAgentBuild)
                 throw new InvalidDataException("The remote update receipt does not match its transaction build.");
         }
 

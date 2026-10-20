@@ -34,6 +34,7 @@ type agentUpdateStore interface {
 	GetActiveAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (*store.AgentUpdateRecord, error)
 	CancelAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (store.AgentUpdateRecord, error)
 	ClaimAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, time.Duration) (*store.AgentUpdateRecord, string, error)
+	ReconcileInstalledAgentUpdates(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string, int64, uuid.UUID) ([]store.AgentUpdateRecord, error)
 	RenewAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, time.Duration) (store.AgentUpdateRecord, error)
 	ProgressAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, store.AgentUpdateProgressInput) (store.AgentUpdateRecord, error)
 	CompleteAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, store.AgentUpdateCompleteInput) (store.AgentUpdateRecord, error)
@@ -231,6 +232,50 @@ func (a *API) claimAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agent_update": agentUpdateView(*item, true), "lease_token": lease,
 	})
+}
+
+func (a *API) reconcileInstalledAgentUpdates(w http.ResponseWriter, r *http.Request) {
+	p := principal(r)
+	if !store.IsPCAgentDeviceType(p.Device.Type) {
+		writeError(w, r, http.StatusForbidden, "WINDOWS_AGENT_REQUIRED", store.ErrDenied)
+		return
+	}
+	pcID, ok := parseAgentUpdatePCID(w, r)
+	if !ok {
+		return
+	}
+	var input struct {
+		Version string    `json:"observed_agent_version"`
+		Build   int64     `json:"observed_agent_build"`
+		LocalID uuid.UUID `json:"local_update_id"`
+	}
+	if err := decodeJSON(r, &input); err != nil || !validObservedAgentIdentity(&input.Version, &input.Build) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_AGENT_UPDATE_RESULT", err)
+		return
+	}
+	if a.Presence == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "AGENT_CONNECTION_UNAVAILABLE", store.ErrDenied)
+		return
+	}
+	if _, online := a.Presence.Online(p.UserID, p.Device.ID); !online {
+		writeError(w, r, http.StatusConflict, "AGENT_NOT_CONNECTED", store.ErrConflict)
+		return
+	}
+	repository := a.agentUpdateRepository()
+	if repository == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "AGENT_UPDATES_UNAVAILABLE", store.ErrDenied)
+		return
+	}
+	items, err := repository.ReconcileInstalledAgentUpdates(r.Context(), p.UserID, p.Device.ID, pcID, input.Version, input.Build, input.LocalID)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	views := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		views = append(views, agentUpdateView(item, false))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent_updates": views})
 }
 
 func (a *API) getAgentUpdate(w http.ResponseWriter, r *http.Request) {

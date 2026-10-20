@@ -56,6 +56,7 @@ namespace TermLink.Agent
         private readonly ProductionFileOperationApi.AuthenticatedSendAsync send;
         private readonly ProductionClaimIdempotencyTracker claimIdempotency =
             new ProductionClaimIdempotencyTracker();
+        private readonly ProductionClaimIdempotencyTracker reconciliationIdempotency = new ProductionClaimIdempotencyTracker();
 
         internal ProductionAgentUpdateApi(
             Guid pcId,
@@ -237,6 +238,36 @@ namespace TermLink.Agent
         }
 
         private string BasePath => "/v1/pcs/" + pcId.ToString("D") + "/agent-updates";
+
+        internal async Task<bool> ReconcileInstalledAsync(
+            string version, long build, Guid localUpdateId, CancellationToken token)
+        {
+            var body = JsonSerializer.SerializeToUtf8Bytes(new {
+                observed_agent_version = version, observed_agent_build = build, local_update_id = localUpdateId
+            });
+            var attempt = reconciliationIdempotency.BeginAttempt();
+            using var response = await send(HttpMethod.Post, BasePath + "/reconcile", body, true,
+                "agent-update-installed-" + attempt, token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) reconciliationIdempotency.ObserveDefinitiveResponse(attempt);
+            // Older servers keep the existing leased completion path.
+            if (response.StatusCode == HttpStatusCode.NotFound || response.StatusCode == HttpStatusCode.MethodNotAllowed) return false;
+            await EnsureSuccessAsync(response, "Installed Agent reconciliation failed.", token).ConfigureAwait(false);
+            var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+            reconciliationIdempotency.ObserveDefinitiveResponse(attempt);
+            using var document = JsonDocument.Parse(bytes);
+            var items = document.RootElement.GetProperty("agent_updates");
+            if (items.ValueKind != JsonValueKind.Array || items.GetArrayLength() > 2)
+                throw new InvalidDataException("Installed Agent reconciliation response is invalid.");
+            var localAccepted = false;
+            foreach (var item in items.EnumerateArray()) {
+                if (item.GetProperty("pc_id").GetGuid() != pcId ||
+                    item.GetProperty("status").GetString() != "SUCCEEDED" ||
+                    item.GetProperty("target_build").GetInt64() > build)
+                    throw new InvalidDataException("Installed Agent reconciliation identity differs.");
+                if (item.GetProperty("id").GetGuid() == localUpdateId) localAccepted = true;
+            }
+            return localUpdateId == Guid.Empty || localAccepted;
+        }
     }
 
     internal sealed class ProductionAgentUpdateWorker : IDisposable
@@ -260,6 +291,7 @@ namespace TermLink.Agent
         private readonly CancellationTokenSource cancellation;
         private Task worker;
         private int disposed;
+        private bool installedBuildReconciled;
 
         internal ProductionAgentUpdateWorker(
             ProductionAgentUpdateApi api,
@@ -306,6 +338,7 @@ namespace TermLink.Agent
             {
                 try
                 {
+                    await ReconcileInstalledBuildAsync(token).ConfigureAwait(false);
                     var recovery = await ResumeInstalledTransactionAsync(token).ConfigureAwait(false);
                     if (recovery.Handled)
                     {
@@ -330,6 +363,36 @@ namespace TermLink.Agent
                     delay = TimeSpan.FromSeconds(Math.Min(20, delay.TotalSeconds * 2));
                 }
             }
+        }
+
+        internal async Task ReconcileInstalledBuildAsync(CancellationToken token)
+        {
+            if (installedBuildReconciled) return;
+            var journalPath = RemoteUpdateTransactionStore.FindActiveJournal(pcId);
+            var transaction = journalPath == null ? null : RemoteUpdateTransactionStore.Load(journalPath);
+            if (transaction != null && agentBuild == transaction.TargetBuild &&
+                (transaction.State == RemoteUpdateTransactionState.RollingBack || transaction.State == RemoteUpdateTransactionState.AwaitingRollbackAgent)) return;
+            await WaitForRelayAsync(token).ConfigureAwait(false);
+            var localId = transaction != null && agentBuild >= transaction.TargetBuild ? transaction.UpdateId : Guid.Empty;
+            var accepted = await api.ReconcileInstalledAsync(agentVersion, agentBuild, localId, token).ConfigureAwait(false);
+            if (accepted && localId != Guid.Empty) {
+                RemoteUpdateTransactionStore.SaveReceipt(Path.GetDirectoryName(journalPath), new RemoteUpdateReceipt {
+                    UpdateId = localId, Outcome = "SUCCEEDED", ObservedAgentVersion = agentVersion, ObservedAgentBuild = agentBuild
+                });
+                transaction.State = RemoteUpdateTransactionState.Succeeded;
+                transaction.LastErrorCode = null;
+                transaction.LastErrorDetail = null;
+                RemoteUpdateTransactionStore.Save(journalPath, transaction);
+                var updater = Path.Combine(AppContext.BaseDirectory, "TermLink.Updater.exe");
+                if (File.Exists(updater)) {
+                    var start = new ProcessStartInfo(updater) { UseShellExecute = false, CreateNoWindow = true };
+                    start.ArgumentList.Add("remote-resume");
+                    start.ArgumentList.Add("--transaction");
+                    start.ArgumentList.Add(journalPath);
+                    using var cleanup = Process.Start(start);
+                }
+            }
+            installedBuildReconciled = true;
         }
 
         internal async Task ProcessAsync(ClaimedAgentUpdate update, CancellationToken token)

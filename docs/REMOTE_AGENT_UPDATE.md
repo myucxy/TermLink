@@ -49,6 +49,7 @@ Windows Agent 使用：
 
 ```text
 POST /v1/pcs/{pcId}/agent-updates/claim
+POST /v1/pcs/{pcId}/agent-updates/reconcile
 POST /v1/pcs/{pcId}/agent-updates/{updateId}/renew
 POST /v1/pcs/{pcId}/agent-updates/{updateId}/progress
 POST /v1/pcs/{pcId}/agent-updates/{updateId}/complete
@@ -58,8 +59,11 @@ POST /v1/pcs/{pcId}/agent-updates/{updateId}/complete
 只保存 SHA-256。领取、续租、进度和完成操作均受设备签名、任务归属、有效期与 lease 约束。进度幂等键包含
 阶段和百分比，续租使用唯一幂等键，完成键由最终状态和 observed build 确定。
 
-`active` 只返回原发起 Android 设备的未完成任务，不返回下载 URL、哈希或签名人信息。Android 进程重启后
-先调用该接口恢复轮询，避免重复创建任务。
+`active` 只返回原发起 Android 设备的未完成任务，不返回下载 URL、哈希或签名人信息。Android 按服务器与账号保存每台 PC 的任务 ID；进程重启后优先查询该任务，包含应用关闭期间已完成的结果，未保存任务的设备再通过 `active` 恢复轮询，避免重复创建任务。
+
+Android 升级弹窗支持最小化，返回键也只收起窗口，不发送取消请求。切换页面、返回前台和重新进入应用均不自动打开升级弹窗；任务恢复、进度和结果只更新对应设备卡片，用户点击“查看进度／查看结果”才展开详情。每台 PC 独立监听与取消，一台 PC 升级或离线不会停止另一台 PC 的任务监听或禁用其操作。
+
+升级中的 PC 即使暂时离线仍保留卡片，但不据此视为在线；已不在服务端设备列表中的设备不会从缓存复活。下载显示真实百分比，安装和连接验证显示阶段进度；只有服务端终态才能表示成功、失败、回滚或取消。查询暂时中断时保留原任务并重试，不将查询失败等同于 Windows 升级失败。最小化与关闭 Android 不会取消服务器授权的升级；取消仍受下节的阶段边界约束。
 
 ## 4. 状态机与取消边界
 
@@ -98,8 +102,15 @@ Updater、journal 和 receipt 都必须位于该目录。备份只能是授权�
    observed version/build 一致、build 等于目标 build，且 `pcs.agent_version` 已经是该 observed version。
 6. Server 接受成功后，Agent 写入本地 receipt；外部 Updater 看到 receipt 后才删除旧版本备份并清除启动恢复项。
 
-已领取且目标 build 相同的任务不会因 PC 注册而提前成功或清除 lease；新 Agent 必须继续领取并完成连接验证。
-独立手动安装更高 build，或任务尚未领取时已安装目标 build，仍可由注册版本对账完成。
+已领取的任务不会仅因 PC 注册新版本而提前成功或清除 lease；新 Agent 必须先验证 Relay 连接。独立手动安装的相同或更高 build 通过 `reconcile` 确认已满足目标，旧版正常事务仍保留领取、连接验证、完成与回执路径。尚未领取的任务可由已登记的目标或更高 build 对账完成。
+
+`reconcile` 仅允许该 PC 的已信任 Windows Agent 调用，服务端要求存在实时连接，且上报版本/build 与同账号同 PC 的登记版本严格一致；不能由 Android 或另一台 PC 替代确认。只结束目标 build 不高于实际已安装 build 的未完成任务，不改写失败、取消或回滚历史。重试可再次返回已完成的本地任务，避免服务端已接受而响应丢失后缺少本地回执。原租约失效，旧进度和完成回报不能覆盖终态。
+
+新 Agent 写入实际版本/build 的成功回执后，将本地 journal 结束并启动当前安装的升级器完成备份与恢复启动项清理。成功回执允许实际 build 高于原目标，但要求 version/build 一致；回滚回执仍只能确认原 build。升级器检测到独立安装的更高 build 后不会启动旧 Setup 或自动回滚；缺少连接确认时保留现有安装和备份。Setup 与升级器对同一安装目录使用互斥，防止并行手动安装和回滚修改目录，远程 Setup 在提交前再次拒绝已满足的目标。
+
+Android 以服务端终态停止该 PC 的进度轮询，卡片显示“电脑已更新至实际版本”，不弹出完成窗口、不影响其他 PC。尚未确认或查询失败时仍显示进行中／恢复查询，不能单凭目录版本或下载 100% 宣称成功。
+
+这些恢复行为需要包含本次修复的 Server、Windows Agent／升级器；已运行的旧版升级器不会因仅升级 Android 而获得新保护。应在正式发布前验证旧事务接管路径，再执行生产部署；旧客户端首次升级的引导限制仍按第 8 节处理。
 
 因此仅“进程启动”或“WebSocket 建立”都不足以提交升级成功。
 

@@ -253,28 +253,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.coroutines.resume
 
-private sealed interface AgentUpdateDialogState {
-    val pc: PcSummary
-
-    data class Loading(override val pc: PcSummary) : AgentUpdateDialogState
-    data class Offer(
-        override val pc: PcSummary,
-        val eligibility: AgentUpdateEligibility,
-    ) : AgentUpdateDialogState
-    data class Starting(
-        override val pc: PcSummary,
-        val eligibility: AgentUpdateEligibility,
-    ) : AgentUpdateDialogState
-    data class Running(
-        override val pc: PcSummary,
-        val progress: AgentUpdateProgress,
-    ) : AgentUpdateDialogState
-    data class Failure(
-        override val pc: PcSummary,
-        val error: Throwable,
-    ) : AgentUpdateDialogState
-}
-
 private sealed class DestructiveProductAction {
     data object SignOut : DestructiveProductAction()
 }
@@ -1170,11 +1148,6 @@ private fun ProductAppContent(
     var pendingInactiveCleanup by remember { mutableStateOf<Pair<PcSummary, List<java.util.UUID>>?>(null) }
     var refreshInFlight by remember { mutableStateOf(false) }
     var signOutConfirmation by remember { mutableStateOf(false) }
-    var agentUpdateDialog by remember { mutableStateOf<AgentUpdateDialogState?>(null) }
-    var agentUpdateJob by remember { mutableStateOf<Job?>(null) }
-    var checkedAgentUpdatePcIds by remember(remoteDirectoryFavoriteScope) {
-        mutableStateOf(emptySet<java.util.UUID>())
-    }
     val deletableSessionId = pendingDeleteSessionId?.takeIf { sessionId ->
         val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return@takeIf false
         !isDeviceSessionActive(session.online)
@@ -1184,34 +1157,17 @@ private fun ProductAppContent(
         isDeviceSessionActive(session.online)
     }
     val scope = rememberCoroutineScope()
+    val agentUpdates = remember(repository, remoteDirectoryFavoriteScope, snapshot.signedIn) {
+        val store = AgentUpdateTaskStore(context, remoteDirectoryFavoriteScope.takeIf { snapshot.signedIn })
+        AgentUpdateCoordinator(repository, scope, store.load(), store::save)
+    }
+    DisposableEffect(agentUpdates) { onDispose { agentUpdates.close() } }
+    val agentUpdateState by agentUpdates.state.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val unavailableOperationMessage = stringResource(R.string.unknown_server_operation)
     val activeSessionDeleteMessage = stringResource(R.string.failure_session_active)
     val sessionTerminateRequestSentMessage = stringResource(R.string.session_terminate_request_sent)
     val sessionTerminateRequestFailedMessage = stringResource(R.string.failure_session_terminate_request)
-
-    fun monitorAgentUpdate(pc: PcSummary, initial: AgentUpdateProgress) {
-        agentUpdateJob?.cancel()
-        agentUpdateDialog = AgentUpdateDialogState.Running(pc, initial)
-        if (initial.terminal) {
-            agentUpdateJob = null
-            return
-        }
-        agentUpdateJob = scope.launch {
-            try {
-                val result = repository.monitorAgentUpdate(pc.id, initial.id) { progress ->
-                    agentUpdateDialog = AgentUpdateDialogState.Running(pc, progress)
-                }
-                agentUpdateDialog = AgentUpdateDialogState.Running(pc, result)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                agentUpdateDialog = AgentUpdateDialogState.Failure(pc, error)
-            } finally {
-                agentUpdateJob = null
-            }
-        }
-    }
 
     LaunchedEffect(pendingDeleteSessionId, deletableSessionId) {
         // A refresh may make the PC/session active while the confirmation is
@@ -1229,40 +1185,18 @@ private fun ProductAppContent(
     }
 
     LaunchedEffect(
+        agentUpdates,
+        foreground,
+        foregroundGeneration,
         snapshot.connectionState,
-        snapshot.pcs.map { Triple(it.id, it.online, PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities) },
-        agentUpdateDialog,
+        snapshot.pcs.map { Triple(it.id, it.online, it.capabilities) },
+        snapshot.devices.map { it.id },
     ) {
-        if (snapshot.connectionState != ProductConnectionState.CONNECTED || agentUpdateDialog != null) {
-            return@LaunchedEffect
-        }
-        repeat(3) { attempt ->
-            var transientFailure = false
-            for (pc in snapshot.pcs.filter {
-                it.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities
-            }) {
-                if (pc.id in checkedAgentUpdatePcIds) continue
-                val active = try {
-                    repository.activeAgentUpdate(pc.id).also {
-                        checkedAgentUpdatePcIds = checkedAgentUpdatePcIds + pc.id
-                    }
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (_: Throwable) {
-                    transientFailure = true
-                    null
-                }
-                if (active != null) {
-                    monitorAgentUpdate(pc, active)
-                    return@LaunchedEffect
-                }
-            }
-            if (!transientFailure || attempt == 2) return@LaunchedEffect
-            delay(2_000)
-            if (agentUpdateDialog != null) return@LaunchedEffect
-            if (snapshot.connectionState != ProductConnectionState.CONNECTED) {
-                return@LaunchedEffect
-            }
+        if (!foreground) {
+            agentUpdates.dismiss()
+        } else if (snapshot.connectionState == ProductConnectionState.CONNECTED) {
+            val allowedDevices = snapshot.devices.filter { it.type.isPcAgent() }.mapTo(hashSetOf()) { it.id }
+            agentUpdates.recover(snapshot.pcs.filter { it.deviceId in allowedDevices })
         }
     }
 
@@ -1736,19 +1670,9 @@ private fun ProductAppContent(
                             repository.browseRemoteDirectory(pc.id, pc.name, "", null)
                         }
                     },
-                    onAgentUpdateRequested = { pc ->
-                        if (agentUpdateDialog == null) {
-                            agentUpdateDialog = AgentUpdateDialogState.Loading(pc)
-                            scope.launch {
-                                try {
-                                    val active = repository.activeAgentUpdate(pc.id)
-                                    if (active != null) monitorAgentUpdate(pc, active)
-                                    else agentUpdateDialog = AgentUpdateDialogState.Offer(pc, repository.agentUpdateEligibility(pc.id))
-                                } catch (error: CancellationException) { throw error }
-                                catch (error: Throwable) { agentUpdateDialog = AgentUpdateDialogState.Failure(pc, error) }
-                            }
-                        }
-                    },
+                    agentUpdateStates = agentUpdateState.devices,
+                    onAgentUpdateRequested = { pc -> agentUpdates.open(pc, checkForUpdate = true) },
+                    onAgentUpdateDetails = { pc -> agentUpdates.open(pc) },
                     onOpenDownloads = {
                         selectedRemotePcId = null
                         selectedRemotePcName = ""
@@ -1882,44 +1806,12 @@ private fun ProductAppContent(
         onCancelDownload = repository::cancelUpdateDownload,
         onInstall = onInstallUpdate,
     )
-    agentUpdateDialog?.let { state ->
+    agentUpdateState.dialog?.let { state ->
         AgentUpdateDialog(
             state = state,
-            onDismiss = { agentUpdateDialog = null },
-            onInstall = { offer ->
-                val targetBuild = offer.eligibility.targetBuild ?: return@AgentUpdateDialog
-                agentUpdateDialog = AgentUpdateDialogState.Starting(offer.pc, offer.eligibility)
-                agentUpdateJob = scope.launch {
-                    try {
-                        val result = repository.runAgentUpdate(offer.pc.id, targetBuild) { progress ->
-                            agentUpdateDialog = AgentUpdateDialogState.Running(offer.pc, progress)
-                        }
-                        agentUpdateDialog = AgentUpdateDialogState.Running(offer.pc, result)
-                    } catch (error: CancellationException) {
-                        // An explicit pre-install cancellation is completed by the separate cancel request.
-                    } catch (error: Throwable) {
-                        agentUpdateDialog = AgentUpdateDialogState.Failure(offer.pc, error)
-                    } finally {
-                        agentUpdateJob = null
-                    }
-                }
-            },
-            onCancel = { running ->
-                if (running.progress.cancelable) {
-                    agentUpdateJob?.cancel()
-                    agentUpdateJob = null
-                    scope.launch {
-                        try {
-                            val cancelled = repository.cancelAgentUpdate(running.pc.id, running.progress.id)
-                            agentUpdateDialog = AgentUpdateDialogState.Running(running.pc, cancelled)
-                        } catch (error: CancellationException) {
-                            throw error
-                        } catch (error: Throwable) {
-                            agentUpdateDialog = AgentUpdateDialogState.Failure(running.pc, error)
-                        }
-                    }
-                }
-            },
+            onDismiss = agentUpdates::dismiss,
+            onInstall = agentUpdates::install,
+            onCancel = agentUpdates::cancel,
         )
     }
 
@@ -3752,7 +3644,9 @@ private fun ProductContent(
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
+    agentUpdateStates: Map<java.util.UUID, AgentUpdateDialogState>,
     onAgentUpdateRequested: (PcSummary) -> Unit,
+    onAgentUpdateDetails: (PcSummary) -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
@@ -3819,7 +3713,9 @@ private fun ProductContent(
                     },
                     onOpenDownloads = onOpenDownloads,
                     onBrowsePc = onBrowsePc,
+                    agentUpdateStates = agentUpdateStates,
                     onAgentUpdateRequested = onAgentUpdateRequested,
+                    onAgentUpdateDetails = onAgentUpdateDetails,
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                     onDeleteInactiveSessionsRequested = onDeleteInactiveSessionsRequested,
@@ -4071,14 +3967,16 @@ private fun DevicesPage(
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
+    agentUpdateStates: Map<java.util.UUID, AgentUpdateDialogState>,
     onAgentUpdateRequested: (PcSummary) -> Unit,
+    onAgentUpdateDetails: (PcSummary) -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
     onDeleteInactiveSessionsRequested: (PcSummary) -> Unit,
 ) {
     PrimaryHomeHeader(onOpenDownloads = onOpenDownloads)
-    val pcs = visibleOnlineWindowsPcs(snapshot)
-    val offline = snapshot.pcs.filter { pc -> !pc.online && snapshot.devices.any { it.id == pc.deviceId && it.type.isPcAgent() } }
+    val pcs = visibleAgentUpdatePcs(snapshot, agentUpdateStates)
+    val offline = snapshot.pcs.filter { pc -> !pc.online && pc.id !in agentUpdateStates && snapshot.devices.any { it.id == pc.deviceId && it.type.isPcAgent() } }
     if (offline.isNotEmpty()) {
         var showOffline by rememberSaveable { mutableStateOf(false) }
         TextButton(onClick = { showOffline = !showOffline }) { Text(stringResource(R.string.devices_unavailable_count, offline.size)) }
@@ -4102,6 +4000,8 @@ private fun DevicesPage(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             pcs.forEach { pc ->
+                val update = agentUpdateStates[pc.id]
+                val updating = update?.blocksPcActions() == true
                 val sessions = visibleDeviceCliSessions(snapshot, pc)
                 val pcKey = pc.id.toString()
                 PcRow(
@@ -4109,10 +4009,10 @@ private fun DevicesPage(
                     sessions = sessions,
                     sessionTitles = snapshot.sessionTitles,
                     expanded = pcKey in expandedPcIds,
-                    catalogConfirmed = pc.id !in snapshot.pcSessionCatalogErrors,
+                    catalogConfirmed = !updating && pc.id !in snapshot.pcSessionCatalogErrors,
                     onToggleExpanded = { onTogglePcExpanded(pc.id) },
                     onOpenSession = onOpenSession,
-                    onBrowseFiles = if (PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) {
+                    onBrowseFiles = if (!updating && pc.online && PcCapabilityIds.FILE_OPERATIONS_V1 in pc.capabilities) {
                         { onBrowsePc(pc) }
                     } else {
                         null
@@ -4123,9 +4023,12 @@ private fun DevicesPage(
                     onAgentUpdate = if (pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities) {
                         { onAgentUpdateRequested(pc) }
                     } else null,
+                    agentUpdate = update,
+                    onAgentUpdateDetails = { onAgentUpdateDetails(pc) },
                     inactiveSessionCount = snapshot.inactiveSessionIds(pc.id).size,
                     aiContent = {
                         DeviceSessionActions(aiWorkspace, pc, snapshot.remoteFileBrowser.openingCommandId != null,
+                            available = !updating,
                             { onBrowsePc(pc) }, onOpenAi, onOpenRemoteShell)
                         AiDeviceSessions(aiWorkspace, pc, pcKey in expandedPcIds, foreground, onOpenAi)
                     },
@@ -4149,17 +4052,81 @@ private fun DevicesPage(
 }
 
 @Composable
+private fun AgentUpdateProgressBar(state: AgentUpdateDialogState.Running) {
+    if (state.progress.terminal) return
+    if (state.progress.phase == "DOWNLOADING" && !state.refreshing) {
+        LinearProgressIndicator(progress = { state.progress.progressPercent / 100f }, modifier = Modifier.fillMaxWidth())
+    } else {
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
+private fun agentUpdateStatusText(progress: AgentUpdateProgress): String {
+    if (progress.status == "SUCCEEDED" && !progress.observedAgentVersion.isNullOrBlank())
+        return stringResource(R.string.agent_update_installed_version, progress.observedAgentVersion)
+    return stringResource(when (progress.status) {
+    "SUCCEEDED" -> R.string.agent_update_succeeded
+    "ROLLED_BACK" -> R.string.agent_update_rolled_back
+    "ROLLBACK_FAILED" -> R.string.agent_update_rollback_failed
+    "CANCELLED" -> R.string.agent_update_cancelled
+    "FAILED", "EXPIRED" -> R.string.agent_update_failed
+    else -> R.string.agent_update_in_progress
+    })
+}
+
+@Composable
+private fun AgentUpdateCard(state: AgentUpdateDialogState, pc: PcSummary, onDetails: () -> Unit) {
+    if (state is AgentUpdateDialogState.Offer) return
+    val running = state as? AgentUpdateDialogState.Running
+    val progress = running?.progress
+    val title = when (state) {
+        is AgentUpdateDialogState.Running -> agentUpdateStatusText(state.progress)
+        is AgentUpdateDialogState.Starting -> stringResource(R.string.agent_update_starting)
+        is AgentUpdateDialogState.Loading -> stringResource(R.string.agent_update_checking)
+        is AgentUpdateDialogState.Failure -> stringResource(R.string.agent_update_status_unavailable)
+        is AgentUpdateDialogState.Offer -> return
+    }
+    Column(
+        modifier = Modifier.fillMaxWidth().testTag("agent-update-card-${pc.id}").padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelLarge,
+                color = if (progress?.status in setOf("FAILED", "ROLLBACK_FAILED", "EXPIRED")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+            TextButton(onClick = onDetails, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(stringResource(if (progress?.terminal == true) R.string.agent_update_view_result else R.string.agent_update_view_progress))
+            }
+        }
+        val target = progress?.targetVersion ?: (state as? AgentUpdateDialogState.Starting)?.eligibility?.targetVersion
+        target?.let { Text(stringResource(R.string.agent_update_target_version, it), style = MaterialTheme.typography.bodySmall) }
+        when {
+            running != null -> {
+                val value = running.progress
+                AgentUpdateProgressBar(running)
+                if (!value.terminal) Text(when {
+                    running.cancelling -> stringResource(R.string.agent_update_cancelling)
+                    running.refreshing -> stringResource(R.string.agent_update_status_refreshing)
+                    !pc.online -> stringResource(R.string.agent_update_waiting_reconnect)
+                    value.phase == "DOWNLOADING" -> stringResource(R.string.agent_update_progress, agentUpdatePhaseText(value.phase), value.progressPercent)
+                    else -> agentUpdatePhaseText(value.phase)
+                }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (progress?.status == "ROLLED_BACK") Text(stringResource(R.string.agent_update_restored_version,
+                    progress.observedAgentVersion ?: progress.currentVersion), style = MaterialTheme.typography.bodySmall)
+            }
+            state is AgentUpdateDialogState.Starting || state is AgentUpdateDialogState.Loading -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
 private fun AgentUpdateDialog(
     state: AgentUpdateDialogState,
     onDismiss: () -> Unit,
     onInstall: (AgentUpdateDialogState.Offer) -> Unit,
     onCancel: (AgentUpdateDialogState.Running) -> Unit,
 ) {
-    val dismissible = when (state) {
-        is AgentUpdateDialogState.Running -> state.progress.terminal
-        is AgentUpdateDialogState.Starting -> false
-        else -> true
-    }
     val title = when (state) {
         is AgentUpdateDialogState.Loading -> stringResource(R.string.agent_update_checking)
         is AgentUpdateDialogState.Offer -> if (state.eligibility.eligible) {
@@ -4168,17 +4135,12 @@ private fun AgentUpdateDialog(
             stringResource(R.string.agent_update_unavailable_title)
         }
         is AgentUpdateDialogState.Starting -> stringResource(R.string.agent_update_starting)
-        is AgentUpdateDialogState.Running -> when (state.progress.status) {
-            "SUCCEEDED" -> stringResource(R.string.agent_update_succeeded)
-            "ROLLED_BACK" -> stringResource(R.string.agent_update_rolled_back)
-            "ROLLBACK_FAILED" -> stringResource(R.string.agent_update_rollback_failed)
-            "FAILED", "EXPIRED", "CANCELLED" -> stringResource(R.string.agent_update_failed)
-            else -> stringResource(R.string.agent_update_in_progress)
-        }
+        is AgentUpdateDialogState.Running -> agentUpdateStatusText(state.progress)
         is AgentUpdateDialogState.Failure -> stringResource(R.string.agent_update_request_failed)
     }
     AlertDialog(
-        onDismissRequest = { if (dismissible) onDismiss() },
+        onDismissRequest = onDismiss,
+        modifier = Modifier.testTag("agent-update-dialog"),
         title = { Text(title) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -4213,22 +4175,18 @@ private fun AgentUpdateDialog(
                         }
                     }
                     is AgentUpdateDialogState.Starting -> {
+                        Text(state.pc.name)
                         CircularProgressIndicator(modifier = Modifier.size(28.dp))
                         Text(stringResource(R.string.agent_update_creating_job))
+                        Text(stringResource(R.string.agent_update_minimize_copy))
                     }
                     is AgentUpdateDialogState.Running -> {
                         val progress = state.progress
-                        LinearProgressIndicator(
-                            progress = { progress.progressPercent / 100f },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        Text(
-                            stringResource(
-                                R.string.agent_update_progress,
-                                agentUpdatePhaseText(progress.phase),
-                                progress.progressPercent,
-                            ),
-                        )
+                        Text(state.pc.name)
+                        Text(stringResource(R.string.agent_update_target_version, progress.targetVersion))
+                        AgentUpdateProgressBar(state)
+                        if (!progress.terminal) Text(if (progress.phase == "DOWNLOADING") stringResource(R.string.agent_update_progress, agentUpdatePhaseText(progress.phase), progress.progressPercent)
+                            else agentUpdatePhaseText(progress.phase))
                         progress.activeSessionCount?.let {
                             Text(stringResource(R.string.agent_update_active_sessions, it))
                         }
@@ -4244,6 +4202,8 @@ private fun AgentUpdateDialog(
                         if (!progress.cancelable && !progress.terminal) {
                             Text(stringResource(R.string.agent_update_cannot_cancel))
                         }
+                        if (state.refreshing) Text(stringResource(R.string.agent_update_status_refreshing))
+                        if (!progress.terminal) Text(stringResource(R.string.agent_update_minimize_copy))
                     }
                     is AgentUpdateDialogState.Failure -> {
                         val apiError = state.error as? TermLinkApiException
@@ -4273,14 +4233,16 @@ private fun AgentUpdateDialog(
                 } else {
                     TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
                 }
-                is AgentUpdateDialogState.Running -> if (state.progress.terminal) {
-                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+                is AgentUpdateDialogState.Running -> TextButton(onClick = onDismiss) {
+                    Text(stringResource(if (state.progress.terminal) R.string.action_close else R.string.agent_update_minimize))
                 }
                 is AgentUpdateDialogState.Loading,
                 is AgentUpdateDialogState.Failure -> {
                     TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
                 }
-                is AgentUpdateDialogState.Starting -> Unit
+                is AgentUpdateDialogState.Starting -> TextButton(onClick = onDismiss) {
+                    Text(stringResource(R.string.agent_update_minimize))
+                }
             }
         },
         dismissButton = {
@@ -4289,7 +4251,9 @@ private fun AgentUpdateDialog(
                     TextButton(onClick = onDismiss) { Text(stringResource(R.string.update_action_later)) }
                 }
                 state is AgentUpdateDialogState.Running && state.progress.cancelable -> {
-                    TextButton(onClick = { onCancel(state) }) { Text(stringResource(R.string.action_cancel)) }
+                    TextButton(onClick = { onCancel(state) }, enabled = !state.cancelling) {
+                        Text(stringResource(if (state.cancelling) R.string.agent_update_cancelling else R.string.agent_update_cancel))
+                    }
                 }
             }
         },
@@ -4347,6 +4311,8 @@ private fun PcRow(
     onOpenSession: ((java.util.UUID) -> Unit)? = null,
     onBrowseFiles: (() -> Unit)? = null,
     onAgentUpdate: (() -> Unit)? = null,
+    agentUpdate: AgentUpdateDialogState? = null,
+    onAgentUpdateDetails: () -> Unit = {},
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteInactiveSessions: (() -> Unit)? = null,
@@ -4457,6 +4423,7 @@ private fun PcRow(
                     }
                 }
             }
+            agentUpdate?.let { AgentUpdateCard(it, pc, onAgentUpdateDetails) }
             aiContent()
             if (expanded && sessions.isNotEmpty()) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))

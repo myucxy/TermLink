@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -154,7 +155,7 @@ func TestClaimAgentUpdateReturnsQualifiedJobColumns(t *testing.T) {
 
 	// A user may finish the same goal with a manually launched, newer Setup while
 	// Android is monitoring INSTALLING. The authenticated Agent registration is
-	// then sufficient evidence to close the stale job without another lease.
+	// still needs an explicit connected-Agent confirmation before closing it.
 	const manuallyInstalledVersion = "0.2.7.49"
 	if err := repository.UpsertPC(ctx, userID, agentID, PCRecord{
 		ID: pcID, Name: "Windows Agent", AgentVersion: manuallyInstalledVersion, KeyEpoch: 1,
@@ -162,6 +163,14 @@ func TestClaimAgentUpdateReturnsQualifiedJobColumns(t *testing.T) {
 		Capabilities: []string{PCCapabilityRealtimeTerminalV1, PCCapabilityRemoteAgentUpdateV1},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	stillRunning, err := repository.GetAgentUpdate(ctx, userID, androidID, pcID, created.ID)
+	if err != nil || stillRunning.Status != AgentUpdateProcessing {
+		t.Fatalf("registration alone completed claimed update: status=%s err=%v", stillRunning.Status, err)
+	}
+	confirmed, err := repository.ReconcileInstalledAgentUpdates(ctx, userID, agentID, pcID, manuallyInstalledVersion, 49, created.ID)
+	if err != nil || len(confirmed) != 1 || confirmed[0].ID != created.ID {
+		t.Fatalf("connected newer Agent confirmation failed: items=%v err=%v", confirmed, err)
 	}
 	reconciled, err := repository.GetAgentUpdate(ctx, userID, androidID, pcID, created.ID)
 	if err != nil {
@@ -180,5 +189,60 @@ func TestClaimAgentUpdateReturnsQualifiedJobColumns(t *testing.T) {
 	claimedAgain, _, err := repository.ClaimAgentUpdate(ctx, userID, agentID, pcID, 2*time.Minute)
 	if err != nil || claimedAgain != nil {
 		t.Fatalf("new Agent reclaimed the reconciled update: claimed=%#v err=%v", claimedAgain, err)
+	}
+	for _, phase := range []string{AgentUpdatePrechecking, AgentUpdateDownloading, AgentUpdateInstalling} {
+		if _, err := pool.Exec(ctx, `UPDATE pcs SET agent_version=$2 WHERE id=$1`, pcID, currentVersion); err != nil {
+			t.Fatal(err)
+		}
+		job, err := repository.CreateAgentUpdate(ctx, userID, androidID, pcID, AgentUpdateCreateInput{
+			CurrentVersion: currentVersion, CurrentBuild: 45, TargetVersion: "0.2.5", TargetBuild: 46,
+			ArtifactURL: "https://updates.example.test/setup.exe", ArtifactFilename: "setup.exe", ArtifactSizeBytes: 1,
+			ArtifactSHA256: artifactHash, ExpiresAt: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, lease, err := repository.ClaimAgentUpdate(ctx, userID, agentID, pcID, 2*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE agent_update_jobs SET phase=$2 WHERE id=$1`, job.ID, phase); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE pcs SET agent_version='0.2.5.46' WHERE id=$1`, pcID); err != nil {
+			t.Fatal(err)
+		}
+		before, err := repository.GetAgentUpdate(ctx, userID, androidID, pcID, job.ID)
+		if err != nil || before.Status != AgentUpdateProcessing {
+			t.Fatalf("same target prematurely completed: %v", err)
+		}
+		for _, wrong := range []struct {
+			user, device, pc uuid.UUID
+			version          string
+			build            int64
+		}{
+			{uuid.New(), agentID, pcID, "0.2.5.46", 46}, {userID, androidID, pcID, "0.2.5.46", 46},
+			{userID, agentID, uuid.New(), "0.2.5.46", 46}, {userID, agentID, pcID, "0.2.6.47", 47},
+			{userID, agentID, pcID, "0.2.5.46", 47},
+		} {
+			if _, err := repository.ReconcileInstalledAgentUpdates(ctx, wrong.user, wrong.device, wrong.pc, wrong.version, wrong.build, job.ID); !errors.Is(err, ErrDenied) {
+				t.Fatalf("unrelated confirmation accepted: %v", err)
+			}
+		}
+		items, err := repository.ReconcileInstalledAgentUpdates(ctx, userID, agentID, pcID, "0.2.5.46", 46, job.ID)
+		if err != nil || len(items) == 0 || items[0].ID != job.ID || items[0].Status != AgentUpdateSucceeded {
+			t.Fatalf("manual same-target confirmation phase=%s err=%v", phase, err)
+		}
+		retry, err := repository.ReconcileInstalledAgentUpdates(ctx, userID, agentID, pcID, "0.2.5.46", 46, job.ID)
+		if err != nil || len(retry) == 0 || retry[0].ID != job.ID {
+			t.Fatalf("lost confirmation response cannot recover: %v", err)
+		}
+		leaseBytes, _ := base64.RawURLEncoding.DecodeString(lease)
+		if _, err := repository.ProgressAgentUpdate(ctx, userID, agentID, pcID, job.ID, sha256.Sum256(leaseBytes), AgentUpdateProgressInput{Phase: phase, ProgressPercent: 99}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("stale lease changed completed job: %v", err)
+		}
+		if active, err := repository.GetActiveAgentUpdate(ctx, userID, androidID, pcID); err != nil || active != nil {
+			t.Fatalf("confirmed job remained active: %v", err)
+		}
 	}
 }

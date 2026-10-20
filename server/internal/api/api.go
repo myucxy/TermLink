@@ -171,6 +171,7 @@ func (a *API) Handler() http.Handler {
 	trusted.HandleFunc("GET /v1/pcs/{pcId}/agent-update-eligibility", a.getAgentUpdateEligibility)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates", a.createAgentUpdate)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates/claim", a.claimAgentUpdate)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/agent-updates/reconcile", a.reconcileInstalledAgentUpdates)
 	trusted.HandleFunc("GET /v1/pcs/{pcId}/agent-updates/active", a.getActiveAgentUpdate)
 	trusted.HandleFunc("GET /v1/pcs/{pcId}/agent-updates/{updateId}", a.getAgentUpdate)
 	trusted.HandleFunc("DELETE /v1/pcs/{pcId}/agent-updates/{updateId}", a.cancelAgentUpdate)

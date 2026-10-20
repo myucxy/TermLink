@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/termlink/termlink/server/internal/presence"
 	"github.com/termlink/termlink/server/internal/store"
 )
 
@@ -94,6 +96,46 @@ func TestObservedAgentIdentityRequiresMatchingBuild(t *testing.T) {
 	}
 }
 
+func TestInstalledAgentConfirmationRequiresWindowsIdentityAndLiveConnection(t *testing.T) {
+	accountID, pcID, deviceID := uuid.New(), uuid.New(), uuid.New()
+	now := time.Now().UTC()
+	for _, scenario := range []struct {
+		role     string
+		online   bool
+		build    int
+		expected int
+	}{
+		{"WINDOWS_PC", false, 141, http.StatusConflict},
+		{"ANDROID", true, 141, http.StatusForbidden},
+		{"WINDOWS_PC", true, 140, http.StatusBadRequest},
+		{"WINDOWS_PC", true, 141, http.StatusOK},
+	} {
+		authentication, privateKey := fileOperationTestAuth(t, accountID, deviceID, scenario.role, now)
+		repository := &fakeAgentUpdateStore{active: &store.AgentUpdateRecord{ID: uuid.New(), PCID: pcID, Status: store.AgentUpdateSucceeded, TargetBuild: 141, ArtifactURL: "https://private.example/setup.exe"}}
+		registry := presence.New(time.Minute)
+		if scenario.online {
+			registry.Register(accountID, deviceID, uuid.New(), "pc")
+		}
+		service := &API{agentUpdates: repository, Presence: registry}
+		path := "/v1/pcs/" + pcID.String() + "/agent-updates/reconcile"
+		body := []byte(fmt.Sprintf(`{"observed_agent_version":"0.3.11.141","observed_agent_build":%d}`, scenario.build))
+		request := signedFileOperationRequest(t, privateKey, deviceID, now, http.MethodPost, path, body)
+		request.SetPathValue("pcId", pcID.String())
+		response := httptest.NewRecorder()
+		authentication.Authenticate(http.HandlerFunc(service.reconcileInstalledAgentUpdates)).ServeHTTP(response, request)
+		if response.Code != scenario.expected {
+			t.Fatalf("role=%s online=%v build=%d status=%d want=%d", scenario.role, scenario.online, scenario.build, response.Code, scenario.expected)
+		}
+		if response.Code == http.StatusOK {
+			if repository.activeCalls != 1 || !strings.Contains(response.Body.String(), `"SUCCEEDED"`) || strings.Contains(response.Body.String(), "artifact_url") {
+				t.Fatal("wrong confirmation view")
+			}
+		} else if repository.activeCalls != 0 {
+			t.Fatal("rejected confirmation reached store")
+		}
+	}
+}
+
 func TestRemoteAgentUpdateBootstrapBuildBoundary(t *testing.T) {
 	if minimumRemoteAgentUpdateBuild != 47 {
 		t.Fatalf("minimum remote Agent update build=%d, want 47", minimumRemoteAgentUpdateBuild)
@@ -138,6 +180,14 @@ func (fake *fakeAgentUpdateStore) CancelAgentUpdate(context.Context, uuid.UUID, 
 
 func (fake *fakeAgentUpdateStore) ClaimAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, time.Duration) (*store.AgentUpdateRecord, string, error) {
 	return nil, "", nil
+}
+
+func (fake *fakeAgentUpdateStore) ReconcileInstalledAgentUpdates(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string, int64, uuid.UUID) ([]store.AgentUpdateRecord, error) {
+	fake.activeCalls++
+	if fake.active == nil {
+		return nil, nil
+	}
+	return []store.AgentUpdateRecord{*fake.active}, nil
 }
 
 func (fake *fakeAgentUpdateStore) RenewAgentUpdate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, [32]byte, time.Duration) (store.AgentUpdateRecord, error) {

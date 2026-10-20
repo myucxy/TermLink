@@ -15,6 +15,7 @@ namespace TermLink.UpdateCore.Validation
             try
             {
                 ValidateBuildIdentity();
+                ValidateInstallRootLock(root);
                 ValidateUpdateSecurity(root);
                 if (args.Length > 0) ValidateSignedUpdate(root, args[0]);
                 ValidateTransactionAndReceipt(updateId, root);
@@ -211,6 +212,14 @@ namespace TermLink.UpdateCore.Validation
             var receipt = RemoteUpdateTransactionStore.TryLoadReceipt(root);
             Assert(receipt != null && receipt.ObservedAgentBuild == 38,
                 "valid build receipt did not round-trip");
+            RemoteUpdateTransactionStore.SaveReceipt(root, new RemoteUpdateReceipt {
+                UpdateId = updateId, Outcome = "SUCCEEDED", ObservedAgentVersion = "0.1.33.39", ObservedAgentBuild = 39
+            });
+            Assert(RemoteUpdateTransactionStore.TryLoadReceipt(root).ObservedAgentBuild == 39,
+                "newer manual installation receipt was rejected");
+            AssertThrows<InvalidDataException>(() => RemoteUpdateTransactionStore.SaveReceipt(root, new RemoteUpdateReceipt {
+                UpdateId = updateId, Outcome = "SUCCEEDED", ObservedAgentVersion = "0.1.33.39", ObservedAgentBuild = 40
+            }), "receipt with inconsistent version/build was accepted");
 
             AssertThrows<InvalidDataException>(() => RemoteUpdateTransactionStore.SaveReceipt(root,
                 new RemoteUpdateReceipt
@@ -294,6 +303,26 @@ namespace TermLink.UpdateCore.Validation
             {
                 if (Directory.Exists(secondRoot)) Directory.Delete(secondRoot, recursive: true);
             }
+        }
+
+        private static void ValidateInstallRootLock(string root)
+        {
+            using var held = new System.Threading.ManualResetEventSlim();
+            using var release = new System.Threading.ManualResetEventSlim();
+            using var entered = new System.Threading.ManualResetEventSlim();
+            var first = System.Threading.Tasks.Task.Run(() => {
+                using var lease = InstallRootLock.Acquire(root);
+                held.Set(); release.Wait();
+            });
+            Assert(held.Wait(5000), "First install lock did not start.");
+            var second = System.Threading.Tasks.Task.Run(() => {
+                using var lease = InstallRootLock.Acquire(root.ToUpperInvariant());
+                entered.Set();
+            });
+            try { Assert(!entered.Wait(100), "Two installers entered the same root simultaneously."); }
+            finally { release.Set(); }
+            Assert(entered.Wait(5000), "Install lock did not release for the next operation.");
+            System.Threading.Tasks.Task.WaitAll(first, second);
         }
 
         private static void ValidatePathBoundary(string root)

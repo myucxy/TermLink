@@ -26,7 +26,9 @@ namespace TermLink.Updater.Validation
                 });
                 return 0;
             }
+            if (args.SequenceEqual(new[] { "--start-hidden" })) return 0;
             if (args.Length == 2 && args[0] == "--remote-rollback-test") return ValidateRemoteRollback(args[1]);
+            if (args.Length == 1 && args[0] == "--manual-installed-test") return ValidateManualInstallation();
             if (args.Length == 2 && args[0] == "--remote-child") { File.WriteAllText(args[1], Environment.ProcessId.ToString()); Thread.Sleep(Timeout.Infinite); return 0; }
             if (args.Length == 2 && args[0] == "--remote-parent") {
                 using var child=Process.Start(new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory,"DescendantProbe.exe")) {
@@ -77,6 +79,59 @@ namespace TermLink.Updater.Validation
             }
         }
 
+        private static int ValidateManualInstallation()
+        {
+            var version = typeof(Program).Assembly.GetName().Version;
+            var build = WindowsUpdateVersion.GetBuild(version);
+            Assert(build > 2, "Run this validation with the current DEV version/build.");
+            using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true);
+            var oldRecovery = key.GetValue("TermLinkRemoteUpdateRecovery");
+            try {
+                foreach (var confirmed in new[] { false, true }) {
+                    foreach (var exactTarget in new[] { false, true }) {
+                    var id = Guid.NewGuid();
+                    var transaction = RemoteUpdateTransactionStore.CreateTransactionRoot(id);
+                    var install = Path.Combine(transaction, "installed");
+                    var backup = Path.Combine(transaction, ".termlink-backup-" + id.ToString("N"));
+                    Directory.CreateDirectory(install);Directory.CreateDirectory(backup);
+                    try {
+                        foreach (var file in Directory.EnumerateFiles(AppContext.BaseDirectory)) File.Copy(file, Path.Combine(install, Path.GetFileName(file)));
+                        File.Copy(Environment.ProcessPath, Path.Combine(install, "TermLink.exe"));
+                        File.Copy(Environment.ProcessPath, Path.Combine(install, "TermLink.Agent.exe"));
+                        File.Copy(typeof(Program).Assembly.Location, Path.Combine(install, "TermLink.Agent.dll"));
+                        File.WriteAllText(Path.Combine(backup,"retained.txt"),"previous installation");
+                        var journal=RemoteUpdateTransactionStore.JournalPath(transaction);
+                        var record=new RemoteUpdateTransactionRecord {UpdateId=id,PcId=Guid.NewGuid(),State=RemoteUpdateTransactionState.SetupRunning,
+                            CurrentVersion="0.3.9."+(build-2),CurrentBuild=build-2,TargetVersion="0.3.10",TargetBuild=exactTarget?build:build-1,
+                            InstallRoot=install,BackupPath=exactTarget?null:backup,SetupPath=Path.Combine(transaction,"TermLink-Setup.exe"),
+                            ArtifactSizeBytes=1,ArtifactSha256=new string('a',64),ExpectedSignerFingerprint=new string('b',40),
+                            PreviousProcessId=Environment.ProcessId,HealthDeadlineUtc=DateTimeOffset.UtcNow.AddMilliseconds(-1)};
+                        RemoteUpdateTransactionStore.Save(journal,record);
+                        if(confirmed)RemoteUpdateTransactionStore.SaveReceipt(transaction,new RemoteUpdateReceipt {UpdateId=id,Outcome="SUCCEEDED",ObservedAgentVersion=version.ToString(),ObservedAgentBuild=build});
+                        var before=System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(Path.Combine(install,"TermLink.Agent.dll")));
+                        var result=new RemoteSetupTransactionRunner().Run(journal);
+                        Assert(result==(confirmed?0:40),"Newer installed build was not confirmed or preserved.");
+                        Assert(before.SequenceEqual(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(Path.Combine(install,"TermLink.Agent.dll")))),"Remote supervisor replaced independently installed newer Agent.");
+                        Assert(Directory.Exists(backup)==(exactTarget || !confirmed),"Unconfirmed or unrelated backup was deleted, or confirmed owned backup was retained.");
+                    }finally{
+                        foreach(var process in Process.GetProcessesByName("TermLink")) {
+                            using(process) {
+                                try {
+                                    if(string.Equals(process.MainModule?.FileName,Path.Combine(install,"TermLink.exe"),StringComparison.OrdinalIgnoreCase)) {
+                                        if(!process.WaitForExit(3000)){process.Kill();process.WaitForExit(3000);}
+                                    }
+                                } catch(InvalidOperationException) { }
+                            }
+                        }
+                        Directory.Delete(transaction,true);
+                    }
+                    }
+                }
+                Console.WriteLine("PASS newer manual install: exact files preserved without receipt; verified receipt commits backup and prevents stale Setup or rollback.");
+                return 0;
+            }finally{if(oldRecovery==null)key.DeleteValue("TermLinkRemoteUpdateRecovery",false);else key.SetValue("TermLinkRemoteUpdateRecovery",oldRecovery);}
+        }
+
         private static int ValidateRemoteRollback(string installParent)
         {
             var id = Guid.NewGuid();
@@ -104,7 +159,7 @@ namespace TermLink.Updater.Validation
                 RemoteUpdateTransactionStore.Save(journal, new RemoteUpdateTransactionRecord
                 {
                     UpdateId = id, PcId = Guid.NewGuid(), State = RemoteUpdateTransactionState.RollingBack,
-                    InstallRoot = install, BackupPath = backup, CurrentVersion = "fixture", CurrentBuild = build,
+                    InstallRoot = install, BackupPath = backup, CurrentVersion = System.Reflection.AssemblyName.GetAssemblyName(assemblyPath).Version.ToString(), CurrentBuild = build,
                     TargetVersion = "fixture-target", TargetBuild = build + 1, PreviousProcessId = Environment.ProcessId,
                     SetupPath = Path.Combine(transaction, "TermLink-Setup.exe"), ArtifactSizeBytes = 1,
                     ArtifactSha256 = new string('a', 64), ExpectedSignerFingerprint = new string('b', 40),

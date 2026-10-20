@@ -339,13 +339,12 @@ func (s *Postgres) ClaimAgentUpdate(
 
 // reconcileSatisfiedAgentUpdates closes the gap between the transactional
 // Android workflow and an independently completed Windows installation. A
-// manually installed target that was never claimed, or an independently installed
-// newer build, already satisfies the job without another installation.
+// manually installed target that was never claimed already satisfies the job.
 //
 // The PC version is authoritative only after the authenticated Agent has
 // registered it. Invalid/legacy development versions are ignored rather than
 // breaking normal PC registration and update reads.
-// A claimed exact target must retain its lease until the new Agent verifies
+// A claimed target must retain its lease until the new Agent verifies
 // Relay and completes the transaction; registration alone leaves no local receipt.
 func reconcileSatisfiedAgentUpdates(
 	ctx context.Context,
@@ -373,9 +372,73 @@ func reconcileSatisfiedAgentUpdates(
 		    error_code=NULL,error_detail=NULL,
 		    observed_agent_version=$3,observed_agent_build=$4,
 		    started_at=COALESCE(started_at,now()),completed_at=now(),updated_at=now()
-		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING')
-		  AND (target_build<$4 OR (target_build=$4 AND status='PENDING'))`, userID, pcID, advertisedVersion, advertisedBuild)
+		WHERE account_id=$1 AND pc_id=$2 AND status='PENDING'
+		  AND target_build<=$4`, userID, pcID, advertisedVersion, advertisedBuild)
 	return err
+}
+
+// A connected, authenticated Agent confirms the installed build. Completed jobs
+// are returned on retry so a lost response cannot strand the local receipt.
+func (s *Postgres) ReconcileInstalledAgentUpdates(
+	ctx context.Context, userID, deviceID, pcID uuid.UUID,
+	version string, build int64, localID uuid.UUID,
+) ([]AgentUpdateRecord, error) {
+	parsed, err := agentupdate.WindowsAgentBuild(version)
+	if err != nil || parsed != build {
+		return nil, ErrDenied
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var registered string
+	err = tx.QueryRow(ctx, `
+		SELECT p.agent_version FROM pcs p JOIN devices d ON d.id=p.device_id
+		WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3 AND p.platform='windows'
+		  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT')
+		  AND d.trust_state='TRUSTED' AND d.disabled_at IS NULL
+		FOR UPDATE OF p`, pcID, userID, deviceID).Scan(&registered)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && registered != version {
+		return nil, ErrDenied
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, `
+		UPDATE agent_update_jobs SET status='SUCCEEDED',phase='SUCCEEDED',progress_percent=100,
+		    attempt_count=GREATEST(attempt_count,1),lease_token_hash=NULL,lease_expires_at=NULL,
+		    error_code=NULL,error_detail=NULL,observed_agent_version=$3,observed_agent_build=$4,
+		    started_at=COALESCE(started_at,now()),completed_at=now(),updated_at=now()
+		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING') AND target_build<=$4`,
+		userID, pcID, version, build); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT `+agentUpdateColumns+` FROM agent_update_jobs
+		WHERE account_id=$1 AND pc_id=$2 AND status='SUCCEEDED' AND target_build<=$3
+		  AND (id=$4 OR (observed_agent_version=$5 AND observed_agent_build=$3))
+		ORDER BY (id=$4) DESC,completed_at DESC,id LIMIT 2`, userID, pcID, build, localID, version)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]AgentUpdateRecord, 0, 2)
+	for rows.Next() {
+		item, scanErr := scanAgentUpdate(rows)
+		if scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (s *Postgres) RenewAgentUpdate(

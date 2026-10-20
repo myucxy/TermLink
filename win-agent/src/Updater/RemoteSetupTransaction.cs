@@ -22,6 +22,10 @@ namespace TermLink.Updater
             var transactionRoot = RemoteUpdateTransactionStore.RequireTransactionRoot(
                 Path.GetDirectoryName(journalPath));
             var record = RemoteUpdateTransactionStore.Load(journalPath);
+            // A manually installed target must never be overwritten by the old Setup.
+            if ((record.State == RemoteUpdateTransactionState.Prepared || record.State == RemoteUpdateTransactionState.SetupRunning) &&
+                InstalledBuild(record.InstallRoot) >= record.TargetBuild)
+                return VerifyTargetOrRollback(journalPath, transactionRoot, record);
             if (record.State == RemoteUpdateTransactionState.Prepared) ValidateSetup(record);
             RegisterRecovery(journalPath);
 
@@ -38,9 +42,17 @@ namespace TermLink.Updater
                 case RemoteUpdateTransactionState.AwaitingRollbackAgent:
                     return VerifyRollback(journalPath, transactionRoot, record);
                 case RemoteUpdateTransactionState.Succeeded:
+                    var receipt = RemoteUpdateTransactionStore.TryLoadReceipt(transactionRoot);
+                    if (receipt == null || receipt.Outcome != "SUCCEEDED" ||
+                        InstalledBuild(record.InstallRoot) < receipt.ObservedAgentBuild)
+                        throw new InvalidDataException("The installed Agent success receipt is missing or stale.");
+                    if (!string.IsNullOrWhiteSpace(record.BackupPath))
+                        TryDeleteDirectory(RemoteUpdateTransactionStore.RequireBackupPath(record.InstallRoot, record.BackupPath));
+                    ClearRecovery();
+                    return 0;
                 case RemoteUpdateTransactionState.RolledBack:
                     ClearRecovery();
-                    return record.State == RemoteUpdateTransactionState.Succeeded ? 0 : 20;
+                    return 20;
                 case RemoteUpdateTransactionState.RollbackFailed:
                     return 30;
                 default:
@@ -57,7 +69,12 @@ namespace TermLink.Updater
             record.LastErrorCode = null;
             record.LastErrorDetail = null;
             RemoteUpdateTransactionStore.Save(journalPath, record);
-            StopOwnedProcesses(record.InstallRoot, record.ControlPipeName);
+            var satisfied = false;
+            using (InstallRootLock.Acquire(record.InstallRoot)) {
+                satisfied = InstalledBuild(record.InstallRoot) >= record.TargetBuild;
+                if (!satisfied) StopOwnedProcesses(record.InstallRoot, record.ControlPipeName);
+            }
+            if (satisfied) return VerifyTargetOrRollback(journalPath, transactionRoot, record);
             var exitCode = LaunchSetup(record, journalPath);
             record = RemoteUpdateTransactionStore.Load(journalPath);
             if (record.State == RemoteUpdateTransactionState.SetupRunning)
@@ -104,12 +121,13 @@ namespace TermLink.Updater
             StartTray(record.InstallRoot);
             var receipt = WaitForReceipt(transactionRoot, record.UpdateId, "SUCCEEDED", record.HealthDeadlineUtc);
             if (receipt != null && receipt.Outcome == "SUCCEEDED" &&
-                receipt.ObservedAgentBuild == record.TargetBuild)
+                receipt.ObservedAgentBuild >= record.TargetBuild &&
+                InstalledBuild(record.InstallRoot) >= receipt.ObservedAgentBuild)
             {
-                var backupPath = RemoteUpdateTransactionStore.RequireBackupPath(
-                    record.InstallRoot,
-                    record.BackupPath);
-                TryDeleteDirectory(backupPath);
+                if (!string.IsNullOrWhiteSpace(record.BackupPath)) {
+                    var backupPath = RemoteUpdateTransactionStore.RequireBackupPath(record.InstallRoot, record.BackupPath);
+                    TryDeleteDirectory(backupPath);
+                }
                 if (!string.IsNullOrWhiteSpace(record.BackupPath) && Directory.Exists(record.BackupPath))
                     throw new IOException("The previous installation backup could not be committed.");
                 record.State = RemoteUpdateTransactionState.Succeeded;
@@ -118,6 +136,12 @@ namespace TermLink.Updater
                 RemoteUpdateTransactionStore.Save(journalPath, record);
                 ClearRecovery();
                 return 0;
+            }
+            if (InstalledBuild(record.InstallRoot) > record.TargetBuild || string.IsNullOrWhiteSpace(record.BackupPath)) {
+                record.LastErrorCode = "INSTALLED_AGENT_CONFIRMATION_REQUIRED";
+                record.LastErrorDetail = "The independently installed Agent must confirm connectivity; its installation was preserved.";
+                RemoteUpdateTransactionStore.Save(journalPath, record);
+                return 40;
             }
             record.LastErrorCode = "NEW_AGENT_CONNECTION_TIMEOUT";
             record.LastErrorDetail = "The new Agent did not confirm Relay and Server connectivity before the deadline.";
@@ -131,6 +155,9 @@ namespace TermLink.Updater
             string transactionRoot,
             RemoteUpdateTransactionRecord record)
         {
+            using var installLock = InstallRootLock.Acquire(record.InstallRoot);
+            if (InstalledBuild(record.InstallRoot) > record.TargetBuild)
+                return VerifyTargetOrRollback(journalPath, transactionRoot, record);
             record.State = RemoteUpdateTransactionState.RollingBack;
             RemoteUpdateTransactionStore.Save(journalPath, record);
             try
@@ -247,12 +274,12 @@ namespace TermLink.Updater
             string expectedOutcome,
             DateTimeOffset deadline)
         {
-            while (DateTimeOffset.UtcNow < deadline)
+            do
             {
                 var receipt = RemoteUpdateTransactionStore.TryLoadReceipt(transactionRoot);
                 if (receipt != null && receipt.UpdateId == updateId && receipt.Outcome == expectedOutcome) return receipt;
                 Thread.Sleep(ReceiptPollInterval);
-            }
+            } while (DateTimeOffset.UtcNow < deadline);
             return null;
         }
 
@@ -344,8 +371,10 @@ namespace TermLink.Updater
         {
             var path = Path.Combine(Path.GetFullPath(installRoot), "TermLink.Agent.dll");
             if (!File.Exists(path)) return -1;
-            var version = AssemblyName.GetAssemblyName(path).Version;
-            return version == null ? -1 : WindowsUpdateVersion.GetBuild(version);
+            try {
+                var version = AssemblyName.GetAssemblyName(path).Version;
+                return version == null ? -1 : WindowsUpdateVersion.GetBuild(version);
+            } catch (BadImageFormatException) { return -1; }
         }
 
         private static string FindBackupForBuild(string installRoot, long currentBuild)
