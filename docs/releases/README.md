@@ -8,12 +8,14 @@
 
 - Android/Windows 客户端使用 AppShip 或本轮指定的 GitHub Release；各自发布状态分开记录。
 - Docker 由本机从固定的已提交源码构建，直接推送 Docker Hub；核验版本镜像后再同步 latest。
-- GitHub 的[客户端发布管道](../development/GITHUB_RELEASE.md)复核本地签名的 APK、Setup 和完整对应源码，全部通过后发布草稿；旧 Docker 工作流已移除。
+- GitHub 的[客户端发布管道](../development/GITHUB_RELEASE.md)复核本地签名的 APK、Setup 和完整对应源码，全部通过后发布草稿；Docker CI 只构建并验证 DEV 镜像，正式镜像仍从本机发布。
 - DEV 沿用对应平台最后一次成功正式发布的版本/build，不能把本索引最上面的文件直接当 DEV 基线。
 - CLI 与 AI 使用及验收范围为 Relay Only。历史 LAN/NAT 结果仅按其记录时间阅读。
 
 ## 产品版本与 build 记录
 
+- [0.3.12 / build 142：升级进度最小化与手动升级任务收尾，客户端、源码及 Docker 已发布](../RELEASE_0.3.12_142.md)
+- [0.3.11 / build 141：AppShip 下载策略与 Server 修复，客户端、源码及 Docker 已发布](../RELEASE_0.3.11_141.md)
 - [0.3.10 / build 140：恢复 Android 发起 Windows 静默升级与回滚修复](../RELEASE_0.3.10_140.md)
 - [0.3.9 / build 139：桌面历史续聊与 OpenCode，GitHub、AppShip 已发布](../RELEASE_0.3.9_139.md)
 - [0.3.8 / build 138：桌面编码引擎检测，GitHub、AppShip 已发布](../RELEASE_0.3.8_138.md)
