@@ -34,6 +34,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -105,6 +106,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.NorthEast
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Warning
@@ -187,8 +189,15 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -1159,7 +1168,8 @@ private fun ProductAppContent(
     val scope = rememberCoroutineScope()
     val agentUpdates = remember(repository, remoteDirectoryFavoriteScope, snapshot.signedIn) {
         val store = AgentUpdateTaskStore(context, remoteDirectoryFavoriteScope.takeIf { snapshot.signedIn })
-        AgentUpdateCoordinator(repository, scope, store.load(), store::save)
+        AgentUpdateCoordinator(repository, scope, store.load(), store::save,
+            store.loadHiddenNotices(), store::saveHiddenNotices)
     }
     DisposableEffect(agentUpdates) { onDispose { agentUpdates.close() } }
     val agentUpdateState by agentUpdates.state.collectAsState()
@@ -1189,7 +1199,7 @@ private fun ProductAppContent(
         foreground,
         foregroundGeneration,
         snapshot.connectionState,
-        snapshot.pcs.map { Triple(it.id, it.online, it.capabilities) },
+        snapshot.pcs.map { listOf(it.id, it.online, it.capabilities, it.agentVersion, it.remoteRoutingEnabled) },
         snapshot.devices.map { it.id },
     ) {
         if (!foreground) {
@@ -1357,7 +1367,10 @@ private fun ProductAppContent(
     fun refresh() {
         if (deviceRefreshInProgress(refreshInFlight, snapshot.connectionState)) return
         refreshInFlight = true
-        runOperation(repository::refresh) { refreshInFlight = false }
+        runOperation(repository::refresh) {
+            refreshInFlight = false
+            agentUpdates.refreshOffers(repository.snapshot.value.pcs, force = true)
+        }
     }
 
     fun refreshCurrentDestination() {
@@ -1670,9 +1683,10 @@ private fun ProductAppContent(
                             repository.browseRemoteDirectory(pc.id, pc.name, "", null)
                         }
                     },
-                    agentUpdateStates = agentUpdateState.devices,
+                    agentUpdateState = agentUpdateState,
                     onAgentUpdateRequested = { pc -> agentUpdates.open(pc, checkForUpdate = true) },
                     onAgentUpdateDetails = { pc -> agentUpdates.open(pc) },
+                    onDismissAgentUpdateNotice = agentUpdates::dismissNotice,
                     onOpenDownloads = {
                         selectedRemotePcId = null
                         selectedRemotePcName = ""
@@ -3644,9 +3658,10 @@ private fun ProductContent(
     onTogglePcExpanded: (java.util.UUID) -> Unit,
     onOpenShellDirectory: (java.util.UUID, String) -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
-    agentUpdateStates: Map<java.util.UUID, AgentUpdateDialogState>,
+    agentUpdateState: AgentUpdateUiState,
     onAgentUpdateRequested: (PcSummary) -> Unit,
     onAgentUpdateDetails: (PcSummary) -> Unit,
+    onDismissAgentUpdateNotice: (java.util.UUID) -> Unit,
     onOpenDownloads: () -> Unit,
     onOpenRemoteFavorite: (RemoteDirectoryFavorite) -> Unit,
     onToggleRemoteFavorite: (java.util.UUID, String, RemoteFileEntry) -> Unit,
@@ -3713,9 +3728,10 @@ private fun ProductContent(
                     },
                     onOpenDownloads = onOpenDownloads,
                     onBrowsePc = onBrowsePc,
-                    agentUpdateStates = agentUpdateStates,
+                    agentUpdateState = agentUpdateState,
                     onAgentUpdateRequested = onAgentUpdateRequested,
                     onAgentUpdateDetails = onAgentUpdateDetails,
+                    onDismissAgentUpdateNotice = onDismissAgentUpdateNotice,
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                     onDeleteInactiveSessionsRequested = onDeleteInactiveSessionsRequested,
@@ -3967,14 +3983,16 @@ private fun DevicesPage(
     onOpenSession: (java.util.UUID) -> Unit,
     onOpenDownloads: () -> Unit,
     onBrowsePc: (PcSummary) -> Unit,
-    agentUpdateStates: Map<java.util.UUID, AgentUpdateDialogState>,
+    agentUpdateState: AgentUpdateUiState,
     onAgentUpdateRequested: (PcSummary) -> Unit,
     onAgentUpdateDetails: (PcSummary) -> Unit,
+    onDismissAgentUpdateNotice: (java.util.UUID) -> Unit,
     onStopSessionRequested: (java.util.UUID) -> Unit,
     onDeleteSessionRequested: (java.util.UUID) -> Unit,
     onDeleteInactiveSessionsRequested: (PcSummary) -> Unit,
 ) {
     PrimaryHomeHeader(onOpenDownloads = onOpenDownloads)
+    val agentUpdateStates = agentUpdateState.devices
     val pcs = visibleAgentUpdatePcs(snapshot, agentUpdateStates)
     val offline = snapshot.pcs.filter { pc -> !pc.online && pc.id !in agentUpdateStates && snapshot.devices.any { it.id == pc.deviceId && it.type.isPcAgent() } }
     if (offline.isNotEmpty()) {
@@ -4025,6 +4043,10 @@ private fun DevicesPage(
                     } else null,
                     agentUpdate = update,
                     onAgentUpdateDetails = { onAgentUpdateDetails(pc) },
+                    onDismissAgentUpdateNotice = if (pc.id !in agentUpdateState.hiddenNotices) {
+                        { onDismissAgentUpdateNotice(pc.id) }
+                    } else null,
+                    agentUpdateAvailable = agentUpdateState.offers[pc.id]?.isUpdateAvailableFor(pc, update) == true,
                     inactiveSessionCount = snapshot.inactiveSessionIds(pc.id).size,
                     aiContent = {
                         DeviceSessionActions(aiWorkspace, pc, snapshot.remoteFileBrowser.openingCommandId != null,
@@ -4076,7 +4098,7 @@ private fun agentUpdateStatusText(progress: AgentUpdateProgress): String {
 }
 
 @Composable
-private fun AgentUpdateCard(state: AgentUpdateDialogState, pc: PcSummary, onDetails: () -> Unit) {
+private fun AgentUpdateCard(state: AgentUpdateDialogState, pc: PcSummary, onDetails: () -> Unit, onDismiss: () -> Unit) {
     if (state is AgentUpdateDialogState.Offer) return
     val running = state as? AgentUpdateDialogState.Running
     val progress = running?.progress
@@ -4097,6 +4119,10 @@ private fun AgentUpdateCard(state: AgentUpdateDialogState, pc: PcSummary, onDeta
                 color = if (progress?.status in setOf("FAILED", "ROLLBACK_FAILED", "EXPIRED")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
             TextButton(onClick = onDetails, modifier = Modifier.heightIn(min = 48.dp)) {
                 Text(stringResource(if (progress?.terminal == true) R.string.agent_update_view_result else R.string.agent_update_view_progress))
+            }
+            if (state.canDismissNotice()) IconButton(onClick = onDismiss,
+                modifier = Modifier.size(48.dp).testTag("agent-update-dismiss-${pc.id}")) {
+                Icon(Icons.Filled.Close, contentDescription = stringResource(R.string.agent_update_dismiss_notice))
             }
         }
         val target = progress?.targetVersion ?: (state as? AgentUpdateDialogState.Starting)?.eligibility?.targetVersion
@@ -4313,6 +4339,8 @@ private fun PcRow(
     onAgentUpdate: (() -> Unit)? = null,
     agentUpdate: AgentUpdateDialogState? = null,
     onAgentUpdateDetails: () -> Unit = {},
+    onDismissAgentUpdateNotice: (() -> Unit)? = null,
+    agentUpdateAvailable: Boolean = false,
     onStopSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteSessionRequested: ((java.util.UUID) -> Unit)? = null,
     onDeleteInactiveSessions: (() -> Unit)? = null,
@@ -4328,6 +4356,9 @@ private fun PcRow(
             else -> R.string.pc_platform_windows
         },
     )
+    fun toggleSessions() {
+        if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) onToggleExpanded?.invoke()
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = ProductShape,
@@ -4340,9 +4371,7 @@ private fun PcRow(
                     .fillMaxWidth()
                     .combinedClickable(
                         enabled = onToggleExpanded != null || onBrowseFiles != null || onDeleteInactiveSessions != null || onAgentUpdate != null,
-                        onClick = {
-                            if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) onToggleExpanded?.invoke()
-                        },
+                        onClick = { toggleSessions() },
                         onLongClick = { deviceMenuExpanded = true },
                         onLongClickLabel = deviceMenuDescription,
                     )
@@ -4368,21 +4397,44 @@ private fun PcRow(
                                 contentDescription = stringResource(if (pc.online) R.string.pc_online_accessibility else R.string.pc_offline_accessibility),
                             )
                         }
-                        Text(
-                            stringResource(
-                                R.string.pc_routing_status,
-                                pc.agentVersion,
-                                stringResource(if (pc.remoteRoutingEnabled) R.string.remote_enabled else R.string.remote_disabled),
-                                platformLabel,
-                            ),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        val updateAvailable = agentUpdateAvailable && onAgentUpdate != null
+                        val versionLabel = stringResource(R.string.pc_agent_version, pc.agentVersion)
+                        val routingLabel = stringResource(if (pc.remoteRoutingEnabled) R.string.pc_routing_detail else R.string.pc_routing_disabled, platformLabel)
+                        val updateDescription = stringResource(R.string.agent_update_available)
+                        val updateColor = MaterialTheme.colorScheme.secondary
+                        Text(buildAnnotatedString {
+                            append(versionLabel)
+                            if (updateAvailable) {
+                                append(" ")
+                                appendInlineContent("agent-update", "↗")
+                            }
+                            append(" · ")
+                            append(routingLabel)
+                        },
+                            inlineContent = mapOf("agent-update" to InlineTextContent(
+                                Placeholder(16.sp, MaterialTheme.typography.bodySmall.fontSize, PlaceholderVerticalAlign.Center),
+                            ) { Icon(Icons.Filled.NorthEast, contentDescription = null, tint = updateColor) }),
+                            modifier = Modifier.fillMaxWidth().then(if (updateAvailable) Modifier
+                                .testTag("agent-update-available-${pc.id}")
+                                // Keep the hit box inside this line, clear of the device-name long press.
+                                .pointerInput(onAgentUpdate) {
+                                    detectTapGestures(onTap = { position ->
+                                        if (position.x >= 0 && position.x < size.width && position.y >= 0 && position.y < size.height)
+                                            onAgentUpdate?.invoke()
+                                        else toggleSessions()
+                                    },
+                                        onLongPress = { deviceMenuExpanded = true })
+                                }
+                                .semantics(mergeDescendants = true) {
+                                    role = Role.Button
+                                    onClick(label = updateDescription) { onAgentUpdate?.invoke(); true }
+                                }
+                                else Modifier),
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                     }
                     if (sessions.isNotEmpty() || "ai_agent_v1" in pc.capabilities) {
-                        IconButton(onClick = { onToggleExpanded?.invoke() }, enabled = onToggleExpanded != null, modifier = Modifier.size(48.dp)) {
+                        IconButton(onClick = { toggleSessions() }, enabled = onToggleExpanded != null, modifier = Modifier.size(48.dp)) {
                             Icon(imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
                                 contentDescription = stringResource(if (expanded) R.string.action_collapse_sessions else R.string.action_expand_sessions),
                                 modifier = Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -4423,7 +4475,7 @@ private fun PcRow(
                     }
                 }
             }
-            agentUpdate?.let { AgentUpdateCard(it, pc, onAgentUpdateDetails) }
+            if (onDismissAgentUpdateNotice != null) agentUpdate?.let { AgentUpdateCard(it, pc, onAgentUpdateDetails, onDismissAgentUpdateNotice) }
             aiContent()
             if (expanded && sessions.isNotEmpty()) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))

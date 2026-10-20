@@ -36,6 +36,8 @@ internal sealed interface AgentUpdateDialogState {
 internal data class AgentUpdateUiState(
     val devices: Map<UUID, AgentUpdateDialogState> = emptyMap(),
     val selectedPcId: UUID? = null,
+    val hiddenNotices: Set<UUID> = emptySet(),
+    val offers: Map<UUID, AgentUpdateEligibility> = emptyMap(),
 ) {
     val dialog: AgentUpdateDialogState? get() = devices[selectedPcId]
 }
@@ -46,13 +48,26 @@ internal class AgentUpdateCoordinator(
     parentScope: CoroutineScope,
     restoredTasks: Map<UUID, UUID> = emptyMap(),
     private val saveTasks: (Map<UUID, UUID>) -> Unit = {},
+    hiddenNotices: Set<UUID> = emptySet(),
+    private val saveHiddenNotices: (Set<UUID>) -> Unit = {},
+    private val nowMillis: () -> Long = System::currentTimeMillis,
 ) {
     private val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
-    private val mutableState = MutableStateFlow(AgentUpdateUiState())
+    private val mutableState = MutableStateFlow(AgentUpdateUiState(hiddenNotices = hiddenNotices))
     val state = mutableState.asStateFlow()
     private val tasks = restoredTasks.toMutableMap()
     private val jobs = mutableMapOf<UUID, Job>()
     private val cancellations = mutableSetOf<UUID>()
+    private val offerJobs = mutableMapOf<UUID, Job>()
+    private val offerChecks = mutableMapOf<UUID, Pair<String, Long>>()
+
+    private fun hideNotice(pcId: UUID, hidden: Boolean) {
+        val current = state.value
+        val notices = if (hidden) current.hiddenNotices + pcId else current.hiddenNotices - pcId
+        if (notices == current.hiddenNotices) return
+        mutableState.value = current.copy(hiddenNotices = notices)
+        saveHiddenNotices(notices)
+    }
 
     private fun put(pcId: UUID, value: AgentUpdateDialogState?) {
         val current = mutableState.value
@@ -61,6 +76,11 @@ internal class AgentUpdateCoordinator(
 
     private fun progress(pc: PcSummary, value: AgentUpdateProgress) {
         require(value.pcId == pc.id)
+        hideNotice(pc.id, false)
+        if (value.terminal) {
+            mutableState.value = state.value.copy(offers = state.value.offers - pc.id)
+            offerChecks.remove(pc.id)
+        }
         if (tasks[pc.id] != value.id) {
             tasks[pc.id] = value.id
             saveTasks(tasks.toMap())
@@ -84,7 +104,23 @@ internal class AgentUpdateCoordinator(
 
     fun dismiss() { mutableState.value = mutableState.value.copy(selectedPcId = null) }
 
+    fun dismissNotice(pcId: UUID) {
+        val notice = state.value.devices[pcId] ?: return
+        if (!notice.canDismissNotice()) return
+        if (notice is AgentUpdateDialogState.Running) {
+            jobs.remove(pcId)?.cancel()
+            tasks.remove(pcId)
+            saveTasks(tasks.toMap())
+            put(pcId, null)
+        } else {
+            // Hide only the error; an unconfirmed task must remain recoverable.
+            hideNotice(pcId, true)
+        }
+        if (state.value.selectedPcId == pcId) dismiss()
+    }
+
     fun open(pc: PcSummary, checkForUpdate: Boolean = false) {
+        hideNotice(pc.id, false)
         mutableState.value = mutableState.value.copy(selectedPcId = pc.id)
         val current = state.value.devices[pc.id]
         if (jobs[pc.id]?.isActive == true || current is AgentUpdateDialogState.Starting) {
@@ -105,6 +141,7 @@ internal class AgentUpdateCoordinator(
     }
 
     fun recover(pcs: List<PcSummary>) {
+        refreshOffers(pcs)
         for (pc in pcs.filter { it.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities }) {
             if (state.value.devices.containsKey(pc.id) || jobs[pc.id]?.isActive == true) continue
             val retained = tasks[pc.id]
@@ -123,6 +160,34 @@ internal class AgentUpdateCoordinator(
                     }
                 }
             }
+        }
+    }
+
+    fun refreshOffers(pcs: List<PcSummary>, force: Boolean = false) {
+        val candidates = pcs.filter { it.online && it.remoteRoutingEnabled && it.platform == "windows" &&
+            PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities }
+        val allowed = candidates.mapTo(hashSetOf()) { it.id }
+        mutableState.value = state.value.copy(offers = state.value.offers.filterKeys { it in allowed })
+        offerChecks.keys.retainAll(allowed)
+        for (pc in candidates) {
+            if (offerJobs[pc.id]?.isActive == true || state.value.devices[pc.id]?.blocksPcActions() == true) continue
+            val checked = offerChecks[pc.id]
+            if (!force && checked?.first == pc.agentVersion && nowMillis() - checked.second in 0 until 300_000) continue
+            offerChecks[pc.id] = pc.agentVersion to nowMillis()
+            val job = scope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    val offer = repository.agentUpdateEligibility(pc.id)
+                    require(offer.pcId == pc.id)
+                    if (offerChecks[pc.id]?.first == pc.agentVersion && state.value.devices[pc.id]?.blocksPcActions() != true) {
+                        mutableState.value = state.value.copy(offers = state.value.offers + (pc.id to offer))
+                    }
+                } catch (error: CancellationException) { throw error }
+                catch (_: Throwable) {
+                    mutableState.value = state.value.copy(offers = state.value.offers - pc.id)
+                } finally { offerJobs.remove(pc.id) }
+            }
+            offerJobs[pc.id] = job
+            job.start()
         }
     }
 
@@ -204,6 +269,14 @@ internal class AgentUpdateTaskStore(context: Context, accountScope: String?) {
     fun save(tasks: Map<UUID, UUID>) {
         key?.let { preferences.edit().putStringSet(it, tasks.map { (pc, task) -> "$pc:$task" }.toSet()).apply() }
     }
+    fun loadHiddenNotices(): Set<UUID> = key?.let { scope ->
+        preferences.getStringSet("$scope:hidden", emptySet()).orEmpty().mapNotNull {
+            runCatching { UUID.fromString(it) }.getOrNull()
+        }.toSet()
+    }.orEmpty()
+    fun saveHiddenNotices(pcs: Set<UUID>) {
+        key?.let { preferences.edit().putStringSet("$it:hidden", pcs.map(UUID::toString).toSet()).apply() }
+    }
 }
 
 internal fun visibleAgentUpdatePcs(snapshot: ProductSnapshot, updates: Map<UUID, AgentUpdateDialogState>): List<PcSummary> {
@@ -214,3 +287,13 @@ internal fun visibleAgentUpdatePcs(snapshot: ProductSnapshot, updates: Map<UUID,
 
 internal fun AgentUpdateDialogState.blocksPcActions(): Boolean =
     this is AgentUpdateDialogState.Starting || this is AgentUpdateDialogState.Running && !progress.terminal
+
+internal fun AgentUpdateDialogState.canDismissNotice(): Boolean =
+    this is AgentUpdateDialogState.Failure || this is AgentUpdateDialogState.Running && progress.terminal
+
+internal fun AgentUpdateEligibility.isUpdateAvailableFor(pc: PcSummary, state: AgentUpdateDialogState?): Boolean =
+    pc.online && pc.remoteRoutingEnabled && pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities &&
+        pcId == pc.id && currentVersion == pc.agentVersion && eligible && !targetVersion.isNullOrBlank() &&
+        currentBuild != null && targetBuild != null && targetBuild > currentBuild &&
+        state?.blocksPcActions() != true &&
+        ((state as? AgentUpdateDialogState.Running)?.progress?.observedAgentBuild ?: -1) < targetBuild

@@ -33,9 +33,9 @@ class AgentUpdateCoordinatorTest {
         val events = mutableMapOf<UUID, Channel<AgentUpdateProgress>>()
         var starts = 0
         var cancels = 0
-        override suspend fun activeAgentUpdate(pcId: UUID) = active[pcId]
+        override suspend fun activeAgentUpdate(pcId: UUID) = active[pcId]?.takeUnless { it.terminal }
         override suspend fun agentUpdateEligibility(pcId: UUID) = AgentUpdateEligibility(pcId, true,
-            currentVersion = "0.3.10.140", targetVersion = "0.3.11", targetBuild = 141)
+            currentVersion = "0.3.10.140", currentBuild = 140, targetVersion = "0.3.11", targetBuild = 141)
         override suspend fun runAgentUpdate(pcId: UUID, expectedTargetBuild: Long, onProgress: (AgentUpdateProgress) -> Unit): AgentUpdateProgress {
             starts++
             return monitorAgentUpdate(pcId, active.getValue(pcId).id, onProgress)
@@ -159,5 +159,112 @@ class AgentUpdateCoordinatorTest {
         assertFalse(AgentUpdateDialogState.Running(second, progress(second, "SUCCEEDED", "SUCCEEDED")).blocksPcActions())
         assertEquals(listOf(second.id), visibleAgentUpdatePcs(snapshot.copy(devices = listOf(peerDevice)), updates).map { it.id })
         assertFalse(visibleAgentUpdatePcs(snapshot, emptyMap()).any { it.id == a.id })
+    }
+
+    @Test fun dismissingTerminalResultForgetsOnlyThatTaskAcrossRestart() {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val repository = Repository()
+        val a = progress(first, "SUCCEEDED", "SUCCEEDED"); val b = progress(second)
+        repository.active[first.id] = a; repository.active[second.id] = b
+        var saved = mapOf(first.id to a.id, second.id to b.id)
+        val coordinator = AgentUpdateCoordinator(repository, scope, saved, { saved = it })
+        try {
+            coordinator.recover(listOf(first, second))
+            coordinator.open(first)
+            coordinator.dismissNotice(second.id)
+            assertFalse(second.id in coordinator.state.value.hiddenNotices)
+            assertEquals(2, saved.size)
+            coordinator.dismissNotice(first.id)
+            assertNull(coordinator.state.value.dialog)
+            assertFalse(first.id in coordinator.state.value.devices)
+            assertEquals(mapOf(second.id to b.id), saved)
+            coordinator.close()
+            val restored = AgentUpdateCoordinator(repository, scope, saved)
+            try {
+                restored.recover(listOf(first, second))
+                assertFalse(first.id in restored.state.value.devices)
+                assertTrue(second.id in restored.state.value.devices)
+                assertEquals(0, repository.cancels)
+            } finally { restored.close() }
+        } finally { coordinator.close(); scope.cancel() }
+    }
+
+    @Test fun dismissedUnknownStatusKeepsTaskAndRevealsNewResultAfterRestart() {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val update = progress(first)
+        var offline = true
+        var saved = mapOf(first.id to update.id)
+        var hidden = emptySet<UUID>()
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun monitorAgentUpdate(pcId: UUID, updateId: UUID, onProgress: (AgentUpdateProgress) -> Unit): AgentUpdateProgress {
+                if (offline) throw IOException("unknown task status")
+                return update.copy(status = "SUCCEEDED", phase = "SUCCEEDED").also(onProgress)
+            }
+        }
+        val coordinator = AgentUpdateCoordinator(repository, scope, saved, { saved = it }, hidden, { hidden = it })
+        try {
+            coordinator.recover(listOf(first))
+            assertTrue(coordinator.state.value.devices[first.id] is AgentUpdateDialogState.Failure)
+            coordinator.dismissNotice(first.id)
+            assertEquals(setOf(first.id), hidden)
+            assertEquals(mapOf(first.id to update.id), saved)
+            coordinator.close()
+            val restored = AgentUpdateCoordinator(repository, scope, saved, { saved = it }, hidden, { hidden = it })
+            try {
+                restored.recover(listOf(first))
+                assertTrue(first.id in restored.state.value.hiddenNotices)
+            } finally { restored.close() }
+            offline = false
+            val connected = AgentUpdateCoordinator(repository, scope, saved, { saved = it }, hidden, { hidden = it })
+            try {
+                connected.recover(listOf(first))
+                assertFalse(first.id in connected.state.value.hiddenNotices)
+                assertTrue((connected.state.value.devices[first.id] as AgentUpdateDialogState.Running).progress.terminal)
+                assertNull(connected.state.value.dialog)
+            } finally { connected.close() }
+        } finally { coordinator.close(); scope.cancel() }
+    }
+
+    @Test fun updateBadgeUsesConfirmedBuildAndSilentlyCachesChecks() {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        var time = 0L
+        var checks = 0
+        var fail = false
+        val offer = AgentUpdateEligibility(first.id, true, currentVersion = first.agentVersion,
+            currentBuild = 140, targetVersion = "0.3.11", targetBuild = 141)
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun agentUpdateEligibility(pcId: UUID): AgentUpdateEligibility {
+                checks++
+                if (fail) throw IOException("catalog unavailable")
+                return offer
+            }
+        }
+        val coordinator = AgentUpdateCoordinator(repository, scope, nowMillis = { time })
+        try {
+            coordinator.refreshOffers(listOf(first, second.copy(platform = "linux")))
+            assertEquals(1, checks)
+            assertTrue(coordinator.state.value.offers.getValue(first.id).isUpdateAvailableFor(first, null))
+            coordinator.refreshOffers(listOf(first))
+            assertEquals(1, checks)
+            time = 300_000
+            fail = true
+            coordinator.refreshOffers(listOf(first))
+            assertEquals(2, checks)
+            assertTrue(coordinator.state.value.offers.isEmpty())
+            assertTrue(coordinator.state.value.devices.isEmpty())
+            assertNull(coordinator.state.value.dialog)
+            fail = false
+            coordinator.refreshOffers(listOf(first), force = true)
+            assertEquals(3, checks)
+            coordinator.refreshOffers(listOf(first.copy(online = false)))
+            assertTrue(coordinator.state.value.offers.isEmpty())
+        } finally { coordinator.close(); scope.cancel() }
+        assertFalse(offer.copy(targetBuild = 140).isUpdateAvailableFor(first, null))
+        assertFalse(offer.copy(eligible = false).isUpdateAvailableFor(first, null))
+        assertFalse(offer.copy(pcId = second.id).isUpdateAvailableFor(first, null))
+        assertFalse(offer.isUpdateAvailableFor(first.copy(agentVersion = "0.3.12.142"), null))
+        assertFalse(offer.isUpdateAvailableFor(first, AgentUpdateDialogState.Running(first, progress(first))))
+        assertFalse(offer.isUpdateAvailableFor(first, AgentUpdateDialogState.Running(first,
+            progress(first, "SUCCEEDED", "SUCCEEDED").copy(observedAgentBuild = 142))))
     }
 }

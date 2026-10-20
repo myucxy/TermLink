@@ -563,6 +563,11 @@
     <string name="close_inactive_sessions_progress">Processed %1$d of %2$d sessions…</string>
     <string name="close_inactive_sessions_result">Deleted: %1$d. Failed: %2$d. Skipped: %3$d. Refresh and retry any remaining inactive sessions.</string>
     <string name="agent_update_action">Update Windows client</string>
+    <string name="agent_update_dismiss_notice">Dismiss update message</string>
+    <string name="agent_update_available">Agent update available. Check update details</string>
+    <string name="pc_agent_version">Agent %1$s</string>
+    <string name="pc_routing_detail">%1$s · remote routing</string>
+    <string name="pc_routing_disabled">%1$s · remote routing disabled</string>
     <string name="agent_update_minimize">Minimize</string>
     <string name="agent_update_minimize_copy">You can minimize this window. The update continues, and its status stays on this device card.</string>
     <string name="agent_update_view_progress">View progress</string>
