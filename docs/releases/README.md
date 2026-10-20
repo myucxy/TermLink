@@ -14,6 +14,7 @@
 
 ## 产品版本与 build 记录
 
+- [0.3.13 / build 143：升级提示关闭与绿色单行更新入口，客户端及源码已发布](../RELEASE_0.3.13_143.md)
 - [0.3.12 / build 142：升级进度最小化与手动升级任务收尾，客户端、源码及 Docker 已发布](../RELEASE_0.3.12_142.md)
 - [0.3.11 / build 141：AppShip 下载策略与 Server 修复，客户端、源码及 Docker 已发布](../RELEASE_0.3.11_141.md)
 - [0.3.10 / build 140：恢复 Android 发起 Windows 静默升级与回滚修复](../RELEASE_0.3.10_140.md)
