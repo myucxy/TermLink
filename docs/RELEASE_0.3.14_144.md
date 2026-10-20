@@ -21,3 +21,22 @@ Android 补齐 OpenCode、Grok 的产品图标，并将已支持 Agent 的名称
 - 正式制品还需验证版本、源码 revision、SHA-256、APK 与 Windows 签名连续性、Windows 时间戳、core 锁和对应源码下载；最终状态以发布结果为准。
 
 保持 Relay Only。本轮不重测 MI 6、真实 AI 生成或完整 Android Relay 链路，UI 受控用例不代表真实模型调用通过。日常 Windows 安装未覆盖；Windows 沿用原自签名身份，不代表公开 CA 信任或 SmartScreen 信誉。core 来源继续为 `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。个别 PC 身份校验 401 不属于本版修复。
+
+
+## 发布结果（2026-10-20）
+
+已发布 [GitHub v0.3.14](https://github.com/myucxy/TermLink/releases/tag/v0.3.14) 和 AppShip stable。APK、Windows Setup 与匹配完整源码的构建 revision/tag 固定为 `a21edc2ef4f145a546a8852fd91ec39549f0ac4d`；文档补记不改变制品及标签。
+
+| 制品 | 下载 | SHA-256 |
+| --- | --- | --- |
+| Android APK | [下载 APK](https://appship.kget.cc:8910/api/v1/artifacts/0696ce01-bb0a-4b4b-9853-4837118ce3a0/download) | `6375d3cf321873f23a2c1a9431a5990de109ddbac17402bec433e61fce26a698` |
+| Windows x64 Setup | [下载安装包](https://appship.kget.cc:8910/api/v1/artifacts/89d25f4a-a8ae-4c1a-8505-d676af793cb0/download) | `f1b72eba7f754e5ac033ad2ee39bf51048c0d36292126524a53d31284279ea91` |
+| 完整对应源码 | [下载源码](https://appship.kget.cc:8910/api/v1/artifacts/857db4f8-15c6-4c10-814a-04b7c6221e11/download) | `d740f9556642fe4e7c1cd1d013d975b9aea1129ca3f079f6b6db40b2fa98a23f` |
+
+- GitHub 七个附件的大小与哈希一致，[独立 Windows 验签管道](https://github.com/myucxy/TermLink/actions/runs/39393189998)及固定源码的仓库 CI 通过。新增 Agent 图标覆盖检查已在远端 CI 实际执行。
+- AppShip 三个 release 为 `published`、制品为 `ready`；匿名完整下载大小与 SHA-256 一致。客户端 build 143 返回 `optional`，144 返回 `no_update`。
+- APK 单一 signer、v2 签名、正式包名及版本正确；Windows Authenticode、RFC 3161 时间戳及 17 个自有载荷签名保持原身份。core 哈希和来源未改变。
+- 正式 APK 包内已确认 OpenCode、Grok 图标及来源许可记录，并验证图标映射与别名随代码打包。手机和平板模拟器均原地从 143 升级至 0.3.14 / 144，保留 appId、首次安装时间和应用数据，冷启动与产品界面检查通过。
+- Android 491 项应用单测及 lint 通过；手机/平板各 2 项新建会话浅色/深色用例通过，验证全部 5 个 Agent 的图标与选中切换，未实际创建模型会话。
+
+Windows 仅同步版本，日常安装未改变。本轮未重新执行 Windows 真机安装、MI 6、真实 AI 生成或完整 Android Relay 回归。Server 镜像和 Docker `latest` 保持 0.3.12 / 142，NAS 未部署。个别 PC 身份校验 401 不属于本版修复。
