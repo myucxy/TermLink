@@ -21,8 +21,8 @@ jobs:
     timeout-minutes: 30
     env:
       # DEV follows the last published Docker release; CI never allocates a version.
-      CI_VERSION: '0.3.5'
-      CI_BUILD: '135'
+      CI_VERSION: '0.3.12'
+      CI_BUILD: '142'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -77,10 +77,11 @@ jobs:
             -e POSTGRES_DB=termlink -e POSTGRES_USER=termlink -e POSTGRES_HOST_AUTH_METHOD=trust \
             postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
           for attempt in $(seq 1 60); do
-            if docker exec termlink-ci-postgres pg_isready -U termlink -d termlink; then break; fi
+            # TCP excludes the socket-only temporary server used during first-time initialization.
+            if docker exec termlink-ci-postgres pg_isready -h 127.0.0.1 -U termlink -d termlink; then break; fi
             sleep 1
           done
-          docker exec termlink-ci-postgres pg_isready -U termlink -d termlink
+          docker exec termlink-ci-postgres pg_isready -h 127.0.0.1 -U termlink -d termlink
           docker run -d --name termlink-ci-server --network termlink-image-ci -p 127.0.0.1:18080:8080 \
             --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --cap-drop ALL --security-opt no-new-privileges:true \
             -e TERMLINK_RUNTIME_MODE=single-node -e TERMLINK_IDENTITY_PROVIDER=embedded \
