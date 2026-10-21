@@ -16,3 +16,18 @@ Android 远程升级 Windows Agent 时，点击确认后自动收起升级窗口
 - Android debug validation APK 按 0.3.15 / 145 构建参数验证了 UI 行为；正式发布构建固定为 0.3.16 / 146。
 
 本轮仅包含客户端行为更新，Server/Docker/NAS 不变，传输范围保持 Relay Only。Windows 安装包随 GitHub 统一发布重新签名构建，Windows 生产代码没有功能变化。
+
+## 发布结果（2026-10-22）
+
+已发布 [GitHub v0.3.16](https://github.com/myucxy/TermLink/releases/tag/v0.3.16) 和 AppShip stable。正式 APK、Windows Setup 与匹配完整源码绑定 `b01f57f8858214be7f95748b3a19928d5ee65bb0`，core revision 为 `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。
+
+| 制品 | 下载 | SHA-256 |
+| --- | --- | --- |
+| Android APK | [AppShip 下载](https://appship.kget.cc:8910/api/v1/artifacts/52b8b4a0-66b8-44bf-ac6a-80702cac42e7/download) | `752b8971ab7d4ccf2078d748c36738521d7ddf068358f6ac46413afe097b7f78` |
+| Windows x64 Setup | [AppShip 下载](https://appship.kget.cc:8910/api/v1/artifacts/bf561878-06c0-4f6f-aa80-582d24d94160/download) | `cd044c611612092e4ab2943ded2d1a05264be8c695d96458f87ed7284130d777` |
+| 完整对应源码 | [AppShip 下载](https://appship.kget.cc:8910/api/v1/artifacts/a6c64e99-e0f4-4cd6-b845-c9f260fad4ff/download) | `13995fea38ba37ea56b35a384fffee03cf1e33b6417e7a1ac1f3239adf0b53bb` |
+
+- GitHub 7 个附件的大小与哈希一致，[独立 Windows 验签管道](https://github.com/myucxy/TermLink/actions/runs/39643909404)及源码仓库 CI 通过。
+- AppShip 三个 release 为 `published`、制品为 `ready`；145 返回 `optional`，146 返回 `no_update`，匿名完整下载校验通过。
+- APK 单一 signer、v2 签名、版本 0.3.16 / 146 正确；Windows Authenticode、RFC 3161 时间戳及 17 个自有载荷签名通过，沿用既有指纹。
+- Server/Docker latest 保持 0.3.12 / 142，NAS 未改动；本轮不包含 Windows 功能代码变化。
