@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -81,6 +82,13 @@ internal class AgentUpdateCoordinator(
             mutableState.value = state.value.copy(offers = state.value.offers - pc.id)
             offerChecks.remove(pc.id)
         }
+        if (value.status == "SUCCEEDED") {
+            if (tasks.remove(pc.id) != null) saveTasks(tasks.toMap())
+            put(pc.id, null)
+            if (state.value.selectedPcId == pc.id) dismiss()
+            jobs[pc.id]?.cancel()
+            return
+        }
         if (tasks[pc.id] != value.id) {
             tasks[pc.id] = value.id
             saveTasks(tasks.toMap())
@@ -93,7 +101,10 @@ internal class AgentUpdateCoordinator(
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try { operation() }
             catch (error: CancellationException) { throw error }
-            catch (error: Throwable) { put(pc.id, AgentUpdateDialogState.Failure(pc, error)) }
+            catch (error: Throwable) {
+                currentCoroutineContext().ensureActive()
+                put(pc.id, AgentUpdateDialogState.Failure(pc, error))
+            }
             finally {
                 if (jobs[pc.id] === currentCoroutineContext()[Job]) jobs.remove(pc.id)
             }
@@ -128,6 +139,7 @@ internal class AgentUpdateCoordinator(
             return
         }
         if (current is AgentUpdateDialogState.Running && (!current.progress.terminal || !checkForUpdate)) return
+        if (current is AgentUpdateDialogState.Failure && !checkForUpdate) return
         put(pc.id, AgentUpdateDialogState.Loading(pc))
         launch(pc) {
             val active = repository.activeAgentUpdate(pc.id)
@@ -196,6 +208,7 @@ internal class AgentUpdateCoordinator(
         val target = offer.eligibility.targetBuild ?: return
         if (state.value.devices[pc.id] != offer || jobs[pc.id]?.isActive == true) return
         put(pc.id, AgentUpdateDialogState.Starting(pc, offer.eligibility))
+        if (state.value.selectedPcId == pc.id) dismiss()
         launch(pc) {
             try {
                 progress(pc, repository.runAgentUpdate(pc.id, target) { progress(pc, it) })
@@ -221,6 +234,7 @@ internal class AgentUpdateCoordinator(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
+                currentCoroutineContext().ensureActive()
                 if (error is TermLinkApiException && error.status in setOf(401, 403, 404)) throw error
                 val running = state.value.devices[pc.id] as? AgentUpdateDialogState.Running
                 if (running?.progress?.terminal == true) return
@@ -289,7 +303,8 @@ internal fun AgentUpdateDialogState.blocksPcActions(): Boolean =
     this is AgentUpdateDialogState.Starting || this is AgentUpdateDialogState.Running && !progress.terminal
 
 internal fun AgentUpdateDialogState.canDismissNotice(): Boolean =
-    this is AgentUpdateDialogState.Failure || this is AgentUpdateDialogState.Running && progress.terminal
+    this is AgentUpdateDialogState.Failure ||
+        this is AgentUpdateDialogState.Running && progress.terminal && progress.status != "SUCCEEDED"
 
 internal fun AgentUpdateEligibility.isUpdateAvailableFor(pc: PcSummary, state: AgentUpdateDialogState?): Boolean =
     pc.online && pc.remoteRoutingEnabled && pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities &&

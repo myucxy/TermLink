@@ -8,6 +8,7 @@ import dev.termlink.model.PcSummary
 import java.time.Instant
 import java.io.IOException
 import java.util.UUID
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,11 +34,13 @@ class AgentUpdateCoordinatorTest {
         val events = mutableMapOf<UUID, Channel<AgentUpdateProgress>>()
         var starts = 0
         var cancels = 0
+        var startGate: CompletableDeferred<Unit>? = null
         override suspend fun activeAgentUpdate(pcId: UUID) = active[pcId]?.takeUnless { it.terminal }
         override suspend fun agentUpdateEligibility(pcId: UUID) = AgentUpdateEligibility(pcId, true,
             currentVersion = "0.3.10.140", currentBuild = 140, targetVersion = "0.3.11", targetBuild = 141)
         override suspend fun runAgentUpdate(pcId: UUID, expectedTargetBuild: Long, onProgress: (AgentUpdateProgress) -> Unit): AgentUpdateProgress {
             starts++
+            startGate?.await()
             return monitorAgentUpdate(pcId, active.getValue(pcId).id, onProgress)
         }
         override suspend fun monitorAgentUpdate(pcId: UUID, updateId: UUID, onProgress: (AgentUpdateProgress) -> Unit): AgentUpdateProgress {
@@ -57,6 +60,89 @@ class AgentUpdateCoordinatorTest {
         }
     }
 
+    @Test fun confirmingInstallImmediatelyMinimizesBeforeRequestReturnsAndSuccessClearsItsTask() = runBlocking {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val repository = Repository()
+        val gate = CompletableDeferred<Unit>()
+        repository.startGate = gate
+        val update = progress(first)
+        val saved = mutableMapOf<UUID, UUID>()
+        val coordinator = AgentUpdateCoordinator(repository, scope, saveTasks = { saved.clear(); saved.putAll(it) })
+        try {
+            coordinator.open(first)
+            val offer = coordinator.state.value.dialog as AgentUpdateDialogState.Offer
+            repository.active[first.id] = update
+            coordinator.install(offer)
+            assertNull(coordinator.state.value.dialog)
+            assertNull(coordinator.state.value.selectedPcId)
+            assertTrue(coordinator.state.value.devices[first.id] is AgentUpdateDialogState.Starting)
+            assertTrue(saved.isEmpty())
+            coordinator.install(offer)
+            assertEquals(1, repository.starts)
+            gate.complete(Unit)
+            assertEquals(mapOf(first.id to update.id), saved)
+            assertTrue(coordinator.state.value.devices[first.id]!!.blocksPcActions())
+            assertFalse(coordinator.state.value.devices[first.id]!!.canDismissNotice())
+            coordinator.open(first)
+            repository.events.getValue(first.id).send(update.copy(status = "SUCCEEDED", phase = "SUCCEEDED"))
+            assertNull(coordinator.state.value.dialog)
+            assertNull(coordinator.state.value.selectedPcId)
+            assertFalse(first.id in coordinator.state.value.devices)
+            assertTrue(saved.isEmpty())
+        } finally { coordinator.close(); scope.cancel() }
+    }
+
+    @Test fun failedInstallRequestStaysMinimizedAndCanBeViewedAndDismissed() {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun agentUpdateEligibility(pcId: UUID) = AgentUpdateEligibility(pcId, true,
+                currentVersion = first.agentVersion, targetVersion = "0.3.11", targetBuild = 141)
+            override suspend fun runAgentUpdate(pcId: UUID, expectedTargetBuild: Long,
+                onProgress: (AgentUpdateProgress) -> Unit): AgentUpdateProgress = throw IOException("fixture request failed")
+        }
+        val coordinator = AgentUpdateCoordinator(repository, scope)
+        try {
+            coordinator.open(first)
+            coordinator.install(coordinator.state.value.dialog as AgentUpdateDialogState.Offer)
+            assertNull(coordinator.state.value.dialog)
+            val failure = coordinator.state.value.devices[first.id] as AgentUpdateDialogState.Failure
+            assertTrue(failure.canDismissNotice())
+            coordinator.open(first)
+            assertEquals(failure, coordinator.state.value.dialog)
+            coordinator.dismissNotice(first.id)
+            assertTrue(first.id in coordinator.state.value.hiddenNotices)
+            coordinator.open(first)
+            assertEquals(failure, coordinator.state.value.dialog)
+            assertFalse(first.id in coordinator.state.value.hiddenNotices)
+            coordinator.open(first, checkForUpdate = true)
+            assertTrue(coordinator.state.value.dialog is AgentUpdateDialogState.Offer)
+        } finally { coordinator.close(); scope.cancel() }
+    }
+
+    @Test fun confirmedSuccessStopsTheMonitorBeforeAnotherQueryCanRestoreAnErrorNotice() {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val update = progress(first)
+        var saved = mapOf(first.id to update.id)
+        var monitoringStopped = false
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun monitorAgentUpdate(pcId: UUID, updateId: UUID,
+                onProgress: (AgentUpdateProgress) -> Unit): AgentUpdateProgress {
+                try {
+                    onProgress(update.copy(status = "SUCCEEDED", phase = "SUCCEEDED"))
+                    throw IOException("fixture late query failure")
+                } finally { monitoringStopped = true }
+            }
+        }
+        val coordinator = AgentUpdateCoordinator(repository, scope, saved, { saved = it })
+        try {
+            coordinator.recover(listOf(first))
+            assertTrue(monitoringStopped)
+            assertTrue(saved.isEmpty())
+            assertFalse(first.id in coordinator.state.value.devices)
+            assertNull(coordinator.state.value.dialog)
+        } finally { coordinator.close(); scope.cancel() }
+    }
+
     @Test fun minimizedProgressAndCompletionNeverReopenAndOtherPcKeepsItsOwnTask() = runBlocking {
         val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
         val repository = Repository()
@@ -73,28 +159,30 @@ class AgentUpdateCoordinatorTest {
             coordinator.open(second)
             repository.events.getValue(first.id).send(a.copy(status = "SUCCEEDED", phase = "SUCCEEDED", progressPercent = 100))
             assertEquals(second.id, coordinator.state.value.dialog?.pc?.id)
-            assertTrue((coordinator.state.value.devices[first.id] as AgentUpdateDialogState.Running).progress.terminal)
+            assertFalse(first.id in coordinator.state.value.devices)
             assertFalse((coordinator.state.value.devices[second.id] as AgentUpdateDialogState.Running).progress.terminal)
-            assertEquals(mapOf(first.id to a.id, second.id to b.id), saved)
+            assertEquals(mapOf(second.id to b.id), saved)
             coordinator.dismiss()
             repository.events.getValue(second.id).send(b.copy(status = "SUCCEEDED", phase = "SUCCEEDED"))
             assertNull(coordinator.state.value.dialog)
+            assertTrue(saved.isEmpty())
             assertEquals(0, repository.starts)
             assertEquals(0, repository.cancels)
         } finally { coordinator.close(); scope.cancel() }
     }
 
-    @Test fun restartRestoresBothExactTasksIncludingFinishedResultWithoutDialog() {
+    @Test fun restartRestoresExactPendingTaskAndAutomaticallyForgetsSuccessWithoutDialog() {
         val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
         val repository = Repository()
         val a = progress(first); val b = progress(second, "SUCCEEDED", "SUCCEEDED")
         repository.active[first.id] = a; repository.active[second.id] = b
-        val coordinator = AgentUpdateCoordinator(repository, scope, mapOf(first.id to a.id, second.id to b.id))
+        var saved = mapOf(first.id to a.id, second.id to b.id)
+        val coordinator = AgentUpdateCoordinator(repository, scope, saved, { saved = it })
         try {
             coordinator.recover(listOf(first.copy(online = false), second))
-            assertEquals(2, coordinator.state.value.devices.size)
+            assertEquals(setOf(first.id), coordinator.state.value.devices.keys)
             assertNull(coordinator.state.value.dialog)
-            assertEquals(b.id, (coordinator.state.value.devices[second.id] as AgentUpdateDialogState.Running).progress.id)
+            assertEquals(mapOf(first.id to a.id), saved)
             coordinator.recover(listOf(first, second))
             assertEquals(0, repository.starts)
             assertNull(coordinator.state.value.dialog)
@@ -115,7 +203,7 @@ class AgentUpdateCoordinatorTest {
             assertEquals(1, repository.cancels)
             assertEquals("CANCELLED", (coordinator.state.value.devices[first.id] as AgentUpdateDialogState.Running).progress.status)
             repository.events.getValue(second.id).send(b.copy(status = "SUCCEEDED", phase = "SUCCEEDED"))
-            assertEquals("SUCCEEDED", (coordinator.state.value.devices[second.id] as AgentUpdateDialogState.Running).progress.status)
+            assertFalse(second.id in coordinator.state.value.devices)
             assertNull(coordinator.state.value.dialog)
         } finally { coordinator.close(); scope.cancel() }
     }
@@ -140,7 +228,7 @@ class AgentUpdateCoordinatorTest {
             assertTrue(waiting.refreshing)
             assertEquals(initial.id, waiting.progress.id)
             assertFalse(waiting.progress.terminal)
-            withTimeout(8_000) { coordinator.state.first { (it.devices[first.id] as? AgentUpdateDialogState.Running)?.progress?.terminal == true } }
+            withTimeout(8_000) { coordinator.state.first { first.id !in it.devices } }
             assertEquals(2, attempts)
             assertNull(coordinator.state.value.dialog)
         } finally { coordinator.close(); scope.cancel() }
@@ -164,7 +252,7 @@ class AgentUpdateCoordinatorTest {
     @Test fun dismissingTerminalResultForgetsOnlyThatTaskAcrossRestart() {
         val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
         val repository = Repository()
-        val a = progress(first, "SUCCEEDED", "SUCCEEDED"); val b = progress(second)
+        val a = progress(first, "FAILED", "FAILED"); val b = progress(second)
         repository.active[first.id] = a; repository.active[second.id] = b
         var saved = mapOf(first.id to a.id, second.id to b.id)
         val coordinator = AgentUpdateCoordinator(repository, scope, saved, { saved = it })
@@ -189,7 +277,7 @@ class AgentUpdateCoordinatorTest {
         } finally { coordinator.close(); scope.cancel() }
     }
 
-    @Test fun dismissedUnknownStatusKeepsTaskAndRevealsNewResultAfterRestart() {
+    @Test fun dismissedUnknownStatusKeepsTaskUntilConfirmedSuccessClearsItAfterRestart() {
         val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
         val update = progress(first)
         var offline = true
@@ -219,10 +307,21 @@ class AgentUpdateCoordinatorTest {
             try {
                 connected.recover(listOf(first))
                 assertFalse(first.id in connected.state.value.hiddenNotices)
-                assertTrue((connected.state.value.devices[first.id] as AgentUpdateDialogState.Running).progress.terminal)
+                assertFalse(first.id in connected.state.value.devices)
+                assertTrue(saved.isEmpty())
                 assertNull(connected.state.value.dialog)
             } finally { connected.close() }
         } finally { coordinator.close(); scope.cancel() }
+    }
+
+    @Test fun onlyErrorsAndUnsuccessfulTerminalResultsOfferNoticeActions() {
+        assertTrue(AgentUpdateDialogState.Failure(first, IOException()).canDismissNotice())
+        for (status in listOf("FAILED", "EXPIRED", "ROLLED_BACK", "ROLLBACK_FAILED", "CANCELLED")) {
+            assertTrue(status, AgentUpdateDialogState.Running(first, progress(first, status, "FAILED")).canDismissNotice())
+        }
+        for (status in listOf("PENDING", "PROCESSING", "SUCCEEDED")) {
+            assertFalse(status, AgentUpdateDialogState.Running(first, progress(first, status)).canDismissNotice())
+        }
     }
 
     @Test fun updateBadgeUsesConfirmedBuildAndSilentlyCachesChecks() {

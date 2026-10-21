@@ -55,7 +55,7 @@ class RemoteAgentUpdateInstrumentedTest {
         screenshot.recycle()
     }
 
-    private fun showDevice(platform: String = "windows") {
+    private fun showDevice(platform: String = "windows"): PcSummary {
         val pc = PcSummary(UUID.randomUUID(), UUID.randomUUID(), "Remote update test PC", "0.3.8.138",
             remoteRoutingEnabled = true, online = true, lastSeenAt = Instant.now(), platform = platform,
             capabilities = setOf(PcCapabilityIds.REMOTE_AGENT_UPDATE_V1))
@@ -81,10 +81,11 @@ class RemoteAgentUpdateInstrumentedTest {
             saveProductPrimaryDestination(compose.activity, ProductPrimaryDestination.DEVICES)
             compose.activity.setContent { MaterialTheme(colorScheme = productColors) { ProductApp(repository) } }
         }
+        return pc
     }
 
     @Test fun longPressChecksAndConfirmsOneWindowsUpgrade() {
-        showDevice()
+        val pc = showDevice()
         compose.onNodeWithText("Remote update test PC", useUnmergedTree = true).performTouchInput { longClick() }
         val label = compose.activity.getString(R.string.agent_update_action)
         compose.onNodeWithText(label).assertIsDisplayed().performClick()
@@ -94,8 +95,8 @@ class RemoteAgentUpdateInstrumentedTest {
         compose.onNodeWithText(compose.activity.getString(R.string.agent_update_confirm)).performClick()
         compose.waitForIdle()
         assertEquals(1, installations)
-        compose.onNode(hasText(compose.activity.getString(R.string.agent_update_succeeded)) and
-            hasAnyAncestor(hasTestTag("agent-update-dialog"))).assertIsDisplayed()
+        compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
+        compose.onNodeWithTag("agent-update-card-${pc.id}").assertDoesNotExist()
     }
 
     @Test fun nonWindowsDeviceDoesNotOfferWindowsInstaller() {
@@ -155,9 +156,11 @@ class RemoteAgentUpdateInstrumentedTest {
             compose.onNodeWithText(pc.name, useUnmergedTree = true).performTouchInput { longClick() }
             compose.onNodeWithText(compose.activity.getString(R.string.agent_update_action)).performClick()
             compose.onNodeWithText(compose.activity.getString(R.string.agent_update_confirm)).performClick()
-            compose.onNodeWithTag("agent-update-dialog").assertIsDisplayed()
-            compose.onNodeWithText(compose.activity.getString(R.string.agent_update_minimize)).performClick()
             compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
+            compose.onNodeWithTag("agent-update-card-${pc.id}").assertIsDisplayed()
+            compose.onNodeWithTag("agent-update-dismiss-${pc.id}").assertDoesNotExist()
+            compose.onNodeWithText(compose.activity.getString(R.string.agent_update_view_progress)).assertDoesNotExist()
+            compose.onNodeWithText(compose.activity.getString(R.string.agent_update_view_result)).assertDoesNotExist()
         }
         start(first)
         compose.onNodeWithTag("agent-update-card-${first.id}").assertIsDisplayed()
@@ -180,8 +183,8 @@ class RemoteAgentUpdateInstrumentedTest {
             screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
         }
         screenshot.recycle()
-        compose.onNode(hasText(compose.activity.getString(R.string.agent_update_view_progress)) and
-            hasAnyAncestor(hasTestTag("agent-update-card-${first.id}"))).performClick()
+        compose.onNodeWithText(first.name, useUnmergedTree = true).performTouchInput { longClick() }
+        compose.onNodeWithText(compose.activity.getString(R.string.agent_update_action)).performClick()
         compose.onNodeWithTag("agent-update-dialog").assertIsDisplayed()
         compose.onNodeWithText(compose.activity.getString(R.string.agent_update_cancel)).assertDoesNotExist()
         check(androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation
@@ -189,24 +192,41 @@ class RemoteAgentUpdateInstrumentedTest {
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("agent-update-dialog").fetchSemanticsNodes().isEmpty() }
         compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
         compose.runOnUiThread {
+            state.value = state.value.copy(pcs = listOf(first.copy(agentVersion = "0.3.12.142"), second))
             events.getValue(first.id).trySend(active.getValue(first.id).copy(status = "SUCCEEDED", phase = "SUCCEEDED", progressPercent = 100,
                 observedAgentVersion = "0.3.12.142", observedAgentBuild = 142)).getOrThrow()
         }
         compose.waitForIdle()
         compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
-        compose.onNodeWithText(compose.activity.getString(R.string.agent_update_installed_version, "0.3.12.142")).assertIsDisplayed()
+        compose.onNodeWithTag("agent-update-card-${first.id}").assertDoesNotExist()
+        compose.onNodeWithText(first.name, useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithTag("agent-update-card-${second.id}").assertIsDisplayed()
         assertEquals(mapOf(first.id to 1, second.id to 1), starts)
         compose.runOnUiThread {
-            events.getValue(second.id).trySend(active.getValue(second.id).copy(status = "SUCCEEDED", phase = "SUCCEEDED", progressPercent = 100)).getOrThrow()
+            events.getValue(second.id).trySend(active.getValue(second.id).copy(status = "FAILED", phase = "FAILED",
+                errorCode = "FIXTURE_INSTALL_FAILED")).getOrThrow()
         }
         compose.waitForIdle()
         compose.onAllNodesWithText(compose.activity.getString(R.string.agent_update_view_result)).fetchSemanticsNodes().also {
-            assertEquals(2, it.size)
+            assertEquals(1, it.size)
         }
+        compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
+        compose.onNodeWithTag("agent-update-dismiss-${second.id}").assertIsDisplayed()
+        capture("remote-agent-update-failed")
+        compose.onNode(hasText(compose.activity.getString(R.string.agent_update_view_result)) and
+            hasAnyAncestor(hasTestTag("agent-update-card-${second.id}"))).performClick()
+        compose.onNodeWithTag("agent-update-dialog").assertIsDisplayed()
+        compose.onNodeWithText(compose.activity.getString(R.string.agent_update_error_code, "FIXTURE_INSTALL_FAILED")).assertIsDisplayed()
+        compose.onNodeWithText(compose.activity.getString(R.string.action_close)).performClick()
+        compose.onNodeWithTag("agent-update-dismiss-${second.id}").performClick()
+        compose.onNodeWithTag("agent-update-card-${second.id}").assertDoesNotExist()
+        compose.runOnUiThread { generation++ }
+        compose.onNodeWithTag("agent-update-card-${first.id}").assertDoesNotExist()
+        compose.onNodeWithTag("agent-update-card-${second.id}").assertDoesNotExist()
+        compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
     }
 
-    @Test fun versionBadgeAndDismissedResultSurviveReentryWithoutAffectingOtherPc() {
+    @Test fun versionBadgeAndSuccessfulResultDisappearAutomaticallyAndStayGoneAfterReentry() {
         val first = PcSummary(UUID.randomUUID(), UUID.randomUUID(), "Update available PC", "0.3.11.141",
             remoteRoutingEnabled = true, online = true, lastSeenAt = Instant.now(),
             capabilities = setOf(PcCapabilityIds.REMOTE_AGENT_UPDATE_V1))
@@ -264,11 +284,10 @@ class RemoteAgentUpdateInstrumentedTest {
         compose.onNodeWithTag("agent-update-available-${second.id}").assertDoesNotExist()
         assertEquals(0, installations)
         compose.onNodeWithText(compose.activity.getString(R.string.agent_update_confirm)).performClick()
-        compose.onNodeWithText(compose.activity.getString(R.string.action_close)).performClick()
-        compose.onNodeWithTag("agent-update-dismiss-${first.id}").assertIsDisplayed()
-        capture("agent-update-dismissible-result")
-        compose.onNodeWithTag("agent-update-dismiss-${first.id}").assertIsDisplayed().performClick()
+        compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
+        compose.onNodeWithTag("agent-update-dismiss-${first.id}").assertDoesNotExist()
         compose.onNodeWithTag("agent-update-card-${first.id}").assertDoesNotExist()
+        capture("agent-update-success-cleared")
         compose.runOnUiThread { generation++ }
         compose.waitForIdle()
         compose.onNodeWithTag("agent-update-card-${first.id}").assertDoesNotExist()

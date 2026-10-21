@@ -4119,12 +4119,14 @@ private fun AgentUpdateCard(state: AgentUpdateDialogState, pc: PcSummary, onDeta
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(title, modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelLarge,
                 color = if (progress?.status in setOf("FAILED", "ROLLBACK_FAILED", "EXPIRED")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-            TextButton(onClick = onDetails, modifier = Modifier.heightIn(min = 48.dp)) {
-                Text(stringResource(if (progress?.terminal == true) R.string.agent_update_view_result else R.string.agent_update_view_progress))
-            }
-            if (state.canDismissNotice()) IconButton(onClick = onDismiss,
-                modifier = Modifier.size(48.dp).testTag("agent-update-dismiss-${pc.id}")) {
-                Icon(Icons.Filled.Close, contentDescription = stringResource(R.string.agent_update_dismiss_notice))
+            if (state.canDismissNotice()) {
+                TextButton(onClick = onDetails, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Text(stringResource(R.string.agent_update_view_result))
+                }
+                IconButton(onClick = onDismiss,
+                    modifier = Modifier.size(48.dp).testTag("agent-update-dismiss-${pc.id}")) {
+                    Icon(Icons.Filled.Close, contentDescription = stringResource(R.string.agent_update_dismiss_notice))
+                }
             }
         }
         val target = progress?.targetVersion ?: (state as? AgentUpdateDialogState.Starting)?.eligibility?.targetVersion
