@@ -41,7 +41,7 @@ func (a *API) fileOperationRepository() fileOperationStore {
 
 func (a *API) createFileOperation(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -115,7 +115,7 @@ func (a *API) claimFileOperation(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getFileOperation(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -149,7 +149,7 @@ func (a *API) getFileOperation(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) cancelFileOperation(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}

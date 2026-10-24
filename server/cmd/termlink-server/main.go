@@ -200,7 +200,8 @@ func runProduction() error {
 			HMACSecret:           embeddedHMACKey,
 			KeyEncryptionKey:     embeddedEncryptionKey,
 			InitialAdminPassword: cfg.InitialAdminPassword.Value(),
-			AndroidClientID:      cfg.AndroidOIDCClientID, AndroidRedirectURI: cfg.AndroidOIDCRedirectURI,
+			IOSClientID:          cfg.IOSOIDCClientID, IOSRedirectURI: cfg.IOSOIDCRedirectURI,
+			AndroidClientID: cfg.AndroidOIDCClientID, AndroidRedirectURI: cfg.AndroidOIDCRedirectURI,
 			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,
 			WebClientID: cfg.WebOIDCClientID, WebRedirectURI: cfg.WebOIDCRedirectURI,
 			StepUpClientID: cfg.WebOIDCStepUpClientID, AllowedParties: cfg.OIDCAllowedParties,
@@ -338,6 +339,7 @@ func runProduction() error {
 		AccountDeletionBinder: accountDeletionBinder, AgentUpdateCatalog: updateCatalog,
 		RegistrationRecoveryEnabled: effectiveRegistrationRecovery,
 		ClientConfig: api.ClientConfiguration{
+			IOSClientID: cfg.IOSOIDCClientID, IOSRedirectURI: cfg.IOSOIDCRedirectURI,
 			OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.AndroidOIDCClientID, RedirectURI: cfg.AndroidOIDCRedirectURI,
 			WindowsClientID: cfg.WindowsOIDCClientID, WindowsRegistrationParties: cfg.WindowsRegistrationOIDCParties,
 			WindowsRedirectURI: cfg.WindowsOIDCRedirectURI,

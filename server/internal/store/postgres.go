@@ -370,7 +370,7 @@ func (s *Postgres) SelfTrustAndroidDevice(ctx context.Context, userID, deviceID 
 	if err != nil {
 		return DeviceRecord{}, false, err
 	}
-	if record.Type != "ANDROID" || record.TrustState == "REVOKED" {
+	if !IsMobileDeviceType(record.Type) || record.TrustState == "REVOKED" {
 		return DeviceRecord{}, false, ErrDenied
 	}
 	if record.TrustState == "TRUSTED" {
@@ -394,7 +394,7 @@ func (s *Postgres) SelfTrustAndroidDevice(ctx context.Context, userID, deviceID 
 	err = tx.QueryRow(ctx, `
 		UPDATE devices
 		SET trust_state='TRUSTED',approved_by=id,approved_at=now()
-		WHERE id=$1 AND user_id=$2 AND device_type='ANDROID' AND trust_state='PENDING'
+		WHERE id=$1 AND user_id=$2 AND device_type IN ('ANDROID','IOS') AND trust_state='PENDING'
 		RETURNING id,device_type,name,key_id,signing_public_key,exchange_public_key,
 		          trust_state,approved_by,approved_at,revoked_at,created_at`, deviceID, userID,
 	).Scan(&record.ID, &record.Type, &record.Name, &record.KeyID, &record.SigningPublicKey,
@@ -409,8 +409,8 @@ func (s *Postgres) SelfTrustAndroidDevice(ctx context.Context, userID, deviceID 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO audit_events(user_id,actor_device_id,action,target_type,target_id,result,trace_id,metadata)
 		VALUES($1,$2,'device.self_trust','device',$2,'SUCCEEDED',$3,
-		       jsonb_build_object('device_type','ANDROID','grants_created',false))`,
-		userID, deviceID, traceID); err != nil {
+		       jsonb_build_object('device_type',$4::text,'grants_created',false))`,
+		userID, deviceID, traceID, record.Type); err != nil {
 		return DeviceRecord{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -596,7 +596,7 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 			SELECT p.id
 			FROM pcs p
 			WHERE $4 AND p.owner_user_id=$2
-			  AND EXISTS(SELECT 1 FROM target WHERE target.device_type='ANDROID')
+			  AND EXISTS(SELECT 1 FROM target WHERE target.device_type IN ('ANDROID','IOS'))
 		), authority AS (
 			SELECT 1
 			FROM actor
@@ -635,7 +635,7 @@ func (s *Postgres) RevokeDevice(ctx context.Context, userID, actorID, targetID u
 			device_id=$1 OR id IN (SELECT pc_id FROM device_grants WHERE device_id=$1)
 			OR ($3 AND EXISTS (
 				SELECT 1 FROM devices target
-				WHERE target.id=$1 AND target.user_id=$2 AND target.device_type='ANDROID'
+				WHERE target.id=$1 AND target.user_id=$2 AND target.device_type IN ('ANDROID','IOS')
 			))
 		)`, targetID, userID, s.AutoTrustDevices); err != nil {
 		return err
@@ -1433,14 +1433,14 @@ func (s *Postgres) ListPCGrants(ctx context.Context, userID, actorID, pcID uuid.
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT d.id,d.device_type,d.name,d.signing_public_key,d.exchange_public_key,d.key_id,
-		       CASE WHEN $3 AND d.device_type='ANDROID' THEN 'MANAGE' ELSE g.permission END,
-		       CASE WHEN $3 AND d.device_type='ANDROID' THEN NULL ELSE g.expires_at END
+		       CASE WHEN $3 AND d.device_type IN ('ANDROID','IOS') THEN 'MANAGE' ELSE g.permission END,
+		       CASE WHEN $3 AND d.device_type IN ('ANDROID','IOS') THEN NULL ELSE g.expires_at END
 		FROM devices d
 		LEFT JOIN device_grants g
 		  ON g.device_id=d.id AND g.pc_id=$2
 		 AND (g.expires_at IS NULL OR g.expires_at>now())
 		WHERE d.user_id=$1 AND d.trust_state='TRUSTED'
-		  AND (($3 AND d.device_type='ANDROID') OR g.device_id IS NOT NULL)
+		  AND (($3 AND d.device_type IN ('ANDROID','IOS')) OR g.device_id IS NOT NULL)
 		ORDER BY d.created_at,d.id`, userID, pcID, s.AutoTrustDevices)
 	if err != nil {
 		return 0, nil, err
@@ -2016,8 +2016,8 @@ func (s *Postgres) SaveLease(ctx context.Context, userID, actorID, leaseID, sess
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id AND p.owner_user_id=$6 AND p.remote_routing_enabled
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
-		JOIN devices actor ON actor.id=$2 AND actor.user_id=$6 AND actor.device_type='ANDROID' AND actor.trust_state='TRUSTED'
-		JOIN devices holder ON holder.id=$7 AND holder.user_id=$6 AND holder.device_type='ANDROID'
+		JOIN devices actor ON actor.id=$2 AND actor.user_id=$6 AND actor.device_type IN ('ANDROID','IOS') AND actor.trust_state='TRUSTED'
+		JOIN devices holder ON holder.id=$7 AND holder.user_id=$6 AND holder.device_type IN ('ANDROID','IOS')
 		LEFT JOIN device_grants grant_authority ON grant_authority.device_id=actor.id AND grant_authority.pc_id=p.id
 		  AND grant_authority.permission IN ('CONTROL','MANAGE')
 		  AND (grant_authority.expires_at IS NULL OR grant_authority.expires_at>now())
@@ -2085,7 +2085,7 @@ func (s *Postgres) DeleteLease(ctx context.Context, userID, actorID, sessionID, 
 		  AND actor.id=$4 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
 		  AND account.id=$3 AND account.status='ACTIVE'
 		  AND (
-			p.device_id=actor.id OR ($5 AND actor.device_type='ANDROID') OR EXISTS (
+			p.device_id=actor.id OR ($5 AND actor.device_type IN ('ANDROID','IOS')) OR EXISTS (
 				SELECT 1 FROM device_grants controller
 				WHERE controller.device_id=actor.id AND controller.pc_id=p.id
 				  AND controller.permission IN ('CONTROL','MANAGE')

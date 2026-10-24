@@ -81,7 +81,7 @@ const userPortalRevokeDevicePCsSQL = `
 		device_id=$1 OR id IN (SELECT pc_id FROM device_grants WHERE device_id=$1)
 		OR ($3 AND EXISTS (
 			SELECT 1 FROM devices target
-			WHERE target.id=$1 AND target.user_id=$2 AND target.device_type='ANDROID'
+			WHERE target.id=$1 AND target.user_id=$2 AND target.device_type IN ('ANDROID','IOS')
 		))
 	)`
 
@@ -272,7 +272,7 @@ func (s *Postgres) RevokeUserPortalDevice(ctx context.Context, accountID, device
 		if command.RowsAffected() != 1 {
 			return UserPortalActionResult{}, ErrConflict
 		}
-		if _, err := tx.Exec(ctx, userPortalRevokeDevicePCsSQL, deviceID, accountID, s.AutoTrustDevices && deviceType == "ANDROID"); err != nil {
+		if _, err := tx.Exec(ctx, userPortalRevokeDevicePCsSQL, deviceID, accountID, s.AutoTrustDevices && IsMobileDeviceType(deviceType)); err != nil {
 			return UserPortalActionResult{}, err
 		}
 		if _, err := tx.Exec(ctx, userPortalDeleteDeviceGrantsSQL, deviceID, accountID); err != nil {

@@ -151,7 +151,7 @@ func (s *Postgres) CreateAgentUpdate(
 		FROM pcs p
 		JOIN users account ON account.id=$2 AND account.status='ACTIVE'
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
-			AND requester.device_type='ANDROID' AND requester.trust_state='TRUSTED'
+			AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED'
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
 			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		WHERE p.id=$14 AND p.owner_user_id=$2 AND p.agent_version=$4
@@ -190,7 +190,7 @@ func (s *Postgres) GetAgentUpdate(
 		FROM agent_update_jobs job
 		WHERE job.id=$1 AND job.account_id=$2 AND job.pc_id=$3 AND job.requester_device_id=$4
 		  AND EXISTS(SELECT 1 FROM devices d WHERE d.id=$4 AND d.user_id=$2
-		      AND d.device_type='ANDROID' AND d.trust_state='TRUSTED')`,
+		      AND d.device_type IN ('ANDROID','IOS') AND d.trust_state='TRUSTED')`,
 		jobID, userID, pcID, requesterID,
 	))
 }
@@ -216,7 +216,7 @@ func (s *Postgres) GetActiveAgentUpdate(
 		WHERE job.account_id=$1 AND job.pc_id=$2 AND job.requester_device_id=$3
 		  AND job.status IN ('PENDING','PROCESSING')
 		  AND EXISTS(SELECT 1 FROM devices d WHERE d.id=$3 AND d.user_id=$1
-		      AND d.device_type='ANDROID' AND d.trust_state='TRUSTED')
+		      AND d.device_type IN ('ANDROID','IOS') AND d.trust_state='TRUSTED')
 		ORDER BY job.created_at DESC,job.id DESC LIMIT 1`,
 		userID, pcID, requesterID,
 	))
@@ -239,7 +239,7 @@ func (s *Postgres) CancelAgentUpdate(
 		SELECT `+agentUpdateColumns+` FROM agent_update_jobs job
 		WHERE id=$1 AND account_id=$2 AND pc_id=$3 AND requester_device_id=$4
 		  AND EXISTS(SELECT 1 FROM devices d WHERE d.id=$4 AND d.user_id=$2
-		      AND d.device_type='ANDROID' AND d.trust_state='TRUSTED') FOR UPDATE`,
+		      AND d.device_type IN ('ANDROID','IOS') AND d.trust_state='TRUSTED') FOR UPDATE`,
 		jobID, userID, pcID, requesterID,
 	))
 	if err != nil {

@@ -15,15 +15,15 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ory/fosite"
-	"github.com/termlink/termlink/server/internal/localnet"
 	"github.com/ory/fosite/compose"
 	"github.com/ory/fosite/token/jwt"
 	"github.com/termlink/termlink/server/internal/auth"
 	"github.com/termlink/termlink/server/internal/humanverification"
+	"github.com/termlink/termlink/server/internal/localnet"
 )
 
 const (
-	embeddedAccessTokenLifetime    = 5 * time.Minute
+	embeddedAccessTokenLifetime = 5 * time.Minute
 	// The refresh grant re-issues the refresh token with a fresh window on
 	// every use (fosite sliding semantics), so this is an inactivity
 	// lifetime: clients that go 20 days without refreshing sign in again.
@@ -43,6 +43,8 @@ type Config struct {
 	HMACSecret           []byte
 	KeyEncryptionKey     []byte
 	InitialAdminPassword string
+	IOSClientID          string
+	IOSRedirectURI       string
 	AndroidClientID      string
 	AndroidRedirectURI   string
 	WindowsClientID      string
@@ -270,8 +272,6 @@ func validateEmbeddedIssuer(raw string) (string, string, error) {
 	return issuer, parsed.Scheme + "://" + parsed.Host, nil
 }
 
-
-
 func embeddedClients(config Config) (map[string]fosite.Client, error) {
 	entries := []struct {
 		id       string
@@ -282,6 +282,16 @@ func embeddedClients(config Config) (map[string]fosite.Client, error) {
 		{config.WindowsClientID, config.WindowsRedirectURI, true},
 		{config.WebClientID, config.WebRedirectURI, false},
 		{config.StepUpClientID, config.WebRedirectURI, false},
+	}
+	if config.IOSClientID != "" {
+		if config.IOSRedirectURI != "dev.termlink.ios:/oauth2redirect" {
+			return nil, errors.New("invalid iOS redirect")
+		}
+		entries = append(entries, struct {
+			id       string
+			redirect string
+			password bool
+		}{config.IOSClientID, config.IOSRedirectURI, false})
 	}
 	clients := make(map[string]fosite.Client, len(entries))
 	for _, entry := range entries {
@@ -329,6 +339,9 @@ func embeddedAuthorizeFormAction(config Config) (string, error) {
 	// RFC 8252 requires native applications to choose an ephemeral loopback
 	// port. CSP otherwise treats the configured default port as exact and
 	// Chromium blocks the login form's 303 callback navigation.
+	if config.IOSClientID != "" {
+		return "'self' dev.termlink: dev.termlink.ios: http://127.0.0.1:*", nil
+	}
 	return "'self' dev.termlink: http://127.0.0.1:*", nil
 }
 

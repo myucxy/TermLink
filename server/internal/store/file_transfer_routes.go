@@ -32,7 +32,7 @@ func (s *Postgres) FileTransferRoute(
 		JOIN pcs pc ON pc.id=operation.pc_id AND pc.owner_user_id=operation.account_id
 		JOIN devices requester ON requester.id=operation.requester_device_id
 		  AND requester.user_id=operation.account_id
-		  AND requester.device_type='ANDROID' AND requester.trust_state='TRUSTED'
+		  AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED'
 		JOIN devices agent ON agent.id=pc.device_id
 		  AND agent.user_id=operation.account_id
 		  AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'

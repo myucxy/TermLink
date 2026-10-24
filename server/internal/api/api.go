@@ -112,6 +112,8 @@ type transcriptPageLister interface {
 }
 
 type ClientConfiguration struct {
+	IOSClientID                string
+	IOSRedirectURI             string
 	OIDCIssuer                 string
 	OIDCClientID               string
 	RedirectURI                string
@@ -537,6 +539,8 @@ func (a *API) getClientConfiguration(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"oidc_issuer":            a.ClientConfig.OIDCIssuer,
+		"ios_oidc_client_id":     a.ClientConfig.IOSClientID,
+		"ios_redirect_uri":       a.ClientConfig.IOSRedirectURI,
 		"oidc_client_id":         a.ClientConfig.OIDCClientID,
 		"redirect_uri":           a.ClientConfig.RedirectURI,
 		"windows_oidc_client_id": a.ClientConfig.WindowsClientID,
@@ -585,7 +589,7 @@ func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_PUBLIC_KEY", errors.New("invalid exchange key"))
 		return
 	}
-	if !store.IsPCAgentDeviceType(input.Type) && input.Type != "ANDROID" {
+	if !store.IsPCAgentDeviceType(input.Type) && !store.IsMobileDeviceType(input.Type) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_DEVICE_TYPE", errors.New("invalid device type"))
 		return
 	}
@@ -635,6 +639,8 @@ func (a *API) registerDevice(w http.ResponseWriter, r *http.Request) {
 func (a *API) canRegisterDeviceType(deviceType, authorizedParty string) bool {
 	authorizedParty = strings.TrimSpace(authorizedParty)
 	switch deviceType {
+	case "IOS":
+		return a.ClientConfig.IOSClientID != "" && authorizedParty == a.ClientConfig.IOSClientID
 	case "ANDROID":
 		return authorizedParty != "" && authorizedParty == a.ClientConfig.OIDCClientID
 	case store.DeviceTypeLegacyWindowsPC, store.DeviceTypePCAgent:
@@ -673,6 +679,9 @@ func (a *API) listDevices(w http.ResponseWriter, r *http.Request) {
 
 func projectDeviceTypesForV1(items []store.DeviceRecord) {
 	for index := range items {
+		if items[index].Type == "IOS" {
+			items[index].Type = "ANDROID"
+		}
 		if items[index].Type == store.DeviceTypePCAgent {
 			items[index].Type = store.DeviceTypeLegacyWindowsPC
 		}
@@ -691,7 +700,7 @@ func (a *API) getCurrentDevice(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) selfTrustAndroidDevice(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" || p.Identity.AuthorizedParty != a.ClientConfig.OIDCClientID ||
+	if !store.IsMobileDeviceType(p.Device.Type) || !a.canRegisterDeviceType(p.Device.Type, p.Identity.AuthorizedParty) ||
 		strings.TrimSpace(p.Identity.TokenID) == "" || len(a.TokenKey) < 32 {
 		writeError(w, r, http.StatusForbidden, "SELF_TRUST_NOT_ALLOWED", store.ErrDenied)
 		return
@@ -1354,6 +1363,12 @@ func (a *API) listPCGrants(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
+	}
+	// Released Windows agents use ANDROID as the V1 mobile recipient role.
+	for index := range items {
+		if items[index].DeviceType == "IOS" {
+			items[index].DeviceType = "ANDROID"
+		}
 	}
 	writeJSON(w, 200, map[string]any{"pc_id": pcID, "key_epoch": keyEpoch, "items": items})
 }

@@ -52,7 +52,7 @@ func (a *API) agentUpdateRepository() agentUpdateStore {
 
 func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -124,7 +124,7 @@ func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) 
 
 func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -280,7 +280,7 @@ func (a *API) reconcileInstalledAgentUpdates(w http.ResponseWriter, r *http.Requ
 
 func (a *API) getAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -303,7 +303,7 @@ func (a *API) getAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getActiveAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}
@@ -330,7 +330,7 @@ func (a *API) getActiveAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) cancelAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
-	if p.Device.Type != "ANDROID" {
+	if !store.IsMobileDeviceType(p.Device.Type) {
 		writeError(w, r, http.StatusForbidden, "ANDROID_DEVICE_REQUIRED", store.ErrDenied)
 		return
 	}

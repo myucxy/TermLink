@@ -148,7 +148,7 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 		SELECT $1,$2,p.id,$3,$4,$5,$6,$7,$8,$9
 		FROM pcs p
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
-			AND requester.device_type='ANDROID' AND requester.trust_state='TRUSTED'
+			AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED'
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
 			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
 		WHERE p.id=$10 AND p.owner_user_id=$2
@@ -337,7 +337,7 @@ func (s *Postgres) GetFileOperation(ctx context.Context, userID, requesterID, pc
 		UPDATE pc_file_operations operation SET status='EXPIRED',updated_at=now()
 		WHERE id=$1 AND account_id=$2 AND requester_device_id=$3 AND pc_id=$4
 		  AND status IN ('PENDING','PROCESSING') AND expires_at<=now()
-		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type='ANDROID' AND trust_state='TRUSTED')`,
+		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type IN ('ANDROID','IOS') AND trust_state='TRUSTED')`,
 		operationID, userID, requesterID, pcID)
 	if err != nil {
 		return FileOperationRecord{}, err
@@ -346,7 +346,7 @@ func (s *Postgres) GetFileOperation(ctx context.Context, userID, requesterID, pc
 		SELECT `+fileOperationColumns+`
 		FROM pc_file_operations operation
 		WHERE id=$1 AND account_id=$2 AND requester_device_id=$3 AND pc_id=$4
-		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type='ANDROID' AND trust_state='TRUSTED')`,
+		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type IN ('ANDROID','IOS') AND trust_state='TRUSTED')`,
 		operationID, userID, requesterID, pcID))
 	return item, err
 }
@@ -361,7 +361,7 @@ func (s *Postgres) CancelFileOperation(ctx context.Context, userID, requesterID,
 		SELECT `+fileOperationColumns+`
 		FROM pc_file_operations operation
 		WHERE id=$1 AND account_id=$2 AND requester_device_id=$3 AND pc_id=$4
-		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type='ANDROID' AND trust_state='TRUSTED')
+		  AND EXISTS (SELECT 1 FROM devices WHERE id=$3 AND user_id=$2 AND device_type IN ('ANDROID','IOS') AND trust_state='TRUSTED')
 		FOR UPDATE`, operationID, userID, requesterID, pcID))
 	if err != nil {
 		return FileOperationRecord{}, err

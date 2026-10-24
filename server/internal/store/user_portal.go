@@ -80,7 +80,7 @@ type UserPortalSession struct {
 
 const userPortalAccountOverviewSQL = `
 	SELECT account.id,account.role,account.status,account.created_at,
-	       (SELECT count(*) FROM devices d WHERE d.user_id=account.id AND d.device_type='ANDROID'),
+	       (SELECT count(*) FROM devices d WHERE d.user_id=account.id AND d.device_type IN ('ANDROID','IOS')),
 	       (SELECT count(*) FROM devices d WHERE d.user_id=account.id AND d.device_type IN ('WINDOWS_PC','PC_AGENT')),
 	       (SELECT count(*) FROM pcs p WHERE p.owner_user_id=account.id),
 	       (SELECT count(*) FROM pcs p WHERE p.owner_user_id=account.id
@@ -100,7 +100,7 @@ const userPortalDevicesSQL = `
 	       device.last_seen_at,device.created_at,device.revoked_at,device.disabled_at
 	FROM devices device
 	JOIN users account ON account.id=device.user_id AND account.id=$1 AND account.status='ACTIVE'
-	WHERE device.user_id=$1 AND device.device_type IN ('ANDROID','WINDOWS_PC','PC_AGENT')
+	WHERE device.user_id=$1 AND device.device_type IN ('ANDROID','IOS','WINDOWS_PC','PC_AGENT')
 	  AND ($2::timestamptz IS NULL OR (device.created_at,device.id)<($2::timestamptz,$3::uuid))
 	ORDER BY device.created_at DESC,device.id DESC
 	LIMIT $5`

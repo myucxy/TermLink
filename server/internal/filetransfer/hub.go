@@ -166,7 +166,7 @@ func (h *Hub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if hello.Role == "pc" && !store.IsPCAgentDeviceType(principal.Device.Type) ||
-		hello.Role == "android" && principal.Device.Type != "ANDROID" {
+		hello.Role == "android" && !store.IsMobileDeviceType(principal.Device.Type) {
 		h.logger.Warn("file-transfer websocket rejected", "stage", "role", "transfer_id", transferID, "device_id", principal.Device.ID, "role", hello.Role, "device_type", principal.Device.Type)
 		closeSocket(socket, websocket.ClosePolicyViolation, "role does not match device")
 		return

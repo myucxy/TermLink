@@ -50,7 +50,6 @@ const (
 	IdentityProviderEmbedded = "embedded"
 )
 
-
 var (
 	// ErrMissing identifies a required configuration value that was not set.
 	ErrMissing = errors.New("required configuration is missing")
@@ -88,6 +87,8 @@ type Config struct {
 	OIDCBackchannelIssuer          string
 	OIDCClientID                   string
 	OIDCAllowedParties             []string
+	IOSOIDCClientID                string
+	IOSOIDCRedirectURI             string
 	AndroidOIDCClientID            string
 	AndroidOIDCRedirectURI         string
 	WindowsOIDCClientID            string
@@ -308,6 +309,8 @@ type Input struct {
 	OIDCBackchannelIssuer          string
 	OIDCClientID                   string
 	OIDCAllowedParties             []string
+	IOSOIDCClientID                string
+	IOSOIDCRedirectURI             string
 	AndroidOIDCClientID            string
 	AndroidOIDCRedirectURI         string
 	WindowsOIDCClientID            string
@@ -362,6 +365,8 @@ func New(input Input) (Config, error) {
 		OIDCBackchannelIssuer:             strings.TrimSpace(input.OIDCBackchannelIssuer),
 		OIDCClientID:                      strings.TrimSpace(input.OIDCClientID),
 		OIDCAllowedParties:                append([]string(nil), input.OIDCAllowedParties...),
+		IOSOIDCClientID:                   strings.TrimSpace(input.IOSOIDCClientID),
+		IOSOIDCRedirectURI:                strings.TrimSpace(input.IOSOIDCRedirectURI),
 		AndroidOIDCClientID:               strings.TrimSpace(input.AndroidOIDCClientID),
 		AndroidOIDCRedirectURI:            strings.TrimSpace(input.AndroidOIDCRedirectURI),
 		WindowsOIDCClientID:               strings.TrimSpace(input.WindowsOIDCClientID),
@@ -531,6 +536,8 @@ func LoadSource(source Source) (Config, error) {
 			return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_CLIENT_ID", ErrMissing)
 		}
 	}
+	iosOIDCClientID := lookupOptional("TERMLINK_IOS_OIDC_CLIENT_ID", "")
+	iosOIDCRedirectURI := lookupOptional("TERMLINK_IOS_OIDC_REDIRECT_URI", "dev.termlink.ios:/oauth2redirect")
 	androidOIDCClientID := lookupOptional("TERMLINK_ANDROID_OIDC_CLIENT_ID", "termlink-android")
 	androidOIDCRedirectURI := lookupOptional("TERMLINK_ANDROID_OIDC_REDIRECT_URI", "dev.termlink:/oauth2redirect")
 	windowsOIDCClientID := lookupOptional("TERMLINK_WINDOWS_OIDC_CLIENT_ID", "termlink-windows")
@@ -540,7 +547,7 @@ func LoadSource(source Source) (Config, error) {
 	), ",")
 	oidcAllowedParties := strings.Split(lookupOptional(
 		"TERMLINK_OIDC_ALLOWED_PARTIES",
-		androidOIDCClientID+","+windowsOIDCClientID,
+		strings.TrimSuffix(androidOIDCClientID+","+windowsOIDCClientID+","+iosOIDCClientID, ","),
 	), ",")
 	windowsOIDCRedirectURI := lookupOptional("TERMLINK_WINDOWS_OIDC_REDIRECT_URI", "http://127.0.0.1/oauth2/callback")
 	webOIDCClientID := lookupOptional("TERMLINK_WEB_OIDC_CLIENT_ID", "termlink-web")
@@ -703,6 +710,8 @@ func LoadSource(source Source) (Config, error) {
 		OIDCBackchannelIssuer:             oidcBackchannelIssuer,
 		OIDCClientID:                      oidcClientID,
 		OIDCAllowedParties:                oidcAllowedParties,
+		IOSOIDCClientID:                   iosOIDCClientID,
+		IOSOIDCRedirectURI:                iosOIDCRedirectURI,
 		AndroidOIDCClientID:               androidOIDCClientID,
 		AndroidOIDCRedirectURI:            androidOIDCRedirectURI,
 		WindowsOIDCClientID:               windowsOIDCClientID,
@@ -898,8 +907,22 @@ func validate(c Config) (Config, error) {
 	if c.WindowsOIDCClientID == c.AndroidOIDCClientID {
 		return Config{}, fmt.Errorf("%w: Android and Windows OIDC clients must be distinct", ErrInvalid)
 	}
+	if c.IOSOIDCClientID != "" {
+		if c.IOSOIDCClientID == c.AndroidOIDCClientID || c.IOSOIDCClientID == c.WindowsOIDCClientID || strings.ContainsAny(c.IOSOIDCClientID, " \t\r\n") || len(c.IOSOIDCClientID) > 128 {
+			return Config{}, fmt.Errorf("%w: iOS OIDC client must be distinct", ErrInvalid)
+		}
+		if c.IOSOIDCRedirectURI == "" {
+			c.IOSOIDCRedirectURI = "dev.termlink.ios:/oauth2redirect"
+		}
+		if c.IOSOIDCRedirectURI != "dev.termlink.ios:/oauth2redirect" {
+			return Config{}, fmt.Errorf("%w: iOS OIDC redirect", ErrInvalid)
+		}
+	}
 	if len(c.OIDCAllowedParties) == 0 {
 		c.OIDCAllowedParties = []string{c.AndroidOIDCClientID, c.WindowsOIDCClientID}
+		if c.IOSOIDCClientID != "" {
+			c.OIDCAllowedParties = append(c.OIDCAllowedParties, c.IOSOIDCClientID)
+		}
 	}
 	allowed := make([]string, 0, len(c.OIDCAllowedParties))
 	seenAllowed := make(map[string]struct{}, len(c.OIDCAllowedParties))
@@ -920,6 +943,11 @@ func validate(c Config) (Config, error) {
 	if _, ok := seenAllowed[c.WindowsOIDCClientID]; !ok {
 		return Config{}, fmt.Errorf("%w: TERMLINK_OIDC_ALLOWED_PARTIES", ErrInvalid)
 	}
+	if c.IOSOIDCClientID != "" {
+		if _, ok := seenAllowed[c.IOSOIDCClientID]; !ok {
+			return Config{}, fmt.Errorf("%w: iOS party is not allowed", ErrInvalid)
+		}
+	}
 	c.OIDCAllowedParties = allowed
 	if len(c.WindowsRegistrationOIDCParties) == 0 {
 		c.WindowsRegistrationOIDCParties = []string{c.WindowsOIDCClientID}
@@ -929,7 +957,7 @@ func validate(c Config) (Config, error) {
 	for _, party := range c.WindowsRegistrationOIDCParties {
 		party = strings.TrimSpace(party)
 		_, tokenAllowed := seenAllowed[party]
-		if party == "" || party == c.AndroidOIDCClientID || !tokenAllowed {
+		if party == "" || party == c.AndroidOIDCClientID || party == c.IOSOIDCClientID || !tokenAllowed {
 			return Config{}, fmt.Errorf("%w: TERMLINK_WINDOWS_REGISTRATION_OIDC_PARTIES", ErrInvalid)
 		}
 		if _, duplicate := seenWindowsRegistrationParty[party]; duplicate {
@@ -1003,6 +1031,9 @@ func validate(c Config) (Config, error) {
 	}
 	if c.WebOIDCStepUpClientID == c.WebOIDCClientID {
 		return Config{}, fmt.Errorf("%w: TERMLINK_WEB_STEP_UP_OIDC_CLIENT_ID must differ from TERMLINK_WEB_OIDC_CLIENT_ID", ErrInvalid)
+	}
+	if c.IOSOIDCClientID != "" && (c.IOSOIDCClientID == c.WebOIDCClientID || c.IOSOIDCClientID == c.WebOIDCStepUpClientID) {
+		return Config{}, fmt.Errorf("%w: iOS and browser OIDC clients must be distinct", ErrInvalid)
 	}
 	if strings.TrimSpace(c.WebOIDCRedirectURI) == "" {
 		c.WebOIDCRedirectURI = strings.TrimRight(c.PublicURL, "/") + "/auth/callback"
