@@ -64,6 +64,7 @@ flowchart LR
 | 目录 | 用途 |
 | --- | --- |
 | [android/](android/README.md) | Android 产品 UI、网络、加密、预编译 JNI 调用与 View |
+| [ios/](ios/README.md) | 开发中的 iPhone / iPad 原生客户端源码；尚未构建验收，终端核心依赖与功能差距见目录说明 |
 | [pc-client/](pc-client/README.md) | Avalonia 桌面 UI、本机 Agent 控制接口及平台适配 |
 | [win-agent/](win-agent/README.md) | Windows Agent、AI 适配器、ConPTY SessionHost、Setup、Updater |
 | [ai-web/](ai-web/README.md) | APK 内嵌的 AI 对话 Web 界面 |

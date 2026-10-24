@@ -33,6 +33,10 @@ artifacts/
 *.py[cod]
 Thumbs.db
 .DS_Store
+**/xcuserdata/
+**/DerivedData/
+*.xcuserstate
+/ios/Local.xcconfig
 # Local build artifacts not covered by generic rules
 server/termlink-server.exe
 # local packaging output

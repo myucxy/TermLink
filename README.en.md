@@ -56,6 +56,7 @@ deployment or acceptance. See [current architecture](docs/architecture/CURRENT.m
 | Directory | Role |
 | --- | --- |
 | [android](android/README.md) | Android UI, crypto/network integration, native terminal bindings and view |
+| [ios](ios/README.md) | iPhone/iPad client source under development; not built or accepted; native dependencies and remaining gaps are documented in the directory |
 | [pc-client](pc-client/README.md) | Avalonia desktop UI and platform adapters |
 | [win-agent](win-agent/README.md) | Agent, AI adapters, ConPTY SessionHost, Setup and Updater |
 | [ai-web](ai-web/README.md) | Application-owned AI conversation UI embedded in Android |
