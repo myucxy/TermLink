@@ -4,8 +4,15 @@ import Foundation
 import Combine
 
 @MainActor final class RemoteFileStore: ObservableObject {
-    @Published private(set) var entries:[RemoteEntry]=[],downloads:[DownloadRecord]=[]
-    @Published var pcID:UUID?,path="",query="",busy=false,error:String?,nextOffset:Int64?,parentPath:String?
+    @Published private(set) var entries:[RemoteEntry]=[]
+    @Published private(set) var downloads:[DownloadRecord]=[]
+    @Published var pcID:UUID?
+    @Published var path=""
+    @Published var query=""
+    @Published var busy=false
+    @Published var error:String?
+    @Published var nextOffset:Int64?
+    @Published var parentPath:String?
     private var jobs:[UUID:Task<Void,Never>]=[:]
     private var favorites:[String:[String]]=[:]
     private unowned let product:ProductStore
@@ -111,8 +118,9 @@ import Combine
     func receive(progress:(DownloadRecord)->Void) async throws {
         let id=record.operationID,keyID=Data("file-transfer-v2:\(id.uuidString.replacingOccurrences(of:"-",with:"").lowercased()):\(pc.keyEpoch)".utf8)
         let pair=try SessionCrypto.pairwise(identity:identity,peer:device.exchangeKey,pc:device.id,mobile:identity.id,epoch:pc.keyEpoch)
-        func transferKey(_ direction:UInt8)->SymmetricKey{SessionCrypto.derive(pair,info:Data("TERMLINK-FILE-TRANSFER-KEY-V2\0".utf8)+id.bytes+Data([direction])+.bigEndian(UInt64(pc.keyEpoch))+keyID)}
-        var request=try await api.signedRequest(path:"/v1/file-transfers",method:"GET");var c=URLComponents(url:request.url!,resolvingAgainstBaseURL:false)!;c.scheme="wss";request.url=c.url;request.setValue("termlink.filetransfer.v2",forHTTPHeaderField:"Sec-WebSocket-Protocol")
+        func transferKey(_ direction:UInt8)->SymmetricKey{SessionCrypto.derive(pair,info:Data("TERMLINK-FILE-TRANSFER-KEY-V2\0".utf8)+id.bytes+Data([direction]) + Data.bigEndian(UInt64(pc.keyEpoch))+keyID)}
+        let signed=try await api.signedRequest(path:"/v1/file-transfers",method:"GET")
+        let request=try MobileRelayProtocol.webSocketRequest(signed,channel:.files)
         let delegate=NoRedirectDelegate(),session=URLSession(configuration:.ephemeral,delegate:delegate,delegateQueue:nil)
         let socket=session.webSocketTask(with:request);socket.maximumMessageSize=1_048_575;socket.resume();defer{socket.cancel(with:.goingAway,reason:nil);session.invalidateAndCancel()}
         let hello=JSONValue.object(["role":.string("android"),"transfer_id":.string(id.uuidString.lowercased()),"protocol_versions":.array([.number(2)]),"capabilities":.array([.string("e2ee"),.string("resume_offset_v2")])])

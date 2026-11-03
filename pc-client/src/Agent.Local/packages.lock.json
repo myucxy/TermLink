@@ -8,14 +8,14 @@
       "termlink.platform.abstractions": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )"
         }
       },
       "termlink.presentation": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )"
         }
       }
     },

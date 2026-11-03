@@ -173,7 +173,16 @@ public sealed record PcAgentIdentity(
 
 public sealed record AiAgentCapability(string Id, string Name, string Path, string Version, string Status, string Strategy = "native")
 {
-    public string Detail => Strategy == "desktop_remote" ? (Status == "available" ? "桌面远控 · 已配置地址" : "桌面远控 · 请重新保存地址") : $"{Version} · " + (Status switch {
+    public string Detail => Strategy == "local_cli" ? (Status switch
+    {
+        "detected" => $"{Version} · 本机 CLI 可启动 · 远程 AI 尚未接通",
+        "missing" => "未检测到本机 CLI",
+        "desktop_only" => "已安装桌面应用 · 未检测到公共 CLI",
+        "runtime_missing" => "已找到 CLI · 缺少所需运行时",
+        "runtime_blocked" => "已找到 CLI · 系统阻止启动",
+        _ => "CLI 检测未通过 · 可重新检测或查看官方说明",
+    }) : ProtocolDetail;
+    private string ProtocolDetail => Strategy == "desktop_remote" ? "旧版网页接入已停用 · 请升级电脑端" : $"{Version} · " + (Status switch {
         "available" => "协议可用 · 认证尚未验证",
         "missing" => "未检测到安装",
         "runtime_missing" => "缺少运行时",

@@ -158,38 +158,17 @@ foreach (var pid in traced.Where(s => s.StartsWith("pid:")).Select(s => int.Pars
 Environment.SetEnvironmentVariable("TERMLINK_AI_FIXTURE_TRACE", null);
 Console.WriteLine("PASS model listing: pagination, filtering, cancellation, no conversations, child cleanup");
 
-var remoteStore = new ZcodeRemoteAddressStore(Path.Combine(directory, "remote.dpapi"));
-var pairingLink = "https://zcode.z.ai/remote/v4?pair=fixture-only#test";
-foreach (var invalid in new[] { "http://zcode.z.ai/remote/v4", "https://zcode.z.ai.evil.test/remote/v4",
-    "https://user@zcode.z.ai/remote/v4", "https://zcode.z.ai:8443/remote/v4", "file:///remote/v4",
-    "https://zcode.z.ai/remote/../../other", "https://zcode.z.ai/other", "javascript:alert(1)" })
-    Require(!ZcodeRemoteAddressStore.IsAllowed(invalid), "Untrusted remote address accepted");
-remoteStore.Save(pairingLink);
-Require(remoteStore.Read() == pairingLink && !System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(directory, "remote.dpapi"))).Contains("fixture-only"), "DPAPI roundtrip or secret protection");
-using (var remoteManager = new AiSessionManager(remoteStore)) {
+// Retired remote requests cannot return a URL or launch a browser.
+using (var nativeManager = new AiSessionManager(installRoot: directory)) {
     var caller = Guid.NewGuid();
-    var catalog = await remoteManager.ExecuteAsync(caller, "{\"action\":\"catalog\"}", CancellationToken.None);
-    using var parsedCatalog = JsonDocument.Parse(catalog);
-    var remoteCapability = parsedCatalog.RootElement.GetProperty("agents").EnumerateArray().Single(a => a.GetProperty("id").GetString() == "zcode");
-    Require(remoteCapability.GetProperty("strategy").GetString() == "desktop_remote" && remoteCapability.GetProperty("status").GetString() == "available", "Remote capability not available");
-    Require(!catalog.Contains("fixture-only") && !catalog.Contains("remoteUrl"), "Catalog leaked pairing link");
-    Require(parsedCatalog.RootElement.GetProperty("directoryMode").GetString() == "per_session" &&
-        Path.GetFileName(parsedCatalog.RootElement.GetProperty("defaultDirectory").GetString()) == "AiWorkspaces", "Managed workspace capability missing");
-    var body = AiSessionManager.Encode(new AiSessionManager.Request("remote", remoteManager.HostId, AgentId: "zcode"));
-    var reply = await remoteManager.ExecuteAsync(caller, body, CancellationToken.None);
-    using var parsedReply = JsonDocument.Parse(reply);
-    Require(parsedReply.RootElement.GetProperty("remoteUrl").GetString() == pairingLink, "Remote link response");
-    Require((await remoteManager.ExecuteAsync(caller, body, CancellationToken.None, () => false)).Contains("AUTHORITY_CHANGED"), "Remote authorization fence");
-    Require((await remoteManager.ExecuteAsync(caller, body.Replace(remoteManager.HostId, "old"), CancellationToken.None)).Contains("HOST_CHANGED"), "Remote host fence");
-    var create = AiSessionManager.Encode(new AiSessionManager.Request("create", remoteManager.HostId, Guid.NewGuid().ToString(), AgentId: "zcode", Directory: directory));
-    Require((await remoteManager.ExecuteAsync(caller, create, CancellationToken.None)).Contains("AGENT_STRATEGY_CHANGED"), "Remote strategy spawned a native agent");
-    remoteStore.Clear();
-    Require(remoteStore.Read() == "" && (await remoteManager.ExecuteAsync(caller, body, CancellationToken.None)).Contains("REMOTE_NOT_CONFIGURED"), "Cleared URL still accessible");
-    var cleared = await remoteManager.ExecuteAsync(caller, "{\"action\":\"catalog\"}", CancellationToken.None);
-    using var parsedClear = JsonDocument.Parse(cleared);
-    Require(parsedClear.RootElement.GetProperty("agents").EnumerateArray().Single(a => a.GetProperty("id").GetString() == "zcode").GetProperty("strategy").GetString() == "native", "Cleared config did not restore native strategy");
+    using var catalog = JsonDocument.Parse(await nativeManager.ExecuteAsync(caller, "{\"action\":\"catalog\"}", CancellationToken.None));
+    Require(catalog.RootElement.GetProperty("agents").EnumerateArray().All(a => a.GetProperty("strategy").GetString() == "native"), "A URL strategy remained advertised");
+    var request = AiSessionManager.Encode(new AiSessionManager.Request("remote", nativeManager.HostId, AgentId: "zcode"));
+    var response = await nativeManager.ExecuteAsync(caller, request, CancellationToken.None);
+    Require(response.Contains("AGENT_STRATEGY_CHANGED") && !response.Contains("remoteUrl"), "Retired URL request remained usable");
+    Require((await nativeManager.ExecuteAsync(caller, request, CancellationToken.None, () => false)).Contains("AUTHORITY_CHANGED"), "Retired request bypassed authorization");
 }
-Console.WriteLine("PASS desktop remote: DPAPI, allowlist, catalog redaction, routing, auth/host fences, clearing");
+Console.WriteLine("PASS native-only catalog and retired URL request rejection");
 
 var actor = Guid.NewGuid();
 Require(AiAgentSession.ToolPresentation("{\"type\":\"commandExecution\",\"command\":\"npm test\",\"status\":\"completed\",\"exitCode\":1}").Status == "failed", "Exit failure shown as success");
@@ -284,6 +263,38 @@ try {
     Require((await manager.ExecuteAsync(actor, browse, CancellationToken.None, () => false)).Contains("AUTHORITY_CHANGED"), "Browser authorization");
     Require((await manager.ExecuteAsync(actor, browse.Replace(manager.HostId, "old"), CancellationToken.None)).Contains("HOST_CHANGED"), "Browser host fence");
     Require((await manager.ExecuteAsync(actor, AiSessionManager.Encode(new AiSessionManager.Request("directories", manager.HostId, Directory: @"\\localhost\C$")), CancellationToken.None)).Contains("LOCAL_DIRECTORY_REQUIRED"), "Network directory accepted");
+
+    var catalogBody = AiSessionManager.Encode(new AiSessionManager.Request("catalog", manager.HostId));
+    using (var catalogReply = JsonDocument.Parse(await manager.ExecuteAsync(actor, catalogBody, CancellationToken.None)))
+        Require(catalogReply.RootElement.GetProperty("cliWorkspaceCreation").GetBoolean() == OperatingSystem.IsWindows(), "CLI workspace capability matches host platform");
+    var cliWorkspaceBefore = Directory.GetDirectories(workspaceRoot).Length;
+    var cliBody = AiSessionManager.Encode(new AiSessionManager.Request(
+        "create-cli-workspace", manager.HostId, Guid.NewGuid().ToString(), Directory: Path.Combine(directory, "caller-controlled")));
+    var cliReplies = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => manager.ExecuteAsync(actor, cliBody, CancellationToken.None)));
+    Require(cliReplies.Distinct().Count() == 1, "CLI workspace duplicate receipt");
+    using var cliReply = JsonDocument.Parse(cliReplies[0]);
+    var cliPath = cliReply.RootElement.GetProperty("directory").GetString();
+    Require(Path.GetDirectoryName(cliPath) == workspaceRoot && Directory.Exists(cliPath) &&
+        System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(cliPath), @"^cli_\d{8}_\d{6}_\d{3}_[a-f0-9]{8}$") &&
+        !cliPath.Contains("caller-controlled", StringComparison.Ordinal), "CLI workspace is host-created and scoped");
+    Require(Directory.GetDirectories(workspaceRoot).Length == cliWorkspaceBefore + 1, "CLI workspace created more than once");
+    var cliConflict = await manager.ExecuteAsync(actor, cliBody.Replace("caller-controlled", "caller-controlled-2"), CancellationToken.None);
+    Require(cliConflict.Contains("OPERATION_ID_CONFLICT"), "CLI workspace operation conflict");
+    var secondCliBody = AiSessionManager.Encode(new AiSessionManager.Request(
+        "create-cli-workspace", manager.HostId, Guid.NewGuid().ToString(), Directory: "Z:\\another-caller-path"));
+    using var secondCliReply = JsonDocument.Parse(await manager.ExecuteAsync(actor, secondCliBody, CancellationToken.None));
+    var secondCliPath = secondCliReply.RootElement.GetProperty("directory").GetString();
+    Require(secondCliPath != cliPath && Directory.Exists(secondCliPath) &&
+        Directory.GetDirectories(workspaceRoot).Length == cliWorkspaceBefore + 2,
+        "A new CLI operation did not create a distinct workspace");
+    var cliUnauthorizedBefore = Directory.GetDirectories(workspaceRoot).Length;
+    var cliUnauthorized = AiSessionManager.Encode(new AiSessionManager.Request("create-cli-workspace", manager.HostId, Guid.NewGuid().ToString(), Directory: "Z:\\must-not-be-used"));
+    Require((await manager.ExecuteAsync(actor, cliUnauthorized, CancellationToken.None, () => false)).Contains("AUTHORITY_CHANGED"), "CLI workspace authority fence");
+    Require(Directory.GetDirectories(workspaceRoot).Length == cliUnauthorizedBefore, "Unauthorized CLI workspace was created");
+    var cliInvalidOperation = AiSessionManager.Encode(new AiSessionManager.Request("create-cli-workspace", manager.HostId, "not-a-guid"));
+    Require((await manager.ExecuteAsync(actor, cliInvalidOperation, CancellationToken.None)).Contains("INVALID_OPERATION_ID"), "CLI workspace operation ID validation");
+    var cliOldHost = AiSessionManager.Encode(new AiSessionManager.Request("create-cli-workspace", "old", Guid.NewGuid().ToString()));
+    Require((await manager.ExecuteAsync(actor, cliOldHost, CancellationToken.None)).Contains("HOST_CHANGED"), "CLI workspace host fence");
     var blockedRoot = Path.Combine(directory, "blocked-install");
     Directory.CreateDirectory(blockedRoot); File.WriteAllText(Path.Combine(blockedRoot, "AiWorkspaces"), "not a directory");
     using var blockedManager = new AiSessionManager(installRoot: blockedRoot);

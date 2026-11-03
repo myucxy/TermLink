@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <PlatformTarget>AnyCPU</PlatformTarget>
     <AssemblyName>TermLink.TerminalCore</AssemblyName>
     <RootNamespace>TermLink.TerminalCore</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

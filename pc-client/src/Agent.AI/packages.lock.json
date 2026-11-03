@@ -1,0 +1,53 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net8.0": {
+      "System.Security.Cryptography.ProtectedData": {
+        "type": "Direct",
+        "requested": "[8.0.0, )",
+        "resolved": "8.0.0",
+        "contentHash": "+TUFINV2q2ifyXauQXRwy4CiBhqvDEDZeVJU7qfxya4aRYOKzVBpN+4acx25VcPB9ywUN6C0n8drWl110PhZEg=="
+      },
+      "BouncyCastle.Cryptography": {
+        "type": "Transitive",
+        "resolved": "2.5.1",
+        "contentHash": "zy8TMeTP+1FH2NrLaNZtdRbBdq7u5MI+NFZQOBSM69u5RFkciinwzV2eveY6Kjf5MzgsYvvl6kTStsj3JrXqkg=="
+      },
+      "Google.Protobuf": {
+        "type": "Transitive",
+        "resolved": "3.31.1",
+        "contentHash": "gSnJbUmGiOTdWddPhqzrEscHq9Ls6sqRDPB9WptckyjTUyx70JOOAaDLkFff8gManZNN3hllQ4aQInnQyq/Z/A=="
+      },
+      "termlink.agent.connection": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Protocol": "[0.3.16, )"
+        }
+      },
+      "termlink.pc.contracts": {
+        "type": "Project"
+      },
+      "termlink.platform.abstractions": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[0.3.16, )"
+        }
+      },
+      "termlink.protocol": {
+        "type": "Project",
+        "dependencies": {
+          "BouncyCastle.Cryptography": "[2.5.1, )",
+          "Google.Protobuf": "[3.31.1, )"
+        }
+      }
+    },
+    "net8.0/linux-arm64": {},
+    "net8.0/linux-x64": {},
+    "net8.0/osx-arm64": {},
+    "net8.0/osx-x64": {},
+    "net8.0/win-arm64": {},
+    "net8.0/win-x64": {}
+  }
+}

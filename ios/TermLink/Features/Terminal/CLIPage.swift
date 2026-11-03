@@ -16,10 +16,31 @@ struct TerminalDetailView:View {
     let fontSize:Double
     @EnvironmentObject var product:ProductStore
     @EnvironmentObject var shortcuts:TerminalShortcutStore
-    @State private var confirmEnd=false,showPaste=false,paste="",resizeBusy=false,resizeFeedback:String?
+    @State private var confirmEnd = false
+    @State private var showPaste = false
+    @State private var paste = ""
+    @State private var resizeBusy = false
+    @State private var resizeFeedback: String?
+    @State private var shellCommands: TerminalShellState?
+    @State private var directoryPath: String?
     var body:some View{VStack(spacing:0){
         HStack(spacing:6){Circle().fill(controller.error==nil ? .green:.orange).frame(width:7,height:7);Text(controller.session.title.isEmpty ? controller.session.shell:controller.session.title).font(.subheadline).lineLimit(1);Spacer();Menu{
-            Button(controller.canInput ? "释放控制权":"请求控制权"){Task{do{if controller.canInput{try await controller.releaseControl()}else{try await controller.requestControl()}}catch{product.report(error)}}}
+            Button(controller.canInput ? "释放控制权":"请求控制权"){Task{do{if controller.canInput{try await controller.releaseControl()}else{try await controller.requestControl()}}catch{product.report(error)}}}.disabled(controller.frozen)
+            Section("历史与目录") {
+                Button("浏览滚回历史") { controller.browseHistory(by: max(1, (controller.frame?.rows ?? 24) - 1)) }.disabled(controller.frame == nil)
+                Button("打开当前目录") {
+                    do {
+                        let state = try controller.shellState()
+                        guard let path = TerminalShellState.localWindowsDirectory(state.currentDirectoryURI) else {
+                            throw ClientError.unavailable("Shell 尚未报告可打开的本地电脑目录。")
+                        }
+                        directoryPath = path
+                    } catch { product.report(error) }
+                }.disabled(controller.frame == nil)
+                Button("Shell 命令记录") {
+                    do { shellCommands = try controller.shellState() } catch { product.report(error) }
+                }.disabled(controller.frame == nil)
+            }
             Divider()
             Section("窗口尺寸"){
                 if let frame=controller.frame{Button("\(frame.columns) 列 × \(frame.rows) 行"){}.disabled(true)}
@@ -33,11 +54,50 @@ struct TerminalDetailView:View {
         }label:{HStack(spacing:4){Text(controller.status).font(.caption);Image(systemName:"cloud.fill")}.foregroundStyle(.secondary)}}.padding(.horizontal,8).frame(minHeight:34)
         if let resizeFeedback{Text(resizeFeedback).font(.caption2).foregroundStyle(.secondary).frame(maxWidth:.infinity,alignment:.leading).padding(.horizontal,8)}
         if let error=controller.error{Text(error).font(.caption).foregroundStyle(.orange).padding(8)}
+        if controller.frozen {
+            HStack {
+                Button("上一屏", systemImage: "chevron.up") { controller.browseHistory(by: max(1, (controller.frame?.rows ?? 24) - 1)) }
+                    .labelStyle(.iconOnly).frame(minWidth:32,minHeight:32)
+                    .disabled(controller.presentation.offset >= controller.presentation.availableRows)
+                Text("历史 · \(controller.presentation.offset)/\(controller.presentation.availableRows) 行").font(.caption).lineLimit(1)
+                Button("下一屏", systemImage: "chevron.down") { controller.browseHistory(by: -max(1, (controller.frame?.rows ?? 24) - 1)) }
+                    .labelStyle(.iconOnly).frame(minWidth:32,minHeight:32)
+                    .disabled(controller.presentation.offset == 0)
+                Spacer()
+                Button("返回实时尾部") { controller.endHistory() }
+            }.font(.caption).padding(8)
+        }
         TerminalSurface(controller:controller,fontSize:fontSize)
         shortcutDock.padding(4).background(.black)
     }.background(Color(red:8/255,green:12/255,blue:16/255))
     .confirmationDialog("结束电脑上的会话？",isPresented:$confirmEnd){Button("结束 SessionHost 与 Shell",role:.destructive){Task{do{try await controller.terminate();product.closeView(controller.session.id)}catch{product.report(error)}}}}message:{Text("这会结束对应电脑进程，关闭视图不会执行此操作。")}
     .sheet(isPresented:$showPaste){NavigationStack{Form{TextEditor(text:$paste).frame(minHeight:180);PasteButton(payloadType:String.self){items in paste=items.joined(separator:"\n")};Button("粘贴到当前终端"){Task{do{try await controller.paste(Data(paste.utf8));showPaste=false;paste=""}catch{product.report(error)}}}.disabled(!controller.canInput)}.navigationTitle("确认粘贴").toolbar{Button("取消"){showPaste=false}}}}
+    .sheet(isPresented:Binding(get:{shellCommands != nil},set:{if !$0{shellCommands=nil}})) {
+        if let shellCommands {
+            NavigationStack {
+                List {
+                    if shellCommands.commands.isEmpty { Text("Shell 尚未报告命令记录。") }
+                    ForEach(shellCommands.commands.reversed()) { command in
+                        Button {
+                            do { try controller.showShellCommand(command); self.shellCommands = nil }
+                            catch { product.report(ClientError.unavailable("此命令的位置已不在保留历史中。")) }
+                        } label: {
+                            VStack(alignment:.leading,spacing:4) {
+                                Text("#\(command.id) · \(command.phaseLabel)")
+                                Text(TerminalShellState.localWindowsDirectory(command.currentDirectoryURI) ?? command.currentDirectoryURI)
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                        }.disabled(command.prompt.alternate || command.prompt.page != 1)
+                    }
+                }.navigationTitle("Shell 命令记录").toolbar { Button("关闭") { self.shellCommands = nil } }
+            }
+        }
+    }
+    .sheet(isPresented:Binding(get:{directoryPath != nil},set:{if !$0{directoryPath=nil}})) {
+        if let directoryPath,let pc=product.pcs.first(where:{$0.id==controller.session.pcID}) {
+            NavigationStack { RemoteFilesView(store:product.files,pc:pc,initialPath:directoryPath) }
+        }
+    }
     }
     private func resizeWindow(_ action:@escaping () async throws ->(columns:Int,rows:Int)){
         resizeBusy=true;resizeFeedback="正在等待 Windows 应用尺寸…"
@@ -70,5 +130,15 @@ struct TerminalDetailView:View {
             case .custom(let shortcut):Text(shortcut.displayLabel).font(.system(size:13,design:.monospaced)).lineLimit(1).frame(minWidth:24,maxWidth:72,minHeight:30)
         }}.padding(.horizontal,7).foregroundStyle(.secondary).background(Color.white.opacity(0.04),in:RoundedRectangle(cornerRadius:5)).overlay{RoundedRectangle(cornerRadius:5).stroke(.gray.opacity(0.5))}.disabled(!controller.canInput)
     }}}.scrollIndicators(.hidden)}
+}
+private extension TerminalShellCommand {
+    var phaseLabel: String {
+        switch phase {
+        case .prompt, .input: return "输入中"
+        case .output: return "运行中"
+        case .completed: return exitCode.map { "退出码 \($0)" } ?? "已结束"
+        case .interrupted: return "已中断"
+        }
+    }
 }
 extension Notification.Name{static let terminalShowKeyboard=Notification.Name("TermLinkTerminalShowKeyboard")}

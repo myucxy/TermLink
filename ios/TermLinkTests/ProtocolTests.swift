@@ -52,12 +52,6 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(AgentBrand.asset("my-codex-proxy"))
         XCTAssertNil(AgentBrand.asset("new-provider"))
     }
-    func testRemoteURLRejectsHostConfusionCredentialsAndSchemeDowngrade() {
-        XCTAssertTrue(ZCodeRemoteURL.allowed(URL(string: "https://zcode.z.ai/remote/session")!))
-        for input in ["https://zcode.z.ai.evil.test/remote/", "http://zcode.z.ai/remote/", "https://user@zcode.z.ai/remote/", "https://zcode.z.ai:444/remote/", "https://zcode.z.ai/account", "https://zcode.z.ai/remote/../../account"] {
-            XCTAssertFalse(ZCodeRemoteURL.allowed(URL(string: input)!))
-        }
-    }
     func testRenderFrameRejectsTruncatedAndUntrustedData() {
         XCTAssertThrowsError(try TerminalFrame.decode(Data()))
         XCTAssertThrowsError(try TerminalFrame.decode(Data(repeating: 0, count: 240)))

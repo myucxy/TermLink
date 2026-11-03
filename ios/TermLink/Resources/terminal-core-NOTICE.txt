@@ -1,0 +1,44 @@
+TermLink Terminal Core
+SPDX-License-Identifier: GPL-3.0-only
+
+TermLink Terminal Core is free software: you can redistribute it and/or
+modify it under the terms of the GNU General Public License as published
+by the Free Software Foundation, version 3 only.
+
+TermLink Terminal Core is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with TermLink Terminal Core in LICENSE. If not, see
+<https://www.gnu.org/licenses/>.
+
+This license applies to the project-owned Rust implementation, C ABI,
+Android JNI wrapper, build scripts and tests. Third-party material retains
+its own license and attribution; do not replace upstream notices.
+
+Source repository: https://github.com/myucxy/terminal-core
+Public access is planned following the 2026-10-09 licensing decision.
+Distributing DLL/SO files under GPLv3 requires providing the complete
+Corresponding Source as required by the license. A private or unavailable
+repository URL alone does not fulfill that requirement. Preserve exact
+source revisions and the build scripts needed for each binary release.
+
+Unicode 16.0.0 property tables and official conformance test data:
+Copyright Unicode, Inc. Used under Unicode License V3.
+See third_party/unicode/16.0.0/LICENSE.txt and SOURCE.md. Preserve this notice
+and the full Unicode permission notice with distributions of derived tables.
+
+Additional fixed legacy character mapping data in terminal-core:
+Copyright (c) Microsoft Corporation. MIT License.
+Derived from the character mapping tables of Windows Terminal revision
+6676c6f938f7e98ad680f0cecedd3bafb6529734. No external terminal parser or
+renderer is linked. Full notice: third_party/legacy-charsets/LICENSE.txt
+
+State Delta SHA-256 uses RustCrypto sha2 0.10.9 and its pinned Rust
+dependencies under MIT or MIT/Apache-2.0 terms (MIT selected where offered).
+Preserve the exact third-party copyright and permission notices in
+third_party/rust-dependencies/ with source and binary distributions.
+SOURCES.json records each version, crates.io archive SHA-256 and license.
+These dependencies are not relicensed as project-owned GPL code.

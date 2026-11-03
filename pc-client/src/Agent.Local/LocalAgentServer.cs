@@ -104,7 +104,14 @@ public sealed class LocalAgentServer : IAsyncDisposable
                 }
                 var response = LocalAgentProtocol.CreateResponse(
                     request, result.Success, result.Code, result.Payload, key, DateTimeOffset.UtcNow);
-                await LocalAgentProtocol.WriteAsync(stream, response, cancellationToken).ConfigureAwait(false);
+                try { await LocalAgentProtocol.WriteAsync(stream, response, cancellationToken).ConfigureAwait(false); }
+                finally
+                {
+                    // Cleanup has completed in the authenticated handler. Send
+                    // its receipt before stopping the listener and other clients.
+                    // A lost receipt must not leave an already-stopped Host alive.
+                    if (request.Command == LocalAgentCommand.Shutdown && result.Success) shutdown.Cancel();
+                }
             }
             catch (Exception error) when (error is InvalidDataException or CryptographicException or ArgumentException)
             {
@@ -113,6 +120,8 @@ public sealed class LocalAgentServer : IAsyncDisposable
                 _ = error;
                 return;
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+            catch (IOException) { }
         }
     }
 

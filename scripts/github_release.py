@@ -41,14 +41,30 @@ def git(*arguments):
     return subprocess.check_output(['git', '-C', str(ROOT), *arguments], encoding='utf-8').strip()
 
 
-def expected_names(version, build):
+def artifact_types_from_manifest(manifest):
+    artifacts = manifest.get('artifacts')
+    require(isinstance(artifacts, list) and artifacts, 'Release manifest must contain at least one client artifact')
+    types = [row.get('type') if isinstance(row, dict) else None for row in artifacts]
+    require(all(kind in ('apk', 'setup') for kind in types), 'Release manifest contains an unknown client artifact type')
+    require(len(types) == len(set(types)), 'Release manifest contains duplicate client artifact types')
+    require('apk' in types and len(types) in (1, 2), 'Release manifest must contain exactly one APK and at most one Setup')
+    return frozenset(types)
+
+
+def expected_names(version, build, artifact_types=None):
     require(isinstance(version, str) and re.fullmatch(r'\d+\.\d+\.\d+', version), 'Invalid release version')
     require(type(build) is int and 1 <= build <= 65535, 'Invalid release build')
-    return {f'TermLink-Android-{version}-{build}.apk',
-            f'TermLink-Setup-{version}.{build}-x64.exe',
+    raw_types = ('apk', 'setup') if artifact_types is None else tuple(artifact_types)
+    require(len(raw_types) == len(set(raw_types)), 'Duplicate client artifact types')
+    types = frozenset(raw_types)
+    require(types in (frozenset(('apk',)), frozenset(('apk', 'setup'))), 'Invalid client artifact types')
+    names = {f'TermLink-Android-{version}-{build}.apk',
             f'TermLink-{version}-{build}-source.zip',
             f'TermLink-{version}-{build}-source.zip.sha256.json',
             'artifact-manifest.json', 'SHA256SUMS'}
+    if 'setup' in types:
+        names.add(f'TermLink-Setup-{version}.{build}-x64.exe')
+    return names
 
 
 def validate_bundle(directory, revision, digest=None):
@@ -63,21 +79,27 @@ def validate_bundle(directory, revision, digest=None):
     require(metadata['source_revision'] == revision == git('rev-parse', '--verify', revision+'^{commit}'), 'Release source commit is unavailable')
     require(metadata['signers'] == json.loads(git('show', revision+':release/github-release-policy.json')), 'Unexpected signing identities')
     records = metadata['files']
-    require(len(records) == len(expected_names(version, build)), 'Unexpected release file count')
-    require({row['name'] for row in records} == expected_names(version, build), 'Unexpected release filenames')
+    manifest = read_json(directory/'artifact-manifest.json')
+    artifact_types = artifact_types_from_manifest(manifest)
+    expected = expected_names(version, build, artifact_types)
+    require(len(records) == len(expected), 'Unexpected release file count')
+    require({row['name'] for row in records} == expected, 'Unexpected release filenames')
     for row in records:
         path = directory/row['name']
         require(path.is_file() and not path.is_symlink(), f'Missing regular release file: {row["name"]}')
         require(path.stat().st_size == row['size'] and sha256(path) == row['sha256'], f'Release file changed: {row["name"]}')
-    manifest = read_json(directory/'artifact-manifest.json')
     require(manifest['release_mode'] == 'production' and manifest['version'] == version and
             manifest['build_number'] == build and manifest['source_revision'] == revision, 'Client manifest identity mismatch')
     lock = json.loads(git('show', revision+':terminal-core.lock.json'))
     require(not lock['source_dirty'] and manifest['core_revision'] == metadata['core_revision'] == lock['revision'], 'Core revision mismatch')
-    require(len(manifest['artifacts']) == 2 and {row['type'] for row in manifest['artifacts']} == {'apk', 'setup'}, 'Expected one APK and one Windows Setup')
+    if 'artifact_types' in metadata:
+        require(frozenset(metadata['artifact_types']) == artifact_types, 'Release metadata artifact types differ from manifest')
     for row in manifest['artifacts']:
         name = PurePosixPath(row['path']).name
         require(row['path'] == f'artifacts/release/{version}-{build}/{name}', 'Unsafe client artifact path')
+        expected_name = (f'TermLink-Android-{version}-{build}.apk' if row['type'] == 'apk'
+                         else f'TermLink-Setup-{version}.{build}-x64.exe')
+        require(name == expected_name, 'Client artifact filename does not match its type')
         record = next((item for item in records if item['name'] == name), None)
         require(record and row['sha256'] == record['sha256'] and row['size'] == record['size'] and row['version'] == version, 'Client hashes differ from release metadata')
     source = directory/f'TermLink-{version}-{build}-source.zip'
@@ -178,13 +200,15 @@ def stage(args, api):
     version, build, revision = manifest['version'], manifest['build_number'], manifest['source_revision']
     require(not git('status', '--porcelain'), 'Commit source and documentation before staging a release')
     require(revision == git('rev-parse', 'HEAD'), 'Stage the clients from their exact build source checkout')
-    names = expected_names(version, build)-{'SHA256SUMS'}
+    artifact_types = artifact_types_from_manifest(manifest)
+    names = expected_names(version, build, artifact_types)-{'SHA256SUMS'}
     checksum_text = ''.join(f'{sha256(directory/name)}  {name}\n' for name in sorted(names))
     (directory/'SHA256SUMS').write_text(checksum_text, encoding='utf-8')
     metadata = dict(schema_version=1, version=version, build_number=build, source_revision=revision,
-                    core_revision=manifest['core_revision'], signers=read_json(ROOT/'release/github-release-policy.json'),
+                    core_revision=manifest['core_revision'], artifact_types=sorted(artifact_types),
+                    signers=read_json(ROOT/'release/github-release-policy.json'),
                     files=[dict(name=name, size=(directory/name).stat().st_size, sha256=sha256(directory/name))
-                           for name in sorted(expected_names(version, build))])
+                           for name in sorted(expected_names(version, build, artifact_types))])
     write_json(directory/'github-release.json', metadata)
     validate_bundle(directory, revision)
     api.require_checks(revision)
@@ -250,7 +274,10 @@ def receive(args, api):
     api.download(indexed['github-release.json']['id'], directory/'github-release.json')
     require(sha256(directory/'github-release.json') == args.metadata_sha256, 'Release metadata digest mismatch')
     metadata = read_json(directory/'github-release.json')
-    require(set(indexed) == expected_names(metadata['version'], metadata['build_number']) | {'github-release.json'}, 'Unexpected remote attachments')
+    metadata_types = frozenset(metadata.get('artifact_types', ('apk', 'setup')))
+    if 'artifact_types' not in metadata:
+        metadata_types = frozenset({'apk'} | ({'setup'} if f'TermLink-Setup-{metadata["version"]}.{metadata["build_number"]}-x64.exe' in indexed else set()))
+    require(set(indexed) == expected_names(metadata['version'], metadata['build_number'], metadata_types) | {'github-release.json'}, 'Unexpected remote attachments')
     require(release['tag_name'] == 'v'+metadata['version'] and release['target_commitish'] == args.revision, 'Draft source identity mismatch')
     api.require_tag(release['tag_name'], args.revision)
     for name, asset in indexed.items():

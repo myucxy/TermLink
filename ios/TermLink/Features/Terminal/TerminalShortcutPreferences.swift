@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import Combine
 import Foundation
 
 /// Custom terminal dock shortcuts, mirroring the Android `TerminalCustomShortcut` model:
@@ -51,7 +52,9 @@ struct TerminalCustomShortcut: Codable, Identifiable, Equatable {
     static func valid(key: UInt32, scalar: UInt32, shift: Bool, alt: Bool, control: Bool) -> Bool {
         if key == 1 {
             guard let unicode = Unicode.Scalar(scalar), !CharacterSet.controlCharacters.contains(unicode) else { return false }
-            return shift || alt || control // A bare character adds nothing over the keyboard.
+            // Android accepts printable character shortcuts, including the canonical
+            // scalar left after Shift-only input has been folded during normalization.
+            return true
         }
         return specialKeys.contains { $0.1 == key }
     }
@@ -83,6 +86,10 @@ enum TerminalShortcutLayout {
 
 /// Device-local dock preferences (UserDefaults, like Android SharedPreferences: UI comfort, not secrets).
 @MainActor final class TerminalShortcutStore: ObservableObject {
+    struct Removal {
+        let entries: [(index: Int, shortcut: TerminalCustomShortcut)]
+    }
+
     private let defaults: UserDefaults
     @Published var twoRows: Bool {
         didSet { defaults.set(twoRows, forKey: "terminal-shortcuts-two-rows") }
@@ -93,16 +100,62 @@ enum TerminalShortcutLayout {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         twoRows = defaults.object(forKey: "terminal-shortcuts-two-rows") as? Bool ?? true
-        customs = defaults.data(forKey: "terminal-shortcuts-custom")
-            .flatMap { try? JSONDecoder().decode([TerminalCustomShortcut].self, from: $0) } ?? []
+        customs = Self.load(defaults.data(forKey: "terminal-shortcuts-custom"))
+        // Save the repaired list as well, so duplicates and invalid entries do not return.
+        defaults.set(try? JSONEncoder().encode(customs), forKey: "terminal-shortcuts-custom")
     }
     func upsert(_ shortcut: TerminalCustomShortcut) throws {
-        guard var value = shortcut.normalized else { throw ClientError.unavailable("快捷键配置无效，请检查名称与内容。") }
-        if !customs.contains(where: { $0.id == value.id }) {
+        guard let value = shortcut.normalized else { throw ClientError.unavailable("快捷键配置无效，请检查名称与内容。") }
+        if let index = customs.firstIndex(where: { $0.id == value.id }) {
+            customs[index] = value
+        } else {
             guard customs.count < TerminalCustomShortcut.maxShortcuts else { throw ClientError.limitExceeded }
-            value.id = UUID().uuidString.lowercased()
+            customs.append(value)
         }
-        customs = (customs.filter { $0.id != value.id } + [value]).sorted { $0.id < $1.id }
     }
     func remove(_ id: String) { customs.removeAll { $0.id == id } }
+
+    func move(from offsets: IndexSet, to destination: Int) {
+        guard !offsets.isEmpty, (0...customs.count).contains(destination),
+              offsets.allSatisfy({ customs.indices.contains($0) }) else { return }
+        let moving = offsets.sorted().map { customs[$0] }
+        var remaining = customs.enumerated().filter { !offsets.contains($0.offset) }.map(\.element)
+        let insertion = destination - offsets.filter { $0 < destination }.count
+        remaining.insert(contentsOf: moving, at: insertion)
+        customs = remaining
+    }
+
+    func remove(at offsets: IndexSet) -> Removal? {
+        let entries = offsets.sorted().compactMap { index -> (index: Int, shortcut: TerminalCustomShortcut)? in
+            customs.indices.contains(index) ? (index, customs[index]) : nil
+        }
+        guard !entries.isEmpty else { return nil }
+        customs = customs.enumerated().filter { !offsets.contains($0.offset) }.map(\.element)
+        return Removal(entries: entries)
+    }
+
+    func restore(_ removal: Removal) throws {
+        let currentIDs = Set(customs.map(\.id))
+        let missing = removal.entries.filter { !currentIDs.contains($0.shortcut.id) }
+        guard customs.count + missing.count <= TerminalCustomShortcut.maxShortcuts else { throw ClientError.limitExceeded }
+        var next = customs
+        for entry in missing.sorted(by: { $0.index < $1.index }) {
+            next.insert(entry.shortcut, at: min(entry.index, next.count))
+        }
+        customs = next
+    }
+
+    private static func load(_ data: Data?) -> [TerminalCustomShortcut] {
+        guard let data, data.count <= 1_048_576,
+              let items = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return [] }
+        var result: [TerminalCustomShortcut] = [], admitted = Set<String>()
+        for item in items {
+            guard let raw = try? JSONSerialization.data(withJSONObject: item, options: .fragmentsAllowed),
+                  let shortcut = try? JSONDecoder().decode(TerminalCustomShortcut.self, from: raw),
+                  let value = shortcut.normalized, admitted.insert(value.id).inserted else { continue }
+            result.append(value)
+            if result.count == TerminalCustomShortcut.maxShortcuts { break }
+        }
+        return result
+    }
 }

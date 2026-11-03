@@ -1,0 +1,20 @@
+# Opt-in overlay for the existing server service. Supply the actual .p8 only
+# through the host secret file; never place it in this repository or environment.
+services:
+  server:
+    environment:
+      TERMLINK_APNS_ENABLED: "true"
+      TERMLINK_APNS_TEAM_ID: ${TERMLINK_APNS_TEAM_ID:?APNs Team ID is required}
+      TERMLINK_APNS_KEY_ID: ${TERMLINK_APNS_KEY_ID:?APNs key ID is required}
+      TERMLINK_APNS_TOPIC: ${TERMLINK_APNS_TOPIC:?APNs app bundle ID is required}
+      TERMLINK_APNS_ENVIRONMENT: ${TERMLINK_APNS_ENVIRONMENT:?sandbox or production is required}
+      TERMLINK_APNS_PRIVATE_KEY_FILE: /run/secrets/apns_auth_key
+    secrets:
+      - source: apns_auth_key
+        target: apns_auth_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+secrets:
+  apns_auth_key:
+    file: ${TERMLINK_APNS_PRIVATE_KEY_FILE:?Host APNs .p8 file is required}

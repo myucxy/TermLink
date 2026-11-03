@@ -16,11 +16,27 @@ namespace TermLink.Desktop.HeadlessTests;
 public static class Program
 {
     [STAThread]
-    public static async Task Main()
+    public static void Main()
     {
         AppBuilder.Configure<App>()
             .UseHeadless(new AvaloniaHeadlessPlatformOptions())
             .SetupWithoutStarting();
+
+        // SetupWithoutStarting has no running dispatcher loop. Keep pumping
+        // the UI thread while awaited command continuations are queued to it.
+        var validation = ValidateAsync();
+        var deadline = Stopwatch.StartNew();
+        while (!validation.IsCompleted && deadline.Elapsed < TimeSpan.FromSeconds(90))
+        {
+            Dispatcher.UIThread.RunJobs();
+            Thread.Sleep(1);
+        }
+        if (!validation.IsCompleted) throw new TimeoutException("Headless UI validation did not complete.");
+        validation.GetAwaiter().GetResult();
+    }
+
+    private static async Task ValidateAsync()
+    {
 
         Require(MainWindowViewModel.DefaultUpdateCheckInterval == TimeSpan.FromMinutes(30),
             "The default update-check interval is not 30 minutes.");
@@ -223,14 +239,9 @@ public static class Program
         viewModel.DetectAiAgentsCommand.Execute(null);
         await DrainCommandAsync(viewModel.DetectAiAgentsCommand);
         Require(viewModel.Settings.AiAgents.Count == 1, "AI rescan duplicated entries.");
-        viewModel.Settings.ZcodeRemoteUrl = "https://zcode.z.ai/remote/v4?pair=fixture-only";
-        viewModel.SaveZcodeRemoteCommand.Execute(null);
-        await DrainCommandAsync(viewModel.SaveZcodeRemoteCommand);
-        Require(client.RemoteConfigured && viewModel.Settings.ZcodeRemoteUrl.Length == 0 &&
-                viewModel.Settings.AiAgents.Single().Strategy == "desktop_remote", "Saving remote config did not clear the input and refresh the strategy.");
-        viewModel.ClearZcodeRemoteCommand.Execute(null);
-        await DrainCommandAsync(viewModel.ClearZcodeRemoteCommand);
-        Require(!client.RemoteConfigured && viewModel.Settings.AiAgents.Single().Strategy == "native", "Clearing config did not restore native strategy.");
+        Require(viewModel.Settings.AiAgents.Single().Strategy == "native", "ZCode must use the native session strategy.");
+        Require(typeof(MainWindowViewModel).GetProperty("SaveZcodeRemoteCommand") == null &&
+            typeof(SettingsPageViewModel).GetProperty("ZcodeRemoteUrl") == null, "Retired URL entry point remained exposed.");
         viewModel.SelectSettingsSection("commands");
         Dispatcher.UIThread.RunJobs();
         Require(currentPageTitle.Text == PresentationText.Settings &&
@@ -573,6 +584,9 @@ public static class Program
             "Explicit control-UI exit did not allow the window to close.");
 
         VerifySingleInstanceActivation();
+        await CompleteExitValidation.ValidateAsync();
+        await MacUsabilityValidation.ValidateAsync();
+        await MacUsabilityValidation.ValidateUpdaterAsync();
 
         var periodicOperations = new FixtureDesktopOperations();
         var periodicClient = new StaticAgentClient(snapshot);
@@ -661,19 +675,14 @@ public static class Program
 
     private sealed class StaticAgentClient(AgentStatusSnapshot snapshot) : IAgentClient
     {
+        public bool SupportsAiAgentDetection => true;
         public AgentStatusSnapshot CurrentSnapshot { get; set; } = snapshot;
         public bool StopSessionCalled { get; private set; }
         public bool BeginAccountAuthorizationCalled { get; private set; }
         public string AuthorizedPcName { get; private set; } = string.Empty;
         public IReadOnlyList<TerminalCommandCapability> SavedTerminalCommands { get; private set; } = Array.Empty<TerminalCommandCapability>();
-        public bool SupportsZcodeRemoteConfiguration => true;
-        public bool RemoteConfigured { get; private set; }
-        public ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken) {
-            RemoteConfigured = url.Length > 0;
-            return ValueTask.CompletedTask;
-        }
         public ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken) =>
-            ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(new[] { new AiAgentCapability("zcode", "ZCode", "D:\\ZCode\\zcode.exe", "1", "available", RemoteConfigured ? "desktop_remote" : "native") });
+            ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(new[] { new AiAgentCapability("zcode", "ZCode", "D:\\ZCode\\zcode.exe", "1", "available", "native") });
         public ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken) =>
             ValueTask.FromResult(CurrentSnapshot);
 

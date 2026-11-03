@@ -2,12 +2,37 @@
   "version": 2,
   "dependencies": {
     "net8.0": {
+      "BouncyCastle.Cryptography": {
+        "type": "Transitive",
+        "resolved": "2.5.1",
+        "contentHash": "zy8TMeTP+1FH2NrLaNZtdRbBdq7u5MI+NFZQOBSM69u5RFkciinwzV2eveY6Kjf5MzgsYvvl6kTStsj3JrXqkg=="
+      },
+      "Google.Protobuf": {
+        "type": "Transitive",
+        "resolved": "3.31.1",
+        "contentHash": "gSnJbUmGiOTdWddPhqzrEscHq9Ls6sqRDPB9WptckyjTUyx70JOOAaDLkFff8gManZNN3hllQ4aQInnQyq/Z/A=="
+      },
+      "termlink.agent.ai": {
+        "type": "Project",
+        "dependencies": {
+          "System.Security.Cryptography.ProtectedData": "[8.0.0, )",
+          "TermLink.Agent.Connection": "[0.3.16, )"
+        }
+      },
+      "termlink.agent.connection": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Protocol": "[0.3.16, )"
+        }
+      },
       "termlink.agent.local": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )",
-          "TermLink.Presentation": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Presentation": "[0.3.16, )"
         }
       },
       "termlink.pc.contracts": {
@@ -16,38 +41,51 @@
       "termlink.platform.abstractions": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )"
         }
       },
       "termlink.platform.linux": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )",
-          "TermLink.Platform.Unix": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Platform.Unix": "[0.3.16, )"
         }
       },
       "termlink.platform.macos": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )",
-          "TermLink.Platform.Unix": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Platform.Unix": "[0.3.16, )"
         }
       },
       "termlink.platform.unix": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )"
         }
       },
       "termlink.presentation": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )"
         }
+      },
+      "termlink.protocol": {
+        "type": "Project",
+        "dependencies": {
+          "BouncyCastle.Cryptography": "[2.5.1, )",
+          "Google.Protobuf": "[3.31.1, )"
+        }
+      },
+      "System.Security.Cryptography.ProtectedData": {
+        "type": "CentralTransitive",
+        "requested": "[8.0.0, )",
+        "resolved": "8.0.0",
+        "contentHash": "+TUFINV2q2ifyXauQXRwy4CiBhqvDEDZeVJU7qfxya4aRYOKzVBpN+4acx25VcPB9ywUN6C0n8drWl110PhZEg=="
       }
     },
     "net8.0/linux-arm64": {},

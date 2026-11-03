@@ -22,6 +22,7 @@ Contracts <- Platform.Abstractions <- Presentation <- Desktop
 | `src/Presentation/` | 平台无关的展示状态和交互 |
 | `src/Contracts/`、`src/Platform.Abstractions/` | 跨层契约和平台接口 |
 | `src/Windows/` | Windows 本机 Agent 适配 |
+| `src/Agent.Connection/` | portable Host 的浏览器授权、账号隔离和 Relay 控制连接 |
 | `src/Agent.Local/`、`src/Agent.Host/`、`src/Unix/`、`src/Linux/`、`src/MacOS/` | 可移植 Host 与 Unix 平台适配 |
 | `tests/` | 架构、Headless、平台适配与性能验证 |
 | `package/` | 平台打包脚本 |
@@ -61,7 +62,13 @@ OpenCode 使用本机 `opencode acp`，支持创建、文本流、审批、中�
 Codex 在仅排除测试进程中的独立 CLI 后，仍能使用已验证签名的桌面引擎续聊。
 ACP 模型选项以会话加载响应为准，避免在初始化阶段误报模型能力不可用。
 
-Linux/macOS 有独立 Host 与认证 Unix-domain IPC；当前真实远程 Relay 仍存在 `PORTABLE_RELAY_NOT_CONFIGURED` 限制，不能按 Windows 的功能和发布状态宣传。AppImage/PKG 需要目标平台、签名材料及专项验收，交叉编译成功不等于可发布。
+Linux/macOS 有独立 Host 与认证 Unix-domain IPC；2026-10-25 已接入浏览器授权、PC_AGENT 注册、Relay 在线状态、心跳、重连与账号隔离。2026-10-27 Mac 新增复用 ZCode App 的原生 AI 会话和加密 Relay 承载，移除 URL 网页方案；官方账户模型授权及真实手机联通尚未验收，远程终端／文件仍未接通，不能按 Windows 完整功能宣传。实现范围、剩余差异及 macOS DEV 构建见 [macOS 开发说明](MACOS.md)。AppImage/PKG 仍需要目标平台、签名材料及专项验收，交叉编译成功不等于可发布。
+
+macOS 托盘支持“完全退出 TermLink”：确认后停止 Relay、受管会话和后台 Agent，再退出 UI，保留登录信息。“退出控制界面”继续只关闭 UI。完全退出的认证、实际进程等待和失败重试见 [macOS 开发说明](MACOS.md#托盘退出行为)。
+
+macOS 设置页提供本机 AI CLI 检测、Shell 刷新、Finder／系统终端／登录项入口与诊断摘要；按平台隐藏 Windows Terminal 和 Windows 更新操作。当前未接通的远程终端、文件、AI 及自定义命令编辑会明确说明范围，完整检查表见 [Mac 桌面功能检查](MACOS.md#桌面功能检查2026-10-26)。
+
+macOS 已实现独立 PKG 更新流程：自动检查、确认下载、SHA-256／固定发布者／公证校验、停止 Agent、系统授权安装和重启。另提供手动 DEV PKG 打包。正式在线更新需 Developer ID 证书、公证及 Mac 渠道发布，目前 DEV 不开启自动升级，见 [安装与自动更新](package/macos/AUTO-UPDATE.md)。
 
 当前生产验收为 Relay Only。历史直连测试和机器专属 WSL 命令不作为新开发者的默认入口。
 

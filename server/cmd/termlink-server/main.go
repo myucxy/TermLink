@@ -38,6 +38,7 @@ import (
 	"github.com/termlink/termlink/server/internal/observability"
 	"github.com/termlink/termlink/server/internal/outbox"
 	"github.com/termlink/termlink/server/internal/presence"
+	"github.com/termlink/termlink/server/internal/pushnotify"
 	"github.com/termlink/termlink/server/internal/realtime"
 	"github.com/termlink/termlink/server/internal/registrationrecovery"
 	serverruntime "github.com/termlink/termlink/server/internal/runtime"
@@ -331,8 +332,26 @@ func runProduction() error {
 		}
 		return cfg.AccountDeletionEnabled
 	}
+	var notificationWorker *pushnotify.Worker
+	pushConfig := api.PushNotificationConfiguration{Enabled: cfg.APNsEnabled, Topic: cfg.APNsTopic, Environment: cfg.APNsEnvironment}
+	if cfg.APNsEnabled {
+		codec, codecErr := pushnotify.New(deriveServerKey(keyMaster, "push-device-token-v1"))
+		if codecErr != nil {
+			return errors.New("initialize push token encryption")
+		}
+		sender, senderErr := pushnotify.NewAPNs(pushnotify.Config{TeamID: cfg.APNsTeamID, KeyID: cfg.APNsKeyID, Topic: cfg.APNsTopic, Environment: cfg.APNsEnvironment, PrivateKey: []byte(cfg.APNsPrivateKey.Value())})
+		if senderErr != nil {
+			return errors.New("initialize APNs sender")
+		}
+		pushConfig.Codec = codec
+		notificationWorker, err = pushnotify.NewWorker(repository, sender, codec)
+		if err != nil {
+			return errors.New("initialize push queue worker")
+		}
+	}
 	productionAPI := &api.API{
 		Store: repository, Valkey: coordinator, Presence: onlinePresence, Tokens: verifier, Auth: authentication,
+		PushNotifications: pushConfig,
 		ServiceEmail:      serviceEmail,
 		HumanVerification: humanVerificationManager,
 		SubjectKey:        subjectKey, TokenKey: tokenKey, RegistrationCodeKey: registrationCodeKey,
@@ -527,6 +546,8 @@ func runProduction() error {
 		Issuer:                      cfg.OIDCIssuer,
 		BackchannelIssuer:           cfg.OIDCBackchannelIssuer,
 		ClientID:                    cfg.WebOIDCClientID,
+		AndroidClientID:             cfg.AndroidOIDCClientID,
+		IOSClientID:                 cfg.IOSOIDCClientID,
 		WindowsClientID:             cfg.WindowsOIDCClientID,
 		StepUpClientID:              cfg.WebOIDCStepUpClientID,
 		RedirectURI:                 cfg.WebOIDCRedirectURI,
@@ -612,6 +633,13 @@ func runProduction() error {
 		return ctx.Err()
 	case <-time.After(5 * time.Second):
 		return errors.New("realtime authority subscription did not become ready")
+	}
+	if notificationWorker != nil {
+		go func() {
+			if err := notificationWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Warn("push notification worker stopped", "error_class", "PUSH_WORKER_STOPPED")
+			}
+		}()
 	}
 	go (outbox.Dispatcher{Store: repository, Valkey: coordinator, Logger: slog.Default()}).Run(ctx)
 	if registrationRecoveryRunner != nil {

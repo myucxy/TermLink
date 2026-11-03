@@ -182,5 +182,29 @@
     "column": 11,
     "sha256": "2eda90f8d81e851e41b22d62f40ffd62d72327eede68ba8dd6c5fc0436333b2c",
     "reason": "Fixed protocol test vector, synthetic deployment fixture, or public signer fingerprint; reviewed 2026-10-16 and byte-checked 2026-10-18"
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "ios/TermLink/Security/KeychainStore.swift",
+    "line": 36,
+    "column": 10,
+    "sha256": "8c0709a76bd9a5a0923031394a892624f0fdbbc771a1515a0aa74b710aee341b",
+    "reason": "Swift computed private-key accessor constructs a key from runtime Keychain bytes; no literal key or credential. Reviewed 2026-11-03."
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "ios/TermLink/Security/KeychainStore.swift",
+    "line": 37,
+    "column": 10,
+    "sha256": "8c0709a76bd9a5a0923031394a892624f0fdbbc771a1515a0aa74b710aee341b",
+    "reason": "Swift computed private-key accessor constructs a key from runtime Keychain bytes; no literal key or credential. Reviewed 2026-11-03."
+  },
+  {
+    "rule": "generic-api-key",
+    "path": "pc-client/tests/RelayConnectionValidation/Program.cs",
+    "line": 555,
+    "column": 73,
+    "sha256": "adc2c92fbe2dfaca1b61f3ccceb903fd9b03cb32b2474df12495fc7f2f8b92ae",
+    "reason": "Loopback-only synthetic JWT assembled by the validation fixture with a noncryptographic fixture-signature suffix; no live account credential. Reviewed 2026-11-03."
   }
 ]

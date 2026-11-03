@@ -10,6 +10,8 @@ import dev.termlink.model.SessionSummary
 import dev.termlink.session.RemoteSessionState
 import dev.termlink.terminal.api.TerminalPaletteSnapshotV1
 import dev.termlink.terminal.api.TerminalTranscriptPageV1
+import dev.termlink.network.production.TermLinkApiException
+import dev.termlink.network.production.HostDeviceUpgradeRequiredException
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.runBlocking
@@ -19,6 +21,49 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProductUiLogicTest {
+    @Test
+    fun operationMessagesAddOnlyAllowlistedConnectionStageDetails() {
+        val relayFailure = TermLinkApiException(
+            status = 503,
+            code = "RELAY_UNAVAILABLE",
+            traceId = null,
+            stage = "relay_handshake",
+        )
+        assertEquals(
+            "服务端暂时无法处理请求，请稍后重试。（连接阶段：Relay 握手）",
+            safeOperationMessage(relayFailure, "fallback"),
+        )
+
+        val unknownStage = TermLinkApiException(
+            status = 503,
+            code = "RELAY_UNAVAILABLE",
+            traceId = null,
+            stage = "secret/user/response",
+        )
+        val safeUnknown = safeOperationMessage(unknownStage, "fallback")
+        assertEquals("服务端暂时无法处理请求，请稍后重试。", safeUnknown)
+        assertFalse(safeUnknown.contains("secret"))
+        assertFalse(safeUnknown.contains("response"))
+    }
+
+    @Test
+    fun operationMessagesKeepAuthPromptAndUseGenericAgentUpgradeCopy() {
+        val authFailure = TermLinkApiException(
+            status = 401,
+            code = "UNAUTHENTICATED",
+            traceId = null,
+            stage = "device_identity",
+        )
+        assertEquals(
+            "登录已失效，请重新登录。（连接阶段：设备身份校验）",
+            safeOperationMessage(authFailure, "fallback"),
+        )
+        assertEquals(
+            "电脑端版本不支持此操作，请升级电脑端 Agent。",
+            safeOperationMessage(HostDeviceUpgradeRequiredException("host_session_catalog_v1"), "fallback"),
+        )
+    }
+
     @Test
     fun deviceRefreshUsesOneBusyGateForPullAndIconActions() {
         assertFalse(deviceRefreshInProgress(false, ProductConnectionState.CONNECTED))

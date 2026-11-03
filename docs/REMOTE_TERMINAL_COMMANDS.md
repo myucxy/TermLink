@@ -79,6 +79,18 @@ that one detected mapping out of the response. Other detected commands and manua
 custom commands remain unchanged. This is a response-only projection: the stored
 `terminal_commands`, `supported_shells`, and `capabilities` values are not modified.
 
+## POSIX shell negotiation
+
+Portable macOS/Linux `PC_AGENT` hosts may advertise the known detected shells `bash`, `zsh`, `sh`, and `fish`. To keep released Android clients from rejecting an otherwise valid PC list, a client that understands these shell values sends this exact header on `GET /v1/pcs`:
+
+```text
+X-TermLink-PC-Shell-Capabilities: posix-shells-v1
+```
+
+Without the exact single token, the response hides those four shell values from `supported_shells` and `terminal_commands`; Windows shell values and manual `shell_type: custom` commands remain unchanged. The projection is response-only and does not change stored PC metadata. A client may send both capability headers; each header is independently exact-token validated.
+
+POSIX shell metadata does not itself grant a remote terminal data plane. A portable host must still explicitly advertise the corresponding server-approved capabilities and may not claim terminal, file, snapshot, shell-command, or update support that it has not implemented.
+
 ## Compatibility
 
 `supported_shells` and `shell_type` remain available for older Android and Agent versions. New Android versions use this fallback only when a PC has not reported `terminal_commands`. Built-in commands retain their existing IDs, so mixed-version clients continue to launch the four fixed shells during rollout.
@@ -88,3 +100,31 @@ Migration 22 adds `pcs.terminal_commands` and broadens the successful `OPEN_TERM
 ## Extension boundary
 
 Future command providers should produce the same local profile and public capability types. Providers own detection and local launch resolution; the server and Android continue to operate only on opaque command IDs and safe display metadata.
+
+## Capability-driven mobile behavior and CLI workspaces
+
+Android uses the host's reported capabilities and permissions to expose AI, file,
+terminal, and remote-update actions. The platform name is display metadata; it
+does not prove support for a feature. An AI-only or control-only host is not
+queried for a terminal session catalog. Hosts that declare terminal support but
+omit the required catalog capability still report an unavailable catalog.
+
+The AI catalog optionally advertises `cliWorkspaceCreation: true`. To create a
+default CLI directory, Android sends `create-cli-workspace` through the existing
+encrypted AI request channel, with `hostId` and a stable `operationId`. The host
+creates a directory under its own workspace root and returns
+`{hostId, operationId, directory}`. The phone treats the returned directory as an
+opaque path and then uses the normal `OPEN_TERMINAL` operation. It never constructs
+a host path with Windows separators. Lost replies retain the original request for
+receipt recovery; a fresh request creates a separate directory. Older hosts that
+omit this capability can still launch terminals in an explicitly selected existing
+directory. Older phones can continue using `cliWorkspaceRoot`.
+
+Schema migration 52 extends the existing bounded shell whitelist and terminal
+result constraint for POSIX metadata. Apply it before deploying a server built
+from this change; historical migrations remain unchanged. Rollback refuses to
+erase POSIX command metadata or operation receipts. This change does not implement
+the Mac terminal data plane, file operations, or remote installation. Mac currently
+reports only the AI capability. Remote-update package selection and installation
+remain checked by the server and the host; removing a mobile platform check does
+not enable Mac upgrades through the Windows update service.

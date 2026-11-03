@@ -5,9 +5,9 @@
       "termlink.agent.local": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )",
-          "TermLink.Presentation": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Presentation": "[0.3.16, )"
         }
       },
       "termlink.pc.contracts": {
@@ -16,21 +16,29 @@
       "termlink.platform.abstractions": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )"
+        }
+      },
+      "termlink.platform.macos": {
+        "type": "Project",
+        "dependencies": {
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )",
+          "TermLink.Platform.Unix": "[0.3.16, )"
         }
       },
       "termlink.platform.unix": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )"
         }
       },
       "termlink.presentation": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )",
-          "TermLink.Platform.Abstractions": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )",
+          "TermLink.Platform.Abstractions": "[0.3.16, )"
         }
       }
     },

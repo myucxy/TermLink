@@ -10,8 +10,9 @@ import (
 func newAppShipSources() (*agentupdate.AppShipCatalog, webportal.PublicReleaseSource, error) {
 	// Both readers share one immutable startup policy; legacy database overrides are ignored.
 	privateIPs := os.Getenv("TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS")
-	catalog, err := agentupdate.NewAppShipCatalogWithSignerAnchor(
+	catalog, err := agentupdate.NewAppShipCatalogWithPlatformAnchors(
 		agentupdate.DefaultAppShipBaseURL, nil, privateIPs, os.Getenv("TERMLINK_APPSHIP_SIGNER_FINGERPRINT"),
+		os.Getenv("TERMLINK_APPSHIP_MACOS_TEAM_ID"),
 	)
 	if err != nil {
 		return nil, nil, err

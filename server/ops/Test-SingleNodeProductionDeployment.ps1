@@ -114,6 +114,10 @@ $expectedEnvironmentNames = @(
     'TERMLINK_PUBLIC_HOST', 'TERMLINK_PUBLIC_URL', 'TERMLINK_RUNTIME_DIR',
     'TERMLINK_SECRETS_DIR'
 )
+# Pre-iOS managed config files remain valid; new identity settings are optional.
+foreach ($optionalName in @('TERMLINK_IOS_OIDC_CLIENT_ID', 'TERMLINK_IOS_OIDC_REDIRECT_URI', 'TERMLINK_OIDC_ALLOWED_PARTIES')) {
+    if ($deploymentEnvironment.ContainsKey($optionalName)) { $expectedEnvironmentNames += $optionalName }
+}
 Assert-ExactSet -Expected $expectedEnvironmentNames -Actual @($deploymentEnvironment.Keys) `
     -Message 'Deployment environment keys differ from the reviewed non-secret set.'
 Assert-SingleNode ($deploymentEnvironment.TERMLINK_CONFIG_VERSION -ceq '2') 'Unsupported deployment environment version.'
@@ -216,6 +220,36 @@ Assert-SingleNode (-not [bool](Get-Value (Get-Value $config.networks 'egress') '
 
 $server = Get-Value $config.services 'server'
 $serverEnvironment = Get-Value $server 'environment'
+$iosClientID = if ($deploymentEnvironment.ContainsKey('TERMLINK_IOS_OIDC_CLIENT_ID')) {
+    [string]$deploymentEnvironment.TERMLINK_IOS_OIDC_CLIENT_ID
+} else { '' }
+$iosRedirectURI = if ($deploymentEnvironment.ContainsKey('TERMLINK_IOS_OIDC_REDIRECT_URI') -and
+    $deploymentEnvironment.TERMLINK_IOS_OIDC_REDIRECT_URI -ne '') {
+    [string]$deploymentEnvironment.TERMLINK_IOS_OIDC_REDIRECT_URI
+} else { 'dev.termlink.ios:/oauth2redirect' }
+Assert-SingleNode ($iosClientID -eq '' -or ($iosClientID -cmatch '^[A-Za-z0-9._-]{1,128}$' -and
+    $iosClientID -cnotin @('termlink-android', 'termlink-windows', 'termlink-web', 'termlink-web-step-up', 'termlink-server'))) `
+    'iOS must use a distinct explicit public client ID, or stay disabled.'
+Assert-SingleNode ($iosRedirectURI -ceq 'dev.termlink.ios:/oauth2redirect') 'iOS callback must remain fixed.'
+Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_IOS_OIDC_CLIENT_ID') -ceq $iosClientID) `
+    'Rendered iOS client ID differs from managed configuration.'
+# Older rendered assets have no iOS redirect field while the client is disabled.
+$renderedIOSRedirect = Get-Value $serverEnvironment 'TERMLINK_IOS_OIDC_REDIRECT_URI'
+Assert-SingleNode (($null -eq $renderedIOSRedirect -and $iosClientID -eq '') -or
+    [string]$renderedIOSRedirect -ceq $iosRedirectURI) 'Rendered iOS callback differs from managed configuration.'
+if ($deploymentEnvironment.ContainsKey('TERMLINK_OIDC_ALLOWED_PARTIES')) {
+    $allowedParties = [string]$deploymentEnvironment.TERMLINK_OIDC_ALLOWED_PARTIES
+    Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_OIDC_ALLOWED_PARTIES') -ceq $allowedParties) `
+        'Rendered OIDC allowed parties differ from managed configuration.'
+    if ($allowedParties -ne '') {
+        $parties = @($allowedParties.Split(','))
+        Assert-SingleNode (@($parties | Where-Object { $_ -cnotmatch '^[A-Za-z0-9._-]{1,128}$' -or $_ -ceq 'termlink-server' }).Count -eq 0) `
+            'OIDC allowed parties contain an invalid client ID.'
+        foreach ($party in @('termlink-android', 'termlink-windows', $iosClientID) | Where-Object { $_ -ne '' }) {
+            Assert-SingleNode ($party -cin $parties) "OIDC allowed parties omitted $party."
+        }
+    }
+}
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_RUNTIME_MODE') -ceq 'single-node') `
     'Server must use single-node runtime mode.'
 Assert-SingleNode ([string](Get-Value $serverEnvironment 'TERMLINK_IDENTITY_PROVIDER') -ceq 'embedded') `

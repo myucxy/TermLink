@@ -28,6 +28,20 @@ IMAGE=''
 HTTP_PORT=''
 PUBLIC_PORT=''
 BACKUP_RECIPIENT=''
+IOS_CLIENT_ID=''
+IOS_REDIRECT_URI='dev.termlink.ios:/oauth2redirect'
+OIDC_ALLOWED_PARTIES=''
+MACOS_UPDATE_TEAM_ID=''
+MACOS_TEAM_ENV_SET="${TERMLINK_APPSHIP_MACOS_TEAM_ID+x}"
+MACOS_TEAM_ENV_VALUE="${TERMLINK_APPSHIP_MACOS_TEAM_ID-}"
+# Capture optional overrides before build_compose_commands clears inherited
+# Compose inputs. An absent variable preserves managed settings on upgrade.
+IOS_ID_ENV_SET="${TERMLINK_IOS_OIDC_CLIENT_ID+x}"
+IOS_ID_ENV_VALUE="${TERMLINK_IOS_OIDC_CLIENT_ID-}"
+IOS_REDIRECT_ENV_SET="${TERMLINK_IOS_OIDC_REDIRECT_URI+x}"
+IOS_REDIRECT_ENV_VALUE="${TERMLINK_IOS_OIDC_REDIRECT_URI-}"
+OIDC_PARTIES_ENV_SET="${TERMLINK_OIDC_ALLOWED_PARTIES+x}"
+OIDC_PARTIES_ENV_VALUE="${TERMLINK_OIDC_ALLOWED_PARTIES-}"
 # Retained only so existing v2 managed config/Compose assets keep validating.
 # The Server does not use this as routing authority; PostgreSQL policy does.
 DIRECT_ROUTING_PERMITTED='false'
@@ -100,6 +114,13 @@ Install/config options:
 Missing install values are requested interactively. A released installer embeds
 its immutable Server image, so normal installation only asks for the domain.
 Source checkouts still require --image explicitly.
+
+Optional iOS identity settings are supplied as environment variables to install,
+config, or upgrade: TERMLINK_IOS_OIDC_CLIENT_ID (empty disables iOS) and
+TERMLINK_IOS_OIDC_REDIRECT_URI (fixed: dev.termlink.ios:/oauth2redirect).
+TERMLINK_OIDC_ALLOWED_PARTIES may be supplied explicitly; it must include all
+configured mobile/Windows client IDs. An empty list uses the Server defaults.
+These settings are saved in config.env and preserved on later upgrades.
 
 TermLink exposes only a loopback HTTP origin. Configure an external HTTPS proxy
 to preserve Host and X-Forwarded-Proto and forward WebSocket upgrades to it.
@@ -204,6 +225,55 @@ config_get() {
   printf '%s' "${line#*=}"
 }
 
+validate_ios_configuration() {
+  local party
+  local -a parties
+  [[ "$IOS_REDIRECT_URI" == 'dev.termlink.ios:/oauth2redirect' ]] || die 'invalid iOS OIDC redirect URI'
+  if [[ -n "$IOS_CLIENT_ID" ]]; then
+    [[ "$IOS_CLIENT_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die 'invalid iOS OIDC client ID'
+    case "$IOS_CLIENT_ID" in
+      termlink-android|termlink-windows|termlink-web|termlink-web-step-up|termlink-server)
+        die 'iOS OIDC client ID must be distinct from existing clients' ;;
+    esac
+  fi
+  if [[ -n "$OIDC_ALLOWED_PARTIES" ]]; then
+    [[ "$OIDC_ALLOWED_PARTIES" != ,* && "$OIDC_ALLOWED_PARTIES" != *, && "$OIDC_ALLOWED_PARTIES" != *,,* ]] || die 'invalid OIDC allowed parties'
+    IFS=',' read -r -a parties <<<"$OIDC_ALLOWED_PARTIES"
+    for party in "${parties[@]}"; do
+      [[ "$party" =~ ^[A-Za-z0-9._-]{1,128}$ && "$party" != termlink-server ]] || die 'invalid OIDC allowed party'
+    done
+    for party in termlink-android termlink-windows "$IOS_CLIENT_ID"; do
+      [[ -z "$party" || ",$OIDC_ALLOWED_PARTIES," == *",$party,"* ]] || die "OIDC allowed parties omitted $party"
+    done
+  fi
+}
+
+validate_macos_update_configuration() {
+  [[ -z "$MACOS_UPDATE_TEAM_ID" || "$MACOS_UPDATE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || die 'Mac update Team ID must contain exactly 10 uppercase letters/digits'
+}
+
+apply_ios_environment() {
+  [[ -z "$MACOS_TEAM_ENV_SET" ]] || MACOS_UPDATE_TEAM_ID="$MACOS_TEAM_ENV_VALUE"
+  [[ -z "$IOS_ID_ENV_SET" ]] || IOS_CLIENT_ID="$IOS_ID_ENV_VALUE"
+  [[ -z "$IOS_REDIRECT_ENV_SET" ]] || IOS_REDIRECT_URI="$IOS_REDIRECT_ENV_VALUE"
+  [[ -z "$OIDC_PARTIES_ENV_SET" ]] || OIDC_ALLOWED_PARTIES="$OIDC_PARTIES_ENV_VALUE"
+  [[ -n "$IOS_REDIRECT_URI" ]] || IOS_REDIRECT_URI='dev.termlink.ios:/oauth2redirect'
+  validate_ios_configuration
+  validate_macos_update_configuration
+}
+
+require_ios_runtime_assets() {
+  if [[ -n "$MACOS_UPDATE_TEAM_ID" ]]; then
+    grep -Fq 'TERMLINK_APPSHIP_MACOS_TEAM_ID:' "$RUNTIME_DIR/compose.yml" || die 'runtime assets do not support Mac updates; upgrade with the newer installer first'
+  fi
+  [[ -z "$IOS_CLIENT_ID" ]] && return
+  local field
+  for field in TERMLINK_IOS_OIDC_CLIENT_ID TERMLINK_IOS_OIDC_REDIRECT_URI TERMLINK_OIDC_ALLOWED_PARTIES; do
+    grep -Fq "$field:" "$RUNTIME_DIR/compose.yml" || \
+      die 'runtime assets do not support iOS; first run upgrade with the newer iOS-capable installer'
+  done
+}
+
 load_config() {
   assert_managed_dir
   [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || die "configuration file is missing: $CONFIG_FILE"
@@ -214,6 +284,13 @@ load_config() {
   [[ "$(stat -c '%a' "$SECRETS_DIR")" == 700 ]] || die 'secret directory must have mode 0700'
   [[ "$(stat -c '%a' "$CONFIG_FILE")" == 600 ]] || die 'configuration file must have mode 0600'
   [[ "$(config_get TERMLINK_CONFIG_VERSION)" == 2 ]] || die 'unsupported deployment configuration version'
+  MACOS_UPDATE_TEAM_ID="$(grep -E '^TERMLINK_APPSHIP_MACOS_TEAM_ID=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  IOS_CLIENT_ID="$(grep -E '^TERMLINK_IOS_OIDC_CLIENT_ID=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  IOS_REDIRECT_URI="$(grep -E '^TERMLINK_IOS_OIDC_REDIRECT_URI=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  [[ -n "$IOS_REDIRECT_URI" ]] || IOS_REDIRECT_URI='dev.termlink.ios:/oauth2redirect'
+  OIDC_ALLOWED_PARTIES="$(grep -E '^TERMLINK_OIDC_ALLOWED_PARTIES=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  validate_ios_configuration
+  validate_macos_update_configuration
   PUBLIC_HOST="$(config_get TERMLINK_PUBLIC_HOST)"
   PUBLIC_URL="$(config_get TERMLINK_PUBLIC_URL)"
   IMAGE="$(config_get TERMLINK_IMAGE)"
@@ -245,6 +322,7 @@ write_config() {
   PUBLIC_URL="$public_url"
   cat > "$tmp" <<EOF
 TERMLINK_CONFIG_VERSION=2
+TERMLINK_APPSHIP_MACOS_TEAM_ID=$MACOS_UPDATE_TEAM_ID
 COMPOSE_PROJECT_NAME=termlink
 TERMLINK_IMAGE=$IMAGE
 TERMLINK_RUNTIME_DIR=$RUNTIME_DIR
@@ -255,6 +333,9 @@ TERMLINK_HTTP_BIND_IP=127.0.0.1
 TERMLINK_HTTP_PORT=$HTTP_PORT
 TERMLINK_PUBLIC_PORT=$PUBLIC_PORT
 TERMLINK_BACKUP_RECIPIENT=$BACKUP_RECIPIENT
+TERMLINK_IOS_OIDC_CLIENT_ID=$IOS_CLIENT_ID
+TERMLINK_IOS_OIDC_REDIRECT_URI=$IOS_REDIRECT_URI
+TERMLINK_OIDC_ALLOWED_PARTIES=$OIDC_ALLOWED_PARTIES
 TERMLINK_DIRECT_ROUTING_PERMITTED=$DIRECT_ROUTING_PERMITTED
 EOF
   chmod 0600 "$tmp"
@@ -347,7 +428,10 @@ services:
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
       TERMLINK_OIDC_ISSUER: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}/realms/termlink
       TERMLINK_OIDC_CLIENT_ID: termlink-server
-      TERMLINK_OIDC_ALLOWED_PARTIES: termlink-android,termlink-windows
+      # Empty allowed parties lets Server derive Android/Windows and opt-in iOS.
+      TERMLINK_OIDC_ALLOWED_PARTIES: ${TERMLINK_OIDC_ALLOWED_PARTIES:-}
+      TERMLINK_IOS_OIDC_CLIENT_ID: ${TERMLINK_IOS_OIDC_CLIENT_ID:-}
+      TERMLINK_IOS_OIDC_REDIRECT_URI: ${TERMLINK_IOS_OIDC_REDIRECT_URI:-dev.termlink.ios:/oauth2redirect}
       TERMLINK_ANDROID_OIDC_CLIENT_ID: termlink-android
       TERMLINK_ANDROID_OIDC_REDIRECT_URI: dev.termlink:/oauth2redirect
       TERMLINK_WINDOWS_OIDC_CLIENT_ID: termlink-windows
@@ -367,6 +451,7 @@ services:
       TERMLINK_DIRECT_ROUTING_PERMITTED: ${TERMLINK_DIRECT_ROUTING_PERMITTED:-false}
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      TERMLINK_APPSHIP_MACOS_TEAM_ID: ${TERMLINK_APPSHIP_MACOS_TEAM_ID:-}
       TERMLINK_LISTEN_ADDR: :8080
       TERMLINK_LOG_LEVEL: ${TERMLINK_LOG_LEVEL:-info}
     volumes:
@@ -492,6 +577,8 @@ build_compose_commands() {
     TERMLINK_CONTAINER_LOG_MAX_FILES TERMLINK_CONTAINER_LOG_MAX_SIZE \
     TERMLINK_DIRECT_ROUTING_PERMITTED TERMLINK_DIRECT_STUN_SERVERS \
     TERMLINK_HTTP_BIND_IP TERMLINK_HTTP_PORT TERMLINK_IMAGE TERMLINK_LOG_LEVEL \
+    TERMLINK_IOS_OIDC_CLIENT_ID TERMLINK_IOS_OIDC_REDIRECT_URI TERMLINK_OIDC_ALLOWED_PARTIES \
+    TERMLINK_APPSHIP_MACOS_TEAM_ID \
     TERMLINK_POSTGRES_CPU_LIMIT \
     TERMLINK_POSTGRES_MEMORY_LIMIT TERMLINK_POSTGRES_MEMORY_RESERVATION TERMLINK_POSTGRES_PIDS_LIMIT \
     TERMLINK_POSTGRES_SHM_SIZE TERMLINK_PUBLIC_HOST TERMLINK_PUBLIC_URL TERMLINK_RUNTIME_DIR \
@@ -802,6 +889,7 @@ command_install() {
     [[ -n "$restore_input" && -n "$restore_identity" ]] || \
     die '--restore and --identity must be supplied together'
 
+  apply_ios_environment
   set_paths "$data_dir"
   create_managed_layout
   PUBLIC_HOST="${domain,,}"
@@ -852,6 +940,7 @@ command_upgrade() {
     IMAGE="$(bundled_image)"
     log "selected the immutable Server image bundled with this installer: $IMAGE"
   fi
+  apply_ios_environment
   install_runtime_assets
   apply_secret_permissions
   write_config
@@ -984,13 +1073,16 @@ command_config() {
       *) die "unknown config option: $1" ;;
     esac
   done
+  if [[ -n "$IOS_ID_ENV_SET$IOS_REDIRECT_ENV_SET$OIDC_PARTIES_ENV_SET$MACOS_TEAM_ENV_SET" ]]; then show_only=false; fi
   need_root
   set_paths "$data_dir"
   require_runtime
+  apply_ios_environment
   if [[ "$show_only" == true ]]; then
     sed -E '/^(TERMLINK_RUNTIME_DIR|TERMLINK_SECRETS_DIR)=/d' "$CONFIG_FILE"
     return
   fi
+  require_ios_runtime_assets
   [[ -z "$new_domain" ]] || { validate_domain "$new_domain"; PUBLIC_HOST="${new_domain,,}"; }
   [[ -z "$new_image" ]] || { validate_image "$new_image"; IMAGE="$new_image"; }
   [[ -z "$new_http" ]] || { validate_port "$new_http" --http-port; HTTP_PORT="$new_http"; }

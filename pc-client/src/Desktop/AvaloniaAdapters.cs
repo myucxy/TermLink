@@ -39,9 +39,15 @@ public sealed class AvaloniaAppearanceController : IAppearanceController
 
     public AvaloniaAppearanceController(string? localApplicationData = null)
     {
-        var root = localApplicationData ??
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        preferencePath = Path.Combine(root, "TermLink", "ui-theme.txt");
+        var root = localApplicationData ?? (OperatingSystem.IsMacOS()
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Application Support")
+            : Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+        var profile = "TermLink";
+#if !WINDOWS
+        if (OperatingSystem.IsMacOS() && TermLink.Platform.MacOS.MacPlatformOptions.IsDevelopmentBuild)
+            profile = "TermLink DEV";
+#endif
+        preferencePath = Path.Combine(root, profile, "ui-theme.txt");
         Current = ReadPreference();
         ApplyThemeVariant(Current);
     }

@@ -21,7 +21,9 @@ class ReleaseChecks(unittest.TestCase):
             for name in release.expected_names('0.3.7', 137):
                 (directory/name).write_bytes(b'fixture')
             release.write_json(directory/'artifact-manifest.json', dict(version='0.3.7', build_number=137,
-                source_revision='a'*40, core_revision='e'*40))
+                source_revision='a'*40, core_revision='e'*40,
+                artifacts=[dict(type='apk', path='artifacts/release/0.3.7-137/TermLink-Android-0.3.7-137.apk'),
+                           dict(type='setup', path='artifacts/release/0.3.7-137/TermLink-Setup-0.3.7.137-x64.exe')]))
             notes = directory/'notes.md'
             notes.write_text('fixture release notes')
             args = argparse.Namespace(directory=directory, notes=notes)
@@ -92,6 +94,30 @@ class ReleaseChecks(unittest.TestCase):
         for version, build in [('../escape', 136), ('0.3.6', True), ('0.3.6', 65536)]:
             with self.assertRaises(ValueError):
                 release.expected_names(version, build)
+
+    def test_android_only_artifact_contract_is_allowed_and_strict(self):
+        manifest = {
+            'artifacts': [
+                {'type': 'apk', 'path': 'artifacts/release/0.3.7-137/TermLink-Android-0.3.7-137.apk'},
+            ],
+        }
+        self.assertEqual(release.artifact_types_from_manifest(manifest), frozenset({'apk'}))
+        names = release.expected_names('0.3.7', 137, {'apk'})
+        self.assertIn('TermLink-Android-0.3.7-137.apk', names)
+        self.assertNotIn('TermLink-Setup-0.3.7.137-x64.exe', names)
+        for invalid in [
+            {'artifacts': []},
+            {'artifacts': [{'type': 'setup'}]},
+            {'artifacts': [{'type': 'apk'}, {'type': 'apk'}]},
+            {'artifacts': [{'type': 'apk'}, {'type': 'msix'}]},
+        ]:
+            with self.assertRaises(ValueError):
+                release.artifact_types_from_manifest(invalid)
+
+    def test_android_only_expected_names_reject_unknown_or_duplicate_types(self):
+        for artifact_types in ({'apk', 'msix'}, ['apk', 'apk'], set()):
+            with self.assertRaises(ValueError):
+                release.expected_names('0.3.7', 137, artifact_types)
 
     def test_native_evidence_is_required_before_publish(self):
         with tempfile.TemporaryDirectory() as root:

@@ -3915,7 +3915,7 @@ internal class ProductionProductRepository(
         command: TerminalCommandCapability,
     ): UUID {
         require(path.isNotBlank() && path.encodeToByteArray().size <= REMOTE_FILE_PATH_MAX_BYTES && '\u0000' !in path) {
-            "The Windows directory is invalid"
+            "The host directory is invalid"
         }
         check(shellLaunchLock.tryLock()) { "请等待当前终端启动完成" }
         mutableSnapshot.update { current ->
@@ -3934,12 +3934,12 @@ internal class ProductionProductRepository(
                 terminalCommand = command,
             )
             val completed = awaitRemoteFileOperation(pcId, operation)
-            val result = completed.result ?: error("The Windows PC returned no terminal session")
+            val result = completed.result ?: error("The host returned no terminal session")
             val sessionId = UUID.fromString(result.requiredString("session_id"))
             val resultCommandId = result["terminal_command_id"]?.jsonPrimitive?.contentOrNull
                 ?: result.requiredString("shell_type")
             require(resultCommandId == command.id) {
-                "The Windows PC returned a different terminal command"
+                "The host returned a different terminal command"
             }
             val ready = withTimeoutOrNull(REMOTE_SHELL_CATALOG_TIMEOUT_MILLIS) {
                 while (true) {
@@ -4597,7 +4597,7 @@ internal class ProductionProductRepository(
         check(pc.online && pc.remoteRoutingEnabled)
         val slots = aiRequestSlots.getOrPut(pcId) { AiRequestSlots() }
         val action = org.json.JSONObject(body).optString("action")
-        val read = action in setOf("catalog", "models", "directories", "files", "remote", "message", "history", "poll", "changes", "watch", "search", "artifacts", "artifact.read", "diff.read", "native-history") || action.startsWith("attachment.")
+        val read = action in setOf("catalog", "models", "directories", "files", "message", "history", "poll", "changes", "watch", "search", "artifacts", "artifact.read", "diff.read", "native-history") || action.startsWith("attachment.")
         return (if (read) slots.reads else slots.commands).withPermit {
             try { requestAiWithCurrentIdentity(pcId, body) }
             catch (error: dev.termlink.network.production.HostDeviceConnectionChangedException) {
@@ -4655,6 +4655,11 @@ internal class ProductionProductRepository(
         val result = mutableListOf<SessionSummary>()
         val observations = mutableSnapshot.value.pcSessionCatalogObservations.toMutableMap()
         for (pc in pcs) {
+            if (!requiresHostSessionCatalog(pc)) {
+                hostCatalogErrors.remove(pc.id)
+                observations.remove(pc.id)
+                continue
+            }
             val device = devices.firstOrNull { it.id == pc.deviceId && it.trustState == DeviceTrustState.TRUSTED }
             try {
                 check(pc.online && pc.remoteRoutingEnabled && device != null &&
@@ -6877,7 +6882,7 @@ internal class ProductionProductRepository(
                         require(name.encodeToByteArray().size in 1..80 && name.none(Char::isISOControl))
                     },
                     shellType = command.requiredString("shell_type").also { shell ->
-                        require(shell in setOf("command-prompt", "windows-powershell", "powershell-7", "wsl", "custom"))
+                        require(shell == "custom" || RemoteShellType.entries.any { it.wireValue == shell })
                     },
                     source = command.requiredString("source").also { source ->
                         require(source == "detected" || source == "manual")

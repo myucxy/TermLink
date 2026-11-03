@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.Agent.AI</AssemblyName>
+    <RootNamespace>TermLink.Agent.AI</RootNamespace>
+    <Nullable>disable</Nullable>
+    <DefineConstants>$(DefineConstants);TERMLINK_PORTABLE_AI</DefineConstants>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Agent.Connection/TermLink.Agent.Connection.csproj" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" />
+    <Compile Include="../../../win-agent/src/Common/AiAgentDiscovery.cs" Link="Shared/AiAgentDiscovery.cs" />
+    <Compile Include="../../../win-agent/src/Common/AiDesktopDiscovery.cs" Link="Shared/AiDesktopDiscovery.cs" />
+    <Compile Include="../../../win-agent/src/Common/ZcodeDesktopRuntime.cs" Link="Shared/ZcodeDesktopRuntime.cs" />
+    <Compile Include="../../../win-agent/src/UpdateCore/AiWorkspaceStorage.cs" Link="Shared/AiWorkspaceStorage.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiAgentSession.cs" Link="Shared/AiAgentSession.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiSessionManager.cs" Link="Shared/AiSessionManager.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiAcpSession.cs" Link="Shared/AiAcpSession.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiSessionTimeline.cs" Link="Shared/AiSessionTimeline.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiSessionArtifacts.cs" Link="Shared/AiSessionArtifacts.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiSessionFeatures.cs" Link="Shared/AiSessionFeatures.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiConfiguration.cs" Link="Shared/AiConfiguration.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiNativeHistory.cs" Link="Shared/AiNativeHistory.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiProcessJob.cs" Link="Shared/AiProcessJob.cs" />
+    <Compile Include="../../../win-agent/src/Agent/WindowsDirectoryListing.cs" Link="Shared/DirectoryListing.cs" />
+    <InternalsVisibleTo Include="TermLink.PortableAI.Validation" />
+  </ItemGroup>
+</Project>

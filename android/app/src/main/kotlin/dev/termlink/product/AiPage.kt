@@ -100,9 +100,9 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
     val session = selected?.let(workspace.conversations::get)
     val reference = workspace.opened.firstOrNull { it.sessionId == selected }
     val pc = snapshot.pcs.firstOrNull { it.id == (session?.pcId ?: reference?.pcId) }
-    val remote = reference?.takeIf { it.strategy == "desktop_remote" }
     val routeOnline = pc?.online == true && pc.remoteRoutingEnabled && snapshot.signedIn
-    val online = routeOnline && workspace.unavailable[pc?.id] != true
+    val nativeUpgradeRequired = session?.let { workspace.catalogs[it.pcId]?.requiresNativeUpgrade(aiAgentId(it.agentId, it.agent)) } == true
+    val online = routeOnline && workspace.unavailable[pc?.id] != true && !nativeUpgradeRequired
     // Once per entry/reconnect, so two phones cannot repeatedly steal control from each other.
     var controlAttempted by remember(selected, online, workspace.catalogs[pc?.id]?.hostId) { mutableStateOf(false) }
     LaunchedEffect(selected, online, foreground, session?.id, workspace.busy, workspace.uncertain) {
@@ -112,11 +112,11 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
             if (!session.canControl) workspace.mutate(session.pcId, "control", session)
         }
     }
-    LaunchedEffect(selected, foreground, snapshot.signedIn, routeOnline, pcs.map { Triple(it.id, it.online, it.remoteRoutingEnabled) }) {
+    LaunchedEffect(selected, foreground, snapshot.signedIn, routeOnline, nativeUpgradeRequired, pcs.map { Triple(it.id, it.online, it.remoteRoutingEnabled) }) {
         if (foreground && snapshot.signedIn) while (true) {
-            if (selected != null && routeOnline) workspace.refresh(checkNotNull(pc).id, selected.takeIf { remote == null })
+            if (selected != null && routeOnline) workspace.refresh(checkNotNull(pc).id, selected.takeUnless { nativeUpgradeRequired })
             else pcs.filter { it.online && it.remoteRoutingEnabled }.forEach { workspace.refresh(it.id) }
-            delay(if (selected == null || remote != null) 6_000 else if (workspace.conversations[selected]?.capabilities?.watch == true && workspace.unavailable[pc?.id] != true) 100 else 1_000)
+            delay(if (selected == null || nativeUpgradeRequired) 6_000 else if (workspace.conversations[selected]?.capabilities?.watch == true && workspace.unavailable[pc?.id] != true) 100 else 1_000)
         }
     }
     LaunchedEffect(selected, foreground, online, session?.canControl, session?.controlVersion) {
@@ -129,7 +129,6 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
     BackHandler(enabled = selected != null) { workspace.selected = null }
     Column(modifier.fillMaxSize().windowInsetsPadding(productImeInsets())) {
         if (selected == null) AiConversationList(workspace, snapshot, pcs, onOpenDevices, Modifier.weight(1f))
-        else if (remote != null) AiRemotePage(workspace, remote, pc?.name ?: "电脑", online, foreground, Modifier.weight(1f))
         else {
             AiConversationHeader(workspace, session, pc, online)
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -139,6 +138,7 @@ internal fun AiPage(workspace: AiWorkspace, snapshot: ProductSnapshot, foregroun
                     snapshot.connectionState != ProductConnectionState.CONNECTED -> "手机连接暂不可用，正在重新连接。"
                     pc?.online == false -> "电脑已离线，连接恢复后重新确认状态。"
                     pc?.remoteRoutingEnabled == false -> "请先在电脑上开启远程访问。"
+                    nativeUpgradeRequired -> stringResource(R.string.ai_native_upgrade_required)
                     !online -> "暂时无法连接电脑，正在重新确认状态。"
                     pc?.id in workspace.catalogs -> "此会话已不在电脑当前目录中，可关闭视图后新建。"
                     else -> "正在确认电脑上的会话状态…"
@@ -234,6 +234,9 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
             }
         }
         AiListTools(workspace, onlineIds, entries)
+        if (onlineIds.any { pc -> workspace.catalogs[pc]?.requiresNativeUpgrade() == true })
+            Text(stringResource(R.string.ai_native_upgrade_required), Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
             if (entries.isEmpty()) item {
                 AiEmptyState(Icons.Default.AutoAwesome, if (workspace.attentionOnly) "暂无待处理请求" else "开始一段 AI 对话",
@@ -254,23 +257,7 @@ private fun AiConversationList(workspace: AiWorkspace, snapshot: ProductSnapshot
                 val host = snapshot.pcs.firstOrNull { it.id == opened.pcId }
                 val online = snapshot.signedIn && host?.online == true && host.remoteRoutingEnabled && workspace.unavailable[host.id] != true
                 Box(Modifier.padding(start = 28.dp).background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(8.dp))) {
-                if (opened.strategy == "desktop_remote") {
-                    var menu by remember { mutableStateOf(false) }
-                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = online, role = Role.Button) {
-                        if (phoneOpened) workspace.selected = opened.sessionId else workspace.openRemote(opened.pcId, opened.agentId)
-                    }.padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(stringResource(R.string.ai_remote_strategy), Modifier.weight(1f),
-                            style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (!online) AiStatusTag("待确认") else Icon(Icons.AutoMirrored.Filled.ArrowForward, null,
-                            Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Box {
-                            IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "ZCode 远控视图操作", Modifier.size(18.dp)) }
-                            DropdownMenu(menu, { menu = false }) {
-                                DropdownMenuItem(text = { Text("关闭手机视图") }, onClick = { menu = false; workspace.closeView(opened.sessionId) })
-                            }
-                        }
-                    }
-                } else AiConversationRow(value, host?.name ?: "电脑", online, opened.pcId in workspace.catalogs,
+                AiConversationRow(value, host?.name ?: "电脑", online, opened.pcId in workspace.catalogs,
                     { if (phoneOpened) workspace.selected = opened.sessionId else if (online && value != null) workspace.open(value) },
                     { workspace.closeView(opened.sessionId) },
                     if (online && value != null && !aiIsHistorical(value)) ({ ending = value }) else null)
@@ -610,7 +597,6 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
     var reasoningEffort by rememberSaveable(pcKey, catalog?.hostId, agent?.id, agent?.strategy) { mutableStateOf("") }
     var confirmedMode by rememberSaveable(pcKey, catalog?.hostId, agent?.id, agent?.strategy) { mutableStateOf<String?>(null) }
     var proposedMode by remember { mutableStateOf<String?>(null) }
-    val remote = agent?.strategy == "desktop_remote"
     val ready = pcs.any { it.id == pcId && it.online && it.remoteRoutingEnabled } && workspace.unavailable[pcId] != true
     val editable = !workspace.isBlocked(pcId)
     val scope = rememberCoroutineScope()
@@ -647,8 +633,9 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                             enabled = ready && editable, onClick = { agentId = option.id }) }
                     }
                 }
-                if (remote) Text(if (initialDirectory != null) "ZCode 桌面远控不接收所选目录，工作目录需在 ZCode 中设置。" else "使用已配置的 ZCode 桌面远控，连接由 ZCode 服务提供。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                else if (agent != null) {
+                if (catalog?.requiresNativeUpgrade() == true)
+                    Text(stringResource(R.string.ai_native_upgrade_required), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (agent != null) {
                     val agentConfiguration = agent.configuration
                     val permissionModes = agentConfiguration.permissionModes.ifEmpty {
                         // Compatibility for a pre-capability host. Only the
@@ -706,12 +693,11 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     AiAction(stringResource(R.string.ai_ui_refresh), Icons.Default.Refresh, enabled = editable, onClick = { scope.launch { workspace.refresh(pcId) } })
                     Spacer(Modifier.weight(1f))
-                    AiAction(if (workspace.busy) "正在创建…" else if (remote) "打开远控" else "创建对话", Icons.AutoMirrored.Filled.ArrowForward, filled = true,
-                        enabled = ready && editable && agent != null && (remote || (managed || directory.isNotBlank()) &&
+                    AiAction(if (workspace.busy) "正在创建…" else "创建对话", Icons.AutoMirrored.Filled.ArrowForward, filled = true,
+                        enabled = ready && editable && agent != null && ((managed || directory.isNotBlank()) &&
                             (agent.id != "zcode" || model.isBlank() == provider.isBlank())), onClick = {
                             agent?.let {
-                                if (remote) workspace.openRemote(pcId, it.id)
-                                else workspace.mutate(pcId, "create", extra = JSONObject().put("agentId", it.id).put("directory", directory.trim())
+                                workspace.mutate(pcId, "create", extra = JSONObject().put("agentId", it.id).put("directory", directory.trim())
                                     .put("directoryMode", if (managed) "managed" else "custom")
                                     .put("permissionMode", mode)
                                     .put("modelId", model.trim()).put("providerId", provider.trim())
@@ -724,7 +710,7 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
             if (workspace.busy) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
         }
     }
-    if (browseDirectory && !remote) AiDirectoryPicker(workspace, pcId, directory, ready,
+    if (browseDirectory) AiDirectoryPicker(workspace, pcId, directory, ready,
         onDismiss = { browseDirectory = false }, onSelect = { directoryOverride = it; customDirectory = true; browseDirectory = false })
     proposedMode?.let { candidate ->
         val selected = agent?.configuration?.permissionModes?.firstOrNull { it.id == candidate }
@@ -849,8 +835,7 @@ internal fun AiDeviceSessions(workspace: AiWorkspace, pc: PcSummary, expanded: B
                 }, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     AiAgentProductIcon(agentId)
                     Text(aiAgentName(agentId), Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                    val count = entries.count { it.strategy != "desktop_remote" }
-                    Text(if (count == 0) stringResource(R.string.ai_remote_strategy) else stringResource(R.string.ai_group_count, count), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(R.string.ai_group_count, entries.size), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Icon(Icons.Default.ChevronRight, stringResource(R.string.ai_group_open, pc.name, aiAgentName(agentId)), Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }

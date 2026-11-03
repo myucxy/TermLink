@@ -55,14 +55,17 @@ class RemoteAgentUpdateInstrumentedTest {
         screenshot.recycle()
     }
 
-    private fun showDevice(platform: String = "windows"): PcSummary {
+    private fun showDevice(
+        platform: String = "windows",
+        capabilities: Set<String> = setOf(PcCapabilityIds.REMOTE_AGENT_UPDATE_V1),
+    ): PcSummary {
         val pc = PcSummary(UUID.randomUUID(), UUID.randomUUID(), "Remote update test PC", "0.3.8.138",
             remoteRoutingEnabled = true, online = true, lastSeenAt = Instant.now(), platform = platform,
-            capabilities = setOf(PcCapabilityIds.REMOTE_AGENT_UPDATE_V1))
+            capabilities = capabilities)
         val state = MutableStateFlow(ProductSnapshot(signedIn = true, configured = true,
             serverUrl = "https://termlink2.kget.cc:8910", connectionState = ProductConnectionState.CONNECTED,
             authenticationState = ProductAuthenticationState.AUTHENTICATED,
-            devices = listOf(DeviceSummary(pc.deviceId, DeviceType.WINDOWS_PC, pc.name, "fixture", ByteArray(32),
+            devices = listOf(DeviceSummary(pc.deviceId, if (platform == "windows") DeviceType.WINDOWS_PC else DeviceType.PC_AGENT, pc.name, "fixture", ByteArray(32),
                 trustState = DeviceTrustState.TRUSTED, createdAt = Instant.now())), pcs = listOf(pc)))
         val repository = object : ProductRepository by UnavailableProductRepository() {
             override val snapshot = state
@@ -99,11 +102,22 @@ class RemoteAgentUpdateInstrumentedTest {
         compose.onNodeWithTag("agent-update-card-${pc.id}").assertDoesNotExist()
     }
 
-    @Test fun nonWindowsDeviceDoesNotOfferWindowsInstaller() {
-        showDevice("linux")
+    @Test fun deviceWithoutAgentUpdateCapabilityDoesNotOfferUpdate() {
+        showDevice("linux", capabilities = emptySet())
         compose.onNodeWithText("Remote update test PC", useUnmergedTree = true).performTouchInput { longClick() }
         compose.onNodeWithText(compose.activity.getString(R.string.agent_update_action)).assertDoesNotExist()
         assertEquals(0, installations)
+    }
+
+    @Test fun macOsAgentWithUpdateCapabilityOffersAndCompletesUpdate() {
+        val pc = showDevice("macos")
+        compose.onNodeWithText("Remote update test PC", useUnmergedTree = true).performTouchInput { longClick() }
+        compose.onNodeWithText(compose.activity.getString(R.string.agent_update_action)).assertIsDisplayed().performClick()
+        compose.onNodeWithText(compose.activity.getString(R.string.agent_update_confirm)).assertIsDisplayed().performClick()
+        compose.waitForIdle()
+        assertEquals(1, installations)
+        compose.onNodeWithTag("agent-update-dialog").assertDoesNotExist()
+        compose.onNodeWithTag("agent-update-card-${pc.id}").assertDoesNotExist()
     }
 
     @Test fun minimizeReentryOfflineAndTwoPcUpdatesStayIndependent() {

@@ -1,0 +1,63 @@
+{
+  "artifacts": [
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/Info.plist",
+      "platform": "ios",
+      "sha256": "4eff522c06fc78cb0594fc8375cbdd86c2b618230b4f26c5fa259864640826a0",
+      "size": 1262
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64/TermLinkTerminalCore.framework/Headers/termlink_terminal.h",
+      "platform": "ios",
+      "sha256": "3292413c57aa51323beeda5491d8a1f50966bb7afb3b20f3cd030f5cb3714317",
+      "size": 58693
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64/TermLinkTerminalCore.framework/Info.plist",
+      "platform": "ios",
+      "sha256": "000eb688473f278afd488ebd98f95dcbeef17f25b89c46d35997a196cdec3c4c",
+      "size": 819
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64/TermLinkTerminalCore.framework/Modules/module.modulemap",
+      "platform": "ios",
+      "sha256": "830c785823fd30c155d5662077d0c77e352aa7fe1abff97faedd04cf5ac7fba4",
+      "size": 123
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64/TermLinkTerminalCore.framework/TermLinkTerminalCore",
+      "platform": "ios",
+      "sha256": "b97d7d2a0f4ae2cd6d05a3b61b7d38185d5231cc5a6d6c8c2e9f98a29e6b5071",
+      "size": 20303016
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64_x86_64-simulator/TermLinkTerminalCore.framework/Headers/termlink_terminal.h",
+      "platform": "ios",
+      "sha256": "3292413c57aa51323beeda5491d8a1f50966bb7afb3b20f3cd030f5cb3714317",
+      "size": 58693
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64_x86_64-simulator/TermLinkTerminalCore.framework/Info.plist",
+      "platform": "ios",
+      "sha256": "3b34d6880a52b4aff45e805a6e86437e4297c734cef9f26f49f022bcccb501fd",
+      "size": 833
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64_x86_64-simulator/TermLinkTerminalCore.framework/Modules/module.modulemap",
+      "platform": "ios",
+      "sha256": "830c785823fd30c155d5662077d0c77e352aa7fe1abff97faedd04cf5ac7fba4",
+      "size": 123
+    },
+    {
+      "path": "native/terminal-core/ios/TermLinkTerminalCore.xcframework/ios-arm64_x86_64-simulator/TermLinkTerminalCore.framework/TermLinkTerminalCore",
+      "platform": "ios",
+      "sha256": "972c1eb2bf247f0324022130da48c175f723005f8a284bba4ee89474c5c06e11",
+      "size": 40660600
+    }
+  ],
+  "repository": "git@github.com:myucxy/terminal-core.git",
+  "revision": "f51936441dea83fa2f9459386fb6c35b90102979",
+  "schema_version": 2,
+  "source_dirty": false,
+  "toolchain": "1.97.1"
+}

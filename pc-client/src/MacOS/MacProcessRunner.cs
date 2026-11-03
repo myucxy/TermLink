@@ -31,7 +31,13 @@ public sealed class MacCommandRunner : IMacCommandRunner
         using var process = Process.Start(start) ?? throw new InvalidOperationException($"Could not start {executable}.");
         var output = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var error = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        try { await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false); }
+        catch (OperationCanceledException)
+        {
+            try { if (!process.HasExited) process.Kill(); }
+            catch (InvalidOperationException) { }
+            throw;
+        }
         return new MacProcessResult(process.ExitCode, await output.ConfigureAwait(false), await error.ConfigureAwait(false));
     }
 }

@@ -8,7 +8,7 @@
       "termlink.platform.abstractions": {
         "type": "Project",
         "dependencies": {
-          "TermLink.Pc.Contracts": "[1.0.0, )"
+          "TermLink.Pc.Contracts": "[0.3.16, )"
         }
       }
     },

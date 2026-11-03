@@ -43,8 +43,12 @@ public static class Program
         // An older Updater starts the new desktop without --start-hidden.
         StartHidden |= TermLink.UpdateCore.RemoteUpdateTransactionStore.IsVerifyingInstallation(AppContext.BaseDirectory);
 #endif
-        using var singleInstance = new SingleInstanceCoordinator(
-            UsePreviewFixture ? "preview-fixture" : "control-ui");
+        var instanceScope = UsePreviewFixture ? "preview-fixture" : "control-ui";
+#if !WINDOWS
+        if (OperatingSystem.IsMacOS() && TermLink.Platform.MacOS.MacPlatformOptions.IsDevelopmentBuild)
+            instanceScope += "-development";
+#endif
+        using var singleInstance = new SingleInstanceCoordinator(instanceScope);
         if (!singleInstance.TryAcquire())
         {
             _ = singleInstance.SignalPrimaryAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();

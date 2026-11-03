@@ -10,6 +10,7 @@ public sealed class PosixTerminalSessionHost : ITerminalSessionHost, IAsyncDispo
 {
     private const int MaximumEnvironmentEntries = 256;
     private readonly ConcurrentDictionary<Guid, Session> sessions = new();
+    private readonly SemaphoreSlim disposeGate = new(1, 1);
     private int disposed;
 
     public ValueTask<TerminalLaunchResult> LaunchAsync(
@@ -130,15 +131,30 @@ public sealed class PosixTerminalSessionHost : ITerminalSessionHost, IAsyncDispo
             try
             {
                 while (!session.TryGetExitCode(out _))
+                {
+                    session.DiscardPendingOutput();
                     await Task.Delay(40, grace.Token).ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 PosixPtyNative.ThrowIfError(
                     PosixPtyNative.SignalGroup(session.ProcessId, (int)TerminalSignal.Kill),
                     "terminal process-group kill");
-                while (!session.TryGetExitCode(out _))
-                    await Task.Delay(20, cancellationToken).ConfigureAwait(false);
+                using var killDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                killDeadline.CancelAfter(TimeSpan.FromSeconds(5));
+                try
+                {
+                    while (!session.TryGetExitCode(out _))
+                    {
+                        session.DiscardPendingOutput();
+                        await Task.Delay(20, killDeadline.Token).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new IOException("The terminal process group did not finish stopping.");
+                }
             }
         }
         if (sessions.TryRemove(sessionId, out var removed)) removed.Dispose();
@@ -146,12 +162,21 @@ public sealed class PosixTerminalSessionHost : ITerminalSessionHost, IAsyncDispo
 
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        foreach (var id in sessions.Keys)
+        Interlocked.Exchange(ref disposed, 1);
+        await disposeGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            try { await StopAsync(id, CancellationToken.None).ConfigureAwait(false); }
-            catch (Exception error) when (error is IOException or ObjectDisposedException) { }
+            // Failed sessions stay in the dictionary so a later complete-exit
+            // request can retry; disposal must not silently skip them.
+            var failures = new List<Exception>();
+            foreach (var id in sessions.Keys)
+            {
+                try { await StopAsync(id, CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception error) when (error is IOException or ObjectDisposedException) { failures.Add(error); }
+            }
+            if (failures.Count > 0) throw new IOException("Some terminal sessions could not be stopped.", new AggregateException(failures));
         }
+        finally { disposeGate.Release(); }
     }
 
     private Session GetSession(Guid id)
@@ -216,6 +241,28 @@ public sealed class PosixTerminalSessionHost : ITerminalSessionHost, IAsyncDispo
         public int ProcessId { get; }
         public string ShellType { get; }
         public int MasterFileDescriptor { get; }
+
+        public void DiscardPendingOutput()
+        {
+            // BSD PTY close/exit can wait for unread slave output to drain.
+            // During shutdown the consumer is gone, so drain bounded batches
+            // while reaping instead of leaving a process stuck in exit.
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(4096);
+            try
+            {
+                for (var batch = 0; batch < 16; batch++)
+                {
+                    var count = PosixPtyNative.Read(MasterFileDescriptor, buffer, 4096);
+                    if (count > 0) continue;
+                    if (count == 0) return;
+                    var error = Marshal.GetLastPInvokeError();
+                    if (error == PosixPtyNative.Interrupted) continue;
+                    if (error == PosixPtyNative.WouldBlock || error == PosixPtyNative.IoError) return;
+                    throw PosixPtyNative.CreateException("PTY shutdown drain", error);
+                }
+            }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
+        }
 
         public async ValueTask<int> ReadAsync(Memory<byte> output, CancellationToken cancellationToken)
         {
@@ -366,7 +413,7 @@ internal static class PosixPtyNative
     private const string Library = "termlink-pty";
     internal const int Interrupted = 4;
     internal const int IoError = 5;
-    internal const int WouldBlock = 11;
+    internal static int WouldBlock => OperatingSystem.IsMacOS() ? 35 : 11;
 
     [DllImport(Library, EntryPoint = "termlink_pty_spawn", ExactSpelling = true)]
     internal static extern int Spawn(

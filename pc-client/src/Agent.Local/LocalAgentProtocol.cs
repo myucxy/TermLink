@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Frozen;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -205,7 +206,51 @@ public static class LocalAgentProtocol
             WriteIndented = false,
         };
         result.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
+        result.Converters.Add(new CapabilitySetConverter());
         return result;
+    }
+
+    // System.Text.Json in .NET 8 can write IReadOnlySet<T> but cannot construct
+    // it when reading a status response. Keep the existing array wire format
+    // and expose an immutable, ordinal set to the control client.
+    private sealed class CapabilitySetConverter : JsonConverter<IReadOnlySet<string>>
+    {
+        public override bool HandleNull => true;
+
+        public override IReadOnlySet<string> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType != JsonTokenType.StartArray) throw new JsonException("A capability array is required.");
+            var values = new HashSet<string>(StringComparer.Ordinal);
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndArray) return values.ToFrozenSet(StringComparer.Ordinal);
+                if (reader.TokenType != JsonTokenType.String) throw new JsonException("Capabilities must be strings.");
+                var value = reader.GetString();
+                ValidateCapability(value);
+                values.Add(value!);
+                if (values.Count > PcContractLimits.MaximumCapabilities) throw new JsonException("Too many capabilities.");
+            }
+            throw new JsonException("The capability array is incomplete.");
+        }
+
+        public override void Write(Utf8JsonWriter writer, IReadOnlySet<string> value, JsonSerializerOptions options)
+        {
+            if (value is null || value.Count > PcContractLimits.MaximumCapabilities) throw new JsonException("Invalid capability set.");
+            writer.WriteStartArray();
+            foreach (var capability in value)
+            {
+                ValidateCapability(capability);
+                writer.WriteStringValue(capability);
+            }
+            writer.WriteEndArray();
+        }
+
+        private static void ValidateCapability(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.IndexOf('\0') >= 0 ||
+                Encoding.UTF8.GetByteCount(value) > PcContractLimits.MaximumIdentifierBytes)
+                throw new JsonException("Invalid capability identifier.");
+        }
     }
 }
 
@@ -221,6 +266,11 @@ public enum LocalAgentCommand
     Register = 8,
     SignOut = 9,
     SaveTerminalCommands = 10,
+    ConfigureServer = 11,
+    BeginAccountAuthorization = 12,
+    Shutdown = 13,
+    DetectAiAgents = 14,
+    CancelAccountAuthorization = 15,
 }
 
 public sealed record LocalAgentEnvelope
@@ -275,6 +325,9 @@ public sealed class BoundedLocalAgentNonceStore(int capacity = 4096) : ILocalAge
 }
 
 public sealed record SetRemoteAccessPayload(bool Enabled);
+public sealed record ConfigureServerPayload(string ServerUrl);
+public sealed record AccountAuthorizationPayload(string PcName);
+public sealed record AgentShutdownReceipt(int ProcessId);
 public sealed record SessionPayload(Guid SessionId);
 public sealed record DevicePayload(Guid DeviceId, string? Permission = null);
 public sealed record LoginPayload(string Username, string Password, string PcName);

@@ -3798,7 +3798,7 @@ private fun ProductContent(
                 val pc = snapshot.pcs.firstOrNull { it.id == pcId }
                 when {
                     pc == null || !pc.online || !pc.remoteRoutingEnabled -> "电脑离线或未启用远程访问，请连接后重试。"
-                    "ai_agent_v1" !in pc.capabilities -> "${pc.name} 尚未提供 AI 聊天能力，请升级 Windows 客户端并检测 AI Agent 后重试。"
+                    "ai_agent_v1" !in pc.capabilities -> "${pc.name} 尚未提供 AI 聊天能力，请检查电脑端版本和 AI Agent 状态。"
                     path.isBlank() -> "请先选择一个工作目录。"
                     else -> {
                         aiWorkspace.beginCreate(pcId, directory = path)
@@ -4040,7 +4040,7 @@ private fun DevicesPage(
                     onStopSessionRequested = onStopSessionRequested,
                     onDeleteSessionRequested = onDeleteSessionRequested,
                     onDeleteInactiveSessions = { onDeleteInactiveSessionsRequested(pc) },
-                    onAgentUpdate = if (pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities) {
+                    onAgentUpdate = if (PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities) {
                         { onAgentUpdateRequested(pc) }
                     } else null,
                     agentUpdate = update,
@@ -9070,23 +9070,39 @@ internal fun sessionActionIdentity(snapshot: ProductSnapshot, id: java.util.UUID
     return "$pc · ${displaySessionTitle(session, snapshot.sessionTitles[id])}"
 }
 
+/** Only translate server-declared stages; never echo an untrusted stage or response value. */
+internal fun safeConnectionStageLabel(stage: String?): String? = when (stage) {
+    "configuration" -> "服务配置"
+    "device_registration" -> "设备注册"
+    "device_identity" -> "设备身份校验"
+    "pc_metadata" -> "电脑信息"
+    "push_registration" -> "推送注册"
+    "relay_handshake" -> "Relay 握手"
+    "file_transfer_handshake" -> "文件传输握手"
+    else -> null
+}
+
 internal fun safeOperationMessage(
     error: Throwable,
     fallback: String,
     activeSessionDeleteMessage: String = fallback,
-): String = when {
-    error is TermLinkApiException && error.code == "SESSION_ACTIVE" -> activeSessionDeleteMessage
-    error is TermLinkApiException && error.status == 401 -> "登录已失效，请重新登录。"
-    error is TermLinkApiException && error.status == 403 -> "当前账号没有此操作权限。"
-    error is TermLinkApiException && error.status >= 500 -> "服务端暂时无法处理请求，请稍后重试。"
-    error is dev.termlink.network.production.HostDeviceUpgradeRequiredException -> "电脑端版本不支持此操作，请升级 Windows 客户端。"
-    error is IllegalArgumentException -> "输入格式或参数不正确，请检查后重试。"
-    error is java.net.UnknownHostException -> "无法解析服务器地址，请检查地址和手机网络。"
-    error is javax.net.ssl.SSLException -> "服务器安全连接验证失败，请检查地址与证书。"
-    error is kotlinx.coroutines.TimeoutCancellationException || error is java.net.SocketTimeoutException -> "请求超时，请检查电脑和服务器连接后重试。"
-    error is SecurityException -> "没有访问所选文件或目录的权限，请重新选择。"
-    error is java.net.ConnectException -> "无法建立连接，请检查服务器与网络。"
-    else -> fallback
+): String {
+    val message = when {
+        error is TermLinkApiException && error.code == "SESSION_ACTIVE" -> activeSessionDeleteMessage
+        error is TermLinkApiException && error.status == 401 -> "登录已失效，请重新登录。"
+        error is TermLinkApiException && error.status == 403 -> "当前账号没有此操作权限。"
+        error is TermLinkApiException && error.status >= 500 -> "服务端暂时无法处理请求，请稍后重试。"
+        error is dev.termlink.network.production.HostDeviceUpgradeRequiredException -> "电脑端版本不支持此操作，请升级电脑端 Agent。"
+        error is IllegalArgumentException -> "输入格式或参数不正确，请检查后重试。"
+        error is java.net.UnknownHostException -> "无法解析服务器地址，请检查地址和手机网络。"
+        error is javax.net.ssl.SSLException -> "服务器安全连接验证失败，请检查地址与证书。"
+        error is kotlinx.coroutines.TimeoutCancellationException || error is java.net.SocketTimeoutException -> "请求超时，请检查电脑和服务器连接后重试。"
+        error is SecurityException -> "没有访问所选文件或目录的权限，请重新选择。"
+        error is java.net.ConnectException -> "无法建立连接，请检查服务器与网络。"
+        else -> fallback
+    }
+    val stage = (error as? TermLinkApiException)?.let { safeConnectionStageLabel(it.stage) }
+    return if (stage == null) message else "$message（连接阶段：$stage）"
 }
 
 @Composable

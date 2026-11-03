@@ -44,7 +44,7 @@ func TestValidateFileOperationRequestShapes(t *testing.T) {
 		{"WSL terminal", store.FileOperationOpenTerminal, `C:\folder`, nil, &wsl, true},
 		{"empty download", store.FileOperationDownload, "", nil, nil, false},
 		{"download offset", store.FileOperationDownload, `C:\file.txt`, &offset, nil, false},
-		{"unknown shell", store.FileOperationOpenTerminal, `C:\`, nil, stringPointerAPI("bash"), false},
+		{"unknown shell", store.FileOperationOpenTerminal, `C:\`, nil, stringPointerAPI("unknown-shell"), false},
 		{"nul path", store.FileOperationList, "C:\x00bad", nil, nil, false},
 		{"oversized", store.FileOperationList, strings.Repeat("x", store.MaxFileOperationPathBytes+1), nil, nil, false},
 	} {
@@ -149,6 +149,37 @@ func TestValidateOpenTerminalResult(t *testing.T) {
 	}
 }
 
+func TestValidateOpenTerminalResultAcceptsKnownPOSIXShellsAndRejectsMappings(t *testing.T) {
+	path := "/workspace/project"
+	for _, shell := range []string{"bash", "zsh", "sh", "fish"} {
+		shell := shell
+		sessionID := uuid.NewString()
+		result := json.RawMessage(`{"session_id":"` + sessionID + `","shell_type":"` + shell + `","cwd":"/workspace/project"}`)
+		if err := validateOpenTerminalResult(result, &shell, path); err != nil {
+			t.Fatalf("POSIX shell %q result rejected: %v", shell, err)
+		}
+		for _, wrongShell := range []string{"bash", "zsh", "sh", "fish"} {
+			if wrongShell == shell {
+				continue
+			}
+			wrongResult := json.RawMessage(`{"session_id":"` + sessionID + `","shell_type":"` + wrongShell + `","cwd":"/workspace/project"}`)
+			if err := validateOpenTerminalResult(wrongResult, &shell, path); err == nil {
+				t.Fatalf("shell mapping %q -> %q was accepted", shell, wrongShell)
+			}
+		}
+	}
+}
+
+func TestOpenTerminalRequestAcceptsKnownPOSIXShellsOnlyAsLegacyShellType(t *testing.T) {
+	path := "/workspace/project"
+	for _, shell := range []string{"bash", "zsh", "sh", "fish"} {
+		shell := shell
+		if err := validateFileOperationRequestWithCommand(store.FileOperationOpenTerminal, path, nil, &shell, nil); err != nil {
+			t.Fatalf("POSIX shell %q request rejected: %v", shell, err)
+		}
+	}
+}
+
 func TestStandardTerminalCommandRequestAndResult(t *testing.T) {
 	commandID := "custom-123456"
 	path := `C:\folder`
@@ -168,6 +199,26 @@ func TestStandardTerminalCommandRequestAndResult(t *testing.T) {
 	wrongCommand := json.RawMessage(`{"session_id":"` + sessionID + `","terminal_command_id":"custom-other","shell_type":"custom","cwd":"C:\\folder"}`)
 	if err := validateOpenTerminalResult(wrongCommand, &commandID, path); err == nil {
 		t.Fatal("mismatched terminal command result accepted")
+	}
+}
+
+func TestStandardPOSIXTerminalCommandBindsCommandIDToShellType(t *testing.T) {
+	path := "/workspace/project"
+	for _, shell := range []string{"bash", "zsh", "sh", "fish"} {
+		shell := shell
+		sessionID := uuid.NewString()
+		valid := json.RawMessage(`{"session_id":"` + sessionID + `","terminal_command_id":"` + shell + `","shell_type":"` + shell + `","cwd":"/workspace/project"}`)
+		if err := validateOpenTerminalResult(valid, &shell, path); err != nil {
+			t.Fatalf("standard POSIX result %q rejected: %v", shell, err)
+		}
+		wrongShell := "bash"
+		if wrongShell == shell {
+			wrongShell = "zsh"
+		}
+		crossWired := json.RawMessage(`{"session_id":"` + sessionID + `","terminal_command_id":"` + shell + `","shell_type":"` + wrongShell + `","cwd":"/workspace/project"}`)
+		if err := validateOpenTerminalResult(crossWired, &shell, path); err == nil {
+			t.Fatalf("standard POSIX command %q accepted shell mapping %q", shell, wrongShell)
+		}
 	}
 }
 

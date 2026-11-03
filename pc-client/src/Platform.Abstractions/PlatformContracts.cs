@@ -101,6 +101,12 @@ public interface IProcessSupervisor
     ValueTask<bool> IsAgentRunningAsync(CancellationToken cancellationToken);
 }
 
+/// <summary>Waits for the authenticated Agent process from this installation to exit.</summary>
+public interface IAgentExitMonitor
+{
+    ValueTask WaitForExitAsync(int processId, TimeSpan timeout, CancellationToken cancellationToken);
+}
+
 public interface IPlatformNotification
 {
     ValueTask ShowAsync(string title, string message, CancellationToken cancellationToken);
@@ -127,9 +133,11 @@ public sealed record DesktopUpdateStatus(
     string? ReleaseNotes,
     string? Message) {
     public bool ReadyToInstall { get; init; }
+    public bool UsesSystemInstaller { get; init; }
+    public bool ApplicationRestartRequired { get; init; }
 }
 
-public sealed record DesktopUpdateProgress(long BytesReceived, long TotalBytes, bool Verifying = false);
+public sealed record DesktopUpdateProgress(long BytesReceived, long TotalBytes, bool Verifying = false, bool Installing = false);
 
 public sealed record DesktopTerminalIntegrationSettings(
     bool AddNoLogo,
@@ -143,11 +151,14 @@ public sealed record DesktopTerminalIntegrationSettings(
 /// </summary>
 public interface IDesktopOperations
 {
+    bool SupportsAutomaticUpdates => true;
+    bool SupportsWindowsTerminalIntegration => true;
+    bool SupportsMacIntegration => false;
+    ValueTask<string> PerformPlatformActionAsync(DesktopPlatformAction action, CancellationToken cancellationToken) =>
+        ValueTask.FromException<string>(new PlatformNotSupportedException());
     ValueTask<string> OpenSessionDirectoryAsync(string directory, CancellationToken cancellationToken) =>
         ValueTask.FromException<string>(new PlatformNotSupportedException());
     ValueTask<string> OpenAgentHelpAsync(string agentId, CancellationToken cancellationToken) =>
-        ValueTask.FromException<string>(new PlatformNotSupportedException());
-    ValueTask<string> OpenZcodeRemoteAsync(CancellationToken cancellationToken) =>
         ValueTask.FromException<string>(new PlatformNotSupportedException());
     ValueTask<DesktopUpdateStatus> CheckForUpdatesAsync(
         bool install,
@@ -162,6 +173,13 @@ public interface IDesktopOperations
         bool addNoProfile,
         CancellationToken cancellationToken);
     ValueTask<string> RepairTerminalIntegrationAsync(CancellationToken cancellationToken);
+}
+
+public enum DesktopPlatformAction
+{
+    OpenTerminal,
+    OpenApplicationDirectory,
+    OpenLoginItems,
 }
 
 public interface IPlatformServices

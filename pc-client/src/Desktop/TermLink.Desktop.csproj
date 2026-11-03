@@ -11,6 +11,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="TermLink.TerminalSurface.Validation" />
+    <InternalsVisibleTo Include="TermLink.Desktop.HeadlessTests" />
     <Compile Include="..\..\..\win-agent\src\Common\NativeDisplayProtocol.cs" Link="NativeDisplayProtocol.cs" />
     <Compile Include="..\..\..\win-agent\src\Common\NativeDisplaySignals.cs" Link="NativeDisplaySignals.cs" />
     <PackageReference Include="Avalonia" ExcludeAssets="analyzers" GeneratePathProperty="true" />

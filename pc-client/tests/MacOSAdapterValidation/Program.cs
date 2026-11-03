@@ -1,5 +1,14 @@
 using System.Xml.Linq;
+using System.Text.Json;
 using TermLink.Platform.MacOS;
+using TermLink.Platform.Unix;
+
+if (args.Contains("--inspect-local", StringComparer.Ordinal))
+{
+    var found = await new PosixAiAgentDiscovery().DiscoverAsync(CancellationToken.None);
+    Console.WriteLine(JsonSerializer.Serialize(found, new JsonSerializerOptions { WriteIndented = true }));
+    return;
+}
 
 var options = new MacLaunchdOptions(
     "dev.termlink.agent",
@@ -7,6 +16,8 @@ var options = new MacLaunchdOptions(
     ["--agent", "--ipc", "/tmp/TermLink & <test>.sock"],
     "/Users/validation/Library/LaunchAgents",
     501);
+await MacDesktopValidation.RunAsync();
+await MacUpdateValidation.RunAsync();
 var plist = MacLaunchdAutostartManager.BuildPlist(options);
 var document = XDocument.Parse(plist, LoadOptions.PreserveWhitespace);
 Require(document.Root?.Name.LocalName == "plist", "The launchd plist is invalid XML.");
@@ -28,6 +39,14 @@ if (!OperatingSystem.IsMacOS())
 }
 else
 {
+    var defaults = MacPlatformOptions.CreateDefault();
+    Require(defaults.IpcEndpoint.Length <= 100, "The macOS Agent socket path exceeds its supported bound.");
+    Require(defaults.DataDirectory.EndsWith(MacPlatformOptions.IsDevelopmentBuild ? "TermLink DEV" : "TermLink", StringComparison.Ordinal),
+        "The macOS data profile does not match the build channel.");
+    Require(MacPlatformOptions.AgentServiceName == (MacPlatformOptions.IsDevelopmentBuild ? "dev.termlink.agent.dev" : "dev.termlink.agent"),
+        "The development Keychain service is not isolated.");
+    Require(defaults.IpcEndpoint.EndsWith(MacPlatformOptions.IsDevelopmentBuild ? "agent-dev-v1.sock" : "agent-v1.sock", StringComparison.Ordinal),
+        "The development Agent socket is not isolated.");
     Console.WriteLine("macOS adapter structure passed; run the signed-host E2E pipeline for Keychain/Gatekeeper/notarization evidence.");
 }
 

@@ -12,9 +12,11 @@ public static class ExecutableLocator
         if (Path.IsPathRooted(executable)) return IsExecutable(executable) ? Path.GetFullPath(executable) : null;
         if (executable.Contains(Path.DirectorySeparatorChar) || executable.Contains(Path.AltDirectorySeparatorChar))
             return null;
-        path ??= Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        foreach (var directory in SearchDirectories(path).Distinct(StringComparer.Ordinal))
         {
+            // A relative PATH entry (including an empty entry) implicitly trusts the
+            // caller's working directory. Agent discovery must not execute from it.
+            if (!Path.IsPathFullyQualified(directory)) continue;
             try
             {
                 var candidate = Path.GetFullPath(Path.Combine(directory, executable));
@@ -25,6 +27,27 @@ public static class ExecutableLocator
             }
         }
         return null;
+    }
+
+    private static IEnumerable<string> SearchDirectories(string? explicitPath)
+    {
+        var path = explicitPath ?? Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            yield return directory;
+        // Finder-launched applications do not inherit a login shell's PATH. Do not
+        // source shell profiles, and keep explicit-path callers fully isolated.
+        if (explicitPath is not null) yield break;
+        if (OperatingSystem.IsMacOS())
+        {
+            yield return "/usr/bin";
+            yield return "/bin";
+        }
+        yield return "/opt/homebrew/bin";
+        yield return "/usr/local/bin";
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!Path.IsPathFullyQualified(home)) yield break;
+        foreach (var suffix in new[] { ".local/bin", ".npm-global/bin", ".bun/bin", ".grok/bin" })
+            yield return Path.Combine(home, suffix);
     }
 
     public static bool IsExecutable(string path)
@@ -38,7 +61,7 @@ public static class ExecutableLocator
                 UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
             return (mode & executable) != 0;
         }
-        catch (UnauthorizedAccessException)
+        catch (Exception error) when (error is UnauthorizedAccessException or IOException)
         {
             return false;
         }
@@ -70,7 +93,8 @@ public sealed class PosixTerminalCommandDiscovery : ITerminalCommandDiscovery
                 command.Name,
                 path,
                 command.Arguments,
-                true));
+                true,
+                RunAsAdministrator: false));
         }
         return ValueTask.FromResult<IReadOnlyList<TerminalCommandCapability>>(result);
     }

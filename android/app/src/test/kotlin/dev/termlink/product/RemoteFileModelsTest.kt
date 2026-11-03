@@ -116,7 +116,8 @@ class RemoteFileModelsTest {
         assertEquals("windows-powershell", RemoteShellType.WINDOWS_POWERSHELL.wireValue)
         assertEquals("powershell-7", RemoteShellType.POWERSHELL_7.wireValue)
         assertEquals("wsl", RemoteShellType.WSL.wireValue)
-        val rejected = runCatching { RemoteShellType.fromWireValue("pwsh") }.isFailure
+        assertEquals(RemoteShellType.PWSH, RemoteShellType.fromWireValue("pwsh"))
+        val rejected = runCatching { RemoteShellType.fromWireValue("unknown-shell") }.isFailure
         assertTrue(rejected)
     }
 

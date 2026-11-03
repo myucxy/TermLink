@@ -4,14 +4,15 @@ import SwiftUI
 struct ShortcutManagerView: View {
     @EnvironmentObject var shortcuts: TerminalShortcutStore
     @State private var editing: TerminalCustomShortcut?
-    @State private var removed: TerminalCustomShortcut?
+    @State private var removed: TerminalShortcutStore.Removal?
+    @State private var failure: String?
     var body: some View {
         Form {
             Section {
                 Picker("Dock 布局", selection: $shortcuts.twoRows) {
                     Text("单行").tag(false); Text("两行").tag(true)
                 }.pickerStyle(.segmented)
-            } footer: { Text("自定义快捷键会自动分配到 Dock 行；最多 \(TerminalCustomShortcut.maxShortcuts) 个。") }
+            } footer: { Text("点击编辑可拖动排序；自定义快捷键按顺序自动分配到 Dock 行，最多 \(TerminalCustomShortcut.maxShortcuts) 个。") }
             Section {
                 ForEach(shortcuts.customs) { shortcut in
                     Button { editing = shortcut } label: {
@@ -25,31 +26,30 @@ struct ShortcutManagerView: View {
                             Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
                         }
                     }
-                }.onDelete { offsets in
-                    let victims = offsets.compactMap { shortcuts.customs.indices.contains($0) ? shortcuts.customs[$0] : nil }
-                    guard let first = victims.first else { return }
-                    victims.forEach { shortcuts.remove($0.id) }; removed = first
-                }
+                }.onMove { offsets, destination in shortcuts.move(from: offsets, to: destination) }
+                    .onDelete { removed = shortcuts.remove(at: $0) }
                 Button { editing = TerminalCustomShortcut(id: UUID().uuidString.lowercased(), label: "", kind: .quickInput,
                     text: "", key: 1, scalar: 0, shift: false, alt: false, control: false) } label: { Label("添加快捷键", systemImage: "plus") }
             } header: { Text("自定义快捷键") }
         }
         .navigationTitle("快捷键")
+        .toolbar { EditButton() }
         .sheet(item: $editing) { shortcut in
             NavigationStack { ShortcutEditorView(original: shortcut) }
         }
-        .undoPrompt(item: $removed) { shortcuts.upsert($0) }
-    }
-}
-
-extension View {
-    /// One-step undo for swipe-to-delete, so a mis-swipe never loses a configured shortcut.
-    func undoPrompt(item: Binding<TerminalCustomShortcut?>, restore: @escaping (TerminalCustomShortcut) throws -> Void) -> some View {
-        confirmationDialog("已删除「\(item.wrappedValue?.displayLabel ?? "")」", isPresented: Binding(
-            get: { item.wrappedValue != nil }, set: { if !$0 { item.wrappedValue = nil } })) {
-            Button("撤销删除") { if let value = item.wrappedValue { try? restore(value) } }
-            Button("关闭", role: .cancel) { item.wrappedValue = nil }
-        } message: { Text("删除的快捷键可以从撤销恢复一次。") }
+        .confirmationDialog("已删除快捷键", isPresented: Binding(
+            get: { removed != nil }, set: { if !$0 { removed = nil } })) {
+            Button("撤销删除") {
+                guard let value = removed else { return }
+                do { try shortcuts.restore(value) } catch { failure = error.localizedDescription }
+                removed = nil
+            }
+            Button("关闭", role: .cancel) { removed = nil }
+        } message: { Text("可一次恢复刚删除的快捷键及其顺序。") }
+        .alert("无法恢复快捷键", isPresented: Binding(
+            get: { failure != nil }, set: { if !$0 { failure = nil } })) {
+            Button("好", role: .cancel) { failure = nil }
+        } message: { Text(failure ?? "") }
     }
 }
 
@@ -62,7 +62,9 @@ struct ShortcutEditorView: View {
     @State private var text = ""
     @State private var baseKey: UInt32 = 1
     @State private var character = ""
-    @State private var shift = false, alt = false, control = false
+    @State private var shift = false
+    @State private var alt = false
+    @State private var control = false
     init(original: TerminalCustomShortcut) {
         self.original = original
         _kind = State(initialValue: original.kind); _label = State(initialValue: original.label)
@@ -77,6 +79,7 @@ struct ShortcutEditorView: View {
             if kind == .quickInput {
                 TextEditor(text: $text).frame(minHeight: 100)
                     .accessibilityLabel("快捷输入内容")
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
             } else {
                 Section("修饰键") {
                     Toggle("Ctrl", isOn: $control); Toggle("Alt", isOn: $alt); Toggle("Shift", isOn: $shift)
@@ -91,24 +94,27 @@ struct ShortcutEditorView: View {
                     }
                 }
             }
-            Button("保存") {
-                var value = original
-                value.kind = kind; value.label = label; value.text = text
-                value.shift = shift; value.alt = alt; value.control = control
-                if kind == .combination {
-                    value.key = baseKey
-                    value.scalar = baseKey == 1 ? (character.unicodeScalars.count == 1 ? character.unicodeScalars.first!.value : 0) : 0
-                }
-                do { try shortcuts.upsert(value); dismiss() } catch { failure = error.localizedDescription }
-            }
         }
         .navigationTitle(original == emptyTemplate ? "添加快捷键" : "编辑快捷键")
-        .toolbar { Button("取消") { dismiss() } }
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+            ToolbarItem(placement: .confirmationAction) { Button("保存", action: save) }
+        }
         .alert("无法保存快捷键", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
             Button("好", role: .cancel) { failure = nil }
         } message: { Text(failure ?? "") }
     }
     @State private var failure: String?
+    private func save() {
+        var value = original
+        value.kind = kind; value.label = label; value.text = text
+        value.shift = shift; value.alt = alt; value.control = control
+        if kind == .combination {
+            value.key = baseKey
+            value.scalar = baseKey == 1 ? (character.unicodeScalars.count == 1 ? character.unicodeScalars.first!.value : 0) : 0
+        }
+        do { try shortcuts.upsert(value); dismiss() } catch { failure = error.localizedDescription }
+    }
     private var emptyTemplate: TerminalCustomShortcut {
         TerminalCustomShortcut(id: original.id, label: "", kind: .quickInput, text: "", key: 1, scalar: 0, shift: false, alt: false, control: false)
     }

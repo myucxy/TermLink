@@ -61,23 +61,35 @@ jobs:
           New-Item -ItemType Directory -Path $batch -Force | Out-Null
           Write-Host 'Preparing the verified release files.'
           Copy-Item "$incoming/*" -Destination $batch
-          $setup = Get-ChildItem $batch -Filter '*.exe'
-          Write-Host 'Extracting the publisher certificate without an online trust check.'
-          $publisher = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
-            [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($setup.FullName))
-          if ($publisher.Thumbprint -ine $policy.windows_signer_sha1) { throw 'Unexpected Windows signer.' }
-          Write-Host 'Pinned publisher certificate extracted.'
-          # Trust only the pinned public certificate inside this disposable runner.
-          $certificate = Join-Path $env:RUNNER_TEMP 'termlink-publisher.cer'
-          Export-Certificate -Cert $publisher -FilePath $certificate | Out-Null
-          # The hosted Windows administrator can add this public root without a user confirmation dialog.
-          & certutil.exe -addstore -f Root $certificate
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned publisher trust setup failed.' }
-          Write-Host 'Verifying native signatures and timestamp with the pinned publisher trusted.'
-          $result = ./release/Verify-LocalRelease.ps1 -ReleaseDirectory $batch -RequireSourceIdentity `
-            -AndroidSdkPath $env:ANDROID_HOME -ExpectedReleaseMode Production `
-            -ExpectedAndroidSignerSha256 $policy.android_signer_sha256 `
-            -ExpectedWindowsSignerSha1 $policy.windows_signer_sha1 -RequireWindowsTimestamp -Verbose
+          $artifactTypes = @($manifest.artifacts | ForEach-Object { [string]$_.type })
+          $hasSetup = $artifactTypes -contains 'setup'
+          if ($hasSetup) {
+            if (($artifactTypes | Where-Object { $_ -eq 'setup' }).Count -ne 1) { throw 'Release manifest must contain one Windows Setup when present.' }
+            $setup = @(Get-ChildItem $batch -Filter '*.exe')
+            if ($setup.Count -ne 1) { throw 'Exactly one Windows Setup is required by the release manifest.' }
+            Write-Host 'Extracting the publisher certificate without an online trust check.'
+            $publisher = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($setup[0].FullName))
+            if ($publisher.Thumbprint -ine $policy.windows_signer_sha1) { throw 'Unexpected Windows signer.' }
+            Write-Host 'Pinned publisher certificate extracted.'
+            # Trust only the pinned public certificate inside this disposable runner.
+            $certificate = Join-Path $env:RUNNER_TEMP 'termlink-publisher.cer'
+            Export-Certificate -Cert $publisher -FilePath $certificate | Out-Null
+            # The hosted Windows administrator can add this public root without a user confirmation dialog.
+            & certutil.exe -addstore -f Root $certificate
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned publisher trust setup failed.' }
+          } elseif ($artifactTypes.Count -ne 1 -or $artifactTypes[0] -ne 'apk') {
+            throw 'Android-only release must contain exactly one APK artifact.'
+          }
+          Write-Host 'Verifying native signatures and timestamps with the pinned publisher trusted when present.'
+          $verifyArgs = @{ ReleaseDirectory = $batch; RequireSourceIdentity = $true;
+            AndroidSdkPath = $env:ANDROID_HOME; ExpectedReleaseMode = 'Production';
+            ExpectedAndroidSignerSha256 = $policy.android_signer_sha256; Verbose = $true }
+          if ($hasSetup) {
+            $verifyArgs.ExpectedWindowsSignerSha1 = $policy.windows_signer_sha1
+            $verifyArgs.RequireWindowsTimestamp = $true
+          }
+          $result = ./release/Verify-LocalRelease.ps1 @verifyArgs
           $result | Set-Content -LiteralPath "$incoming/ci-verification.json" -Encoding utf8
       - name: Record successful verification of the exact draft
         shell: pwsh

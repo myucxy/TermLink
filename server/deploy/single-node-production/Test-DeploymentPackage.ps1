@@ -113,6 +113,21 @@ try {
     & $policyPath -EnvFile $envPath -ComposeFile (Join-Path $runtimePath 'compose.yml')
     Assert-Test ($LASTEXITCODE -eq 0) 'Single-node production policy validation failed.'
 
+    # The first fixture intentionally omits new keys to retain pre-iOS compatibility.
+    foreach ($iosID in @('', 'termlink-ios')) {
+        $iosSuffix = if ($iosID -eq '') { 'disabled' } else { 'enabled' }
+        $iosEnvPath = Join-Path $fixturePath ("config-ios-" + $iosSuffix + '.env')
+        $iosParties = if ($iosID -eq '') { '' } else { 'termlink-android,termlink-windows,termlink-ios' }
+        $iosEnvironment = $environment + @(
+            "TERMLINK_IOS_OIDC_CLIENT_ID=$iosID"
+            'TERMLINK_IOS_OIDC_REDIRECT_URI=dev.termlink.ios:/oauth2redirect'
+            "TERMLINK_OIDC_ALLOWED_PARTIES=$iosParties"
+        )
+        [IO.File]::WriteAllLines($iosEnvPath, $iosEnvironment, [Text.UTF8Encoding]::new($false))
+        & $policyPath -EnvFile $iosEnvPath -ComposeFile (Join-Path $runtimePath 'compose.yml')
+        Assert-Test ($LASTEXITCODE -eq 0) "iOS $iosSuffix deployment policy validation failed."
+    }
+
     $directRoutingEnvPath = Join-Path $fixturePath 'config-direct-routing.env'
     $directRoutingEnvironment = $environment | ForEach-Object {
         if ($_ -ceq 'TERMLINK_DIRECT_ROUTING_PERMITTED=false') {

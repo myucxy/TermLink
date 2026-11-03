@@ -6,12 +6,16 @@ import UIKit
 
 @MainActor final class ProductStore: ObservableObject {
     @Published var tab: ProductTab = .devices
-    @Published private(set) var pcs: [PC] = [], devices: [DeviceRecord] = [], sessions: [TerminalSession] = []
-    @Published private(set) var signedIn = false, refreshing = false
+    @Published private(set) var pcs: [PC] = []
+    @Published private(set) var devices: [DeviceRecord] = []
+    @Published private(set) var sessions: [TerminalSession] = []
+    @Published private(set) var signedIn = false
+    @Published private(set) var refreshing = false
     @Published private(set) var signingIn = false
     private(set) var active=true
     @Published private(set) var catalogErrors: [UUID:String] = [:]
-    @Published var error: String?, selectedCLI: UUID?
+    @Published var error: String?
+    @Published var selectedCLI: UUID?
     @Published var server = UserDefaults.standard.string(forKey:"server") ?? "https://termlink.kget.cc:8910"
     @Published private(set) var relay: RelayClient?
     @Published private(set) var terminals: [UUID:TerminalController] = [:]
@@ -74,7 +78,7 @@ import UIKit
         let account = localScope
         self.api=api;self.identity=identity;self.tokens=tokens;self.accountID=account;self.signedIn=true
         self.relay=RelayClient(api:api,identity:identity)
-        ai.restore();updates.restore();files.restore()
+        await ai.restore();guard owner==epoch else{throw CancellationError()};updates.restore();files.restore()
         try await refresh();try await relay?.connect();await refreshCatalogs()
         beginPolling()
         activityStore.record("signed-in","已登录并连接 \(root.host ?? root.absoluteString)")

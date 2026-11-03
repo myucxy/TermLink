@@ -7,6 +7,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Agent.Local\TermLink.Agent.Local.csproj" />
+    <ProjectReference Include="..\Agent.Connection\TermLink.Agent.Connection.csproj" />
+    <ProjectReference Include="..\Agent.AI\TermLink.Agent.AI.csproj" />
     <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\Linux\TermLink.Platform.Linux.csproj" />

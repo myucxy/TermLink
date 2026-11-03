@@ -16,7 +16,7 @@ struct ProductRootView:View {
     var body:some View{
         Group{if size == .regular{
             NavigationSplitView{List(ProductTab.allCases,selection:Binding<ProductTab?>(get:{product.tab},set:{if let value=$0{product.tab=value}})){tab in Label(tab.title,systemImage:tab.symbol).tag(tab)}.navigationTitle("TermLink")}detail:{NavigationStack{destination(product.tab)}}
-        }else{TabView(selection:$product.tab){ForEach(ProductTab.allCases){tab in NavigationStack{destination(tab)}.tabItem{Label(tab.title,systemImage:tab.symbol)}.tag(tab)}}}
+        }else{TabView(selection:$product.tab){ForEach(ProductTab.allCases){tab in NavigationStack{destination(tab)}.tabItem{Label(tab.title,systemImage:tab.symbol)}.tag(tab)}}}}
         .tint(Color(red:0.61,green:0.70,blue:1)).preferredColorScheme(appearance=="dark" ? .dark:appearance=="light" ? .light:nil)
         .alert("操作未完成",isPresented:Binding(get:{product.error != nil},set:{if !$0{product.error=nil}})){Button("关闭",role:.cancel){product.error=nil}}message:{Text(product.error ?? "")}
     }

@@ -154,6 +154,11 @@ the P6 exit gate: the portable Relay worker still rejects remote mutations with
 `PORTABLE_RELAY_NOT_CONFIGURED`, and Ubuntu arm64 plus a real Secret Service desktop and Android-control E2E
 remain unavailable. See `docs/validation/pc-avalonia-p6-linux.json`.
 
+Update (2026-10-25): the placeholder rejection has been replaced by the portable account/Relay control plane.
+Browser PKCE, PC_AGENT enrollment, proof-bound REST/WebSocket, presence, retry, refresh and account isolation
+now have local HTTP/WebSocket fixture coverage on macOS arm64. Remote terminal/file/AI data planes and real
+Linux/Android E2E remain outstanding; no P6 exit gate is claimed. See [macOS development](../pc-client/MACOS.md).
+
 ### P7 - macOS Agent
 
 - Implement PTY, process groups, Keychain, launchd, command discovery, package update, rollback, signing,

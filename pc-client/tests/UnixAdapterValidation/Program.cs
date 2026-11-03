@@ -15,6 +15,8 @@ try
 {
     await ValidateCommandsAsync();
     Console.WriteLine("PASS commands");
+    await TermLink.Platform.Unix.Validation.PosixAiAgentDiscoveryValidation.RunAsync();
+    Console.WriteLine("PASS AI CLI discovery: five brands, Finder PATH, runtime, timeout, cancellation and output limits");
     await ValidateFilesAsync(testRoot);
     Console.WriteLine("PASS files");
     await ValidateIpcAsync(testRoot);
@@ -25,9 +27,13 @@ try
     Console.WriteLine("PASS autostart");
     ValidateSecretStoreFailsClosed();
     Console.WriteLine("PASS secrets");
-    await ValidateAppImageAsync(testRoot);
-    Console.WriteLine("PASS appimage");
-    Console.WriteLine("Unix/Linux adapter validation passed: PTY, process groups, resize, Unicode/ANSI, UDS peer identity, files, commands, secrets, autostart, and AppImage rollback.");
+    if (OperatingSystem.IsLinux())
+    {
+        await ValidateAppImageAsync(testRoot);
+        Console.WriteLine("PASS appimage");
+    }
+    else Console.WriteLine("NOT APPLICABLE AppImage rollback (Linux only)");
+    Console.WriteLine("Unix adapter validation passed: PTY, process groups, resize, Unicode/ANSI, UDS peer identity, files, commands, secret-store failure and autostart generation.");
 }
 finally
 {

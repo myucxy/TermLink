@@ -236,6 +236,8 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
     /// A failed shutdown restores normal client operation so the UI can report and
     /// retry the failure without silently losing its control surface.
     /// </summary>
+    public bool SupportsCompleteShutdown => true;
+
     public async ValueTask ShutdownCompletelyAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -282,15 +284,10 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         }
     }
 
-    public bool SupportsZcodeRemoteConfiguration => true;
 
-    public ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrWhiteSpace(url)) TermLink.Ai.ZcodeRemoteAddressStore.Default.Clear();
-        else TermLink.Ai.ZcodeRemoteAddressStore.Default.Save(url);
-        return ValueTask.CompletedTask;
-    }
+    public bool SupportsAiAgentDetection => true;
+
+    public bool SupportsAiAgentDetection => true;
 
     public async ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken)
     {

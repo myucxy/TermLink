@@ -22,7 +22,7 @@ internal sealed class AiSessionManager : IDisposable
     private bool updating;
     private int activeMutations;
     private long receiptBytes;
-    private readonly ZcodeRemoteAddressStore remoteStore;
+    private readonly Func<Task<AiAgentInstallation[]>> catalog;
     private readonly string workspaceRoot;
     private readonly CancellationTokenSource lifetime = new();
     private readonly SemaphoreSlim modelQueries = new(2, 2);
@@ -50,8 +50,8 @@ internal sealed class AiSessionManager : IDisposable
         }
     }
     private readonly Dictionary<(Guid Caller, string Agent, string NativeId), (AiNativeHistoryEntry Entry, DateTime At)> nativeHistory = new();
-    internal AiSessionManager(ZcodeRemoteAddressStore remoteStore = null, string installRoot = null, string archiveRoot = null) {
-        this.remoteStore = remoteStore ?? ZcodeRemoteAddressStore.Default;
+    internal AiSessionManager(string installRoot = null, string archiveRoot = null, Func<Task<AiAgentInstallation[]>> catalog = null) {
+        this.catalog = catalog ?? (() => AiAgentDiscovery.CatalogAsync());
         workspaceRoot = AiWorkspaceStorage.Under(installRoot ?? AppContext.BaseDirectory);
         if (archiveRoot != null) archive = new AiSessionArchive(archiveRoot);
     }
@@ -70,11 +70,14 @@ internal sealed class AiSessionManager : IDisposable
         Request request;
         try { request = JsonSerializer.Deserialize<Request>(body, Json) ?? throw new JsonException(); }
         catch (JsonException) { return Error("INVALID_REQUEST"); }
+        if (!OperatingSystem.IsWindows() && (request.Action != null && request.Action.StartsWith("attachment.", StringComparison.Ordinal) ||
+            request.Action is "artifacts" or "artifact.read" || request.AttachmentIds is { Length: > 0 } || request.FileReferences is { Length: > 0 }))
+            return Error("AI_FILE_ACCESS_UNAVAILABLE");
         if (request.Action == null || request.HostId == null || request.SessionId == null || request.AgentId == null ||
             request.Directory == null || request.Text == null || request.RequestId == null || request.Decision == null)
             return Error("INVALID_REQUEST");
         if (request.Action == "catalog") {
-            var agents = await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore).WaitAsync(token).ConfigureAwait(false);
+            var agents = (await catalog().WaitAsync(token).ConfigureAwait(false)).Where(a => a.Strategy == "native").ToArray();
             lock (sync) {
                 if (disposed) return Error("HOST_RETIRED");
                 if (authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
@@ -87,6 +90,7 @@ internal sealed class AiSessionManager : IDisposable
                 }
                 return Encode(new { hostId = HostId, agents = agents.Select(a => new { a.Id, a.Name, a.Path, a.RuntimePath, a.Version, a.Protocol, a.Status, a.Strategy,
                     nativeHistory = AiAgentSession.SupportsNativeHistory(a), configuration = AiAgentSession.ConfigurationFor(a) }).ToArray(), defaultDirectory = workspaceRoot, directoryMode = "per_session", directoryBrowsing = true, modelListing = true,
+                    cliWorkspaceCreation = OperatingSystem.IsWindows(),
                     cliWorkspaceRoot = workspaceRoot,
                     configurationModes = agents.Where(a => a.Strategy == "native").ToDictionary(a => a.Id, a => AiAgentSession.Modes(a.Protocol)),
                     sessions = sessions.Values.Select(s => s.Snapshot(caller, false)).ToArray() });
@@ -98,7 +102,7 @@ internal sealed class AiSessionManager : IDisposable
             if (!await modelQueries.WaitAsync(0, token)) return Error("MODEL_LIST_BUSY");
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
             try {
-                var installation = (await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore).WaitAsync(linked.Token)).FirstOrDefault(a => a.Id == request.AgentId);
+                var installation = (await catalog().WaitAsync(linked.Token)).FirstOrDefault(a => a.Id == request.AgentId);
                 if (installation == null) return Error("AGENT_UNAVAILABLE");
                 var page = await AiAgentSession.NativeHistoryAsync(installation, request.Text, linked.Token);
                 lock (sync) {
@@ -119,7 +123,7 @@ internal sealed class AiSessionManager : IDisposable
             if (!await modelQueries.WaitAsync(0, token)) return Error("MODEL_LIST_BUSY");
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
             try {
-                var installation = (await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore).WaitAsync(linked.Token))
+                var installation = (await catalog().WaitAsync(linked.Token))
                     .FirstOrDefault(a => a.Id == request.AgentId && a.Status == "available");
                 if (installation == null) return Error("AGENT_UNAVAILABLE");
                 if (authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
@@ -147,19 +151,9 @@ internal sealed class AiSessionManager : IDisposable
                 }
             } catch (FileOperationException) { return Error("DIRECTORY_BROWSE_FAILED"); }
         }
+        // Older phones may still ask for the retired URL. Never read or return it.
         if (request.Action == "remote") {
-            lock (sync) {
-                if (disposed || request.HostId != HostId) return Error("HOST_CHANGED");
-                if (request.AgentId != "zcode") return Error("AGENT_UNAVAILABLE");
-                try {
-                    var url = remoteStore.Read();
-                    if (authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
-                    return url.Length == 0 ? Error("REMOTE_NOT_CONFIGURED") : Encode(new { hostId = HostId,
-                        agentId = "zcode", strategy = "desktop_remote", remoteUrl = url });
-                } catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.Cryptography.CryptographicException) {
-                    return Error("REMOTE_CONFIGURATION_INVALID");
-                }
-            }
+            lock (sync) return disposed || request.HostId != HostId ? Error("HOST_CHANGED") : Error("AGENT_STRATEGY_CHANGED");
         }
         if (request.Action == "message") {
             lock (sync) {
@@ -263,7 +257,21 @@ internal sealed class AiSessionManager : IDisposable
         }
         AiAgentSession session = null;
         try {
-            if (request.Action == "import-native") {
+            if (request.Action == "create-cli-workspace") {
+                if (!OperatingSystem.IsWindows()) return Error("CLI_WORKSPACE_UNAVAILABLE");
+                if (authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
+                string directory;
+                lock (sync) {
+                    if (disposed || authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
+                    directory = CreateWorkspace("cli");
+                }
+                if (authorized != null && !authorized()) {
+                    try { if (Directory.Exists(directory)) Directory.Delete(directory); }
+                    catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+                    return Error("AUTHORITY_CHANGED");
+                }
+                return Encode(new { hostId = HostId, operationId = request.OperationId, directory });
+            } else if (request.Action == "import-native") {
                 AiNativeHistoryEntry source;
                 lock (sync) {
                     if (disposed || authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
@@ -272,7 +280,7 @@ internal sealed class AiSessionManager : IDisposable
                     var existing = sessions.Values.FirstOrDefault(s => s.MatchesNative(request.AgentId, source.NativeId));
                     if (existing != null) return Encode(new { hostId = HostId, session = existing.Snapshot(caller, true) });
                 }
-                var installation = (await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore)).FirstOrDefault(a => a.Id == request.AgentId && AiAgentSession.SupportsNativeHistory(a));
+                var installation = (await catalog()).FirstOrDefault(a => a.Id == request.AgentId && AiAgentSession.SupportsNativeHistory(a));
                 if (installation == null) return Error("NATIVE_HISTORY_UNSUPPORTED");
                 if (!IsLocalDirectory(source.Directory)) return Error("LOCAL_DIRECTORY_REQUIRED");
                 var imported = AiAgentSession.Import(installation, source, caller, null);
@@ -300,7 +308,7 @@ internal sealed class AiSessionManager : IDisposable
                 var mode = request.DirectoryMode == "" ? (request.Directory.Length == 0 ? "managed" : "custom") : request.DirectoryMode;
                 if (mode != "managed" && mode != "custom" || mode == "managed" && request.Directory.Length != 0) return Error("INVALID_DIRECTORY_MODE");
                 if (mode == "custom" && !IsLocalDirectory(request.Directory)) return Error("LOCAL_DIRECTORY_REQUIRED");
-                var installation = (await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore).ConfigureAwait(false))
+                var installation = (await catalog().ConfigureAwait(false))
                     .FirstOrDefault(a => a.Id == request.AgentId && a.Status == "available");
                 if (installation == null) return Error("AGENT_UNAVAILABLE");
                 if (installation.Strategy != "native") return Error("AGENT_STRATEGY_CHANGED");
@@ -329,7 +337,7 @@ internal sealed class AiSessionManager : IDisposable
                     if (request.Action == "resume" && !source.MatchesControl(request.ControlVersion)) return Error("CONTROL_CHANGED");
                 }
                 var record = request.Action == "fork" ? await source.ForkAsync(caller, request.ControlVersion) : source.ArchiveRecord();
-                var agent = (await AiAgentDiscovery.CatalogAsync(remoteStore: remoteStore)).FirstOrDefault(a => a.Id == record.AgentId && a.Strategy == "native" && a.Status == "available");
+                var agent = (await catalog()).FirstOrDefault(a => a.Id == record.AgentId && a.Strategy == "native" && a.Status == "available");
                 if (agent == null || agent.Protocol is not ("codex" or "claude" or "acp") || record.NativeId.Length == 0) return Error("RESUME_UNAVAILABLE");
                 lock (sync) {
                     if (disposed || authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");

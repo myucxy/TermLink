@@ -11,12 +11,41 @@ namespace TermLink.Presentation;
 /// </summary>
 public static class PresentationText
 {
+    public static string PcDevice => Pick("电脑", "Computer");
+    public static string ServerConnection => Pick("服务器连接", "Server connection");
+    public static string RelayEnabled => Pick("Relay 已启用", "Relay enabled");
+    public static string RelayDisabled => Pick("Relay 已关闭", "Relay disabled");
+    public static string PortableConnectionDetail => Pick("登录后可启用 Relay 在线连接。此版本尚未开放手机远程终端、文件和 AI 会话。", "Sign in to enable the Relay connection. Remote terminal, files and AI sessions are not available in this build.");
+    public static string PortableSessionsDetail => Pick("此版本尚未开放远程终端和 AI 会话。", "Remote terminal and AI sessions are not available in this build.");
+    public static string PortableCommandsDetail => Pick("检测本机已安装的 Shell，刷新可重新检测。远程终端尚未接通，暂不提供命令编辑。", "Shows installed local shells. Refresh to detect changes. Command editing requires the remote terminal integration.");
+    public static string PortableDetectionDetail => Pick("检测本机 CLI 的安装和启动状态。模型授权需独立验证，其他 Agent 的检测结果不代表远程可用。", "Checks local CLI installation and startup. Model authorization requires separate validation; detection alone does not enable remote access.");
+    public static string AgentDetectionDetail => Pick("自动识别本机安装与协议。认证由 Agent 本身处理，首次对话后确认。", "Detects local installations and protocols. Authentication is handled by each Agent.");
+    public static string PortableCapabilitiesDetail => Pick("账号登录、设备注册与 Relay 在线连接；终端、文件及 AI 远程功能待接入。", "Account sign-in, device registration and Relay presence; remote terminal, files and AI are pending.");
+    public static string AgentDetectionNotRun => Pick("尚未检测", "Not checked yet");
+    public static string DetectingAgents => Pick("正在检测本机 CLI…", "Checking local CLIs…");
+    public static string AgentDetectionFailed => Pick("检测未完成，请重试。", "Detection failed. Try again.");
+    public static string AgentDetectionResult(int count, int available) => Pick($"已检查 {count} 项 · {available} 项可在本机启动", $"Checked {count} tools · {available} can start locally");
+    public static string MacManualUpdateDetail => Pick("当前 macOS 开发版通过下载新应用包手动更新。", "Update this macOS development build by downloading a new application package.");
+    public static string MacAutomaticUpdateDetail => Pick("自动检查 Mac 更新。下载后校验发布者签名与公证，确认安装后会停止任务，由 macOS 请求授权并在完成后重启。", "Checks for Mac updates automatically. Downloads are verified against the publisher and notarization; installation stops tasks, requests macOS authorization, then restarts the application.");
+    public static string MacInstallerAuthorizationDetail => Pick("macOS 将请求安装授权。取消授权后后台可以重新启动；已结束的任务不会恢复。", "macOS will request installation authorization. Cancelling allows the Agent to start again; stopped tasks are not resumed.");
+    public static string MacInstallerCancelled => Pick("已取消系统安装授权。当前客户端可继续运行，已结束的任务需要重新创建。", "System installation authorization was cancelled. The current client can keep running; stopped tasks must be recreated.");
+    public static string MacInstallerFailed => Pick("Mac 更新安装或重启未完成，请查看本机诊断后重试。", "Mac update installation or restart did not complete. Check local diagnostics and retry.");
+    public static string MacTerminal => Pick("macOS 终端", "macOS Terminal");
+    public static string MacTerminalDetail => Pick("打开系统终端使用本机 Shell。", "Open Terminal to use a local shell.");
+    public static string OpenTerminal => Pick("打开终端", "Open Terminal");
+    public static string MacLoginItems => Pick("登录项与后台权限", "Login items and background permissions");
+    public static string MacLoginItemsDetail => Pick("在 macOS 系统设置中管理。当前开发包需手动启动；关闭控制界面后 Agent 可继续运行。", "Manage permissions in System Settings. Start this development build manually; the Agent can keep running after the control UI closes.");
+    public static string OpenSystemSettings => Pick("打开系统设置", "Open System Settings");
+    public static string ApplicationLocation => Pick("应用位置", "Application location");
+    public static string ApplicationLocationDetail => Pick("在 Finder 中定位当前运行的应用包。", "Locate the running application bundle in Finder.");
+    public static string OpenFinder => Pick("在 Finder 中显示", "Show in Finder");
+    public static string SignOutBeforeServerChange => Pick("请先退出当前账号，再更改服务器地址。", "Sign out before changing the server address.");
     public static string TerminalProtocolDiagnostic => Pick("协议错误详情", "Protocol error details");
     public static string CopyTerminalDiagnostic => Pick("复制诊断", "Copy diagnostic");
     public static string CloseTerminalDiagnostic => Pick("关闭", "Close");
     public static string TerminalProtocolDiagnosticContext => Pick(
-        "Windows 权威核心拒绝了输出，已请求停止该会话桥接。下方为首次错误；检测位置不一定是首个无效参数的位置。",
-        "The Windows authority rejected output and requested this session bridge to stop. The first error is shown below; the detection position may differ from the first invalid parameter.");
+        "终端权威核心拒绝了输出，已请求停止该会话桥接。下方为首次错误；检测位置不一定是首个无效参数的位置。",
+        "The terminal authority rejected output and requested this session bridge to stop. The first error is shown below; the detection position may differ from the first invalid parameter.");
     public static string AgentStateUnknown => Pick("暂时无法读取本机 Agent，账户与会话状态待确认。", "Local Agent unavailable. Account and session status are unconfirmed.");
     private static bool IsChinese =>
         CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.Equals("zh", StringComparison.OrdinalIgnoreCase);
@@ -40,7 +69,6 @@ public static class PresentationText
     public static string SessionSearch => Pick("搜索标题、Agent、工作目录", "Search titles, Agents and directories");
     public static string OpenDirectory => Pick("目录", "Folder");
     public static string AgentSetupHelp => Pick("安装 / 登录说明", "Install / sign in");
-    public static string VerifyZcodeRemote => Pick("打开验证", "Open to verify");
     public static string CancelAuthorization => Pick("取消授权", "Cancel sign-in");
     public static string AuthorizationCancelled => Pick("已取消网页授权", "Browser sign-in cancelled");
     public static string AuthorizationNotWaiting => Pick("授权页面尚未就绪或等待已结束，请查看登录状态后重试。", "The page is not ready or sign-in has finished. Check the account status and retry.");
@@ -118,11 +146,11 @@ public static class PresentationText
         "已有网页授权正在进行，TermLink 已重新打开授权页面，请在页面中继续。",
         "A web authorization is already in progress. TermLink reopened the authorization page so you can continue.");
     public static string BrowserCallbackListenerFailedDetail => Pick(
-        "无法启动本机授权回调监听。请检查 Windows 网络权限后重试；本地会话不会受到影响。",
-        "The local authorization callback listener could not be started. Check Windows network permissions and try again; local sessions are unaffected.");
+        "无法启动本机授权回调监听。请检查 系统网络权限后重试；本地会话不会受到影响。",
+        "The local authorization callback listener could not be started. Check system network permissions and try again; local sessions are unaffected.");
     public static string BrowserOpenFailedDetail => Pick(
-        "Windows 无法打开默认浏览器。请在系统设置中为 HTTP 和 HTTPS 选择默认浏览器后重试。",
-        "Windows could not open the default browser. Choose a default browser for HTTP and HTTPS in Windows Settings, then try again.");
+        "系统无法打开默认浏览器。请在系统设置中为 HTTP 和 HTTPS 选择默认浏览器后重试。",
+        "The system could not open the default browser. Choose a default browser for HTTP and HTTPS in system settings, then try again.");
     public static string BrowserAuthorizationTimeoutDetail => Pick(
         "网页授权已超时。请重新点击登录，并在 5 分钟内完成登录或注册。",
         "Web authorization timed out. Start sign-in again and complete it within 5 minutes.");
@@ -130,8 +158,8 @@ public static class PresentationText
         "网页授权被取消或返回内容无效，请重新发起登录。",
         "Web authorization was cancelled or returned an invalid response. Start sign-in again.");
     public static string BrowserAuthorizationFailedDetail => Pick(
-        "Agent 未能启动网页授权。请检查默认浏览器和 Windows 网络权限后重试；本地会话不会受到影响。",
-        "The Agent could not start web authorization. Check the default browser and Windows network permissions, then try again; local sessions are unaffected.");
+        "Agent 未能启动网页授权。请检查默认浏览器和 系统网络权限后重试；本地会话不会受到影响。",
+        "The Agent could not start web authorization. Check the default browser and system network permissions, then try again; local sessions are unaffected.");
     public static string IdentityServiceTimeoutDetail => Pick(
         "身份服务响应超时。请检查服务器连接后重试。",
         "The identity service timed out. Check the server connection and try again.");
@@ -230,8 +258,8 @@ public static class PresentationText
     public static string OpenLogs => Pick("打开日志目录", "Open log directory");
     public static string DiagnosticsDirectoryOpened => Pick("已打开诊断日志目录。", "The diagnostics log directory is open.");
     public static string ShellOpenFailedDetail => Pick(
-        "Windows 无法打开请求的页面或目录。请检查默认应用和资源管理器后重试。",
-        "Windows could not open the requested page or directory. Check default apps and File Explorer, then try again.");
+        "无法打开请求的页面或目录。请检查默认应用和目录访问权限后重试。",
+        "The requested page or directory could not be opened. Check default apps and directory permissions, then try again.");
     public static string RefreshStatus => Pick("刷新状态", "Refresh status");
     public static string OpenTermLink => Pick("打开 TermLink", "Open TermLink");
     public static string ExitControlUi => Pick("退出控制 UI（Agent 继续运行）", "Exit control UI (Agent keeps running)");

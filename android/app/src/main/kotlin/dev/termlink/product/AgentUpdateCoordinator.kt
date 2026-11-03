@@ -154,7 +154,7 @@ internal class AgentUpdateCoordinator(
 
     fun recover(pcs: List<PcSummary>) {
         refreshOffers(pcs)
-        for (pc in pcs.filter { it.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities }) {
+        for (pc in pcs.filter { PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities }) {
             if (state.value.devices.containsKey(pc.id) || jobs[pc.id]?.isActive == true) continue
             val retained = tasks[pc.id]
             if (retained != null) put(pc.id, AgentUpdateDialogState.Loading(pc))
@@ -176,7 +176,7 @@ internal class AgentUpdateCoordinator(
     }
 
     fun refreshOffers(pcs: List<PcSummary>, force: Boolean = false) {
-        val candidates = pcs.filter { it.online && it.remoteRoutingEnabled && it.platform == "windows" &&
+        val candidates = pcs.filter { it.online && it.remoteRoutingEnabled &&
             PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in it.capabilities }
         val allowed = candidates.mapTo(hashSetOf()) { it.id }
         mutableState.value = state.value.copy(offers = state.value.offers.filterKeys { it in allowed })
@@ -307,7 +307,7 @@ internal fun AgentUpdateDialogState.canDismissNotice(): Boolean =
         this is AgentUpdateDialogState.Running && progress.terminal && progress.status != "SUCCEEDED"
 
 internal fun AgentUpdateEligibility.isUpdateAvailableFor(pc: PcSummary, state: AgentUpdateDialogState?): Boolean =
-    pc.online && pc.remoteRoutingEnabled && pc.platform == "windows" && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities &&
+    pc.online && pc.remoteRoutingEnabled && PcCapabilityIds.REMOTE_AGENT_UPDATE_V1 in pc.capabilities &&
         pcId == pc.id && currentVersion == pc.agentVersion && eligible && !targetVersion.isNullOrBlank() &&
         currentBuild != null && targetBuild != null && targetBuild > currentBuild &&
         state?.blocksPcActions() != true &&

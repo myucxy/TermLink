@@ -92,9 +92,13 @@ type API struct {
 	historyUploads     historyUploadStore
 	transcriptPages    transcriptPageLister
 	fileOperations     fileOperationStore
+	agentRouting       agentRoutingStore
+	agentUpdatePCs     agentUpdatePCContextStore
 	agentUpdates       agentUpdateStore
 	AgentUpdateCatalog agentupdate.Catalog
 	operationSecurity  operationSecurityStore
+	pushNotifications  pushNotificationStore
+	PushNotifications  PushNotificationConfiguration
 }
 
 type historyPageLister interface {
@@ -156,11 +160,17 @@ func (a *API) Handler() http.Handler {
 	registered.HandleFunc("GET /v1/devices/self", a.getCurrentDevice)
 
 	trusted := http.NewServeMux()
+	trusted.HandleFunc("GET /v1/devices/self/push", a.devicePush)
+	trusted.HandleFunc("PUT /v1/devices/self/push", a.devicePush)
+	trusted.HandleFunc("DELETE /v1/devices/self/push", a.devicePush)
+	trusted.HandleFunc("POST /v1/pcs/{pcId}/notification-events", a.notificationEvent)
 	trusted.HandleFunc("GET /v1/devices", a.listDevices)
 	trusted.HandleFunc("POST /v1/pairing/challenges", a.createPairingChallenge)
 	trusted.HandleFunc("POST /v1/devices/{id}/revoke", a.revokeDevice)
 	trusted.HandleFunc("GET /v1/pcs", a.listPCs)
 	trusted.HandleFunc("PUT /v1/pcs/{id}", a.upsertPC)
+	trusted.HandleFunc("GET /v1/pcs/{pcId}/remote-routing", a.agentPCRemoteRouting)
+	trusted.HandleFunc("PUT /v1/pcs/{pcId}/remote-routing", a.agentPCRemoteRouting)
 	trusted.HandleFunc("PUT /v1/pcs/{id}/session-snapshot", a.replaceSessionSnapshot)
 	trusted.HandleFunc("POST /v1/pcs/{id}/session-deletions", a.applyHostSessionDeletions)
 	trusted.HandleFunc("POST /v1/pcs/{pcId}/file-operations", a.createFileOperation)
@@ -218,6 +228,7 @@ func (a *API) Handler() http.Handler {
 	root.Handle("/v1/auth/register/email-code", public)
 	root.Handle("/v1/auth/register", public)
 	root.Handle("/v1/devices/self", a.Auth.AuthenticateRegistered(registered))
+	root.Handle("/v1/devices/self/push", a.Auth.Authenticate(a.idempotency(http.HandlerFunc(a.devicePush))))
 	root.Handle("/v1/devices/self/trust", a.Auth.AuthenticateRegistered(a.idempotency(http.HandlerFunc(a.selfTrustAndroidDevice))))
 	// Register the exact create path as well as the completion subtree. Without
 	// this, net/http redirects POST /v1/pairing/challenges to a trailing slash,
@@ -548,6 +559,7 @@ func (a *API) getClientConfiguration(w http.ResponseWriter, r *http.Request) {
 		"web_oidc_client_id":     a.ClientConfig.WebClientID,
 		"web_redirect_uri":       a.ClientConfig.WebRedirectURI,
 		"protocol_versions":      []int{1},
+		"push_notifications":     map[string]any{"enabled": a.PushNotifications.Enabled, "provider": "apns", "event_types": []string{"ai.completed", "ai.needs_input", "upgrade.succeeded", "upgrade.failed"}},
 	})
 }
 
@@ -956,12 +968,15 @@ func (a *API) listPCs(w http.ResponseWriter, r *http.Request) {
 	}
 	projectPCServerCapabilities(items)
 	projectPCCommandCapabilities(items, pcCommandCapabilitiesRequested(r))
+	projectPCShellCapabilities(items, pcShellCapabilitiesRequested(r))
 	writeJSON(w, 200, map[string]any{"items": items})
 }
 
 const (
 	pcCommandCapabilitiesHeader = "X-TermLink-PC-Command-Capabilities"
 	enhancedPowerShellCommandID = "powershell-7-enhanced"
+	pcShellCapabilitiesHeader   = "X-TermLink-PC-Shell-Capabilities"
+	posixShellCapabilitiesToken = "posix-shells-v1"
 )
 
 func pcCommandCapabilitiesRequested(r *http.Request) bool {
@@ -990,6 +1005,44 @@ func projectPCCommandCapabilities(items []store.PCRecord, exposeEnhanced bool) {
 		}
 		items[index].TerminalCommands = projected
 	}
+}
+
+func pcShellCapabilitiesRequested(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL == nil || r.URL.Path != "/v1/pcs" {
+		return false
+	}
+	values := r.Header.Values(pcShellCapabilitiesHeader)
+	return len(values) == 1 && strings.TrimSpace(values[0]) == posixShellCapabilitiesToken
+}
+
+func projectPCShellCapabilities(items []store.PCRecord, exposePOSIX bool) {
+	if exposePOSIX {
+		return
+	}
+	for index := range items {
+		if len(items[index].SupportedShells) > 0 {
+			filteredShells := make([]string, 0, len(items[index].SupportedShells))
+			for _, shell := range items[index].SupportedShells {
+				if !isPOSIXShellType(shell) {
+					filteredShells = append(filteredShells, shell)
+				}
+			}
+			items[index].SupportedShells = filteredShells
+		}
+		if len(items[index].TerminalCommands) > 0 {
+			filteredCommands := make([]store.TerminalCommandCapability, 0, len(items[index].TerminalCommands))
+			for _, command := range items[index].TerminalCommands {
+				if !isPOSIXShellType(command.ShellType) {
+					filteredCommands = append(filteredCommands, command)
+				}
+			}
+			items[index].TerminalCommands = filteredCommands
+		}
+	}
+}
+
+func isPOSIXShellType(value string) bool {
+	return store.ShellAllowedOnPlatform(store.PCPlatformMacOS, value)
 }
 
 func projectPCServerCapabilities(items []store.PCRecord) {
@@ -1142,7 +1195,7 @@ var pcCapabilityIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
 func normalizePCAgentMetadata(
 	deviceType, platform, architecture, platformVersion string,
 	capabilities []string,
-	_, remoteAgentUpdateCapable bool,
+	sessionHeartbeatCapable, remoteAgentUpdateCapable bool,
 	supportedShells []string,
 	terminalCommands []store.TerminalCommandCapability,
 ) (string, string, string, []string, error) {
@@ -1201,8 +1254,30 @@ func normalizePCAgentMetadata(
 		seen[capability] = true
 		normalized = append(normalized, capability)
 	}
-	if !store.HasPCCapability(normalized, store.PCCapabilityRealtimeTerminalV1) {
+	// Portable Hosts advertise only implemented features. AI and signed remote
+	// update control do not imply a terminal, snapshot or file data plane.
+	portableControl := deviceType == store.DeviceTypePCAgent &&
+		(platform == store.PCPlatformMacOS || platform == store.PCPlatformLinux) &&
+		capabilities != nil && !sessionHeartbeatCapable &&
+		len(supportedShells) == 0 && len(terminalCommands) == 0 &&
+		remoteAgentUpdateCapable == store.HasPCCapability(normalized, store.PCCapabilityRemoteAgentUpdateV1)
+	for _, capability := range normalized {
+		if capability != store.PCCapabilityAIAgentV1 && capability != store.PCCapabilityRemoteAgentUpdateV1 {
+			portableControl = false
+		}
+	}
+	if !portableControl && !store.HasPCCapability(normalized, store.PCCapabilityRealtimeTerminalV1) {
 		return "", "", "", nil, errors.New("realtime terminal capability is required")
+	}
+	for _, shell := range supportedShells {
+		if !store.ShellAllowedOnPlatform(platform, shell) {
+			return "", "", "", nil, errors.New("shell is incompatible with PC platform")
+		}
+	}
+	for _, command := range terminalCommands {
+		if command.Source == "detected" && !store.ShellAllowedOnPlatform(platform, command.ShellType) {
+			return "", "", "", nil, errors.New("terminal command is incompatible with PC platform")
+		}
 	}
 	if (len(supportedShells) > 0 || len(terminalCommands) > 0) &&
 		!store.HasPCCapability(normalized, store.PCCapabilityTerminalCommandsV1) {
@@ -1225,9 +1300,7 @@ func normalizeTerminalCommands(values []store.TerminalCommandCapability) ([]stor
 		}
 		switch value.Source {
 		case "detected":
-			legacyDetected := value.ShellType == value.ID &&
-				(value.ID == "command-prompt" || value.ID == "windows-powershell" ||
-					value.ID == "powershell-7" || value.ID == "wsl")
+			legacyDetected := value.ShellType == value.ID && store.IsManagedShellType(value.ID)
 			enhancedPowerShell := value.ID == "powershell-7-enhanced" && value.ShellType == "powershell-7"
 			if !legacyDetected && !enhancedPowerShell {
 				return nil, errors.New("invalid detected terminal command capability")
@@ -1251,15 +1324,13 @@ func normalizeSupportedShells(values []string) ([]string, error) {
 	}
 	seen := make(map[string]bool, len(values))
 	for _, value := range values {
-		switch value {
-		case "command-prompt", "windows-powershell", "powershell-7", "wsl":
-			seen[value] = true
-		default:
+		if !store.IsManagedShellType(value) {
 			return nil, errors.New("unsupported shell capability")
 		}
+		seen[value] = true
 	}
 	normalized := make([]string, 0, len(seen))
-	for _, value := range []string{"command-prompt", "windows-powershell", "powershell-7", "wsl"} {
+	for _, value := range store.ManagedShellTypes() {
 		if seen[value] {
 			normalized = append(normalized, value)
 		}
@@ -2711,7 +2782,11 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 }
 func writeError(w http.ResponseWriter, r *http.Request, status int, code string, _ error) {
-	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message_key": "errors." + strings.ToLower(code), "trace_id": traceID(r.Context())}})
+	detail := map[string]string{"code": code, "message_key": "errors." + strings.ToLower(code), "trace_id": traceID(r.Context())}
+	if stage := connectionErrorStage(r); stage != "" {
+		detail["stage"] = stage
+	}
+	writeJSON(w, status, map[string]any{"error": detail})
 }
 
 func verifyBearer(ctx context.Context, verifier auth.TokenVerifier, header string) (auth.Identity, error) {
@@ -2757,7 +2832,7 @@ func (a *API) idempotency(next http.Handler) http.Handler {
 			// PC metadata is a periodically refreshed current-state declaration,
 			// not a replayable command. Keep the request/key guards above, but do
 			// not let a stale response prevent the next state from being stored.
-			if isCurrentPCUpsertRequest(r) {
+			if isCurrentPCUpsertRequest(r) || r.URL.Path == "/v1/devices/self/push" {
 				next.ServeHTTP(w, r)
 				return
 			}

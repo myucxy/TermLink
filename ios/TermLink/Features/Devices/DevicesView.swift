@@ -3,7 +3,11 @@ import SwiftUI
 
 struct DevicesView:View {
     @EnvironmentObject var product:ProductStore
-    @State private var filesPC:PC?,createPC:PC?,updatePC:PC?,showDownloads=false,showActivity=false
+    @State private var filesPC:PC?
+    @State private var createPC:PC?
+    @State private var updatePC:PC?
+    @State private var showDownloads=false
+    @State private var showActivity=false
     @State private var ending:TerminalSession?
     var body:some View{ScrollView{LazyVStack(spacing:12){
         if !product.signedIn{ContentUnavailableView("登录 TermLink",systemImage:"laptopcomputer.and.iphone",description:Text("使用同一账号连接电脑，访问 CLI、AI 和文件。"));Button("授权登录"){Task{await product.signIn()}}.buttonStyle(.borderedProminent)}
@@ -28,7 +32,9 @@ struct CreateTerminalView:View {
     let pc:PC
     @EnvironmentObject var product:ProductStore
     @Environment(\.dismiss) private var dismiss
-    @State private var directory="",command="",busy=false
+    @State private var directory=""
+    @State private var command=""
+    @State private var busy=false
     var body:some View{Form{TextField("工作目录（电脑端默认目录留空）",text:$directory).textInputAutocapitalization(.never);Picker("终端命令",selection:$command){ForEach(pc.commands,id:\.self){c in Text(c["display_name"].string).tag(c["id"].string)}};Button("创建会话"){busy=true;Task{defer{busy=false};do{try await product.files.openShell(pc:pc.id,path:directory,command:command);dismiss()}catch{product.report(error)}}}.disabled(busy || command.isEmpty)}.navigationTitle("新建 CLI 会话").toolbar{Button("取消"){dismiss()}}.onAppear{command=pc.commands.first?["id"].string ?? ""}}
 }
 struct AgentVersionRow:View {
@@ -51,6 +57,7 @@ struct AgentUpdateSheet:View {
     @ObservedObject var updates:AgentUpdateStore
     let pc:PC
     @Environment(\.dismiss) private var dismiss
-    @State private var eligibility:JSONValue?,error:String?
+    @State private var eligibility:JSONValue?
+    @State private var error:String?
     var body:some View{NavigationStack{Form{Text(pc.name);if let task=updates.tasks[pc.id]{Text(task.status);Text(task.phase);ProgressView(value:task.percent);if task.cancelable{Button("取消升级",role:.destructive){Task{do{try await updates.cancel(pc.id)}catch{self.error=error.localizedDescription}}}}}else if let value=eligibility{Text("当前 \(pc.version) → \(value["target_version"].string)");if value["eligible"].bool{Button("确认升级"){dismiss();Task{await updates.install(pc.id,target:value["target_build"].integer)}}}else{Text(value["reason_code"].string)}}else{ProgressView()};if let error{Text(error).foregroundStyle(.red)}}.navigationTitle("升级 Windows 客户端").toolbar{Button("收起"){updates.minimize();dismiss()}}.task{do{eligibility=try await updates.eligibility(pc.id)}catch{self.error=error.localizedDescription}}}}
 }

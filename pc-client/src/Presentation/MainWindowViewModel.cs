@@ -243,10 +243,8 @@ public sealed class SettingsPageViewModel : PageViewModel
     public bool CommandEditorOpen { get => commandEditorOpen; internal set => SetProperty(ref commandEditorOpen, value); }
     public bool HasUnsavedCommands { get => hasUnsavedCommands; internal set => SetProperty(ref hasUnsavedCommands, value); }
     public ObservableCollection<AiAgentCapability> AiAgents { get; } = new();
-    private string zcodeRemoteUrl = string.Empty;
-    private string zcodeRemoteStatus = "未配置 · 使用本地协议";
-    public string ZcodeRemoteUrl { get => zcodeRemoteUrl; set => SetProperty(ref zcodeRemoteUrl, value); }
-    public string ZcodeRemoteStatus { get => zcodeRemoteStatus; internal set => SetProperty(ref zcodeRemoteStatus, value); }
+    private string agentDetectionStatus = PresentationText.AgentDetectionNotRun;
+    public string AgentDetectionStatus { get => agentDetectionStatus; internal set => SetProperty(ref agentDetectionStatus, value); }
     public ObservableCollection<TerminalCommandCapability> TerminalCommands { get; } = new();
     internal List<TerminalCommandCapability> RemovedTerminalCommands { get; } = new();
 }
@@ -276,6 +274,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private readonly AgentStateStore stateStore;
     private readonly IAgentClient client;
     private readonly IDesktopOperations? desktopOperations;
+    private readonly PcPlatform platform;
     private readonly IAppearanceController? appearanceController;
     private readonly IUiDispatcher dispatcher;
     private readonly INavigationTelemetry? navigationTelemetry;
@@ -304,6 +303,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private bool hasAvailableUpdate;
     private string availableUpdateText = string.Empty;
     private bool updateProgressVisible;
+    private bool isInstallingUpdate;
     private double updateProgressPercent;
     private string updateProgressText = string.Empty;
     private CancellationTokenSource? updateDownloadCancellation;
@@ -336,6 +336,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(noticeAutoDismissDelay));
         appearancePreference = appearanceController?.Current ?? AppearancePreference.System;
         ArgumentNullException.ThrowIfNull(descriptor);
+        platform = descriptor.Platform;
 
         Connection = new ConnectionPageViewModel();
         Sessions = new SessionsPageViewModel();
@@ -348,6 +349,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             ApplicationVersion = applicationVersion,
             Author = author,
         };
+        if (platform == PcPlatform.MacOS && !SupportsAutomaticUpdates) Settings.UpdateStatusText = PresentationText.MacManualUpdateDetail;
         pages = new PageViewModel[] { Devices, Sessions, Settings }
             .ToDictionary(page => page.Key, StringComparer.Ordinal);
         currentPage = Devices;
@@ -368,9 +370,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 SetAppearance(preference);
             return Task.CompletedTask;
         });
-        DetectAiAgentsCommand = new AsyncCommand((_, token) => DetectAiAgentsAsync(token));
-        SaveZcodeRemoteCommand = new AsyncCommand((_, token) => ConfigureZcodeRemoteAsync(false, token));
-        ClearZcodeRemoteCommand = new AsyncCommand((_, token) => ConfigureZcodeRemoteAsync(true, token));
+        DetectAiAgentsCommand = new AsyncCommand((_, token) => DetectAiAgentsAsync(token), _ => client.SupportsAiAgentDetection);
         RefreshCommand = new AsyncCommand((_, cancellationToken) => RefreshAsync(cancellationToken));
         SetRemoteAccessCommand = new AsyncCommand((parameter, cancellationToken) =>
             SetRemoteAccessAsync(ParseBoolean(parameter), cancellationToken));
@@ -407,12 +407,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             OpenTerminalCommandEditor(parameter as TerminalCommandCapability);
             return Task.CompletedTask;
-        });
+        }, _ => SupportsTerminalCommandEditing);
         AddTerminalCommandCommand = new AsyncCommand((_, _) =>
         {
             CommitTerminalCommandEditor();
             return Task.CompletedTask;
-        });
+        }, _ => SupportsTerminalCommandEditing);
         CancelTerminalCommandEditorCommand = new AsyncCommand((_, _) =>
         {
             CloseTerminalCommandEditor();
@@ -422,12 +422,12 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             RemoveTerminalCommand(parameter as TerminalCommandCapability);
             return Task.CompletedTask;
-        });
-        SaveTerminalCommandsCommand = new AsyncCommand((_, cancellationToken) => SaveTerminalCommandsAsync(cancellationToken));
+        }, _ => SupportsTerminalCommandEditing);
+        SaveTerminalCommandsCommand = new AsyncCommand((_, cancellationToken) => SaveTerminalCommandsAsync(cancellationToken), _ => SupportsTerminalCommandEditing);
         CheckForUpdatesCommand = new AsyncCommand((_, cancellationToken) =>
-            CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
+            CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken), _ => SupportsAutomaticUpdates);
         UpdateActionCommand = new AsyncCommand((_, cancellationToken) =>
-            CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken));
+            CheckForUpdatesAsync(interactive: true, showNotice: true, cancellationToken), _ => SupportsAutomaticUpdates);
         OpenDiagnosticsDirectoryCommand = new AsyncCommand((_, cancellationToken) =>
             RunDesktopOperationAsync(token => RequireDesktopOperations().OpenDiagnosticsDirectoryAsync(token), cancellationToken));
         ShowTerminalDiagnosticCommand = new AsyncCommand((parameter, _) => {
@@ -438,11 +438,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         CloseTerminalDiagnosticCommand = new AsyncCommand((_, _) => { TerminalDiagnosticText = string.Empty; return Task.CompletedTask; });
         OpenSessionDirectoryCommand = new AsyncCommand((path, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenSessionDirectoryAsync(path as string ?? "", t), token));
         OpenAgentHelpCommand = new AsyncCommand((id, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenAgentHelpAsync(id as string ?? "", t), token));
-        OpenZcodeRemoteCommand = new AsyncCommand((_, token) => RunDesktopOperationAsync(t => RequireDesktopOperations().OpenZcodeRemoteAsync(t), token));
         RepairTerminalIntegrationCommand = new AsyncCommand((_, cancellationToken) =>
-            RunDesktopOperationAsync(token => RequireDesktopOperations().RepairTerminalIntegrationAsync(token), cancellationToken));
+            RunDesktopOperationAsync(token => RequireDesktopOperations().RepairTerminalIntegrationAsync(token), cancellationToken), _ => SupportsWindowsTerminalIntegration);
         OpenTerminalIntegrationSettingsCommand = new AsyncCommand((_, cancellationToken) =>
-            OpenTerminalIntegrationSettingsAsync(cancellationToken));
+            OpenTerminalIntegrationSettingsAsync(cancellationToken), _ => SupportsWindowsTerminalIntegration);
+        PerformPlatformActionCommand = new AsyncCommand((parameter, token) =>
+            Enum.TryParse<DesktopPlatformAction>(parameter as string, out var action)
+                ? RunDesktopOperationAsync(t => RequireDesktopOperations().PerformPlatformActionAsync(action, t), token)
+                : Task.CompletedTask, _ => SupportsMacIntegration);
         SaveTerminalIntegrationSettingsCommand = new AsyncCommand((_, cancellationToken) =>
             SaveTerminalIntegrationSettingsAsync(cancellationToken));
         CancelTerminalIntegrationSettingsCommand = new AsyncCommand((_, _) =>
@@ -472,6 +475,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             return Task.CompletedTask;
         });
         stateStore.Changed += StateChanged;
+        stateStore.RefreshFailed += RefreshFailed;
     }
 
     public ConnectionPageViewModel Connection { get; }
@@ -484,9 +488,26 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand SelectSettingsSectionCommand { get; }
     public AsyncCommand SetAppearanceCommand { get; }
     public AsyncCommand DetectAiAgentsCommand { get; }
-    public bool SupportsZcodeRemoteConfiguration => client.SupportsZcodeRemoteConfiguration;
-    public AsyncCommand SaveZcodeRemoteCommand { get; }
-    public AsyncCommand ClearZcodeRemoteCommand { get; }
+    public bool SupportsTerminalCommandEditing => client.SupportsTerminalCommandEditing;
+    public bool SupportsAutomaticUpdates => desktopOperations?.SupportsAutomaticUpdates == true;
+    public bool SupportsWindowsTerminalIntegration => platform == PcPlatform.Windows && desktopOperations?.SupportsWindowsTerminalIntegration == true;
+    public bool SupportsMacIntegration => platform == PcPlatform.MacOS && desktopOperations?.SupportsMacIntegration == true;
+    public bool IsPortableHost => platform is PcPlatform.MacOS or PcPlatform.Linux;
+    public string RemoteAccessTitle => IsPortableHost ? PresentationText.ServerConnection : PresentationText.RemoteAccess;
+    public string RemoteAccessDetail => platform == PcPlatform.MacOS
+        ? PresentationText.Pick("启用 Relay 后可从手机创建 ZCode 原生会话。模型授权由本机 ZCode 处理；远程终端和文件尚未接通。", "Enable Relay to create native ZCode sessions from your phone. ZCode model authorization remains local; remote terminal and files are unavailable.")
+        : IsPortableHost ? PresentationText.PortableConnectionDetail : PresentationText.RemoteAccessDetail;
+    public string EmptySessionsDetail => platform == PcPlatform.MacOS
+        ? PresentationText.Pick("远程终端尚未接通；ZCode 会话从手机 AI 页面查看和管理。", "Remote terminal is unavailable. View and manage ZCode sessions on the phone's AI page.")
+        : IsPortableHost ? PresentationText.PortableSessionsDetail : PresentationText.NoSessionsDetail;
+    public string CommandsDetail => SupportsTerminalCommandEditing ? PresentationText.CommandsDetail : PresentationText.PortableCommandsDetail;
+    public string AiDetectionDetail => platform == PcPlatform.MacOS
+        ? PresentationText.Pick("ZCode 复用本机 App 的内置 Agent，通过原生会话接入；模型授权仍需验证。其他 Agent 暂为本机检测。", "ZCode uses the installed app's Agent for native sessions; model authorization requires validation. Other Agents are detection only.")
+        : IsPortableHost ? PresentationText.PortableDetectionDetail : PresentationText.AgentDetectionDetail;
+    public string UpdateSafetyDetail => platform == PcPlatform.MacOS
+        ? SupportsAutomaticUpdates ? PresentationText.MacAutomaticUpdateDetail : PresentationText.MacManualUpdateDetail
+        : PresentationText.UpdateSafetyDetail;
+    public event EventHandler? UpdateInstalled;
     public AsyncCommand RefreshCommand { get; }
     public AsyncCommand SetRemoteAccessCommand { get; }
     public AsyncCommand RetryConnectionCommand { get; }
@@ -501,6 +522,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand CancelAccountAuthorizationCommand { get; }
     public AsyncCommand ReopenAccountAuthorizationCommand { get; }
     public bool SupportsBrowserAuthorizationControls => client.SupportsBrowserAuthorizationControls;
+    public bool SupportsBrowserAuthorizationCancellation => client.SupportsBrowserAuthorizationCancellation;
     public AsyncCommand ConfigureServerCommand { get; }
     public AsyncCommand SignOutCommand { get; }
     public AsyncCommand OpenTerminalCommandEditorCommand { get; }
@@ -513,9 +535,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand OpenDiagnosticsDirectoryCommand { get; }
     public AsyncCommand OpenSessionDirectoryCommand { get; }
     public AsyncCommand OpenAgentHelpCommand { get; }
-    public AsyncCommand OpenZcodeRemoteCommand { get; }
     public AsyncCommand RepairTerminalIntegrationCommand { get; }
     public AsyncCommand OpenTerminalIntegrationSettingsCommand { get; }
+    public AsyncCommand PerformPlatformActionCommand { get; }
     public AsyncCommand SaveTerminalIntegrationSettingsCommand { get; }
     public AsyncCommand CancelTerminalIntegrationSettingsCommand { get; }
     public AsyncCommand DismissNoticeCommand { get; }
@@ -591,10 +613,13 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string ServerConnectionToolTip => string.IsNullOrWhiteSpace(Connection.Detail)
         ? StatusText
         : $"{StatusText} · {Connection.Detail}";
-    public bool CanRetryConnection => Connection.State is AgentConnectionState.Offline or AgentConnectionState.Faulted;
-    public bool CanEnableRemoteAccess => !Connection.RemoteAccessEnabled && Account.AccountLinked && IsConnected;
+    public bool CanRetryConnection => (!IsPortableHost || Connection.RemoteAccessEnabled) && Connection.State is AgentConnectionState.Offline or AgentConnectionState.Faulted;
+    public bool CanEnableRemoteAccess => !Connection.RemoteAccessEnabled && Account.AccountLinked &&
+        !RequiresReauthentication && !AgentUnavailable && (IsConnected || IsPortableHost);
     public bool CanDisableRemoteAccess => Connection.RemoteAccessEnabled && !RequiresReauthentication;
-    public string RemoteAccessStatusText => Connection.RemoteAccessEnabled ? PresentationText.RemoteAccessOn : PresentationText.RemoteAccessOff;
+    public string RemoteAccessStatusText => IsPortableHost
+        ? (Connection.RemoteAccessEnabled ? PresentationText.RelayEnabled : PresentationText.RelayDisabled)
+        : Connection.RemoteAccessEnabled ? PresentationText.RemoteAccessOn : PresentationText.RemoteAccessOff;
     public int ActiveSessionCount => Sessions.Sessions.Count(session => session.State is ManagedSessionState.Starting or ManagedSessionState.Connected or ManagedSessionState.Disconnected);
     public string SessionCountText => PresentationText.SessionCount(Sessions.Items.Count);
     public int OnlineDeviceCount => Devices.Devices.Count(device => device.Online);
@@ -628,13 +653,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string AvailableUpdateText { get => availableUpdateText; private set => SetProperty(ref availableUpdateText, value); }
     public string UpdateActionText => HasAvailableUpdate ? PresentationText.StartUpdate : PresentationText.CheckUpdates;
     public bool UpdateProgressVisible { get => updateProgressVisible; private set { if (SetProperty(ref updateProgressVisible, value)) RaisePropertyChanged(nameof(BlockingOverlayVisible)); } }
+    public bool IsInstallingUpdate { get => isInstallingUpdate; private set => SetProperty(ref isInstallingUpdate, value); }
     public double UpdateProgressPercent { get => updateProgressPercent; private set => SetProperty(ref updateProgressPercent, value); }
     public string UpdateProgressText { get => updateProgressText; private set => SetProperty(ref updateProgressText, value); }
 
     public void Start()
     {
         stateStore.Start();
-        if (desktopOperations is not null)
+        if (SupportsAutomaticUpdates)
             updatePolling ??= PollForUpdatesAsync(lifetimeCancellation.Token);
     }
 
@@ -689,6 +715,19 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private void StateChanged(object? sender, AgentStatusSnapshot snapshot) =>
         _ = dispatcher.InvokeAsync(() => Apply(snapshot));
 
+    private void RefreshFailed(object? sender, Exception error) => _ = dispatcher.InvokeAsync(() =>
+    {
+        agentUnavailable = true;
+        accountStateKnown = false;
+        Connection.State = AgentConnectionState.Offline;
+        Connection.RemoteAccessEnabled = false;
+        Connection.Detail = LocalizeFailure(ErrorCode(error), error.Message).Detail;
+        StatusText = PresentationText.AgentStateUnknown;
+        RaisePropertyChanged(nameof(AgentUnavailable));
+        RaiseStatusProperties();
+        RaiseAccountStateProperties();
+    });
+
     private void Apply(AgentStatusSnapshot snapshot)
     {
         agentUnavailable = !snapshot.StatusKnown;
@@ -728,7 +767,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         var sessionItems = snapshot.Sessions.Select(CreateSessionItem).ToArray();
         ObservableCollectionDiff.Apply(Sessions.Items, sessionItems, item => item.SessionId);
         ObservableCollectionDiff.Apply(Sessions.AiSessions, snapshot.AiSessions, item => item.Id);
-        Sessions.AiStatus = !snapshot.SessionDetailsAvailable ? PresentationText.Pick("升级 Windows Agent 后显示 AI 任务。", "Update the Windows Agent to view AI tasks.") :
+        Sessions.AiStatus = !snapshot.SessionDetailsAvailable ? (IsPortableHost ? PresentationText.PortableSessionsDetail : PresentationText.Pick("升级 Windows Agent 后显示 AI 任务。", "Update the Windows Agent to view AI tasks.")) :
             PresentationText.Pick($"本机已加载 AI 会话 · {snapshot.ObservedAt.LocalDateTime:HH:mm:ss}" + (snapshot.AiSessionsTruncated ? " · 列表已截断" : ""),
                 $"AI sessions loaded on this PC · {snapshot.ObservedAt.LocalDateTime:HH:mm:ss}" + (snapshot.AiSessionsTruncated ? " · list truncated" : ""));
         Sessions.Filter();
@@ -746,6 +785,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Diagnostics.Capabilities = snapshot.Capabilities.Count == 0
             ? "-"
             : string.Join(", ", snapshot.Capabilities.Order(StringComparer.Ordinal));
+        if (IsPortableHost && snapshot.Capabilities.Count == 0) Diagnostics.Capabilities = PresentationText.PortableCapabilitiesDetail;
         Diagnostics.LastError = string.IsNullOrWhiteSpace(snapshot.LastErrorCode)
             ? PresentationText.Pick("无", "None")
             : snapshot.LastErrorCode + ": " +
@@ -757,35 +797,17 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private async Task DetectAiAgentsAsync(CancellationToken cancellationToken)
     {
         try {
+            await dispatcher.InvokeAsync(() => Settings.AgentDetectionStatus = PresentationText.DetectingAgents, cancellationToken);
             var agents = await client.DetectAiAgentsAsync(cancellationToken).ConfigureAwait(false);
             await dispatcher.InvokeAsync(() => {
                 Settings.AiAgents.Clear();
                 foreach (var agent in agents) Settings.AiAgents.Add(agent);
-                var zcode = agents.FirstOrDefault(a => a.Id == "zcode");
-                Settings.ZcodeRemoteStatus = zcode?.Strategy == "desktop_remote" ? zcode.Detail : "未配置 · 使用本地协议";
+                Settings.AgentDetectionStatus = PresentationText.AgentDetectionResult(agents.Count, agents.Count(a => a.Status is "available" or "detected"));
             }, cancellationToken);
-        } catch (Exception error) when (error is not OperationCanceledException) { await ShowFailureAsync(error); }
-    }
-
-    private bool configuringZcode;
-    private async Task ConfigureZcodeRemoteAsync(bool clear, CancellationToken token)
-    {
-        if (configuringZcode || !SupportsZcodeRemoteConfiguration) return;
-        if (!clear && string.IsNullOrWhiteSpace(Settings.ZcodeRemoteUrl)) {
-            ShowNotice(UiNoticeSeverity.Warning, "请输入 ZCode 桌面远控地址", "清除配置请使用清除按钮。");
-            return;
+        } catch (Exception error) when (error is not OperationCanceledException) {
+            await dispatcher.InvokeAsync(() => Settings.AgentDetectionStatus = PresentationText.AgentDetectionFailed);
+            await ShowFailureAsync(error);
         }
-        configuringZcode = true;
-        try {
-            await client.ConfigureZcodeRemoteAsync(clear ? string.Empty : Settings.ZcodeRemoteUrl, token).ConfigureAwait(false);
-            await dispatcher.InvokeAsync(() => {
-                Settings.ZcodeRemoteUrl = string.Empty;
-                Settings.ZcodeRemoteStatus = clear ? "未配置 · 使用本地协议" : "桌面远控 · 已配置地址";
-                ShowNotice(UiNoticeSeverity.Success, clear ? "已清除 ZCode 远控地址" : "已保存 ZCode 远控地址", "安卓重新读取电脑能力后生效。");
-            }, token);
-            await DetectAiAgentsAsync(token).ConfigureAwait(false);
-        } catch (Exception error) when (error is not OperationCanceledException) { await ShowFailureAsync(error); }
-        finally { configuringZcode = false; }
     }
 
     private async Task RefreshAsync(CancellationToken cancellationToken)
@@ -814,7 +836,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         if (enabled == Connection.RemoteAccessEnabled) return;
         if (!enabled && !await RequestConfirmationAsync(
                 PresentationText.ConfirmStopRemoteTitle,
-                PresentationText.ConfirmStopRemoteDetail,
+                platform == PcPlatform.MacOS
+                    ? PresentationText.Pick("手机将无法控制这台 Mac，当前 ZCode 原生会话会结束，需要重新创建。", "Your phone will lose access to this Mac. Current native ZCode sessions will end and must be created again.")
+                    : PresentationText.ConfirmStopRemoteDetail,
                 cancellationToken)) return;
         await MutateAsync(
             token => client.SetRemoteAccessAsync(enabled, token),
@@ -984,7 +1008,11 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         bool showNotice,
         CancellationToken cancellationToken)
     {
+        using var checkLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetimeCancellation.Token);
+        cancellationToken = checkLifetime.Token;
         var entered = false;
+        var restartRequired = false;
+        var progressActive = 1;
         CancellationTokenSource? downloadCancellation = null;
         try
         {
@@ -1002,8 +1030,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 Volatile.Write(ref updateDownloadCancellation, downloadCancellation);
             }
             var progress = interactive
-                ? new Progress<DesktopUpdateProgress>(value =>
-                    _ = dispatcher.InvokeAsync(() => ApplyUpdateProgress(value), CancellationToken.None))
+                ? new UpdateProgressReporter(value => _ = DispatchProgressAsync(value))
                 : null;
             var status = await RequireDesktopOperations()
                 .CheckForUpdatesAsync(
@@ -1012,6 +1039,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                     progress,
                     downloadCancellation?.Token ?? cancellationToken)
                 .ConfigureAwait(false);
+            restartRequired = status.ApplicationRestartRequired;
             await dispatcher.InvokeAsync(() =>
             {
                 ApplyUpdateStatus(status);
@@ -1036,7 +1064,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         {
             await dispatcher.InvokeAsync(
                 () => ShowNotice(UiNoticeSeverity.Info, PresentationText.UpdateDownloadCanceled, string.Empty),
-                CancellationToken.None);
+                cancellationToken);
         }
         catch (Exception error)
         {
@@ -1052,20 +1080,46 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                         failure.Detail,
                         failure.Code);
                 }
-            }, CancellationToken.None);
+            }, cancellationToken);
         }
         finally
         {
+            Volatile.Write(ref progressActive, 0);
             Volatile.Write(ref updateDownloadCancellation, null);
             downloadCancellation?.Dispose();
-            await dispatcher.InvokeAsync(() =>
+            try
             {
-                UpdateProgressVisible = false;
-                UpdateProgressPercent = 0;
-                UpdateProgressText = string.Empty;
-            }, CancellationToken.None);
+                await dispatcher.InvokeAsync(() =>
+                {
+                    UpdateProgressVisible = false;
+                    IsInstallingUpdate = false;
+                    UpdateProgressPercent = 0;
+                    UpdateProgressText = string.Empty;
+                }, lifetimeCancellation.Token);
+            }
+            catch (OperationCanceledException) when (lifetimeCancellation.IsCancellationRequested) { }
             if (entered) updateCheckLock.Release();
         }
+        if (restartRequired) await dispatcher.InvokeAsync(() => UpdateInstalled?.Invoke(this, EventArgs.Empty), lifetimeCancellation.Token);
+
+        async Task DispatchProgressAsync(DesktopUpdateProgress value)
+        {
+            try
+            {
+                await dispatcher.InvokeAsync(() =>
+                {
+                    if (Volatile.Read(ref progressActive) != 0) ApplyUpdateProgress(value);
+                }, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        }
+    }
+
+    // Report queues directly on the UI dispatcher. Progress<T> first queues on
+    // a captured context, allowing a late installation report after completion.
+    private sealed class UpdateProgressReporter(Action<DesktopUpdateProgress> report) : IProgress<DesktopUpdateProgress>
+    {
+        public void Report(DesktopUpdateProgress value) => report(value);
     }
 
     private async ValueTask<bool> ConfirmUpdateAsync(
@@ -1084,7 +1138,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 $"Active CLI sessions: {ActiveSessionCount}; AI tasks: {(current.SessionDetailsAvailable ? current.ActiveAiSessions.ToString() : "unknown")}. Installing interrupts these tasks.") : PresentationText.AgentStateUnknown;
             confirmation = RequestConfirmationAsync(
                 status.ReadyToInstall ? PresentationText.Pick("安装已验证的更新", "Install verified update") : PresentationText.ConfirmUpdateTitle,
-                status.ReadyToInstall ? impact : PresentationText.ConfirmUpdateDetail(status),
+                status.ReadyToInstall ? impact + (status.UsesSystemInstaller ? "\n" + PresentationText.MacInstallerAuthorizationDetail : "") : PresentationText.ConfirmUpdateDetail(status),
                 cancellationToken, danger: status.ReadyToInstall,
                 action: status.ReadyToInstall ? PresentationText.Pick("安装并重启", "Install and restart") : PresentationText.Pick("下载", "Download"),
                 cancel: status.ReadyToInstall ? PresentationText.Pick("稍后安装", "Install later") : null);
@@ -1102,6 +1156,14 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
 
     private void ApplyUpdateProgress(DesktopUpdateProgress progress)
     {
+        if (progress.Installing)
+        {
+            IsInstallingUpdate = true;
+            UpdateProgressVisible = true;
+            UpdateProgressPercent = 100;
+            UpdateProgressText = PresentationText.Pick("正在等待系统安装授权并安装…", "Waiting for system authorization and installation…");
+            return;
+        }
         if (!UpdateProgressVisible) return;
         UpdateProgressPercent = progress.TotalBytes <= 0
             ? 0
@@ -1456,7 +1518,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     private static string LocalizeDeviceType(string type) => type.ToUpperInvariant() switch
     {
         "ANDROID" => PresentationText.AndroidDevice,
-        "WINDOWS_PC" or "PC_AGENT" => PresentationText.WindowsDevice,
+        "WINDOWS_PC" => PresentationText.WindowsDevice,
+        "PC_AGENT" => PresentationText.PcDevice,
+        "IOS" => "iPhone / iPad",
         "LINUX_PC" => PresentationText.LinuxDevice,
         "MACOS_PC" => PresentationText.MacDevice,
         _ => PresentationText.UnknownDevice,
@@ -1487,6 +1551,10 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "UNAUTHORIZED",
             "TIMEOUT",
             "CONNECTION_FAILED",
+            "PC_SHELL_OPEN_FAILED",
+            "UPDATE_INSTALLER_CANCELLED",
+            "UPDATE_INSTALLER_FAILED",
+            "UPDATE_RELAUNCH_FAILED",
             "RELAY_DISCONNECTED"
         })
             if (text.Contains(code, StringComparison.OrdinalIgnoreCase)) return code;
@@ -1524,12 +1592,18 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "ACCOUNT_TOKEN_EXCHANGE_TIMEOUT" or "ACCOUNT_TOKEN_EXCHANGE_FAILED" => PresentationText.TokenExchangeFailedDetail,
             "ACCOUNT_MACHINE_IDENTITY_UNAVAILABLE" => PresentationText.MachineIdentityUnavailableDetail,
             "PC_SHELL_OPEN_FAILED" => PresentationText.ShellOpenFailedDetail,
+            "PORTABLE_COMMAND_EDITING_UNAVAILABLE" => PresentationText.PortableCommandsDetail,
+            "ACCOUNT_LOGIN_REQUIRED" => PresentationText.SignInDetail,
+            "ACCOUNT_SIGN_OUT_REQUIRED" => PresentationText.SignOutBeforeServerChange,
+            "ACCOUNT_CONNECTION_FAILED" => PresentationText.ConnectionFailedDetail,
             "PC-AGENT-IPC-UNAVAILABLE" or "PC-AGENT-IPC-AUTHENTICATION" or
                 "PC-AGENT-CREDENTIAL-ERROR" or "PC-AGENT-ACCESS-DENIED" or
                 "PC-AGENT-TIMEOUT" or "PC-AGENT-UNAVAILABLE" => PresentationText.ConnectionFailedDetail,
             "UPDATE_VERIFICATION_FAILED" => PresentationText.UpdateVerificationFailedDetail,
             "UPDATE_METADATA_INVALID" => PresentationText.UpdateMetadataInvalidDetail,
             "UPDATE_INSTALLER_LAUNCH_FAILED" => PresentationText.UpdateInstallerLaunchFailedDetail,
+            "UPDATE_INSTALLER_CANCELLED" => PresentationText.MacInstallerCancelled,
+            "UPDATE_INSTALLER_FAILED" or "UPDATE_RELAUNCH_FAILED" => PresentationText.MacInstallerFailed,
             _ => PresentationText.UnexpectedFailureDetail,
         };
         return (string.IsNullOrWhiteSpace(code) ? "UNEXPECTED" : code, detail);
@@ -1542,6 +1616,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         catch (ObjectDisposedException) { }
         pendingConfirmation?.TrySetResult(false);
         stateStore.Changed -= StateChanged;
+        stateStore.RefreshFailed -= RefreshFailed;
         if (updatePolling is not null)
         {
             try { await updatePolling.ConfigureAwait(false); }

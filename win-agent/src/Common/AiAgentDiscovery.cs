@@ -10,7 +10,13 @@ using Microsoft.Win32;
 namespace TermLink.Ai;
 
 public sealed record AiAgentInstallation(string Id, string Name, string Path, string RuntimePath,
-    string Version, string Protocol, string Status, string Strategy = "native");
+    string Version, string Protocol, string Status, string Strategy = "native")
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string SessionDataDirectory { get; init; } = "";
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string ConfigurationDataDirectory { get; init; } = "";
+}
 
 /// <summary>Probes never start a conversation, read model credentials, or install software.</summary>
 public static partial class AiAgentDiscovery
@@ -18,30 +24,20 @@ public static partial class AiAgentDiscovery
     private static readonly object Sync = new();
     private static Task<AiAgentInstallation[]> detection;
     private static DateTime detectedAt;
-    public static Task<AiAgentInstallation[]> CatalogAsync(bool refresh = false, ZcodeRemoteAddressStore remoteStore = null)
+    public static Task<AiAgentInstallation[]> CatalogAsync(bool refresh = false)
     {
         lock (Sync) {
             if (detection == null || detection.IsCompleted && (refresh || DateTime.UtcNow - detectedAt > TimeSpan.FromMinutes(1))) {
                 detectedAt = DateTime.UtcNow;
                 detection = DetectAsync();
             }
-            return WithRemoteStrategyAsync(detection, remoteStore ?? ZcodeRemoteAddressStore.Default);
+            return detection;
         }
     }
-    private static async Task<AiAgentInstallation[]> WithRemoteStrategyAsync(Task<AiAgentInstallation[]> pending, ZcodeRemoteAddressStore remoteStore)
-    {
-        var agents = await pending.ConfigureAwait(false);
-        try { return ApplyRemoteStrategy(agents, remoteStore.Read().Length > 0); }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.Cryptography.CryptographicException) {
-            return agents.Select(a => a.Id == "zcode" ? a with { Status = "configuration_error", Strategy = "desktop_remote" } : a).ToArray();
-        }
-    }
-
-    public static AiAgentInstallation[] ApplyRemoteStrategy(AiAgentInstallation[] agents, bool configured) =>
-        agents.Select(a => configured && a.Id == "zcode" ? a with { Status = "available", Strategy = "desktop_remote" } : a).ToArray();
-
     public static async Task<AiAgentInstallation[]> DetectAsync(CancellationToken token = default)
     {
+        if (OperatingSystem.IsMacOS()) return new[] { await ZcodeDesktopRuntime.DetectMacAsync(token).ConfigureAwait(false) };
+        if (!OperatingSystem.IsWindows()) return Array.Empty<AiAgentInstallation>();
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var zcode = Find("zcode.exe");
         var script = FindZcodeScript();
@@ -50,7 +46,7 @@ public static partial class AiAgentDiscovery
             new AiAgentInstallation("claude", "Claude Code", Find("claude.exe") ?? Existing(System.IO.Path.Combine(home, ".local", "bin", "claude.exe")) ?? "", "", "", "claude", "missing"),
             new AiAgentInstallation("opencode", "OpenCode", Find("opencode.exe") ?? Find("opencode.cmd") ?? "", "", "", "acp", "missing"),
             new AiAgentInstallation("grok", "Grok Build", Find("grok.exe") ?? Find("grok.cmd") ?? Existing(System.IO.Path.Combine(home, ".grok", "bin", "grok.exe")) ?? "", "", "", "acp", "missing"),
-            new AiAgentInstallation("zcode", "ZCode", script ?? zcode ?? "", script == null ? "" : Find("node.exe") ?? "", "", "zcode", "missing"),
+            new AiAgentInstallation("zcode", "ZCode", script ?? zcode ?? "", script == null ? "" : Find("node.exe") ?? Existing(Path.GetFullPath(Path.Combine(Path.GetDirectoryName(script), "..", "..", "ZCode.exe"))) ?? "", "", "zcode", "missing"),
         };
         return await Task.WhenAll(candidates.Select(async candidate => {
             if (candidate.Id is "codex" or "claude") {
@@ -93,6 +89,9 @@ public static partial class AiAgentDiscovery
                 failure ??= detected;
             } catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (System.ComponentModel.Win32Exception error) when (error.NativeErrorCode == 5) {
+#if TERMLINK_PORTABLE_AI
+                failure ??= candidate with { Status = "runtime_blocked" };
+#else
                 if (candidate.Id == "codex" && candidate.Name.Contains("桌面内置", StringComparison.Ordinal)) {
                     try {
                         var path = await CodexDesktopRuntime.PrepareAsync(candidate.Path, budget.Token, runtimeCacheRoot).ConfigureAwait(false);
@@ -105,6 +104,7 @@ public static partial class AiAgentDiscovery
                         failure ??= candidate with { Status = "runtime_blocked" };
                     }
                 } else failure ??= candidate with { Status = "runtime_blocked" };
+#endif
             }
             catch (Exception error) when (error is IOException or InvalidOperationException or System.ComponentModel.Win32Exception or OperationCanceledException) {
                 failure ??= candidate with { Status = "probe_failed" };
@@ -123,14 +123,7 @@ public static partial class AiAgentDiscovery
             StandardOutputEncoding = System.Text.Encoding.UTF8, StandardErrorEncoding = System.Text.Encoding.UTF8,
         };
         if (agent.Id == "grok") start.Environment["GROK_DISABLE_AUTOUPDATER"] = "1";
-        if (agent.Id == "zcode" && agent.RuntimePath.Length > 0) {
-            var config = System.IO.Path.GetFullPath(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(agent.Path), "..", "config", "provider", "zcode-builtin.json"));
-            if (File.Exists(config)) {
-                start.Environment["ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"] = config;
-                start.Environment["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "v2", "provider_config.json");
-            }
-        }
+        if (agent.Id == "zcode" && agent.RuntimePath.Length > 0) ZcodeDesktopRuntime.Configure(start, agent, arguments);
         if (agent.RuntimePath.Length > 0) start.ArgumentList.Add(agent.Path);
         else if (agent.Path.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)) {
             // Only fixed probe/app-server switches reach cmd. All user text travels through stdin.

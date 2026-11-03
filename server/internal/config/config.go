@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/termlink/termlink/server/internal/localnet"
+	"github.com/termlink/termlink/server/internal/pushnotify"
 )
 
 const (
@@ -80,25 +81,29 @@ func (Secret) GoString() string { return "[REDACTED]" }
 // Config is the validated production server configuration. Values ending in
 // Secret, URL, or Key are loaded from secret files and are redacted by String.
 type Config struct {
-	RuntimeMode                    string
-	IdentityProvider               string
-	PublicURL                      string
-	OIDCIssuer                     string
-	OIDCBackchannelIssuer          string
-	OIDCClientID                   string
-	OIDCAllowedParties             []string
-	IOSOIDCClientID                string
-	IOSOIDCRedirectURI             string
-	AndroidOIDCClientID            string
-	AndroidOIDCRedirectURI         string
-	WindowsOIDCClientID            string
-	WindowsRegistrationOIDCParties []string
-	WindowsOIDCRedirectURI         string
-	WebOIDCClientID                string
-	WebOIDCStepUpClientID          string
-	WebOIDCRedirectURI             string
-	HumanVerificationProvider      string
-	HumanVerificationSiteKey       string
+	APNsEnabled                                       bool
+	APNsTeamID, APNsKeyID, APNsTopic, APNsEnvironment string
+	APNsPrivateKey                                    Secret
+	APNsPrivateKeyFile                                string
+	RuntimeMode                                       string
+	IdentityProvider                                  string
+	PublicURL                                         string
+	OIDCIssuer                                        string
+	OIDCBackchannelIssuer                             string
+	OIDCClientID                                      string
+	OIDCAllowedParties                                []string
+	IOSOIDCClientID                                   string
+	IOSOIDCRedirectURI                                string
+	AndroidOIDCClientID                               string
+	AndroidOIDCRedirectURI                            string
+	WindowsOIDCClientID                               string
+	WindowsRegistrationOIDCParties                    []string
+	WindowsOIDCRedirectURI                            string
+	WebOIDCClientID                                   string
+	WebOIDCStepUpClientID                             string
+	WebOIDCRedirectURI                                string
+	HumanVerificationProvider                         string
+	HumanVerificationSiteKey                          string
 
 	OIDCClientSecret           Secret
 	InitialAdminPassword       Secret
@@ -302,25 +307,28 @@ func clearAccountDeletionIdentityKeys(keys map[int16][]byte) {
 // obtain secrets from a managed secret provider instead of files. Production
 // startup should use Load, which enforces file permissions.
 type Input struct {
-	RuntimeMode                    string
-	IdentityProvider               string
-	PublicURL                      string
-	OIDCIssuer                     string
-	OIDCBackchannelIssuer          string
-	OIDCClientID                   string
-	OIDCAllowedParties             []string
-	IOSOIDCClientID                string
-	IOSOIDCRedirectURI             string
-	AndroidOIDCClientID            string
-	AndroidOIDCRedirectURI         string
-	WindowsOIDCClientID            string
-	WindowsRegistrationOIDCParties []string
-	WindowsOIDCRedirectURI         string
-	WebOIDCClientID                string
-	WebOIDCStepUpClientID          string
-	WebOIDCRedirectURI             string
-	HumanVerificationProvider      string
-	HumanVerificationSiteKey       string
+	APNsEnabled                                       bool
+	APNsTeamID, APNsKeyID, APNsTopic, APNsEnvironment string
+	APNsPrivateKey                                    string
+	RuntimeMode                                       string
+	IdentityProvider                                  string
+	PublicURL                                         string
+	OIDCIssuer                                        string
+	OIDCBackchannelIssuer                             string
+	OIDCClientID                                      string
+	OIDCAllowedParties                                []string
+	IOSOIDCClientID                                   string
+	IOSOIDCRedirectURI                                string
+	AndroidOIDCClientID                               string
+	AndroidOIDCRedirectURI                            string
+	WindowsOIDCClientID                               string
+	WindowsRegistrationOIDCParties                    []string
+	WindowsOIDCRedirectURI                            string
+	WebOIDCClientID                                   string
+	WebOIDCStepUpClientID                             string
+	WebOIDCRedirectURI                                string
+	HumanVerificationProvider                         string
+	HumanVerificationSiteKey                          string
 
 	OIDCClientSecret           string
 	InitialAdminPassword       string
@@ -358,6 +366,7 @@ type Input struct {
 // it does not read environment variables or secret files.
 func New(input Input) (Config, error) {
 	return validate(Config{
+		APNsEnabled: input.APNsEnabled, APNsTeamID: input.APNsTeamID, APNsKeyID: input.APNsKeyID, APNsTopic: input.APNsTopic, APNsEnvironment: input.APNsEnvironment, APNsPrivateKey: Secret(input.APNsPrivateKey),
 		RuntimeMode:                       strings.ToLower(strings.TrimSpace(input.RuntimeMode)),
 		IdentityProvider:                  strings.ToLower(strings.TrimSpace(input.IdentityProvider)),
 		PublicURL:                         strings.TrimSpace(input.PublicURL),
@@ -629,6 +638,17 @@ func LoadSource(source Source) (Config, error) {
 		return Config{}, err
 	}
 
+	apnsEnabled, err := parseBool("TERMLINK_APNS_ENABLED", lookupOptional("TERMLINK_APNS_ENABLED", "false"))
+	if err != nil {
+		return Config{}, err
+	}
+	var apnsKey Secret
+	if apnsEnabled {
+		apnsKey, err = readSecret(source, "TERMLINK_APNS_PRIVATE_KEY_FILE")
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	var oidcSecret Secret
 	if identityProvider != IdentityProviderEmbedded {
 		oidcSecret, err = readSecret(source, "TERMLINK_OIDC_CLIENT_SECRET_FILE")
@@ -703,6 +723,10 @@ func LoadSource(source Source) (Config, error) {
 	}
 
 	return validate(Config{
+		APNsEnabled: apnsEnabled, APNsTeamID: lookupOptional("TERMLINK_APNS_TEAM_ID", ""),
+		APNsKeyID: lookupOptional("TERMLINK_APNS_KEY_ID", ""), APNsTopic: lookupOptional("TERMLINK_APNS_TOPIC", ""),
+		APNsEnvironment: lookupOptional("TERMLINK_APNS_ENVIRONMENT", ""), APNsPrivateKey: apnsKey,
+		APNsPrivateKeyFile:                envPath(source, "TERMLINK_APNS_PRIVATE_KEY_FILE"),
 		RuntimeMode:                       runtimeMode,
 		IdentityProvider:                  identityProvider,
 		PublicURL:                         publicURL,
@@ -834,6 +858,15 @@ func parseDurationRange(name, value string, minimum, maximum time.Duration) (tim
 }
 
 func validate(c Config) (Config, error) {
+	if c.APNsEnabled {
+		if c.IOSOIDCClientID == "" {
+			return Config{}, fmt.Errorf("%w: APNs requires an enabled iOS client", ErrInvalid)
+		}
+		if err := pushnotify.ValidateConfig(pushnotify.Config{TeamID: c.APNsTeamID, KeyID: c.APNsKeyID, Topic: c.APNsTopic, Environment: c.APNsEnvironment, PrivateKey: []byte(c.APNsPrivateKey.Value())}); err != nil {
+			return Config{}, fmt.Errorf("%w: APNs configuration", ErrInvalid)
+		}
+	}
+
 	c.RuntimeMode = strings.ToLower(strings.TrimSpace(c.RuntimeMode))
 	if c.RuntimeMode == "" {
 		if !c.RedisURL.Empty() {

@@ -233,8 +233,8 @@
                   <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12">
                     <Border Classes="status-dot" Classes.online="{Binding IsConnected}" VerticalAlignment="Center" />
                     <StackPanel Grid.Column="1">
-                      <TextBlock Text="{x:Static text:PresentationText.RemoteAccess}" FontSize="18" FontWeight="SemiBold" />
-                      <TextBlock Text="{x:Static text:PresentationText.RemoteAccessDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
+                      <TextBlock Text="{Binding RemoteAccessTitle}" FontSize="18" FontWeight="SemiBold" />
+                      <TextBlock Text="{Binding RemoteAccessDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
                     </StackPanel>
                   </Grid>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
@@ -285,7 +285,7 @@
                 <PathIcon Data="{DynamicResource TermLinkTerminalIcon}" Width="32" Height="32" Foreground="{DynamicResource TermLinkMutedBrush}" VerticalAlignment="Center" />
                 <StackPanel Grid.Column="1" VerticalAlignment="Center">
                   <TextBlock Text="{x:Static text:PresentationText.NoSessions}" FontSize="18" FontWeight="SemiBold" />
-                  <TextBlock Text="{x:Static text:PresentationText.NoSessionsDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
+                  <TextBlock Text="{Binding EmptySessionsDetail}" Classes="muted" TextWrapping="Wrap" Margin="0,2,0,0" />
                 </StackPanel>
               </Grid>
             </Border>
@@ -409,9 +409,9 @@
                     <Border x:Name="BrowserAuthorizationProgress" Classes="notice" IsVisible="{Binding BeginAccountAuthorizationCommand.IsRunning}">
                       <StackPanel Spacing="8">
                         <TextBlock Text="{x:Static text:PresentationText.BrowserAuthorizationStartedDetail}" TextWrapping="Wrap" />
-                        <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding SupportsBrowserAuthorizationControls}">
-                          <Button Content="{x:Static text:PresentationText.ReopenBrowser}" Command="{Binding ReopenAccountAuthorizationCommand}" />
-                          <Button Content="{x:Static text:PresentationText.CancelAuthorization}" Command="{Binding CancelAccountAuthorizationCommand}" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                          <Button Content="{x:Static text:PresentationText.ReopenBrowser}" IsVisible="{Binding SupportsBrowserAuthorizationControls}" Command="{Binding ReopenAccountAuthorizationCommand}" />
+                          <Button Content="{x:Static text:PresentationText.CancelAuthorization}" IsVisible="{Binding SupportsBrowserAuthorizationCancellation}" Command="{Binding CancelAccountAuthorizationCommand}" />
                         </StackPanel>
                       </StackPanel>
                     </Border>
@@ -433,7 +433,10 @@
                   </StackPanel>
                   <Button Grid.Column="1" Content="重新检测" Command="{Binding DetectAiAgentsCommand}" />
                 </Grid>
-                <TextBlock Grid.Row="1" Text="自动识别本机安装与协议。认证由 Agent 本身处理，首次对话后确认。" TextWrapping="Wrap" />
+                <StackPanel Grid.Row="1" Spacing="4">
+                  <TextBlock Text="{Binding AiDetectionDetail}" TextWrapping="Wrap" />
+                  <TextBlock Text="{Binding Settings.AgentDetectionStatus}" Classes="muted" TextWrapping="Wrap" />
+                </StackPanel>
                 <ItemsControl Grid.Row="2" ItemsSource="{Binding Settings.AiAgents}">
                   <ItemsControl.ItemTemplate>
                     <DataTemplate x:DataType="contracts:AiAgentCapability">
@@ -446,23 +449,11 @@
                     </DataTemplate>
                   </ItemsControl.ItemTemplate>
                 </ItemsControl>
-                <StackPanel Grid.Row="3" Spacing="6" IsVisible="{Binding SupportsZcodeRemoteConfiguration}">
-                  <TextBlock Text="ZCode 桌面远控" FontWeight="SemiBold" />
-                  <TextBlock Text="{Binding Settings.ZcodeRemoteStatus}" FontSize="12" />
-                  <TextBox Text="{Binding Settings.ZcodeRemoteUrl, Mode=TwoWay}" PasswordChar="●" MaxLength="8192"
-                           PlaceholderText="粘贴 https://zcode.z.ai/remote/ 远控地址" />
-                  <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="保存地址" Command="{Binding SaveZcodeRemoteCommand}" />
-                    <Button Content="清除" Command="{Binding ClearZcodeRemoteCommand}" />
-                    <Button Content="{x:Static text:PresentationText.VerifyZcodeRemote}" Command="{Binding OpenZcodeRemoteCommand}" />
-                  </StackPanel>
-                  <TextBlock Text="配置后，安卓在 AI 中打开桌面远控网页。ZCode 桌面需开启远控；地址失效时重新粘贴保存。" TextWrapping="Wrap" FontSize="12" />
-                </StackPanel>
               </Grid>
               <Grid x:Name="CommandsSettingsRoot" IsVisible="{Binding IsCommandsSettingsSelected}" RowDefinitions="Auto,Auto,*">
                 <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,14">
-                  <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.AvailableCommands}" /><TextBlock Classes="muted" Text="{x:Static text:PresentationText.CommandsDetail}" TextWrapping="Wrap" /></StackPanel>
-                  <Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.AddCustomCommand}" Command="{Binding OpenTerminalCommandEditorCommand}" VerticalAlignment="Center" />
+                  <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.AvailableCommands}" /><TextBlock Classes="muted" Text="{Binding CommandsDetail}" TextWrapping="Wrap" /></StackPanel>
+                  <Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.AddCustomCommand}" IsVisible="{Binding SupportsTerminalCommandEditing}" Command="{Binding OpenTerminalCommandEditorCommand}" VerticalAlignment="Center" />
                 </Grid>
                 <Border Grid.Row="1" Classes="notice warning" IsVisible="{Binding Settings.HasUnsavedCommands}" Margin="0,0,0,12">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12"><TextBlock Text="{x:Static text:PresentationText.UnsavedChanges}" VerticalAlignment="Center" FontWeight="SemiBold" /><Button Grid.Column="1" Classes="primary" Content="{x:Static text:PresentationText.Save}" Command="{Binding SaveTerminalCommandsCommand}" /></Grid>
@@ -483,7 +474,7 @@
                               <TextBlock Text="{x:Static text:PresentationText.CustomCommand}" IsVisible="{Binding !Detected}" FontSize="12" />
                             </Grid>
                           </Border>
-                          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" IsVisible="{Binding $parent[Window].DataContext.SupportsTerminalCommandEditing}">
                             <Button Classes="subtle" Content="{x:Static text:PresentationText.Edit}" Command="{Binding $parent[Window].DataContext.OpenTerminalCommandEditorCommand}" CommandParameter="{Binding}" />
                             <Button Classes="danger" Content="{x:Static text:PresentationText.Delete}" Command="{Binding $parent[Window].DataContext.RemoveTerminalCommandCommand}" CommandParameter="{Binding}" />
                           </StackPanel>
@@ -495,13 +486,31 @@
               </Grid>
 
               <StackPanel x:Name="IntegrationSettingsRoot" IsVisible="{Binding IsIntegrationSettingsSelected}" Spacing="14">
-                <Border Classes="card">
+                <Border x:Name="WindowsTerminalIntegrationCard" Classes="card" IsVisible="{Binding SupportsWindowsTerminalIntegration}">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
                     <StackPanel><TextBlock Classes="section-title" Text="Windows Terminal" /><TextBlock Text="{x:Static text:PresentationText.TerminalIntegrationDetail}" Classes="muted" /></StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
                       <Button x:Name="ConfigureTerminalIntegrationButton" Classes="subtle" Content="{x:Static text:PresentationText.Configure}" AutomationProperties.Name="配置 Windows Terminal 集成" Command="{Binding OpenTerminalIntegrationSettingsCommand}" />
                       <Button Classes="subtle" Content="{x:Static text:PresentationText.RepairTerminal}" AutomationProperties.Name="修复 Windows Terminal 集成" Command="{Binding RepairTerminalIntegrationCommand}" />
                     </StackPanel>
+                  </Grid>
+                </Border>
+                <Border x:Name="MacTerminalIntegrationCard" Classes="card" IsVisible="{Binding SupportsMacIntegration}">
+                  <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
+                    <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.MacTerminal}" /><TextBlock Text="{x:Static text:PresentationText.MacTerminalDetail}" Classes="muted" TextWrapping="Wrap" /></StackPanel>
+                    <Button Grid.Column="1" Content="{x:Static text:PresentationText.OpenTerminal}" Command="{Binding PerformPlatformActionCommand}" CommandParameter="OpenTerminal" VerticalAlignment="Center" />
+                  </Grid>
+                </Border>
+                <Border Classes="card" IsVisible="{Binding SupportsMacIntegration}">
+                  <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
+                    <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.MacLoginItems}" /><TextBlock Text="{x:Static text:PresentationText.MacLoginItemsDetail}" Classes="muted" TextWrapping="Wrap" /></StackPanel>
+                    <Button Grid.Column="1" Content="{x:Static text:PresentationText.OpenSystemSettings}" Command="{Binding PerformPlatformActionCommand}" CommandParameter="OpenLoginItems" VerticalAlignment="Center" />
+                  </Grid>
+                </Border>
+                <Border Classes="card" IsVisible="{Binding SupportsMacIntegration}">
+                  <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
+                    <StackPanel><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.ApplicationLocation}" /><TextBlock Text="{x:Static text:PresentationText.ApplicationLocationDetail}" Classes="muted" TextWrapping="Wrap" /></StackPanel>
+                    <Button Grid.Column="1" Content="{x:Static text:PresentationText.OpenFinder}" Command="{Binding PerformPlatformActionCommand}" CommandParameter="OpenApplicationDirectory" VerticalAlignment="Center" />
                   </Grid>
                 </Border>
               </StackPanel>
@@ -549,8 +558,8 @@
                 </Border>
                 <Border Classes="card">
                   <Grid ColumnDefinitions="*,Auto" ColumnSpacing="18">
-                    <StackPanel Spacing="5"><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.DesktopAndUpdates}" /><TextBlock Text="{x:Static text:PresentationText.UpdateSafetyDetail}" Classes="muted" TextWrapping="Wrap" /><TextBlock Text="{Binding Settings.UpdateStatusText}" Classes="muted" TextWrapping="Wrap" /></StackPanel>
-                    <Button x:Name="AboutUpdateActionButton" Grid.Column="1" Classes="primary" Content="{Binding UpdateActionText}" AutomationProperties.Name="执行 TermLink 更新操作" Command="{Binding UpdateActionCommand}" VerticalAlignment="Center" />
+                    <StackPanel Spacing="5"><TextBlock Classes="section-title" Text="{x:Static text:PresentationText.DesktopAndUpdates}" /><TextBlock Text="{Binding UpdateSafetyDetail}" Classes="muted" TextWrapping="Wrap" /><TextBlock Text="{Binding Settings.UpdateStatusText}" Classes="muted" TextWrapping="Wrap" /></StackPanel>
+                    <Button x:Name="AboutUpdateActionButton" Grid.Column="1" Classes="primary" Content="{Binding UpdateActionText}" IsVisible="{Binding SupportsAutomaticUpdates}" AutomationProperties.Name="执行 TermLink 更新操作" Command="{Binding UpdateActionCommand}" VerticalAlignment="Center" />
                   </Grid>
                 </Border>
               </StackPanel>
@@ -597,7 +606,7 @@
             <TextBlock Text="{Binding UpdateProgressText}" Classes="muted" />
           </StackPanel>
           <ProgressBar Minimum="0" Maximum="100" Value="{Binding UpdateProgressPercent}" Height="8" AutomationProperties.Name="更新下载进度" />
-          <Button x:Name="CancelUpdateDownloadButton" Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelUpdateDownloadCommand}" HorizontalAlignment="Right" />
+          <Button x:Name="CancelUpdateDownloadButton" Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" IsVisible="{Binding !IsInstallingUpdate}" Command="{Binding CancelUpdateDownloadCommand}" HorizontalAlignment="Right" />
         </StackPanel>
       </Border>
     </Border>

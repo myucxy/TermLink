@@ -8,12 +8,16 @@ namespace TermLink.Presentation;
 
 public interface IAgentClient
 {
+    bool SupportsAiAgentDetection => false;
+    bool SupportsTerminalCommandEditing => true;
+    bool SupportsRemoteSessions => true;
+    bool SupportsBrowserAuthorizationCancellation => SupportsBrowserAuthorizationControls;
+    bool SupportsCompleteShutdown => false;
+    ValueTask ShutdownCompletelyAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException("Complete Agent shutdown is unavailable on this platform."));
     bool SupportsBrowserAuthorizationControls => false;
     ValueTask ControlBrowserAuthorizationAsync(bool cancel, CancellationToken cancellationToken) =>
         ValueTask.FromException(new PlatformNotSupportedException("Browser authorization controls are unavailable."));
-    bool SupportsZcodeRemoteConfiguration => false;
-    ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken) =>
-        ValueTask.FromException(new PlatformNotSupportedException("ZCode remote configuration is unavailable on this platform."));
     ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken) =>
         ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(Array.Empty<AiAgentCapability>());
     ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken);
@@ -151,6 +155,7 @@ public sealed class AgentStateStore : IAsyncDisposable
     private Task? activeRefresh;
     private Task? polling;
     private AgentStatusSnapshot? current;
+    private bool refreshFailed;
     private bool disposed;
 
     public AgentStateStore(IAgentClient client, TimeSpan? interval = null)
@@ -167,6 +172,7 @@ public sealed class AgentStateStore : IAsyncDisposable
     }
 
     public event EventHandler<AgentStatusSnapshot>? Changed;
+    public event EventHandler<Exception>? RefreshFailed;
 
     public Task RefreshAsync(bool forceRefresh = false, CancellationToken cancellationToken = default)
     {
@@ -195,11 +201,12 @@ public sealed class AgentStateStore : IAsyncDisposable
         var publish = false;
         lock (synchronization)
         {
-            if (current is null || current.Revision != next.Revision)
+            if (current is null || current.Revision != next.Revision || refreshFailed)
             {
                 current = next;
                 publish = true;
             }
+            refreshFailed = false;
         }
         if (publish) Changed?.Invoke(this, next);
     }
@@ -209,9 +216,20 @@ public sealed class AgentStateStore : IAsyncDisposable
         using var timer = new PeriodicTimer(interval);
         try
         {
-            await RefreshAsync(false, cancellationToken).ConfigureAwait(false);
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
-                await RefreshAsync(false, cancellationToken).ConfigureAwait(false);
+            do
+            {
+                try { await RefreshAsync(false, cancellationToken).ConfigureAwait(false); }
+                catch (AgentClientOperationException error) when (error.Code == "PC_AGENT_EXITING") { }
+                catch (Exception error) when (!cancellationToken.IsCancellationRequested &&
+                    error is IOException or InvalidOperationException or UnauthorizedAccessException or
+                    System.Security.Cryptography.CryptographicException or System.Net.Sockets.SocketException or TimeoutException)
+                {
+                    // An unavailable Agent is recoverable. Keep polling so a
+                    // restart or a transient IPC failure does not freeze the UI.
+                    lock (synchronization) refreshFailed = true;
+                    RefreshFailed?.Invoke(this, error);
+                }
+            } while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -232,6 +250,7 @@ public sealed class AgentStateStore : IAsyncDisposable
         {
             try { await wait.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
+            catch (AgentClientOperationException error) when (error.Code == "PC_AGENT_EXITING") { }
         }
         lifetime.Dispose();
     }

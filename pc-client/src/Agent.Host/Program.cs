@@ -50,11 +50,10 @@ try
     }
     try
     {
-        var handler = await PortableAgentRuntime.CreateAsync(platform, CancellationToken.None);
+        await using var handler = await PortableAgentRuntime.CreateAsync(platform, CancellationToken.None);
         await using var server = new LocalAgentServer(platform.LocalIpc, endpoint, key, handler);
         using var shutdown = new CancellationTokenSource();
         Console.CancelKeyPress += (_, eventArgs) => { eventArgs.Cancel = true; shutdown.Cancel(); };
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => shutdown.Cancel();
         await server.RunAsync(shutdown.Token);
         return 0;
     }

@@ -252,7 +252,7 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 		t,
 		signedJSON(t, server.URL, pc, http.MethodGet, directInputLeasePath, nil, "", http.StatusOK),
 		android.id,
-		"SINGLE",
+		"COLLABORATIVE",
 		1,
 	)
 	pcSocket := dialRealtime(t, server.URL, pc, "pc")
@@ -315,7 +315,7 @@ func TestProductionAccountRelayAndRevocation(t *testing.T) {
 		t,
 		signedJSON(t, server.URL, pc, http.MethodGet, directInputLeasePath, nil, "", http.StatusOK),
 		android.id,
-		"SINGLE",
+		"COLLABORATIVE",
 		1,
 	)
 	assertWebSocketClosed(t, androidSocket, websocket.ClosePolicyViolation)

@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <!-- Managed wire/crypto code is shared by Windows and portable Hosts. -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
     <AssemblyName>TermLink.Protocol</AssemblyName>
     <RootNamespace>TermLink.Protocol</RootNamespace>
   </PropertyGroup>

@@ -27,6 +27,8 @@ Server 不执行 Windows 命令，不创建 Windows ConPTY，不保存完整终�
 
 ## 部署
 
+iOS 已有独立客户端与移动端权限支持；默认通过显式 iOS client ID 开启，部署变量、migration 51 和验证边界见 [iOS 接入说明](IOS_ACCESS.md)。本轮代码支持不表示在线服务已经部署。
+
 直接使用仓库内的完整 Compose 文件，不需要 `.env` 文件。将部署参数
 作为本次 Docker 命令的环境变量传入：
 
@@ -102,3 +104,7 @@ GET /readyz    PostgreSQL 和运行时依赖检查
 LAN Replay、Phase 1、Keycloak 验收栈、Valkey 集成栈和监控栈属于开发验证内容，
 不属于生产部署。相关文件应从生产部署文档和发布包中排除；需要运行测试时，
 请使用仓库的 `technical-validation` 文档和 CI 流程。
+
+Mac / Linux 能力及 POSIX Shell、本机路由开关和 Mac PKG 更新任务的服务端契约见 [Mac 接入说明](MACOS_ACCESS.md)。新增迁移53/54；此实现不表示桌面与手机已完成端到端验收或已部署线上。
+
+可选 iOS 后台推送服务端（APNs注册、状态事件、重试队列及升级结果）见 [后台通知契约](PUSH_NOTIFICATIONS.md)。需schema55和显式私钥配置，默认关闭；客户端与真机接入仍待验收。

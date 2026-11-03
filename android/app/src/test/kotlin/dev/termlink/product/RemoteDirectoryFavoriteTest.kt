@@ -113,4 +113,14 @@ class RemoteDirectoryFavoriteTest {
 
         assertEquals(commands, supportedRemoteTerminalCommands(pc))
     }
+
+    @Test fun posixFavoritesPreserveCaseAndBackslashesInNames() {
+        val upper = RemoteDirectoryFavorite(pcId, "Mac", "Project", "/Users/me/Project")
+        val lower = upper.copy(path = "/Users/me/project")
+        val escaped = upper.copy(path = "/Users/me/Project\\file")
+        val favorites = toggleRemoteDirectoryFavorite(toggleRemoteDirectoryFavorite(listOf(upper), lower), escaped)
+        assertEquals(listOf(escaped, lower, upper), favorites)
+        assertEquals(listOf(escaped, lower), removeRemoteDirectoryFavorite(favorites, upper.copy(path = upper.path + "/")))
+        assertTrue(isRemoteDirectoryFavorite(listOf(upper), pcId, upper.path + "/"))
+    }
 }

@@ -53,7 +53,7 @@ internal data class AiAgentConfiguration(
 }
 internal data class AiAgentOption(val id: String, val name: String, val version: String, val status: String, val strategy: String = "native",
     val configuration: AiAgentConfiguration = AiAgentConfiguration(), val nativeHistory: Boolean = false) {
-    val supported: Boolean get() = status == "available" && (strategy == "native" || strategy == "desktop_remote" && id == "zcode")
+    val supported: Boolean get() = status == "available" && strategy == "native"
 }
 internal data class AiMessage(val id: String, val role: String, val text: String,
     val kind: String = "text", val title: String = "", val summary: String = "", val status: String = "unknown", val model: String = "", val mode: String = "", val fullLength: Int = 0)
@@ -84,7 +84,10 @@ internal data class AiConversation(
     val diffLength: Int = diff.length, val diffTruncated: Boolean = false,
 )
 internal data class AiCatalog(val hostId: String, val agents: List<AiAgentOption>, val sessions: List<AiConversation>, val defaultDirectory: String = "",
-    val directoryMode: String = "custom", val directoryBrowsing: Boolean = false, val modelListing: Boolean = false, val modes: Map<String, List<String>> = emptyMap(), val cliWorkspaceRoot: String = "")
+    val directoryMode: String = "custom", val directoryBrowsing: Boolean = false, val modelListing: Boolean = false, val modes: Map<String, List<String>> = emptyMap(), val cliWorkspaceRoot: String = "",
+    val cliWorkspaceCreation: Boolean = false)
+internal fun AiCatalog.requiresNativeUpgrade(agent: String = "zcode"): Boolean =
+    agents.any { it.id == agent && it.strategy != "native" } && agents.none { it.id == agent && it.supported }
 internal data class AiModelOption(val modelId: String, val name: String, val providerId: String = "", val isDefault: Boolean = false,
     val reasoning: AiReasoning = AiReasoning())
 internal data class AiModelList(val models: List<AiModelOption>, val truncated: Boolean)
@@ -176,7 +179,10 @@ internal class AiWorkspace(
         private set
     var closedSessionIds by mutableStateOf(preferences.getStringSet("closed_sessions", emptySet()).orEmpty().toSet())
         private set
-    var selected by mutableStateOf<String?>(null)
+    private var selectedId by mutableStateOf<String?>(null)
+    var selected: String?
+        get() = selectedId
+        set(value) { selectedId = value?.takeUnless { it.startsWith("remote:") } }
     var listPc by mutableStateOf<UUID?>(null)
     var listTarget by mutableStateOf<AiGroupTarget?>(null)
     fun browseAgentGroup(pcId: UUID, agentId: String) {
@@ -199,6 +205,7 @@ internal class AiWorkspace(
     }
     var attentionOnly by mutableStateOf(false)
     private val busyPcs = mutableStateMapOf<UUID, Boolean>()
+    private val cliDirectories = mutableStateMapOf<UUID, Pair<String, String>>()
     private val pending = mutableStateMapOf<UUID, String>().apply {
         runCatching { preferences.getString("pending", null)?.let { encoded ->
             val stored = JSONObject(unseal(encoded))
@@ -209,6 +216,10 @@ internal class AiWorkspace(
     private val displayedPc: UUID? get() = createPc ?: conversations[selected]?.pcId ?: opened.firstOrNull { it.sessionId == selected }?.pcId ?: listPc
     fun isBusy(pc: UUID) = busyPcs[pc] == true
     fun isUncertain(pc: UUID) = pc in pending && !isBusy(pc)
+    fun isCliWorkspaceUncertain(pc: UUID): Boolean = isUncertain(pc) && runCatching {
+        val request = JSONObject(pending.getValue(pc))
+        request.optString("action") == "create-cli-workspace" && request.optString("hostId") == catalogs[pc]?.hostId
+    }.getOrDefault(false)
     fun isBlocked(pc: UUID) = isBusy(pc) || pc in pending
     val busy: Boolean get() = displayedPc?.let(::isBusy) ?: busyPcs.values.any { it }
     val uncertain: Boolean get() = displayedPc?.let(::isUncertain) ?: pending.keys.any(::isUncertain)
@@ -218,7 +229,7 @@ internal class AiWorkspace(
         val session = conversations[request.optString("sessionId")]
         val action = when (request.optString("action")) {
             "create" -> "创建对话"; "send", "steer" -> "发送消息"; "answer" -> "审批/回答"
-            "configure" -> "更改设置"; "interrupt" -> "停止生成"; else -> "会话操作"
+            "configure" -> "更改设置"; "interrupt" -> "停止生成"; "create-cli-workspace" -> "创建 CLI 目录"; else -> "会话操作"
         }
         listOfNotNull(session?.let(::aiConversationTitle), action).joinToString(" · ")
     }.getOrDefault("会话操作")
@@ -236,6 +247,19 @@ internal class AiWorkspace(
             editor.putString("pending", seal(JSONObject(requests.first().toString()).put("requests", JSONArray(requests)).toString()))
         }
         check(editor.commit())
+    }
+    private suspend fun nativeRequest(pcId: UUID, body: String): String {
+        val request = JSONObject(body)
+        val sessionId = request.optString("sessionId")
+        val agentId = request.optString("agentId").ifBlank {
+            conversations[sessionId]?.let { aiAgentId(it.agentId, it.agent) }
+                ?: opened.firstOrNull { it.pcId == pcId && it.sessionId == sessionId }?.agentId.orEmpty()
+        }
+        check(!sessionId.startsWith("remote:") &&
+            (agentId.isBlank() || catalogs[pcId]?.requiresNativeUpgrade(aiAgentId(agentId)) != true)) {
+            "此电脑尚未提供该 Agent 的原生接入，请升级电脑端后重新检测。"
+        }
+        return repository.aiRequest(pcId, body)
     }
     private var retired = false
     private var draftJob: kotlinx.coroutines.Job? = null
@@ -341,7 +365,7 @@ internal class AiWorkspace(
         if (!session.capabilities.history || session.historyBefore <= 0) return
         try {
             val host = catalogs[session.pcId]?.hostId ?: return
-            val result = JSONObject(repository.aiRequest(session.pcId, JSONObject().put("action", "history").put("hostId", host)
+            val result = JSONObject(nativeRequest(session.pcId, JSONObject().put("action", "history").put("hostId", host)
                 .put("sessionId", session.id).put("streamId", session.streamId).put("offset", session.historyBefore).toString()))
             check(!retired && host == catalogs[session.pcId]?.hostId && result.getString("hostId") == host)
             if (result.optString("error").isNotEmpty()) throw java.io.IOException()
@@ -356,7 +380,7 @@ internal class AiWorkspace(
         var before = 0L
         val pages = mutableListOf<List<AiMessage>>()
         do {
-            val value = JSONObject(repository.aiRequest(session.pcId, JSONObject().put("action", "history").put("hostId", host).put("sessionId", session.id).put("offset", before).toString()))
+            val value = JSONObject(nativeRequest(session.pcId, JSONObject().put("action", "history").put("hostId", host).put("sessionId", session.id).put("offset", before).toString()))
             check(!retired && host == catalogs[session.pcId]?.hostId && value.getString("hostId") == host)
             val page = value.getJSONObject("history")
             pages += page.getJSONArray("messages").objects().map(::parseAiMessage)
@@ -373,7 +397,7 @@ internal class AiWorkspace(
         val host = catalogs[session.pcId]?.hostId ?: throw java.io.IOException()
         val output = StringBuilder(); var offset = 0L
         do {
-            val value = JSONObject(repository.aiRequest(session.pcId, JSONObject().put("action", "message").put("hostId", host)
+            val value = JSONObject(nativeRequest(session.pcId, JSONObject().put("action", "message").put("hostId", host)
                 .put("sessionId", session.id).put("requestId", message.id).put("offset", offset).toString()))
             check(!retired && catalogs[session.pcId]?.hostId == host && value.getString("hostId") == host)
             val page = value.getJSONObject("message"); require(page.getString("id") == message.id && page.getLong("offset") == offset)
@@ -401,7 +425,7 @@ internal class AiWorkspace(
                 saveDrafts()
                 suspend fun request(action: String, extra: JSONObject = JSONObject()): JSONObject {
                     check(!retired && catalogs[session.pcId]?.hostId == entry.host && conversations[session.id]?.controlVersion == entry.controlVersion)
-                    val value = JSONObject(repository.aiRequest(session.pcId, extra.put("action", action).put("hostId", entry.host)
+                    val value = JSONObject(nativeRequest(session.pcId, extra.put("action", action).put("hostId", entry.host)
                         .put("sessionId", session.id).put("controlVersion", entry.controlVersion).put("attachmentId", entry.id).toString()))
                     check(!retired && value.getString("hostId") == entry.host && catalogs[session.pcId]?.hostId == entry.host)
                     if (value.optString("error").isNotEmpty()) throw java.io.IOException(aiErrorLabel(value.getString("error")))
@@ -435,7 +459,7 @@ internal class AiWorkspace(
     fun removeUpload(session: AiConversation, entry: AiUpload) {
         entry.job?.cancel(); entry.file?.delete()
         attachments[session.id] = attachments[session.id].orEmpty().filterNot { it.id == entry.id }
-        scope.launch { runCatching { repository.aiRequest(session.pcId, JSONObject().put("action", "attachment.remove").put("hostId", entry.host)
+        scope.launch { runCatching { nativeRequest(session.pcId, JSONObject().put("action", "attachment.remove").put("hostId", entry.host)
             .put("sessionId", session.id).put("controlVersion", entry.controlVersion).put("attachmentId", entry.id).toString()) } }
     }
     fun send(session: AiConversation) = mutate(session.pcId, "send", session, JSONObject().put("text", drafts[session.id].orEmpty())
@@ -443,18 +467,27 @@ internal class AiWorkspace(
         .put("fileReferences", JSONArray(fileReferences[session.id].orEmpty())))
 
     private fun readOpened(): List<AiOpened> = runCatching {
-        JSONArray(preferences.getString("opened", "[]")).objects().take(64).map {
-            val pc = UUID.fromString(it.getString("pc"))
-            if (it.optString("strategy") == "desktop_remote" && it.optString("agentId") == "zcode")
-                AiOpened(pc, "remote:$pc:zcode", "desktop_remote", "zcode")
-            else AiOpened(pc, UUID.fromString(it.getString("session")).toString(), agentId = it.optString("agentId"))
+        val stored = JSONArray(preferences.getString("opened", "[]"))
+        val restored = (0 until stored.length()).mapNotNull { index -> runCatching {
+            val value = stored.getJSONObject(index)
+            // Old webpage references are discarded, never rebound to a native
+            // conversation. A malformed legacy row must not drop other chats.
+            require(!value.has("strategy") || value.optString("strategy") == "native")
+            AiOpened(UUID.fromString(value.getString("pc")), UUID.fromString(value.getString("session")).toString(),
+                agentId = value.optString("agentId"))
+        }.getOrNull() }.distinctBy { it.sessionId }.takeLast(64)
+        if (restored.size != stored.length()) {
+            preferences.edit().putString("opened", encodeOpened(restored).toString()).apply()
         }
+        restored
     }.getOrDefault(emptyList())
 
+    private fun encodeOpened(entries: List<AiOpened>) = JSONArray().apply { entries.filter { it.strategy == "native" }.forEach {
+        put(JSONObject().put("pc", it.pcId).put("session", it.sessionId).put("strategy", "native").put("agentId", it.agentId))
+    } }
+
     private fun saveOpened() {
-        preferences.edit().putStringSet("closed_sessions", closedSessionIds).putString("opened", JSONArray().apply { opened.forEach {
-            put(JSONObject().put("pc", it.pcId).put("session", it.sessionId).put("strategy", it.strategy).put("agentId", it.agentId))
-        } }.toString()).apply()
+        preferences.edit().putStringSet("closed_sessions", closedSessionIds).putString("opened", encodeOpened(opened).toString()).apply()
     }
 
     fun open(session: AiConversation) {
@@ -473,11 +506,20 @@ internal class AiWorkspace(
     fun preferredDirectory(pcId: UUID): String = preferences.getString("directory:$pcId", null)
         ?: catalogs[pcId]?.defaultDirectory.orEmpty()
 
+    suspend fun createCliWorkspace(pcId: UUID): String? {
+        val catalog = catalogs[pcId]?.takeIf { !retired && it.cliWorkspaceCreation } ?: return null
+        cliDirectories[pcId]?.takeIf { it.first == catalog.hostId }?.let { cliDirectories.remove(pcId); return it.second }
+        val operation = if (isCliWorkspaceUncertain(pcId)) submit(pcId)
+        else mutate(pcId, "create-cli-workspace")
+        if (operation?.await() != true || retired || catalogs[pcId]?.hostId != catalog.hostId) return null
+        return cliDirectories.remove(pcId)?.takeIf { it.first == catalog.hostId }?.second
+    }
+
     suspend fun directories(pcId: UUID, path: String, offset: Long = 0, includeFiles: Boolean = false): RemoteDirectoryPage {
         val catalog = checkNotNull(catalogs[pcId])
         check(!retired && catalog.directoryBrowsing)
         require(path.length <= 4096 && '\u0000' !in path && offset >= 0)
-        val result = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", if (includeFiles) "files" else "directories").put("hostId", catalog.hostId)
+        val result = JSONObject(nativeRequest(pcId, JSONObject().put("action", if (includeFiles) "files" else "directories").put("hostId", catalog.hostId)
             .put("directory", path).put("offset", offset).toString()))
         check(!retired && catalogs[pcId]?.hostId == catalog.hostId)
         if (result.optString("error").isNotEmpty()) throw java.io.IOException(aiErrorLabel(result.getString("error")))
@@ -496,7 +538,7 @@ internal class AiWorkspace(
         val catalog = checkNotNull(catalogs[pcId])
         val agent = catalog.agents.single { it.id == agentId }
         check(!retired && agent.configuration.modelListing && agent.supported && agent.strategy == "native")
-        val result = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", "models")
+        val result = JSONObject(nativeRequest(pcId, JSONObject().put("action", "models")
             .put("hostId", catalog.hostId).put("agentId", agentId).toString()))
         check(!retired && catalogs[pcId]?.hostId == catalog.hostId &&
             catalogs[pcId]?.agents?.any { it.id == agentId && it.supported && it.strategy == "native" } == true)
@@ -518,7 +560,7 @@ internal class AiWorkspace(
     suspend fun nativeHistory(pcId: UUID, agentId: String, cursor: String = ""): AiNativePage {
         val host = checkNotNull(catalogs[pcId]).hostId
         check(!retired && catalogs[pcId]?.agents?.any { it.id == agentId && it.supported && it.nativeHistory } == true)
-        val result = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", "native-history").put("hostId", host)
+        val result = JSONObject(nativeRequest(pcId, JSONObject().put("action", "native-history").put("hostId", host)
             .put("agentId", agentId).put("text", cursor).toString()))
         check(!retired && catalogs[pcId]?.hostId == host)
         if (result.optString("error").isNotEmpty()) throw java.io.IOException(aiErrorLabel(result.getString("error")))
@@ -529,26 +571,6 @@ internal class AiWorkspace(
         return AiNativePage(entries.map { AiNativeEntry(aiNativeHistoryId(agentId, it.getString("nativeId")),
             it.optString("title").take(160), it.getString("directory").take(4096), it.optLong("updatedAtMs")) },
             page.optString("nextCursor").also { require(it.length <= 4096) }, page.optBoolean("truncated"))
-    }
-
-    fun openRemote(pcId: UUID, agentId: String) {
-        if (retired || isBlocked(pcId) || catalogs[pcId]?.agents?.none { it.id == agentId && it.strategy == "desktop_remote" && it.supported } != false) return
-        val entry = AiOpened(pcId, "remote:$pcId:$agentId", "desktop_remote", agentId)
-        closedSessionIds = closedSessionIds - entry.sessionId
-        if (entry !in opened) opened = (opened + entry).takeLast(64)
-        saveOpened()
-        selected = entry.sessionId; createPc = null
-    }
-
-    suspend fun remoteAddress(entry: AiOpened): String {
-        val host = catalogs[entry.pcId]?.hostId ?: throw java.io.IOException("电脑能力尚未就绪")
-        check(!retired && entry.strategy == "desktop_remote" && entry.agentId == "zcode")
-        val result = JSONObject(repository.aiRequest(entry.pcId, JSONObject().put("action", "remote")
-            .put("hostId", host).put("agentId", entry.agentId).toString()))
-        if (result.optString("error").isNotEmpty()) throw java.io.IOException(aiErrorLabel(result.getString("error")))
-        check(!retired && catalogs[entry.pcId]?.hostId == host && result.getString("hostId") == host &&
-            result.getString("strategy") == "desktop_remote" && result.getString("agentId") == entry.agentId)
-        return result.getString("remoteUrl").also { require(isAllowedZcodeRemoteUrl(it)) }
     }
 
     fun closeView(id: String) {
@@ -583,7 +605,7 @@ internal class AiWorkspace(
         if (!clearPending) saveDrafts()
         draftJob?.cancel(); draftJob = null
         stopBackgroundWatch()
-        retired = true; catalogs.clear(); conversations.clear(); drafts.clear(); unavailable.clear(); pending.clear(); busyPcs.clear()
+        retired = true; catalogs.clear(); conversations.clear(); drafts.clear(); unavailable.clear(); pending.clear(); busyPcs.clear(); cliDirectories.clear()
         questionDrafts.clear()
         queued.clear(); fileReferences.clear(); attachments.values.flatten().forEach { it.job?.cancel(); if (clearPending) it.file?.delete() }; attachments.clear()
         if (clearPending) preferences.edit().apply { remove("pending"); remove("drafts"); preferences.all.keys.filter { it.startsWith("web:") }.forEach(::remove) }.commit()
@@ -592,7 +614,7 @@ internal class AiWorkspace(
     suspend fun renewControl(session: AiConversation) {
         val host = catalogs[session.pcId]?.hostId ?: return
         if (retired || !session.canControl || !session.capabilities.watch || selected != session.id || !foreground) return
-        val result = JSONObject(repository.aiRequest(session.pcId, JSONObject().put("action", "renew").put("hostId", host)
+        val result = JSONObject(nativeRequest(session.pcId, JSONObject().put("action", "renew").put("hostId", host)
             .put("sessionId", session.id).put("controlVersion", session.controlVersion).toString()))
         if (!retired && catalogs[session.pcId]?.hostId == host && result.optString("error").isNotEmpty()) error = aiErrorLabel(result.getString("error"))
     }
@@ -602,7 +624,7 @@ internal class AiWorkspace(
         require(action in setOf("search", "artifacts", "artifact.read", "diff.read"))
         val host = checkNotNull(catalogs[session.pcId]).hostId
         check(!retired && conversations[session.id]?.pcId == session.pcId)
-        val result = JSONObject(repository.aiRequest(session.pcId, extra.put("action", action).put("hostId", host)
+        val result = JSONObject(nativeRequest(session.pcId, extra.put("action", action).put("hostId", host)
             .put("sessionId", session.id).toString()))
         check(!retired && catalogs[session.pcId]?.hostId == host && conversations[session.id]?.pcId == session.pcId)
         if (result.optString("error").isNotEmpty()) throw java.io.IOException(aiErrorLabel(result.getString("error")))
@@ -611,6 +633,12 @@ internal class AiWorkspace(
     }
 
     suspend fun refresh(pcId: UUID, sessionId: String? = null) {
+        val agent = sessionId?.let { id -> conversations[id]?.let { aiAgentId(it.agentId, it.agent) }
+            ?: opened.firstOrNull { it.pcId == pcId && it.sessionId == id }?.agentId }
+        if (sessionId?.startsWith("remote:") == true || agent != null && catalogs[pcId]?.requiresNativeUpgrade(agent) == true) {
+            error = "此电脑尚未提供该 Agent 的原生接入，请升级电脑端后重新检测。"
+            return
+        }
         if (retired || isBlocked(pcId) || !loading.add(pcId)) return
         val version = version(pcId)
         try {
@@ -620,7 +648,7 @@ internal class AiWorkspace(
                 JSONObject().put("action", if (current?.capabilities?.watch == true && foreground && selected == sessionId) "watch" else if (current?.capabilities?.changes == true) "changes" else "poll").put("hostId", host).put("sessionId", sessionId)
                     .put("streamId", current?.streamId.orEmpty()).put("cursor", current?.cursor ?: "0")
                 else JSONObject().put("action", "catalog")
-            val result = JSONObject(repository.aiRequest(pcId, body.toString()))
+            val result = JSONObject(nativeRequest(pcId, body.toString()))
             if (retired || isBlocked(pcId) || version != version(pcId)) return
             if (result.optString("error") == "SESSION_NOT_FOUND" && sessionId != null) conversations.remove(sessionId)
             accept(pcId, result)
@@ -640,12 +668,12 @@ internal class AiWorkspace(
     suspend fun readNotificationSession(pcId: UUID, id: String): AiConversation {
         check(!retired && !isBlocked(pcId)) { "请先确认这台电脑尚未完成的操作。" }
         val version = advance(pcId)
-        val catalog = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", "catalog").toString()))
+        val catalog = JSONObject(nativeRequest(pcId, JSONObject().put("action", "catalog").toString()))
         check(!retired && !isBlocked(pcId) && version == version(pcId))
         check(catalog.optString("error").isEmpty()) { aiErrorLabel(catalog.optString("error")) }
         accept(pcId, catalog)
         val host = catalog.getString("hostId")
-        val result = JSONObject(repository.aiRequest(pcId, JSONObject().put("action", "poll").put("hostId", host).put("sessionId", id).toString()))
+        val result = JSONObject(nativeRequest(pcId, JSONObject().put("action", "poll").put("hostId", host).put("sessionId", id).toString()))
         check(!retired && !isBlocked(pcId) && version == version(pcId) && result.getString("hostId") == host)
         check(result.optString("error").isEmpty()) { aiErrorLabel(result.optString("error")) }
         check(result.getJSONObject("session").getString("id") == id)
@@ -655,7 +683,18 @@ internal class AiWorkspace(
 
     fun mutate(pcId: UUID, action: String, session: AiConversation? = null, extra: JSONObject = JSONObject()): Deferred<Boolean>? {
         if (isBlocked(pcId) || retired) return null
-        val host = catalogs[pcId]?.hostId ?: return null
+        val catalog = catalogs[pcId] ?: return null
+        if (action == "create-cli-workspace" && !catalog.cliWorkspaceCreation) return null
+        if (session != null && catalog.requiresNativeUpgrade(aiAgentId(session.agentId, session.agent))) {
+            error = "此电脑尚未提供该 Agent 的原生接入，请升级电脑端后重新检测。"
+            return null
+        }
+        if (action in setOf("create", "import-native") && extra.has("agentId") &&
+            catalog.agents.none { it.id == extra.optString("agentId") && it.supported }) {
+            error = "此电脑尚未提供该 Agent 的原生接入，请升级电脑端后重新检测。"
+            return null
+        }
+        val host = catalog.hostId
         val body = extra.put("action", action).put("hostId", host).put("operationId", UUID.randomUUID().toString())
         if (session != null) body.put("sessionId", session.id).put("controlVersion", session.controlVersion)
         val encoded = body.toString()
@@ -675,9 +714,17 @@ internal class AiWorkspace(
         busyPcs[pcId] = true; error = ""
         return scope.async {
             try {
-                val result = JSONObject(repository.aiRequest(pcId, body))
+                val result = JSONObject(nativeRequest(pcId, body))
                 if (retired) return@async false
                 val request = JSONObject(body)
+                val createdDirectory = if (result.optString("error").isEmpty() && request.optString("action") == "create-cli-workspace") {
+                    check(result.getString("hostId") == request.getString("hostId") &&
+                        result.getString("operationId") == request.getString("operationId"))
+                    val directory = result.getString("directory")
+                    require(directory.isNotBlank() && directory.encodeToByteArray().size <= 4096 &&
+                        directory.none(Char::isISOControl))
+                    request.getString("hostId") to directory
+                } else null
                 if (result.optString("error").isEmpty() && request.optString("action") in setOf("end", "forget")) {
                     check(result.getString("hostId") == request.getString("hostId"))
                     if (request.getString("action") == "forget") check(result.getString("deletedSessionId") == request.getString("sessionId"))
@@ -690,6 +737,7 @@ internal class AiWorkspace(
                 unavailable.remove(pcId)
                 savePending(pending.toMap() - pcId)
                 pending.remove(pcId)
+                createdDirectory?.let { cliDirectories[pcId] = it }
                 if (result.optString("error").isNotEmpty() && request.has("queueId")) {
                     val id = request.optString("sessionId")
                     queued[id] = queued[id].orEmpty().map { if (it.id == request.optString("queueId")) it.copy(failed = true) else it }
@@ -743,12 +791,13 @@ internal class AiWorkspace(
             val globalModelListing = result.optBoolean("modelListing")
             val next = AiCatalog(result.getString("hostId"), agents.objects().map {
                 val id = it.getString("id")
-                AiAgentOption(id, it.getString("name"), it.optString("version"), it.getString("status"), it.optString("strategy", "native"),
+                AiAgentOption(id, it.getString("name"), it.optString("version"), it.getString("status"), if (it.has("strategy")) it.optString("strategy") else "native",
                     parseAgentConfiguration(it.optJSONObject("configuration"), id, globalModelListing, legacyModes[id].orEmpty()), it.optBoolean("nativeHistory"))
             }, sessions, result.optString("defaultDirectory"), result.optString("directoryMode", "custom"), result.optBoolean("directoryBrowsing"), globalModelListing,
-                legacyModes, result.optString("cliWorkspaceRoot"))
+                legacyModes, result.optString("cliWorkspaceRoot"), result.optBoolean("cliWorkspaceCreation"))
             require(next.agents.size <= 16 && sessions.size <= 64)
             if (catalogs[pcId]?.hostId != next.hostId) {
+                cliDirectories.remove(pcId)
                 conversations.entries.removeAll { it.value.pcId == pcId }
                 opened.filter { it.pcId == pcId }.forEach { entry -> attachments[entry.sessionId]?.forEach { upload ->
                     if (upload.host != next.hostId) { upload.job?.cancel(); upload.status = "failed"; upload.error = "电脑已重启，请移除附件后重新选择。" }
@@ -911,10 +960,11 @@ internal fun aiErrorLabel(code: String): String = when (code) {
     "HISTORY_SAVE_FAILED" -> "电脑历史保存失败，请检查磁盘空间。"
     "MODEL_LIST_UNSUPPORTED" -> "此 Agent 暂不提供模型列表，可使用默认模型或手动输入。"
     "MODEL_LIST_BUSY", "MODEL_LIST_TIMEOUT", "MODEL_LIST_UNAVAILABLE" -> "模型列表暂时不可用，可重试或手动输入。"
-    "AI_WORKSPACE_CREATE_FAILED" -> "无法在 Windows 安装目录下创建会话目录，请检查写权限或改选已有目录。"
+    "AI_WORKSPACE_CREATE_FAILED" -> "无法在电脑端创建会话目录，请检查写权限或改选已有目录。"
+    "CLI_WORKSPACE_UNAVAILABLE" -> "这台电脑尚未提供默认 CLI 目录创建能力，请选择已有目录。"
     "DIRECTORY_BROWSE_FAILED" -> "无法读取该目录，请检查权限或返回上级目录。"
     "INVALID_DIRECTORY_MODE" -> "目录选项已改变，请刷新电脑能力后重试。"
-    "REMOTE_NOT_CONFIGURED", "REMOTE_CONFIGURATION_INVALID" -> "请在 Windows 设置中重新保存 ZCode 桌面远控地址。"
+    "REMOTE_NOT_CONFIGURED", "REMOTE_CONFIGURATION_INVALID", "AGENT_STRATEGY_MISMATCH" -> "请升级电脑端并重新检测 ZCode 原生接入。"
     "AGENT_STRATEGY_CHANGED" -> "电脑端接入方式已改变，请刷新能力后重新打开。"
     "AGENT_MODEL_REQUIRED", "PROVIDER_AND_MODEL_REQUIRED" -> "请先在电脑端配置模型，或填写已配置的 Provider 与模型 ID。"
     "CONTROL_CHANGED" -> "控制权已改变，请重新获取控制权。"

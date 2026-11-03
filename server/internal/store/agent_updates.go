@@ -7,6 +7,9 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"net/url"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +40,10 @@ const (
 )
 
 type AgentUpdateCreateInput struct {
+	ArtifactPlatform          string
+	ArtifactArchitecture      string
+	ArtifactType              string
+	ArtifactAppleTeamID       *string
 	CurrentVersion            string
 	CurrentBuild              int64
 	TargetVersion             string
@@ -64,6 +71,10 @@ type AgentUpdateCompleteInput struct {
 }
 
 type AgentUpdateRecord struct {
+	ArtifactPlatform          string     `json:"artifact_platform"`
+	ArtifactArchitecture      string     `json:"artifact_architecture"`
+	ArtifactType              string     `json:"artifact_type"`
+	ArtifactAppleTeamID       *string    `json:"artifact_apple_team_id,omitempty"`
 	ID                        uuid.UUID  `json:"id"`
 	AccountID                 uuid.UUID  `json:"-"`
 	PCID                      uuid.UUID  `json:"pc_id"`
@@ -100,7 +111,8 @@ const agentUpdateColumns = `
 	id,account_id,pc_id,requester_device_id,current_version,current_build,target_version,target_build,
 	artifact_url,artifact_filename,artifact_size_bytes,artifact_sha256,artifact_signer_fingerprint,
 	status,phase,progress_percent,active_session_count,attempt_count,lease_token_hash,lease_expires_at,
-	error_code,error_detail,observed_agent_version,observed_agent_build,expires_at,started_at,completed_at,cancelled_at,created_at,updated_at`
+	error_code,error_detail,observed_agent_version,observed_agent_build,expires_at,started_at,completed_at,cancelled_at,created_at,updated_at,
+	artifact_platform,artifact_architecture,artifact_type,artifact_apple_team_id`
 
 // agentUpdateJobColumns must be used by UPDATE ... FROM queries whose joined
 // relations expose columns with the same names as agent_update_jobs. PostgreSQL
@@ -110,7 +122,8 @@ const agentUpdateJobColumns = `
 	job.id,job.account_id,job.pc_id,job.requester_device_id,job.current_version,job.current_build,job.target_version,job.target_build,
 	job.artifact_url,job.artifact_filename,job.artifact_size_bytes,job.artifact_sha256,job.artifact_signer_fingerprint,
 	job.status,job.phase,job.progress_percent,job.active_session_count,job.attempt_count,job.lease_token_hash,job.lease_expires_at,
-	job.error_code,job.error_detail,job.observed_agent_version,job.observed_agent_build,job.expires_at,job.started_at,job.completed_at,job.cancelled_at,job.created_at,job.updated_at`
+	job.error_code,job.error_detail,job.observed_agent_version,job.observed_agent_build,job.expires_at,job.started_at,job.completed_at,job.cancelled_at,job.created_at,job.updated_at,
+	job.artifact_platform,job.artifact_architecture,job.artifact_type,job.artifact_apple_team_id`
 
 type agentUpdateRow interface {
 	Scan(...any) error
@@ -131,6 +144,7 @@ func scanAgentUpdate(row agentUpdateRow) (AgentUpdateRecord, error) {
 		&item.ActiveSessionCount, &item.AttemptCount, &item.LeaseTokenHash, &item.LeaseExpiresAt,
 		&item.ErrorCode, &item.ErrorDetail, &item.ObservedAgentVersion, &item.ObservedAgentBuild, &item.ExpiresAt,
 		&item.StartedAt, &item.CompletedAt, &item.CancelledAt, &item.CreatedAt, &item.UpdatedAt,
+		&item.ArtifactPlatform, &item.ArtifactArchitecture, &item.ArtifactType, &item.ArtifactAppleTeamID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AgentUpdateRecord{}, ErrNotFound
@@ -143,26 +157,36 @@ func (s *Postgres) CreateAgentUpdate(
 	userID, requesterID, pcID uuid.UUID,
 	input AgentUpdateCreateInput,
 ) (AgentUpdateRecord, error) {
+	if err := normalizeAgentUpdateArtifact(&input); err != nil {
+		return AgentUpdateRecord{}, err
+	}
 	row := s.Pool.QueryRow(ctx, `
 		INSERT INTO agent_update_jobs(
 			id,account_id,pc_id,requester_device_id,current_version,current_build,target_version,target_build,
-			artifact_url,artifact_filename,artifact_size_bytes,artifact_sha256,artifact_signer_fingerprint,expires_at)
-		SELECT $1,$2,p.id,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+			artifact_url,artifact_filename,artifact_size_bytes,artifact_sha256,artifact_signer_fingerprint,expires_at,
+			artifact_platform,artifact_architecture,artifact_type,artifact_apple_team_id)
+		SELECT $1,$2,p.id,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$16,$17,$18,$19
 		FROM pcs p
 		JOIN users account ON account.id=$2 AND account.status='ACTIVE'
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
 			AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED'
+			AND requester.disabled_at IS NULL
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
 			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
+			AND agent.disabled_at IS NULL
 		WHERE p.id=$14 AND p.owner_user_id=$2 AND p.agent_version=$4
-		  AND p.platform='windows' AND 'remote_agent_update_v1'=ANY(p.capabilities)
+		  AND p.platform=$16 AND (p.architecture=$17 OR (p.platform='windows' AND p.architecture='unknown' AND $17='x64'))
+		  AND 'remote_agent_update_v1'=ANY(p.capabilities)
 		  AND p.remote_routing_enabled
+		  AND ($20 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=p.id AND g.device_id=requester.id
+		    AND g.permission='MANAGE' AND (g.expires_at IS NULL OR g.expires_at>now())))
 		  AND p.last_seen_at > now()-($15 * interval '1 second')
 		RETURNING `+agentUpdateColumns,
 		uuid.New(), userID, requesterID, input.CurrentVersion, input.CurrentBuild,
 		input.TargetVersion, input.TargetBuild, input.ArtifactURL, input.ArtifactFilename,
 		input.ArtifactSizeBytes, input.ArtifactSHA256[:], input.ArtifactSignerFingerprint,
 		input.ExpiresAt, pcID, int(sessionOnlineWindow/time.Second),
+		input.ArtifactPlatform, input.ArtifactArchitecture, input.ArtifactType, input.ArtifactAppleTeamID, s.AutoTrustDevices,
 	)
 	item, err := scanAgentUpdate(row)
 	if errors.Is(err, ErrNotFound) {
@@ -287,7 +311,7 @@ func (s *Postgres) ClaimAgentUpdate(
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
 		WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-		  AND p.platform='windows' AND 'remote_agent_update_v1'=ANY(p.capabilities)
+		  AND p.platform IN ('windows','macos') AND 'remote_agent_update_v1'=ANY(p.capabilities)
 		  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')`,
 		pcID, userID, agentDeviceID,
 	).Scan(&authorized); err != nil {
@@ -310,7 +334,17 @@ func (s *Postgres) ClaimAgentUpdate(
 		WITH candidate AS (
 			SELECT job.id FROM agent_update_jobs job
 			WHERE job.account_id=$1 AND job.pc_id=$2 AND job.expires_at>now()
-			  AND (job.status='PENDING' OR (job.status='PROCESSING' AND (
+			  AND EXISTS(SELECT 1 FROM pcs target WHERE target.id=job.pc_id
+			    AND target.platform=job.artifact_platform
+			    AND (target.architecture=job.artifact_architecture OR (target.platform='windows' AND target.architecture='unknown' AND job.artifact_architecture='x64')))
+			  AND (job.phase IN ('INSTALLING','STARTING_NEW_AGENT','VERIFYING_CONNECTION','ROLLING_BACK') OR
+                  EXISTS(SELECT 1 FROM pcs target
+                    JOIN devices requester ON requester.id=job.requester_device_id AND requester.user_id=job.account_id
+                      AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED' AND requester.disabled_at IS NULL
+                    WHERE target.id=job.pc_id AND target.remote_routing_enabled
+                      AND ($5 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=target.id AND g.device_id=requester.id
+                        AND g.permission='MANAGE' AND (g.expires_at IS NULL OR g.expires_at>now())))))
+              AND (job.status='PENDING' OR (job.status='PROCESSING' AND (
 			      job.lease_expires_at<=now() OR job.phase IN ('INSTALLING','STARTING_NEW_AGENT',
 			      'VERIFYING_CONNECTION','ROLLING_BACK'))))
 			ORDER BY job.created_at,job.id FOR UPDATE SKIP LOCKED LIMIT 1
@@ -320,7 +354,7 @@ func (s *Postgres) ClaimAgentUpdate(
 		    lease_expires_at=LEAST(job.expires_at,now()+($4 * interval '1 millisecond')),
 		    started_at=COALESCE(started_at,now()),updated_at=now()
 		FROM candidate WHERE job.id=candidate.id RETURNING `+agentUpdateJobColumns,
-		userID, pcID, tokenHash[:], leaseDuration.Milliseconds(),
+		userID, pcID, tokenHash[:], leaseDuration.Milliseconds(), s.AutoTrustDevices,
 	))
 	if errors.Is(err, ErrNotFound) {
 		if err := tx.Commit(ctx); err != nil {
@@ -351,16 +385,16 @@ func reconcileSatisfiedAgentUpdates(
 	executor agentUpdateExecutor,
 	userID, pcID uuid.UUID,
 ) error {
-	var advertisedVersion string
+	var advertisedVersion, platform, architecture string
 	if err := executor.QueryRow(ctx, `
-		SELECT agent_version FROM pcs WHERE id=$1 AND owner_user_id=$2`, pcID, userID,
-	).Scan(&advertisedVersion); err != nil {
+		SELECT agent_version,platform,architecture FROM pcs WHERE id=$1 AND owner_user_id=$2`, pcID, userID,
+	).Scan(&advertisedVersion, &platform, &architecture); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
 		return err
 	}
-	advertisedBuild, err := agentupdate.WindowsAgentBuild(advertisedVersion)
+	advertisedBuild, err := agentupdate.AgentBuild(advertisedVersion)
 	if err != nil {
 		return nil
 	}
@@ -373,7 +407,8 @@ func reconcileSatisfiedAgentUpdates(
 		    observed_agent_version=$3,observed_agent_build=$4,
 		    started_at=COALESCE(started_at,now()),completed_at=now(),updated_at=now()
 		WHERE account_id=$1 AND pc_id=$2 AND status='PENDING'
-		  AND target_build<=$4`, userID, pcID, advertisedVersion, advertisedBuild)
+		  AND target_build<=$4 AND artifact_platform=$5
+		  AND (artifact_architecture=$6 OR ($5='windows' AND $6='unknown' AND artifact_architecture='x64'))`, userID, pcID, advertisedVersion, advertisedBuild, platform, architecture)
 	return err
 }
 
@@ -383,7 +418,7 @@ func (s *Postgres) ReconcileInstalledAgentUpdates(
 	ctx context.Context, userID, deviceID, pcID uuid.UUID,
 	version string, build int64, localID uuid.UUID,
 ) ([]AgentUpdateRecord, error) {
-	parsed, err := agentupdate.WindowsAgentBuild(version)
+	parsed, err := agentupdate.AgentBuild(version)
 	if err != nil || parsed != build {
 		return nil, ErrDenied
 	}
@@ -392,13 +427,13 @@ func (s *Postgres) ReconcileInstalledAgentUpdates(
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var registered string
+	var registered, platform, architecture string
 	err = tx.QueryRow(ctx, `
-		SELECT p.agent_version FROM pcs p JOIN devices d ON d.id=p.device_id
-		WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3 AND p.platform='windows'
+		SELECT p.agent_version,p.platform,p.architecture FROM pcs p JOIN devices d ON d.id=p.device_id
+		WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3 AND p.platform IN ('windows','macos')
 		  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT')
 		  AND d.trust_state='TRUSTED' AND d.disabled_at IS NULL
-		FOR UPDATE OF p`, pcID, userID, deviceID).Scan(&registered)
+		FOR UPDATE OF p`, pcID, userID, deviceID).Scan(&registered, &platform, &architecture)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && registered != version {
 		return nil, ErrDenied
 	}
@@ -410,14 +445,16 @@ func (s *Postgres) ReconcileInstalledAgentUpdates(
 		    attempt_count=GREATEST(attempt_count,1),lease_token_hash=NULL,lease_expires_at=NULL,
 		    error_code=NULL,error_detail=NULL,observed_agent_version=$3,observed_agent_build=$4,
 		    started_at=COALESCE(started_at,now()),completed_at=now(),updated_at=now()
-		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING') AND target_build<=$4`,
-		userID, pcID, version, build); err != nil {
+		WHERE account_id=$1 AND pc_id=$2 AND status IN ('PENDING','PROCESSING') AND target_build<=$4
+		  AND artifact_platform=$5 AND (artifact_architecture=$6 OR ($5='windows' AND $6='unknown' AND artifact_architecture='x64'))`,
+		userID, pcID, version, build, platform, architecture); err != nil {
 		return nil, err
 	}
 	rows, err := tx.Query(ctx, `SELECT `+agentUpdateColumns+` FROM agent_update_jobs
 		WHERE account_id=$1 AND pc_id=$2 AND status='SUCCEEDED' AND target_build<=$3
 		  AND (id=$4 OR (observed_agent_version=$5 AND observed_agent_build=$3))
-		ORDER BY (id=$4) DESC,completed_at DESC,id LIMIT 2`, userID, pcID, build, localID, version)
+		  AND artifact_platform=$6 AND (artifact_architecture=$7 OR ($6='windows' AND $7='unknown' AND artifact_architecture='x64'))
+		ORDER BY (id=$4) DESC,completed_at DESC,id LIMIT 2`, userID, pcID, build, localID, version, platform, architecture)
 	if err != nil {
 		return nil, err
 	}
@@ -548,9 +585,18 @@ func (s *Postgres) mutateAgentUpdateLease(
 		WHERE job.id=$1 AND job.account_id=$2 AND job.pc_id=$3
 		  AND EXISTS(SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
 		      WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$4
-		        AND p.platform='windows' AND 'remote_agent_update_v1'=ANY(p.capabilities)
+		        AND p.platform=job.artifact_platform
+		        AND (p.architecture=job.artifact_architecture OR (p.platform='windows' AND p.architecture='unknown' AND job.artifact_architecture='x64'))
+		        AND 'remote_agent_update_v1'=ANY(p.capabilities)
 		        AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')
-		FOR UPDATE`, jobID, userID, pcID, agentDeviceID,
+        AND (job.phase IN ('INSTALLING','STARTING_NEW_AGENT','VERIFYING_CONNECTION','ROLLING_BACK') OR
+                  EXISTS(SELECT 1 FROM pcs target
+                    JOIN devices requester ON requester.id=job.requester_device_id AND requester.user_id=job.account_id
+                      AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED' AND requester.disabled_at IS NULL
+                    WHERE target.id=job.pc_id AND target.remote_routing_enabled
+                      AND ($5 OR EXISTS(SELECT 1 FROM device_grants g WHERE g.pc_id=target.id AND g.device_id=requester.id
+                        AND g.permission='MANAGE' AND (g.expires_at IS NULL OR g.expires_at>now())))))
+		FOR UPDATE`, jobID, userID, pcID, agentDeviceID, s.AutoTrustDevices,
 	))
 	if err != nil {
 		return AgentUpdateRecord{}, err
@@ -624,4 +670,42 @@ func terminalAgentUpdatePhase(current, status string) (string, int, bool) {
 	default:
 		return "", 0, false
 	}
+}
+
+var appleUpdateTeamPattern = regexp.MustCompile(`^[A-Z0-9]{10}$`)
+
+// The catalog owns trusted origins/signers. This final boundary also rejects
+// cross-platform task shapes before any database write, including direct callers.
+func normalizeAgentUpdateArtifact(input *AgentUpdateCreateInput) error {
+	if input.ArtifactPlatform == "" {
+		input.ArtifactPlatform = PCPlatformWindows
+	}
+	if input.ArtifactPlatform == PCPlatformWindows && input.ArtifactArchitecture == "" {
+		input.ArtifactArchitecture = PCArchitectureX64
+	}
+	if input.ArtifactPlatform == PCPlatformWindows && input.ArtifactType == "" {
+		input.ArtifactType = "exe"
+	}
+	switch input.ArtifactPlatform {
+	case PCPlatformWindows:
+		if input.ArtifactArchitecture != PCArchitectureX64 || input.ArtifactType != "exe" || input.ArtifactAppleTeamID != nil {
+			return ErrDenied
+		}
+	case PCPlatformMacOS:
+		if (input.ArtifactArchitecture != PCArchitectureArm64 && input.ArtifactArchitecture != PCArchitectureX64) ||
+			input.ArtifactType != "pkg" || !strings.HasSuffix(strings.ToLower(input.ArtifactFilename), ".pkg") ||
+			input.ArtifactAppleTeamID == nil || !appleUpdateTeamPattern.MatchString(*input.ArtifactAppleTeamID) ||
+			input.ArtifactSignerFingerprint != nil {
+			return ErrDenied
+		}
+		uri, err := url.Parse(input.ArtifactURL)
+		if err != nil || uri.Scheme != "https" || uri.Host == "" || uri.User != nil || uri.Fragment != "" ||
+			input.ArtifactSizeBytes < 1 || input.ArtifactSizeBytes > 2<<30 ||
+			strings.ContainsAny(input.ArtifactFilename, "/\\\x00") {
+			return ErrDenied
+		}
+	default:
+		return ErrDenied
+	}
+	return nil
 }

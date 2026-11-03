@@ -48,7 +48,7 @@ class AiWebConversationTest {
         assertThrows(IllegalArgumentException::class.java) { aiArtifactLocation(session().copy(directory = "D:"), "file.txt") }
     }
 
-    @Test fun uiStateOnlyRestoresCurrentQuestionsAndCliUsesDistinctWorkspace() {
+    @Test fun uiStateOnlyRestoresCurrentQuestions() {
         val q = AiQuestion("q", "范围", listOf("测试", "全部"), false)
         val p = AiPending("request", "question", "", listOf(q), true)
         val current = session().copy(pending = listOf(p))
@@ -59,8 +59,6 @@ class AiWebConversationTest {
         assertEquals(1, safe.length()); assertEquals("测试", safe.getJSONObject(p.id).getJSONObject("answers").getJSONArray("q").getString(0))
         assertEquals(0, sanitizeAiWebState(state, session()).getJSONObject("questions").length())
         assertEquals(0, sanitizeAiWebState(state, current.copy(pending = listOf(p.copy(questions = listOf(q.copy(text = "不同请求")))))).getJSONObject("questions").length())
-        val path = cliWorkspacePath("D:\\TermLink\\AiWorkspaces", java.util.Date(0), UUID.fromString("11111111-1111-1111-1111-111111111111"))
-        assertTrue(path.matches(Regex("D:\\\\TermLink\\\\AiWorkspaces\\\\cli_[0-9]{8}_[0-9]{6}_[0-9]{3}_11111111111111111111111111111111")))
     }
 
     @Test fun unchangedMessagesAreNotResentAndHistoryPrependsHaveExplicitOrder() {

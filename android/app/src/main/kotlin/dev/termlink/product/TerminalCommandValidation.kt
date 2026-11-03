@@ -6,7 +6,7 @@ import dev.termlink.model.TerminalCommandCapability
 internal fun isValidTerminalCommandCapability(command: TerminalCommandCapability): Boolean = when (command.source) {
     "manual" -> command.shellType == "custom"
     "detected" -> command.id == command.shellType && command.id in setOf(
-        "command-prompt", "windows-powershell", "powershell-7", "wsl",
+        "command-prompt", "windows-powershell", "powershell-7", "wsl", "bash", "zsh", "sh", "fish", "pwsh",
     ) || command.id == "powershell-7-enhanced" && command.shellType == "powershell-7"
     else -> false
 }

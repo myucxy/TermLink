@@ -64,33 +64,12 @@ func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	currentBuild, err := agentupdate.WindowsAgentBuild(pc.AgentVersion)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"eligible": false, "reason_code": "AGENT_VERSION_UNSUPPORTED",
-			"current_version": pc.AgentVersion, "active_session_count": sessions,
-		})
-		return
-	}
-	if !pc.Online || !pc.RemoteRoutingEnabled || pc.Platform != store.PCPlatformWindows ||
-		!store.HasPCCapability(pc.Capabilities, store.PCCapabilityRemoteAgentUpdateV1) {
-		reason := "REMOTE_UPDATE_UNSUPPORTED"
-		if !pc.Online {
-			reason = "PC_OFFLINE"
-		} else if !pc.RemoteRoutingEnabled {
-			reason = "REMOTE_UPDATE_DISABLED"
-		}
+	currentBuild, reason := agentUpdateEligibility(pc)
+	if reason != "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"eligible": false, "reason_code": reason, "current_version": pc.AgentVersion,
 			"current_build": currentBuild, "active_session_count": sessions,
-		})
-		return
-	}
-	if !remoteAgentUpdateBootstrapCapable(currentBuild) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"eligible": false, "reason_code": "AGENT_VERSION_UNSUPPORTED",
-			"current_version": pc.AgentVersion, "current_build": currentBuild,
-			"active_session_count": sessions,
+			"platform": pc.Platform, "architecture": pc.Architecture,
 		})
 		return
 	}
@@ -98,7 +77,7 @@ func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, http.StatusServiceUnavailable, "AGENT_UPDATE_CATALOG_UNAVAILABLE", agentupdate.ErrUnavailable)
 		return
 	}
-	offer, err := a.AgentUpdateCatalog.LatestWindowsStable(r.Context(), currentBuild)
+	offer, err := a.latestAgentUpdate(r.Context(), pc, currentBuild)
 	if err != nil {
 		code := "AGENT_UPDATE_CATALOG_UNAVAILABLE"
 		if errors.Is(err, agentupdate.ErrInvalidArtifact) {
@@ -119,6 +98,7 @@ func (a *API) getAgentUpdateEligibility(w http.ResponseWriter, r *http.Request) 
 		"eligible": true, "current_version": pc.AgentVersion, "current_build": currentBuild,
 		"target_version": offer.Version, "target_build": offer.Build, "required": offer.Required,
 		"release_notes": offer.ReleaseNotes, "active_session_count": sessions,
+		"platform": pc.Platform, "architecture": updateArchitecture(pc), "artifact_type": offer.ArtifactType,
 	})
 }
 
@@ -143,14 +123,9 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	currentBuild, err := agentupdate.WindowsAgentBuild(pc.AgentVersion)
-	if err != nil || !pc.Online || !pc.RemoteRoutingEnabled || pc.Platform != store.PCPlatformWindows ||
-		!store.HasPCCapability(pc.Capabilities, store.PCCapabilityRemoteAgentUpdateV1) {
-		writeError(w, r, http.StatusConflict, "REMOTE_UPDATE_UNAVAILABLE", store.ErrConflict)
-		return
-	}
-	if !remoteAgentUpdateBootstrapCapable(currentBuild) {
-		writeError(w, r, http.StatusConflict, "AGENT_VERSION_UNSUPPORTED", store.ErrConflict)
+	currentBuild, reason := agentUpdateEligibility(pc)
+	if reason != "" {
+		writeError(w, r, http.StatusConflict, reason, store.ErrConflict)
 		return
 	}
 	// Presence is the normal liveness source. Refresh the durable timestamp
@@ -166,7 +141,7 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "AGENT_UPDATE_CATALOG_UNAVAILABLE", agentupdate.ErrUnavailable)
 		return
 	}
-	offer, err := a.AgentUpdateCatalog.LatestWindowsStable(r.Context(), currentBuild)
+	offer, err := a.latestAgentUpdate(r.Context(), pc, currentBuild)
 	if err != nil {
 		writeError(w, r, http.StatusServiceUnavailable, "AGENT_UPDATE_CATALOG_UNAVAILABLE", err)
 		return
@@ -190,7 +165,9 @@ func (a *API) createAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		ArtifactURL: offer.DownloadURL, ArtifactFilename: offer.ArtifactFilename,
 		ArtifactSizeBytes: offer.SizeBytes, ArtifactSHA256: offer.SHA256,
 		ArtifactSignerFingerprint: offer.SignerFingerprint,
-		ExpiresAt:                 a.now().Add(agentUpdateLifetime),
+		ArtifactPlatform:          pc.Platform, ArtifactArchitecture: updateArchitecture(pc),
+		ArtifactType: offer.ArtifactType, ArtifactAppleTeamID: optionalAppleTeamID(offer.AppleTeamID),
+		ExpiresAt: a.now().Add(agentUpdateLifetime),
 	})
 	if errors.Is(err, store.ErrConflict) {
 		writeError(w, r, http.StatusConflict, "AGENT_UPDATE_ALREADY_ACTIVE", err)
@@ -468,7 +445,7 @@ func validObservedAgentIdentity(version *string, build *int64) bool {
 	if len(*version) < 1 || len(*version) > 64 || *build < 0 {
 		return false
 	}
-	parsed, err := agentupdate.WindowsAgentBuild(*version)
+	parsed, err := agentupdate.AgentBuild(*version)
 	return err == nil && parsed == *build
 }
 
@@ -510,7 +487,15 @@ func (a *API) agentUpdatePCContext(
 	pcID uuid.UUID,
 ) (store.PCRecord, int, bool) {
 	p := principal(r)
-	pcs, err := a.Store.ListPCs(r.Context(), p.UserID, p.Device.ID)
+	repository := a.agentUpdatePCs
+	if repository == nil && a.Store != nil {
+		repository = a.Store
+	}
+	if repository == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "PCS_UNAVAILABLE", store.ErrDenied)
+		return store.PCRecord{}, 0, false
+	}
+	pcs, err := repository.ListPCs(r.Context(), p.UserID, p.Device.ID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return store.PCRecord{}, 0, false
@@ -534,7 +519,13 @@ func (a *API) agentUpdatePCContext(
 			pc.LastSeenAt = &seen
 		}
 	}
-	sessions, err := a.Store.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID)
+	if pc.Online && pc.RemoteRoutingEnabled {
+		if _, err := repository.SessionCleanupDevice(r.Context(), p.UserID, p.Device.ID, pcID); err != nil {
+			writeStoreError(w, r, err)
+			return store.PCRecord{}, 0, false
+		}
+	}
+	sessions, err := repository.ListSessionsIncludingEnded(r.Context(), p.UserID, p.Device.ID, pcID)
 	if err != nil {
 		writeStoreError(w, r, err)
 		return store.PCRecord{}, 0, false
@@ -586,12 +577,17 @@ func agentUpdateView(item store.AgentUpdateRecord, includeArtifact bool) map[str
 		"status": item.Status, "phase": item.Phase, "progress_percent": item.ProgressPercent,
 		"attempt_count": item.AttemptCount, "expires_at": item.ExpiresAt,
 		"created_at": item.CreatedAt, "updated_at": item.UpdatedAt,
+		"platform": item.ArtifactPlatform, "architecture": item.ArtifactArchitecture,
+		"artifact_type": item.ArtifactType,
 	}
 	if includeArtifact {
 		result["artifact_url"] = item.ArtifactURL
 		result["artifact_filename"] = item.ArtifactFilename
 		result["artifact_size_bytes"] = item.ArtifactSizeBytes
 		result["artifact_sha256"] = hex.EncodeToString(item.ArtifactSHA256)
+		if item.ArtifactAppleTeamID != nil {
+			result["artifact_apple_team_id"] = *item.ArtifactAppleTeamID
+		}
 		if item.ArtifactSignerFingerprint != nil {
 			result["artifact_signer_fingerprint"] = *item.ArtifactSignerFingerprint
 		}
@@ -644,4 +640,94 @@ func knownAgentUpdateCompletion(value string) bool {
 	default:
 		return false
 	}
+}
+
+type agentUpdatePCContextStore interface {
+	ListPCs(context.Context, uuid.UUID, uuid.UUID) ([]store.PCRecord, error)
+	SessionCleanupDevice(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (uuid.UUID, error)
+	ListSessionsIncludingEnded(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) ([]store.SessionRecord, error)
+}
+
+func updateArchitecture(pc store.PCRecord) string {
+	if pc.Platform == store.PCPlatformWindows && (pc.Architecture == "" || pc.Architecture == store.PCArchitectureUnknown) {
+		return store.PCArchitectureX64
+	}
+	return pc.Architecture
+}
+
+func agentUpdateEligibility(pc store.PCRecord) (int64, string) {
+	build, err := agentupdate.AgentBuild(pc.AgentVersion)
+	if err != nil {
+		return 0, "AGENT_VERSION_UNSUPPORTED"
+	}
+	if !pc.Online {
+		return build, "PC_OFFLINE"
+	}
+	if !pc.RemoteRoutingEnabled {
+		return build, "REMOTE_UPDATE_DISABLED"
+	}
+	if !store.HasPCCapability(pc.Capabilities, store.PCCapabilityRemoteAgentUpdateV1) {
+		return build, "REMOTE_UPDATE_UNSUPPORTED"
+	}
+	switch pc.Platform {
+	case store.PCPlatformWindows:
+		if updateArchitecture(pc) != store.PCArchitectureX64 {
+			return build, "REMOTE_UPDATE_UNSUPPORTED"
+		}
+		if !remoteAgentUpdateBootstrapCapable(build) {
+			return build, "AGENT_VERSION_UNSUPPORTED"
+		}
+	case store.PCPlatformMacOS:
+		if pc.Architecture != store.PCArchitectureArm64 && pc.Architecture != store.PCArchitectureX64 {
+			return build, "REMOTE_UPDATE_UNSUPPORTED"
+		}
+	default:
+		return build, "REMOTE_UPDATE_UNSUPPORTED"
+	}
+	return build, ""
+}
+
+func (a *API) latestAgentUpdate(ctx context.Context, pc store.PCRecord, build int64) (agentupdate.Offer, error) {
+	var offer agentupdate.Offer
+	var err error
+	if catalog, ok := a.AgentUpdateCatalog.(agentupdate.PlatformCatalog); ok {
+		offer, err = catalog.LatestStable(ctx, pc.Platform, updateArchitecture(pc), build)
+	} else if pc.Platform == store.PCPlatformWindows && updateArchitecture(pc) == store.PCArchitectureX64 {
+		offer, err = a.AgentUpdateCatalog.LatestWindowsStable(ctx, build)
+		// Compatibility for existing Windows-only catalog implementations.
+		if offer.Platform == "" {
+			offer.Platform = "windows"
+		}
+		if offer.Architecture == "" {
+			offer.Architecture = "x64"
+		}
+		if offer.ArtifactType == "" {
+			offer.ArtifactType = "exe"
+		}
+	} else {
+		return offer, agentupdate.ErrUnavailable
+	}
+	if err != nil {
+		return offer, err
+	}
+	if !offer.Available {
+		return offer, nil
+	}
+	kind := "exe"
+	if pc.Platform == store.PCPlatformMacOS {
+		kind = "pkg"
+	}
+	if offer.Platform != pc.Platform || offer.Architecture != updateArchitecture(pc) || offer.ArtifactType != kind ||
+		offer.Build <= build || (pc.Platform == store.PCPlatformMacOS &&
+		(!regexp.MustCompile(`^[A-Z0-9]{10}$`).MatchString(offer.AppleTeamID) || offer.SignerFingerprint != nil)) {
+		return agentupdate.Offer{}, agentupdate.ErrInvalidArtifact
+	}
+	return offer, nil
+}
+
+func optionalAppleTeamID(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }

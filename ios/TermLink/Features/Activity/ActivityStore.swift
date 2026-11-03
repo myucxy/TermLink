@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import Combine
 import Foundation
 
 /// Local device activity feed, mirroring the Android 活动页: this is the phone's own

@@ -5,6 +5,8 @@
 !server/go.mod
 !server/go.sum
 !server/THIRD_PARTY_NOTICES.md
+!server/licenses/
+!server/licenses/THIRD_PARTY_NOTICES.txt
 !server/cmd/
 !server/cmd/**
 !server/internal/
