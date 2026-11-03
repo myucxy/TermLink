@@ -28,3 +28,20 @@ Mac 当前通过 Relay 提供的远程 AI 能力仍以实际主机声明为准�
 - Portable AI 协议模拟通过，GitHub 发布脚本 8 项测试通过；图标、依赖清单和公开文档检查通过。
 
 制品哈希与实际发布状态记录在最终发布结果中。本轮使用现有 Android 签名身份，不更换签名密钥、不清理用户数据。Mac/iOS 真机、真实模型账号和 APNs 投递未在 Windows 环境验收。
+
+## 发布结果（2026-11-03）
+
+已发布 GitHub `v0.3.17` 与 AppShip stable，平台范围为 Android APK＋完整对应源码。制品固定应用提交 `9d0a207d3cd21e0c74a02e3225bab0573d913095`、Android/Windows core `1c907c51b3c6652b23a7d7216ff1bb13d3410a69`。GitHub 上传器修复提交 `e2bdab4c6f538c696ace5fbcadd320e760930577` 仅修正 Android-only 附件清单，复用原制品、源码包、草稿和标签，没有重新编译或移动标签；发布工具回归共9项通过。
+
+| 制品 | 大小 | SHA-256 |
+| --- | ---: | --- |
+| TermLink-Android-0.3.17-147.apk | 43,785,130 | `67823e5e9cc305112f61fe18e6a8fe52c0e2e12f40c42f14f6337b3f02327de7` |
+| TermLink-0.3.17-147-source.zip | 88,343,402 | `069925d3c89447f6c4e893ea11d49b9e663342ba3906fb3e0577426dc2a80ee7` |
+
+- [GitHub Release](https://github.com/myucxy/TermLink/releases/tag/v0.3.17)：6个附件，含APK、源码、sidecar、manifest、SHA256SUMS和发布元数据。
+- [GitHub 独立验证](https://github.com/myucxy/TermLink/actions/runs/41628722117)：源码、附件哈希、版本、Android签名全部通过。源码提交对应的 Repository checks `41626430545` 与 Docker DEV checks `41626430898` 通过；后者没有发布镜像。
+- [AppShip APK](https://appship.kget.cc:8910/api/v1/artifacts/ef77e5d9-75cd-4678-9163-97d9963c7366/download)：release `4d7fa8c9-8286-4214-962b-f3ee6c84abaa`，`published`；artifact `ready`、签名审核 `manual_approved`。
+- [AppShip 完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/a94896be-c6f6-4cec-b3dd-848633acc58d/download)：release `369622bc-2179-42cf-a981-d047eb62feb6`，`published`；artifact `ready`。
+- APK唯一签名者指纹延续 `f374794c07dbc34299d6c141cba4eee034849efc625a031eb893dc5748df021b`，apksigner v2验证通过。公开更新API：146返回`optional`、147返回`no_update`，两份匿名完整下载哈希匹配。
+- 正式构建首次因JVM本机内存分配失败而中止；关闭本轮测试模拟器、降低并发后用相同版本/build与同一提交成功重试。没有改变签名或绕过验证。
+- Windows/macOS/iOS安装包、Docker镜像与现有Server均未升级；本地Server仍健康。Mac/iOS设备、真实模型与APNs验收仍按上文边界记录。
