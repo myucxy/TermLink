@@ -119,6 +119,44 @@ class ReleaseChecks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.expected_names('0.3.7', 137, artifact_types)
 
+    def test_android_only_stage_resumes_exact_asset_set_without_windows_setup(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            for name in release.expected_names('0.3.7', 137, {'apk'}):
+                (directory/name).write_bytes(b'fixture')
+            release.write_json(directory/'artifact-manifest.json', dict(version='0.3.7', build_number=137,
+                source_revision='a'*40, core_revision='e'*40, artifacts=[dict(type='apk')]))
+            notes = directory/'notes.md'
+            notes.write_text('fixture notes')
+            args = argparse.Namespace(directory=directory, notes=notes)
+            api = unittest.mock.Mock()
+            api.token = 'fixture'
+            polls = 0
+            def request(path, method='GET', value=None):
+                nonlocal polls
+                if path.endswith('/runs?event=workflow_dispatch&per_page=20'):
+                    polls += 1
+                    metadata = release.sha256(directory/'github-release.json')
+                    return dict(workflow_runs=[] if polls == 1 else [dict(id=18,
+                        display_title='Verify release 12 '+metadata, status='completed', conclusion='success')])
+                if path == '/releases?per_page=100':
+                    return [dict(id=12, tag_name='v0.3.7', target_commitish='a'*40, draft=True, body=notes.read_text())]
+                if path == '/releases/12/assets?per_page=100':
+                    return [dict(name=name, size=(directory/name).stat().st_size,
+                        digest='sha256:'+release.sha256(directory/name))
+                        for name in release.expected_names('0.3.7', 137, {'apk'}) | {'github-release.json'}]
+                if path.endswith('/dispatches'):
+                    return None
+                self.fail('Unexpected API operation: '+path)
+            api.request.side_effect = request
+            with patch.object(release, 'git', side_effect=lambda *args: '' if args[0] == 'status' else 'a'*40), \
+                    patch.object(release, 'validate_bundle'), patch.object(release, 'publish') as publish, \
+                    redirect_stdout(io.StringIO()):
+                release.stage(args, api)
+            publish.assert_called_once_with(args, api)
+            self.assertNotIn('TermLink-Setup-0.3.7.137-x64.exe',
+                {row['name'] for row in release.read_json(directory/'github-release.json')['files']})
+
     def test_native_evidence_is_required_before_publish(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)

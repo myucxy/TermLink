@@ -225,7 +225,7 @@ def stage(args, api):
         release = api.request('/releases', 'POST', dict(tag_name=tag, target_commitish=revision,
             name=f'TermLink {version} (build {build})', body=args.notes.read_text(encoding='utf-8'), draft=True, prerelease=False))
     assets = {row['name']: row for row in api.request(f'/releases/{release["id"]}/assets?per_page=100')}
-    upload_names = expected_names(version, build) | {'github-release.json'}
+    upload_names = expected_names(version, build, artifact_types) | {'github-release.json'}
     require(set(assets) <= upload_names, 'Unexpected existing draft attachments; preserve draft and inspect manually')
     for name in sorted(upload_names):
         path = directory/name
