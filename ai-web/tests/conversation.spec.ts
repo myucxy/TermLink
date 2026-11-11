@@ -89,7 +89,7 @@ test('compact tools remain reachable on narrow screens with large text and a fix
   const toolbar=page.getByRole('navigation',{name:'Conversation tools'});
   await expect(page.locator('[data-message-id="m1"]')).toBeVisible();
   expect((await toolbar.boundingBox())!.height).toBeLessThanOrEqual(38);
-  await page.screenshot({path:'test-results/compact-toolbar.png'});
+  await page.screenshot({path:test.info().outputPath('compact-toolbar.png')});
   await page.setViewportSize({width:320,height:740});
   await page.evaluate(session=>(window as any).termlinkUpdate({session,messages:[],reset:false}),{...session,language:'en',fontScale:2,plan:[]});
   const stop=toolbar.getByRole('button',{name:'Stop',exact:true});
@@ -106,7 +106,7 @@ test('compact tools remain reachable on narrow screens with large text and a fix
   }
   await stop.click();
   expect(await page.evaluate(()=>(window as any).calls.filter((r:any)=>r.action==='interrupt').length)).toBe(1);
-  await page.screenshot({path:'test-results/compact-toolbar-large-font.png'});
+  await page.screenshot({path:test.info().outputPath('compact-toolbar-large-font.png')});
 });
 test('user bubbles fit short prompts and keep actions accessible outside long content',async({page})=>{
   const idle={...session,state:'idle',plan:[],dark:true,language:'en'};
@@ -120,7 +120,7 @@ test('user bubbles fit short prompts and keep actions accessible outside long co
   await user.getByRole('button',{name:'Append to draft',exact:true}).click();
   expect(await page.evaluate(()=>(window as any).calls.filter((r:any)=>r.action==='copy'||r.action==='edit').map((r:any)=>[r.action,r.text]))).toEqual([['copy','hi'],['edit','hi']]);
   for(const button of await user.getByRole('button').all()) {const box=(await button.boundingBox())!;expect(box.width).toBeGreaterThanOrEqual(44);expect(box.height).toBeGreaterThanOrEqual(44);expect(box.y).toBeGreaterThanOrEqual(bounds.y+bounds.height);}
-  await page.screenshot({path:'test-results/user-bubble-dark.png'});
+  await page.screenshot({path:test.info().outputPath('user-bubble-dark.png')});
   await page.setViewportSize({width:320,height:740});
   const long='长内容保持换行 '.repeat(16)+'\n\n```text\n'+('long_path_without_spaces/'.repeat(30))+'\n```';
   for(const dark of [true,false]) {
@@ -130,7 +130,7 @@ test('user bubbles fit short prompts and keep actions accessible outside long co
     expect(await bubble.evaluate(el=>el.scrollWidth<=el.clientWidth+1)).toBe(true);
     const box=(await bubble.boundingBox())!;expect(box.x).toBeGreaterThanOrEqual(12);expect(box.x+box.width).toBeLessThanOrEqual(308);
   }
-  await page.screenshot({path:'test-results/user-bubble-large-font.png'});
+  await page.screenshot({path:test.info().outputPath('user-bubble-large-font.png')});
 });
 test('compact transcript exposes plan, thought, usage and per-file diff',async({page})=>{
   await open(page,[msg('m1','检查公开事件并执行测试','assistant','reasoning'),msg('m2','## 已完成\n\n| 功能 | 状态 |\n|---|---|\n| 预览 | 通过 |')]);
@@ -138,7 +138,7 @@ test('compact transcript exposes plan, thought, usage and per-file diff',async({
   await page.getByText('思考摘要',{exact:true}).click();await expect(page.getByText('检查公开事件并执行测试')).toBeVisible();
   await page.getByRole('button',{name:'用量',exact:true}).click();await expect(page.locator('progress')).toHaveAttribute('value','12000');
   await page.getByRole('button',{name:'± 变更'}).click();await expect(page.getByText('demo.html', {exact:false}).first()).toBeVisible();
-  await page.screenshot({path:'test-results/compact-chat.png'});
+  await page.screenshot({path:test.info().outputPath('compact-chat.png')});
 });
 
 test('native saved question drafts and reading anchor survive a destroyed WebView',async({page})=>{
@@ -187,4 +187,38 @@ test('file filters do not change search results; native Back closes preview befo
   await expect(page.locator('.panel')).toBeVisible();
   await page.evaluate(()=>(window as any).termlinkBack());
   await expect(page.locator('.panel')).toHaveCount(0);
+});
+
+test('optional MCP fields can be blank; changed requirements invalidate the saved draft',async({page})=>{
+  const request={id:'form',kind:'question',title:'MCP form',summary:'',detail:'fixture',canApprove:true,questions:[
+    {id:'required',text:'Required value',options:[],multiSelect:false},
+    {id:'optional',text:'Optional value',options:[],multiSelect:false,required:false},
+  ]};
+  const value={...session,language:'en',pending:[request]};
+  await open(page,[msg('m1','MCP form')],value);
+  const submit=page.getByRole('button',{name:'Submit answer'});await expect(submit).toBeDisabled();
+  await page.getByRole('textbox',{name:'Required value',exact:true}).fill('answer');
+  await expect(page.getByRole('textbox',{name:'Optional value',exact:true})).toHaveValue('');
+  await expect(submit).toBeEnabled();await submit.click();
+  expect(await page.evaluate(()=>(window as any).calls.find((r:any)=>r.action==='answer').answers)).toEqual({required:['answer'],optional:[]});
+  await page.evaluate(session=>(window as any).termlinkUpdate({session,messages:[],reset:false}),{
+    ...value,pending:[{...request,questions:request.questions.map(q=>({...q,required:true}))}],
+  });
+  await expect(page.getByRole('textbox',{name:'Required value',exact:true})).toHaveValue('');
+  await expect(submit).toBeDisabled();
+  await page.evaluate(session=>(window as any).termlinkUpdate({session,messages:[],reset:false}),{
+    ...value,pending:[{...request,canApprove:false,questions:request.questions.map(q=>({...q,required:false}))}],
+  });
+  await expect(submit).toBeDisabled();
+});
+
+test('form property names cannot access Object prototype or corrupt drafts',async({page})=>{
+  const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  const questions=['__proto__','constructor','toString'].map(id=>({id,text:id,options:['true','false'],multiSelect:false,required:true}));
+  await open(page,[],{...session,pending:[{id:'prototype-form',kind:'question',title:'Form',summary:'',detail:'{}',canApprove:true,questions}]});
+  for(const name of ['__proto__','constructor','toString'])await page.getByRole('group',{name}).getByRole('radio',{name:'true',exact:true}).check();
+  await page.getByRole('button',{name:'提交回答',exact:true}).click();
+  const answer=await page.evaluate(()=>{const call=(window as any).calls.find((c:any)=>c.action==='answer');return Object.entries(call.answers);});
+  expect(answer).toEqual([['__proto__',['true']],['constructor',['true']],['toString',['true']]]);
+  expect(errors).toEqual([]);
 });

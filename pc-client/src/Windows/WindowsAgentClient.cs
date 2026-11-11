@@ -236,6 +236,8 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
     /// A failed shutdown restores normal client operation so the UI can report and
     /// retry the failure without silently losing its control surface.
     /// </summary>
+    public bool SupportsCompleteShutdown => true;
+
     public async ValueTask ShutdownCompletelyAsync(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -282,21 +284,26 @@ public sealed class WindowsAgentClient : IAgentClient, IAsyncDisposable
         }
     }
 
-    public bool SupportsZcodeRemoteConfiguration => true;
 
-    public ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken)
+    public bool SupportsAiAgentDetection => true;
+
+    public bool SupportsCapabilityDetection => true;
+    public async ValueTask<CapabilityDetectionReport> DetectCapabilitiesAsync(CancellationToken token)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrWhiteSpace(url)) TermLink.Ai.ZcodeRemoteAddressStore.Default.Clear();
-        else TermLink.Ai.ZcodeRemoteAddressStore.Default.Save(url);
-        return ValueTask.CompletedTask;
+        var state=await GetStatusAsync(true,token).ConfigureAwait(false);
+        var agents=await DetectAiAgentsAsync(token).ConfigureAwait(false);
+        return CapabilityReportFactory.Create(state,agents,remoteSessions:true,commandEditing:true);
     }
 
     public async ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken)
     {
         var response = await SendRequiredAsync(new RegistryRequest { Command = RegistryCommand.DetectAiAgents }, 30_000, cancellationToken).ConfigureAwait(false);
         var agents = System.Text.Json.JsonSerializer.Deserialize<AiAgentCapability[]>(response.Production?.AiAgentsJson ?? "[]");
-        return agents ?? Array.Empty<AiAgentCapability>();
+        return (agents ?? Array.Empty<AiAgentCapability>()).Select(agent => agent with {
+            Protocol=agent.Id switch { "codex"=>"codex", "claude"=>"claude", "opencode" or "grok"=>"acp", "zcode"=>"zcode", _=>"" },
+            ProtocolStatus=agent.Status=="available" ? "available" : agent.Status=="incompatible" ? "incompatible" : "not_checked",
+            RemoteExecutionAvailable=agent.Strategy=="native" && agent.Status=="available",
+        }).ToArray();
     }
 
     public async ValueTask SaveTerminalCommandsAsync(

@@ -13,13 +13,24 @@ public sealed record MacPlatformOptions(
     string LaunchAgentsDirectory,
     uint UserId)
 {
+    public static bool IsDevelopmentBuild =>
+#if TERMLINK_DEVELOPMENT_BUILD
+        true;
+#else
+        false;
+#endif
+    public static string AgentServiceName => IsDevelopmentBuild ? "dev.termlink.agent.dev" : "dev.termlink.agent";
+
     public static MacPlatformOptions CreateDefault()
     {
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var bundledAgent = Path.Combine(AppContext.BaseDirectory, "agent", "TermLink.Agent");
         return new MacPlatformOptions(
-            Path.Combine(AppContext.BaseDirectory, "TermLink.Agent"),
-            UnixDomainSocketTransport.DefaultEndpoint(),
-            Path.Combine(home, "Library", "Application Support", "TermLink"),
+            File.Exists(bundledAgent) ? bundledAgent : Path.Combine(AppContext.BaseDirectory, "TermLink.Agent"),
+            IsDevelopmentBuild
+                ? Path.Combine(Path.GetDirectoryName(UnixDomainSocketTransport.DefaultEndpoint())!, "agent-dev-v1.sock")
+                : UnixDomainSocketTransport.DefaultEndpoint(),
+            Path.Combine(home, "Library", "Application Support", IsDevelopmentBuild ? "TermLink DEV" : "TermLink"),
             Path.Combine(home, "Library", "LaunchAgents"),
             GetEffectiveUserId());
     }
@@ -42,7 +53,7 @@ public sealed class MacPlatformServices : IPlatformServices, IAsyncDisposable
             RuntimeInformation.OSDescription,
             RuntimeInformation.RuntimeIdentifier,
             true);
-        SecretStore = new MacKeychainSecretStore("dev.termlink.agent");
+        SecretStore = new MacKeychainSecretStore(MacPlatformOptions.AgentServiceName);
         LocalIpc = new UnixDomainSocketTransport();
         terminalHost = new PosixTerminalSessionHost();
         TerminalHost = terminalHost;
@@ -50,12 +61,15 @@ public sealed class MacPlatformServices : IPlatformServices, IAsyncDisposable
         TerminalCommands = new PosixTerminalCommandDiscovery();
         var arguments = new[] { "--agent", "--ipc", options.IpcEndpoint };
         Autostart = new MacLaunchdAutostartManager(new MacLaunchdOptions(
-            "dev.termlink.agent",
+            MacPlatformOptions.AgentServiceName,
             options.AgentExecutable,
             arguments,
             options.LaunchAgentsDirectory,
             options.UserId));
-        Updates = new MacPackageUpdateInstaller(Path.Combine(options.DataDirectory, "updates"));
+        var updateOptions = MacUpdateOptions.CreateDefault();
+        Updates = new MacPackageUpdateInstaller(Path.Combine(options.DataDirectory, "updates"),
+            trustedTeamId: updateOptions?.TrustedTeamId,
+            applicationBundlePath: updateOptions?.ApplicationBundlePath ?? "/Applications/TermLink.app");
         Processes = new MacProcessSupervisor(options.AgentExecutable, options.IpcEndpoint, Path.Combine(options.DataDirectory, "agent.pid"));
         Notifications = new MacNotification();
     }
@@ -74,7 +88,7 @@ public sealed class MacPlatformServices : IPlatformServices, IAsyncDisposable
     public ValueTask DisposeAsync() => terminalHost.DisposeAsync();
 }
 
-public sealed class MacProcessSupervisor(string agentExecutable, string ipcEndpoint, string pidPath) : IProcessSupervisor
+public sealed class MacProcessSupervisor(string agentExecutable, string ipcEndpoint, string pidPath) : IProcessSupervisor, IAgentExitMonitor
 {
     private readonly SemaphoreSlim gate = new(1, 1);
 
@@ -95,7 +109,7 @@ public sealed class MacProcessSupervisor(string agentExecutable, string ipcEndpo
             start.ArgumentList.Add("--agent");
             start.ArgumentList.Add("--ipc");
             start.ArgumentList.Add(ipcEndpoint);
-            var process = Process.Start(start) ?? throw new InvalidOperationException("The macOS Agent did not start.");
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("The macOS Agent did not start.");
             Directory.CreateDirectory(Path.GetDirectoryName(pidPath)!);
             File.WriteAllText(pidPath + ".new", process.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
             File.Move(pidPath + ".new", pidPath, true);
@@ -119,6 +133,42 @@ public sealed class MacProcessSupervisor(string agentExecutable, string ipcEndpo
         {
             return ValueTask.FromResult(false);
         }
+    }
+
+    public async ValueTask WaitForExitAsync(int processId, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (processId <= 0 || timeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(processId));
+        Process process;
+        try { process = Process.GetProcessById(processId); }
+        catch (ArgumentException) { RemoveExitedPid(processId); return; }
+        using (process)
+        {
+            if (!process.HasExited)
+            {
+                // Only observe the PID returned by the authenticated Host and
+                // require this installation's executable. Never kill by name.
+                try
+                {
+                    if (!string.Equals(Path.GetFullPath(agentExecutable), process.MainModule?.FileName, StringComparison.Ordinal) && !process.HasExited)
+                        throw new InvalidDataException("PC_AGENT_PROCESS_IDENTITY_MISMATCH");
+                }
+                catch (InvalidOperationException) when (process.HasExited) { }
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                deadline.CancelAfter(timeout);
+                try { await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException("PC_AGENT_PROCESSES_STILL_RUNNING");
+                }
+            }
+        }
+        RemoveExitedPid(processId);
+    }
+
+    private void RemoveExitedPid(int processId)
+    {
+        if (File.Exists(pidPath) && int.TryParse(File.ReadAllText(pidPath), out var recorded) && recorded == processId)
+            File.Delete(pidPath);
     }
 }
 

@@ -56,6 +56,9 @@ services:
     image: ${TERMLINK_IMAGE:?TERMLINK_IMAGE immutable tag@sha256 digest is required}
     command: ["migrate"]
     environment: &server-environment
+      # iOS remains disabled unless an explicit, distinct client ID is supplied.
+      TERMLINK_IOS_OIDC_CLIENT_ID: ${TERMLINK_IOS_OIDC_CLIENT_ID:-}
+      TERMLINK_IOS_OIDC_REDIRECT_URI: ${TERMLINK_IOS_OIDC_REDIRECT_URI:-dev.termlink.ios:/oauth2redirect}
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:?TERMLINK_PUBLIC_URL is required}
       TERMLINK_OIDC_ISSUER: ${TERMLINK_OIDC_ISSUER:?TERMLINK_OIDC_ISSUER is required}
       TERMLINK_OIDC_CLIENT_ID: ${TERMLINK_OIDC_CLIENT_ID:?TERMLINK_OIDC_CLIENT_ID is required}
@@ -135,6 +138,7 @@ services:
     environment:
       <<: *server-environment
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      TERMLINK_APPSHIP_MACOS_TEAM_ID: ${TERMLINK_APPSHIP_MACOS_TEAM_ID:-}
     secrets: *server-secrets
     networks:
       - frontend

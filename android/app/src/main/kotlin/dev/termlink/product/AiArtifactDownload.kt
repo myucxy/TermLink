@@ -19,7 +19,9 @@ internal fun rememberAiArtifactDownload(workspace: AiWorkspace, session: AiConve
         if (uri != null && file != null) {
             runCatching {
                 check(workspace.catalogs[file.session.pcId]?.hostId == file.host)
-                checkNotNull(workspace.downloads).start(file.session, file.host, file.session.pcId.toString().take(8), file.file, uri)
+                val current = checkNotNull(workspace.conversations[file.session.id])
+                check(current.pcId == file.session.pcId && current.directory == file.session.directory)
+                checkNotNull(workspace.downloads).start(current, file.host, current.pcId.toString().take(8), file.file, uri)
             }.onSuccess {
                 Toast.makeText(context, "已加入下载中心，可离开当前页面。", Toast.LENGTH_SHORT).show()
             }.onFailure { Toast.makeText(context, "无法开始下载，请重新读取文件后重试。", Toast.LENGTH_LONG).show() }
@@ -27,7 +29,8 @@ internal fun rememberAiArtifactDownload(workspace: AiWorkspace, session: AiConve
     }
     return { file ->
         check(pending == null) { "请先选择保存位置" }
-        pending = PendingArtifactDownload(file, session, checkNotNull(workspace.catalogs[session.pcId]).hostId)
+        val artifactId = aiArtifactRelativePath(session.directory, file.id, session.capabilities.pathStyle)
+        pending = PendingArtifactDownload(file.copy(id = artifactId), session, checkNotNull(workspace.catalogs[session.pcId]).hostId)
         launcher.launch(file.name.take(160))
     }
 }

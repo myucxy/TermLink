@@ -1486,8 +1486,10 @@ func (s *Postgres) SessionRoute(ctx context.Context, userID, deviceID, sessionID
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
-		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
+		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.user_id=p.owner_user_id
+		  AND owner_device.trust_state='TRUSTED' AND owner_device.disabled_at IS NULL AND owner_device.revoked_at IS NULL
 		JOIN devices actor ON actor.id=$2 AND actor.user_id=$3 AND actor.trust_state='TRUSTED'
+		  AND actor.disabled_at IS NULL AND actor.revoked_at IS NULL
 		LEFT JOIN device_grants g ON g.pc_id=p.id AND g.device_id=actor.id AND (g.expires_at IS NULL OR g.expires_at>now())
 		WHERE s.id=$1 AND p.owner_user_id=$3 AND p.remote_routing_enabled AND s.deleted_at IS NULL
 		  AND ($4 OR p.device_id=actor.id OR g.device_id IS NOT NULL)`, sessionID, deviceID, userID, s.AutoTrustDevices).
@@ -1510,7 +1512,8 @@ func (s *Postgres) SessionPCDevice(ctx context.Context, userID, sessionID uuid.U
 		FROM sessions s
 		JOIN pcs p ON p.id=s.pc_id
 		JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
-		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.trust_state='TRUSTED'
+		JOIN devices owner_device ON owner_device.id=p.device_id AND owner_device.user_id=p.owner_user_id
+		  AND owner_device.trust_state='TRUSTED' AND owner_device.disabled_at IS NULL AND owner_device.revoked_at IS NULL
 		WHERE s.id=$1 AND p.owner_user_id=$2 AND p.remote_routing_enabled AND s.deleted_at IS NULL`, sessionID, userID).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrNotFound

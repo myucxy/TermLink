@@ -35,11 +35,13 @@ class AiHistoryListTest {
         val sessions = listOf(first, target, claude).associateBy { it.id }
         val catalog = AiCatalog("host", listOf(AiAgentOption("zcode", "ZCode", "", "available", "desktop_remote")), listOf(target, claude))
         val opened = listOf(AiOpened(other, first.id, agentId = "codex"), AiOpened(pc, target.id, agentId = "codex"))
+        val legacy = AiOpened(pc, "remote:$pc:zcode", "desktop_remote", "zcode")
+        assertEquals(opened, aiListEntries(opened + legacy, null, null, false))
         val entries = aiListEntries(opened, pc, catalog, true)
-        assertEquals(4, entries.size) // One duplicate plus one desktop entry, not duplicated native views.
+        assertEquals(3, entries.size) // Duplicate native rows collapse; legacy webpage catalog items do not become sessions.
         assertEquals(opened, aiListEntries(opened, pc, catalog, false)) // Offline: no cached catalog disclosures.
         assertEquals(opened, aiListEntries(opened, null, catalog, true))
-        assertEquals(listOf("codex", "claude", "zcode"), aiCatalogEntries(pc, catalog).map { aiEntryAgentId(it, sessions[it.sessionId]) })
+        assertEquals(listOf("codex", "claude"), aiCatalogEntries(pc, catalog).map { aiEntryAgentId(it, sessions[it.sessionId]) })
         val rows = aiListRows(entries, sessions, emptyMap())
         val targetKey = AiGroupTarget(pc, "codex").key
         val index = rows.indexOfFirst { it.key == targetKey }
@@ -74,7 +76,7 @@ class AiHistoryListTest {
     @Test fun filteringUsesDeviceAgentAndActualTitleAndRetainsOfflineAgentIdentity() {
         val pc = UUID.randomUUID(); val second = UUID.randomUUID(); val id = UUID.randomUUID().toString()
         val session = parseConversation(pc, JSONObject("""{"kind":"ai","id":"$id","agentId":"codex","agentName":"Codex","directory":"D:\\work","state":"idle","controlVersion":1,"canControl":true,"title":"修复登录","preview":"摘要"}"""))
-        val entries = listOf(AiOpened(pc, id, agentId = "codex"), AiOpened(second, "remote", "desktop_remote", "zcode"))
+        val entries = listOf(AiOpened(pc, id, agentId = "codex"), AiOpened(second, UUID.randomUUID().toString(), agentId = "zcode"))
         val sessions = mapOf(id to session); val devices = mapOf(pc to "HOME-PC", second to "OTHER-PC")
         assertEquals(listOf(entries[0]), aiVisibleEntries(entries, sessions, devices, "登录", false))
         assertEquals(listOf(entries[0]), aiVisibleEntries(entries, sessions, devices, "home", false))

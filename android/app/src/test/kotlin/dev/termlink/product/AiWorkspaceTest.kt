@@ -241,15 +241,19 @@ class AiWorkspaceTest {
             workspace.mutate(pc, "send", value, JSONObject().put("text", "hello"))
             assertTrue(workspace.uncertain)
             assertEquals("hello", workspace.drafts[sessionId])
+            val uncertainRequest = requests.last()
             workspace.refresh(pc)
-            assertTrue(workspace.error.isNotEmpty())
+            // Catalog refresh is read-only and must neither clear nor duplicate the pending mutation.
+            assertTrue(workspace.uncertain)
+            assertEquals("catalog", JSONObject(requests.last()).getString("action"))
+            val afterDiscovery = requests.size
             workspace.mutate(pc, "send", value, JSONObject().put("text", "another"))
-            assertEquals(2, requests.size)
+            assertEquals(afterDiscovery, requests.size)
             // Process recreation recovers the exact encrypted request instead of inventing a new operation ID.
             val restored = AiWorkspace(repository, scope, prefs)
             assertTrue(restored.uncertain)
             restored.retryUncertain()
-            assertEquals(requests[1], requests[2])
+            assertEquals(uncertainRequest, requests.last())
             assertFalse(restored.uncertain)
             val before = requests.size
             workspace.closeView(sessionId)
@@ -260,6 +264,29 @@ class AiWorkspaceTest {
             assertEquals(before, requests.size)
             assertTrue(workspace.conversations.isEmpty())
         } finally { scope.cancel(); prefs.edit().clear().commit() }
+    }
+
+    @Test fun replacementHistoryRejectsAnEarlierInFlightPage(): Unit = runBlocking {
+        val pc=UUID.randomUUID(); val id=UUID.randomUUID().toString(); val page=CompletableDeferred<String>()
+        fun session(stream:String,text:String)= """{"kind":"ai","id":"$id","agentName":"fixture","directory":"/work","state":"idle","controlVersion":1,"canControl":true,"streamId":"$stream","cursor":"2","historyBefore":1,"capabilities":{"history":true},"messages":[{"id":"$text","role":"assistant","text":"$text"}]}"""
+        val repository=object:ProductRepository by UnavailableProductRepository(){
+            override suspend fun aiRequest(pcId:UUID,body:String):String=when(JSONObject(body).getString("action")){
+                "catalog" -> """{"hostId":"host","agents":[],"sessions":[${session("old","stale")}]}"""
+                "history" -> page.await()
+                else -> """{"hostId":"host","session":${session("new","retained")}}"""
+            }
+        }
+        val prefs=ApplicationProvider.getApplicationContext<Context>().getSharedPreferences("history-reset-"+UUID.randomUUID(),Context.MODE_PRIVATE)
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Unconfined)
+        try{
+            val workspace=AiWorkspace(repository,scope,prefs);workspace.refresh(pc);val old=workspace.conversations.getValue(id)
+            val read=launch{workspace.loadHistory(old)};yield()
+            workspace.mutate(pc,"revert",old,JSONObject().put("requestId","turn"))?.await()
+            page.complete("""{"hostId":"host","history":{"streamId":"old","before":0,"messages":[{"id":"deleted","role":"assistant","text":"deleted"}]}}""")
+            read.join()
+            assertEquals("new",workspace.conversations.getValue(id).streamId)
+            assertEquals(listOf("retained"),workspace.conversations.getValue(id).messages.map{it.text})
+        }finally{scope.cancel();prefs.edit().clear().commit()}
     }
 
     @Test fun endingSessionRemovesPhoneViewAndLeavesCatalogHistory() = runBlocking {

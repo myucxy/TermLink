@@ -8,6 +8,9 @@ import {request, staticHtml, type Message, type Pending, type Session, type Upda
 import {timelineRows,questionSchema,type TimelineRow} from './timeline';
 import './style.css';
 import {CodeBlock} from './CodeBlock';
+import {ToolCard} from './ToolCard';
+import {AgentFeatures} from './AgentFeatures';
+import {HistoryActions} from './HistoryActions';
 
 type Preview = {name: string; text?: string; mime: string; url?: string; fileId?: string};
 type Artifact = {id: string; name: string; mime: string; size: number; version: string};
@@ -31,7 +34,7 @@ function App() {
   const pendingSchemas=useRef(new Map<string,string>());
   const [firstIndex,setFirstIndex]=useState(100000);
   const messageMap = useRef(new Map<string,Message>()); const order = useRef<string[]>([]);
-  const [error,setError] = useState(''); const [panel,setPanel] = useState<'files'|'search'|'usage'|'diff'|null>(null);
+  const [error,setError] = useState(''); const [panel,setPanel] = useState<'files'|'search'|'usage'|'diff'|'features'|'history-actions'|null>(null);
   const [files,setFiles] = useState<Artifact[]>([]); const [query,setQuery] = useState('');
   const [fileQuery,setFileQuery] = useState('');
   const [fullDiff,setFullDiff]=useState<string>();const [diffBusy,setDiffBusy]=useState(false);
@@ -79,6 +82,8 @@ function App() {
         restoring.current=uiRef.current.tail===false&&!!anchor&&at<0;setRestoreAnchor(restoring.current?anchor:undefined);
         setInitial(at>=0?{index:at,align:'start',offset:anchor?.offset||0}:{index:'LAST',align:'end'});}
       setLanguage(u.session.language); setSession(u.session);
+      if(!u.session.agentFeatures)setPanel(panel=>panel==='features'?null:panel);
+      if(!u.session.historyActions)setPanel(panel=>panel==='history-actions'?null:panel);
       document.documentElement.dataset.theme = u.session.dark?'dark':'light';
       document.documentElement.style.fontSize = `${14 * Math.min(2,Math.max(.85,u.session.fontScale || 1))}px`;
     };
@@ -160,6 +165,8 @@ function App() {
       {session.artifacts&&<button onClick={openFiles}>{t('▱ 文件')}</button>}
       <button onClick={()=>setPanel(panel==='diff'?null:'diff')}>{t('± 变更')}</button>
       {session.usage&&<button onClick={()=>setPanel(panel==='usage'?null:'usage')}>{t('用量')}</button>}
+      {session.historyActions&&<button onClick={()=>setPanel(panel==='history-actions'?null:'history-actions')}>{t('历史操作')}</button>}
+      {session.agentFeatures&&<button onClick={()=>setPanel(panel==='features'?null:'features')}>{t('Agent 能力')}</button>}
       </div>
       {session.state==='running'&&<button className="danger" disabled={!session.canControl||session.busy||session.uncertain} onClick={()=>act('interrupt')}>{t('停止')}</button>}
     </nav>
@@ -167,13 +174,15 @@ function App() {
     {session.plan?.length>0&&<details className="plan"><summary>{t('计划')} · {session.plan.filter(s=>s.status==='completed').length}/{session.plan.length}</summary>{session.plan.map((s,i)=><p key={i}><span>{s.status==='completed'?'✓':s.status==='in_progress'?'◉':'○'}</span> {s.step}</p>)}</details>}
     {error&&<div role="alert" className="error" onClick={()=>setError('')}>{error} ×</div>}
     {restoreAnchor&&<div className="status"><span>{t('阅读位置在更早的历史中')}</span>{session.historyBefore>0?<button onClick={()=>act('history')}>{t('加载并恢复')}</button>:<span>{t('当前历史中已不可用')}</span>}<button onClick={()=>{restoring.current=false;setRestoreAnchor(undefined);saveUi({tail:true});}}>{t('回到最新')}</button></div>}
-    {panel&&<section className="panel"><div className="panel-title"><strong>{{files:t('工作目录文件'),search:t('搜索会话'),usage:t('上下文与用量'),diff:t('文件变更')}[panel]}</strong><button onClick={()=>setPanel(null)}>{t('关闭')}</button></div>
+    {panel&&<section className="panel"><div className="panel-title"><strong>{{files:t('工作目录文件'),search:t('搜索会话'),usage:t('上下文与用量'),diff:t('文件变更'),features:t('Agent 能力'),'history-actions':t('历史操作')}[panel]}</strong><button onClick={()=>setPanel(null)}>{t('关闭')}</button></div>
       {panel==='search'&&<><form onSubmit={e=>{e.preventDefault();void search();}}><input value={query} maxLength={200} onChange={e=>changeQuery(e.target.value)} placeholder={t('输入要查找的内容')}/><button disabled={searching||!query.trim()}>{t('查找')}</button></form>{hits.map(hit=><button className="file" key={hit.id} onClick={async()=>{const m=rows.findIndex(r=>r.messages.some(m=>m.id===hit.id));if(m>=0){expand('tools:'+rows[m].id,true);expand(hit.id,true);setPanel(null);list.current?.scrollToIndex({index:m,align:'center'});}else{const text=await act('message',{messageId:hit.id});if(text)setPreview({name:t('消息内容'),mime:'text/markdown',text});}}}>{hit.text}</button>)}
         {searching&&<p role="status">{t('正在搜索…')}</p>}{searched&&hits.length===0&&<p className="hint">{t('没有匹配的消息')}</p>}
         {nextHit>=0&&<button disabled={searching} onClick={()=>void search(nextHit)}>{t('加载更多结果')}</button>}
         {searched&&searchTruncated&&<p className="hint">{t('仅搜索电脑当前保留的历史')}</p>}</>}
       {panel==='files'&&<><form onSubmit={async e=>{e.preventDefault();const v=await act('artifacts',{query:fileQuery});if(v)setFiles(v.files);}}><input value={fileQuery} maxLength={200} onChange={e=>setFileQuery(e.target.value)} placeholder={t('筛选文件名称')}/><button>{t('筛选')}</button></form>{files.map(file=><div className="file-row" key={file.id}><button className="file" onClick={()=>inspect(file)}><strong>{file.name}</strong><small>{file.id} · {Math.ceil(file.size/1024)} KB</small></button><button aria-label={`${t('打开所在目录')} · ${file.name}`} title={t('打开所在目录')} onClick={()=>act('open-directory',{fileId:file.id})}><FolderIcon/></button><button aria-label={`${t('保存')} ${file.name}`} onClick={()=>act('download',{fileId:file.id,version:file.version})}>{t('保存')}</button></div>)}</>}
       {panel==='usage'&&<Usage raw={session.usage}/>}
+      {panel==='history-actions'&&<HistoryActions key={session.id} session={session} onAction={act}/>}
+      {panel==='features'&&session.agentFeatures&&<AgentFeatures key={session.id} onAction={act}/>}
       {panel==='diff'&&<>{(session.diffLength||0)>session.diff.length&&fullDiff===undefined&&<button disabled={diffBusy||!session.diffRead} onClick={loadDiff}>{diffBusy?t('正在读取…'):t('读取完整变更')}</button>}
         {session.diffTruncated&&<p className="hint">{t('变更超过当前保留上限，完整内容请在电脑查看。')}</p>}<Diff text={(fullDiff??session.diff)||t('Agent 尚未报告文件变更')}/></>}
     </section>}
@@ -182,8 +191,8 @@ function App() {
       components={timelineComponents} context={{session,act,ui,save:saveUi}}
       itemContent={(_,row)=><div data-row-id={row.id}>{row.messages.length>1?<details className="tool-group" open={ui.expanded?.includes('tools:'+row.id)||false} onToggle={e=>{if(e.target===e.currentTarget)expand('tools:'+row.id,e.currentTarget.open);}}>
         <summary>{t('工具')} · {row.messages.length} {t('项')} <small>{row.messages.filter(m=>m.status==='running').length} {t('执行中')} · {row.messages.filter(m=>m.status==='failed').length} {t('失败')}</small></summary>
-        {row.messages.map(m=><MessageCard key={m.id} message={m} agent={session.agent} onAction={act} onPreview={previewHtml} open={ui.expanded?.includes(m.id)||false} onExpand={open=>expand(m.id,open)}/>)}</details>:
-        <MessageCard message={row.messages[0]} agent={session.agent} onAction={act} onPreview={previewHtml} open={ui.expanded?.includes(row.id)||false} onExpand={open=>expand(row.id,open)}/>}</div>}/>
+        {row.messages.map(m=><MessageCard key={m.id} message={m} agent={session.agent} pathStyle={session.pathStyle} onAction={act} onPreview={previewHtml} open={ui.expanded?.includes(m.id)||false} onExpand={open=>expand(m.id,open)}/>)}</details>:
+        <MessageCard message={row.messages[0]} agent={session.agent} pathStyle={session.pathStyle} onAction={act} onPreview={previewHtml} open={ui.expanded?.includes(row.id)||false} onExpand={open=>expand(row.id,open)}/>}</div>}/>
       {!bottom&&<button className="latest" onClick={()=>list.current?.scrollToIndex({index:'LAST',align:'end',behavior:'auto'})}>{session.pending.length?t('查看待处理'):t('↓ 最新')}</button>}
       {messages.length===0&&session.pending.length===0&&<div className="empty-overlay">{t('描述要完成的任务')}</div>}
     </div>
@@ -191,16 +200,21 @@ function App() {
   </main>;
 }
 
-const MessageCard=memo(function MessageCard({message:m,agent,onAction,onPreview,open,onExpand}:{message:Message;agent:string;onAction:(action:string,args?:Record<string,unknown>)=>Promise<any>;onPreview:(text:string)=>void;open:boolean;onExpand:(open:boolean)=>void}) {
+const MessageCard=memo(function MessageCard({message:m,agent,pathStyle,onAction,onPreview,open,onExpand}:{message:Message;agent:string;pathStyle?:string;onAction:(action:string,args?:Record<string,unknown>)=>Promise<any>;onPreview:(text:string)=>void;open:boolean;onExpand:(open:boolean)=>void}) {
   const content=<RichText text={m.text} onAction={onAction} onPreview={onPreview}/>;
   return <article className={`message ${m.role}`} data-message-id={m.id} aria-label={m.role==='user'?t('你'):undefined}>
-    {m.kind==='reasoning'?<details className="reasoning" open={open} onToggle={e=>onExpand(e.currentTarget.open)}><summary><i className={m.status==='running'?'dot pulse':'dot'}/>{t('思考摘要')}</summary>{content}</details>:
-      m.role==='tool'?<details className="tool" open={open} onToggle={e=>onExpand(e.currentTarget.open)}><summary>{{running:'◉',failed:'!',completed:'✓',cancelled:'×'}[m.status]||'?'} {m.title||t('工具操作')}<small>{m.summary}</small></summary><pre>{m.text}</pre></details>:
+    {m.kind==='error'?<ErrorCard text={m.text}/>:m.kind==='reasoning'?<details className="reasoning" open={open} onToggle={e=>onExpand(e.currentTarget.open)}><summary><i className={m.status==='running'?'dot pulse':'dot'}/>{t('思考摘要')}</summary>{content}</details>:
+      m.role==='tool'?<ToolCard pathStyle={pathStyle} message={m} open={open} onExpand={onExpand} onAction={onAction}/>:
       m.role==='user'?<><div className="user-bubble">{content}</div><div className="message-actions"><button aria-label={t('复制')} title={t('复制')} onClick={()=>onAction('copy',{text:m.text})}><MessageActionIcon/></button><button aria-label={t('追加到草稿')} title={t('追加到草稿')} onClick={()=>onAction('edit',{text:m.text})}><MessageActionIcon append/></button></div></>:
       <><div className="message-head"><span>{agent}</span><button onClick={()=>onAction('copy',{text:m.text})}>{t('复制')}</button><button onClick={()=>onAction('quote',{text:m.text})}>{t('引用')}</button></div>{content}</>}
-    {m.fullLength>m.text.length&&<button onClick={async()=>{const text=await onAction('message',{messageId:m.id});if(text)await onAction('show-text',{text});}}>{t('查看完整内容')}</button>}
+    {m.role!=='tool'&&m.fullLength>m.text.length&&<button onClick={async()=>{const text=await onAction('message',{messageId:m.id});if(text)await onAction('show-text',{text});}}>{t('查看完整内容')}</button>}
   </article>;
 });
+function ErrorCard({text}:{text:string}) {
+  let code='',message=text,retryable=false;
+  try{const value=JSON.parse(text);if(value?.schema==='termlink.error.v1'){code=typeof value.code==='string'?value.code:'';message=typeof value.message==='string'?value.message:text;retryable=value.retryable===true;}}catch{}
+  return <section className="error" role="status"><strong>{t(retryable?'正在重试':'请求失败')}</strong><p>{t(message)}</p>{code&&<small>{code}</small>}</section>;
+}
 function MessageActionIcon({append=false}:{append?:boolean}) {
   return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     {append?<path d="M13 3H5v18h14V9Z M13 3v6h6 M12 12v6 M9 15h6"/>:<><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>}
@@ -217,14 +231,20 @@ function RichText({text,onAction,onPreview}:{text:string;onAction:(action:string
 }
 function Interaction({value:p,disabled,onAnswer,draft,onDraft}:{value:Pending;disabled:boolean;onAnswer:(d:string,a:Record<string,string[]>)=>void;draft?:QuestionDraft;onDraft:(d:QuestionDraft)=>void}) {
   const saved=draft?.schema===questionSchema(p)?draft:undefined;
-  const answers=saved?.answers||{};const extra=saved?.extra||{};
+  const answers:Record<string,string[]>=Object.create(null);const extra:Record<string,string>=Object.create(null);
+  for(const q of p.questions){
+    const value=saved?.answers&&Object.hasOwn(saved.answers,q.id)?saved.answers[q.id]:undefined;
+    answers[q.id]=Array.isArray(value)?value.filter((v):v is string=>typeof v==='string').slice(0,16):[];
+    const text=saved?.extra&&Object.hasOwn(saved.extra,q.id)?saved.extra[q.id]:undefined;
+    extra[q.id]=typeof text==='string'?text:'';
+  }
   const setAnswers=(answers:Record<string,string[]>)=>onDraft({schema:questionSchema(p),answers,extra});
   const setExtra=(extra:Record<string,string>)=>onDraft({schema:questionSchema(p),answers,extra});
   return <section className="approval"><strong>{p.kind==='question'?t('需要你的回答'):p.title||t('需要批准')}</strong>
     {p.summary&&<p>{p.summary}</p>}<details><summary>{t('请求详情')}</summary><pre>{p.detail}</pre></details>
-    {p.questions.map(q=><fieldset key={q.id} disabled={disabled}><legend>{q.text}</legend>{q.options.map(option=><label key={option}><input type={q.multiSelect?'checkbox':'radio'} name={q.id} checked={(answers[q.id]||[]).includes(option)} onChange={()=>setAnswers({...answers,[q.id]:q.multiSelect?(answers[q.id]||[]).includes(option)?answers[q.id].filter(x=>x!==option):[...(answers[q.id]||[]),option]:[option]})}/>{option}</label>)}<input placeholder={t('补充回答')} maxLength={4000} value={extra[q.id]||''} onChange={e=>setExtra({...extra,[q.id]:e.target.value})}/></fieldset>)}
+    {p.questions.map(q=><fieldset key={q.id} disabled={disabled}><legend>{q.text}{q.required===false&&<small> · {t('可选')}</small>}</legend>{q.options.map(option=><label key={option}><input type={q.multiSelect?'checkbox':'radio'} name={q.id} checked={(answers[q.id]||[]).includes(option)} onChange={()=>setAnswers({...answers,[q.id]:q.multiSelect?(answers[q.id]||[]).includes(option)?answers[q.id].filter(x=>x!==option):[...(answers[q.id]||[]),option]:[option]})}/>{option}</label>)}<input aria-label={q.text} placeholder={t('补充回答')} maxLength={4000} value={extra[q.id]||''} onChange={e=>setExtra({...extra,[q.id]:e.target.value})}/></fieldset>)}
     {!p.canApprove&&<p>{t('请在电脑端查看完整请求')}</p>}
-    <div className="actions"><button disabled={disabled} onClick={()=>onAnswer('deny',{})}>{t('拒绝')}</button><button className="primary" disabled={disabled||!p.canApprove||p.questions.some(q=>!(answers[q.id]?.length||extra[q.id]?.trim()))} onClick={()=>onAnswer('allow',Object.fromEntries(p.questions.map(q=>[q.id,[...(answers[q.id]||[]),...(extra[q.id]?.trim()?[extra[q.id].trim()]:[])]])))}>{p.kind==='question'?t('提交回答'):t('允许本次')}</button></div>
+    <div className="actions"><button disabled={disabled} onClick={()=>onAnswer('deny',{})}>{t('拒绝')}</button><button className="primary" disabled={disabled||!p.canApprove||p.questions.some(q=>q.required!==false&&!(answers[q.id]?.length||extra[q.id]?.trim()))} onClick={()=>onAnswer('allow',Object.fromEntries(p.questions.map(q=>[q.id,[...(answers[q.id]||[]),...(extra[q.id]?.trim()?[extra[q.id].trim()]:[])]])))}>{p.kind==='question'?t('提交回答'):t('允许本次')}</button></div>
   </section>;
 }
 function Usage({raw}:{raw:string}){

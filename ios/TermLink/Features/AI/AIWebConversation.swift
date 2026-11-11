@@ -2,6 +2,114 @@
 import SwiftUI
 import WebKit
 
+/// Host-advertised style is authoritative; only old hosts fall back to their actual directory syntax.
+private struct AIArtifactRoot {
+    let path: String
+    let windows: Bool
+    var prefix: String { path.utf16.last == 47 ? path : path + "/" }
+
+    init(_ directory: String, pathStyle: String) throws {
+        guard Self.validText(directory, maximum: 4096) else { throw ClientError.invalidResponse("artifact root") }
+        let drive = Self.hasDrive(directory)
+        let network = Self.hasNetworkRoot(directory)
+        switch pathStyle {
+        case "windows": windows = true
+        case "posix": windows = false
+        case "": windows = drive || network
+        default: throw ClientError.invalidResponse("host path style")
+        }
+        guard windows ? (drive || network) : (!drive && !network) else { throw ClientError.invalidResponse("artifact root") }
+        let normalized = windows ? directory.replacingOccurrences(of: "\\", with: "/", options: .literal) : directory
+        var rootUnits = Array(normalized.utf16)
+        while rootUnits.last == 47 { rootUnits.removeLast() }
+        let root = String(decoding: rootUnits, as: UTF16.self)
+        if drive {
+            guard normalized.utf16.dropFirst(2).first == 47,
+                  rootUnits.count == 2 || Self.validSegments(String(decoding: rootUnits.dropFirst(3), as: UTF16.self), windows: true) else {
+                throw ClientError.invalidResponse("artifact root")
+            }
+            path = rootUnits.count == 2 ? root + "/" : root
+        } else if windows {
+            let share = String(decoding: rootUnits.dropFirst(2), as: UTF16.self)
+            guard rootUnits.starts(with: [47, 47]), share.utf16.split(separator: 47).count >= 2,
+                  Self.validSegments(share, windows: true) else { throw ClientError.invalidResponse("artifact root") }
+            path = root
+        } else {
+            guard normalized.utf16.first == 47,
+                  root.isEmpty || Self.validSegments(String(decoding: rootUnits.dropFirst(), as: UTF16.self), windows: false) else {
+                throw ClientError.invalidResponse("artifact root")
+            }
+            path = root.isEmpty ? "/" : root
+        }
+    }
+
+    func relative(_ value: String) throws -> String {
+        guard Self.validText(value, maximum: 2048),
+              windows || (!Self.hasDrive(value) && !Self.hasNetworkRoot(value)) else {
+            throw ClientError.invalidResponse("artifact path")
+        }
+        let normalized = windows ? value.replacingOccurrences(of: "\\", with: "/", options: .literal) : value
+        let options: NSString.CompareOptions = windows ? [.anchored, .literal, .caseInsensitive] : [.anchored, .literal]
+        let match = (normalized as NSString).range(of: prefix, options: options)
+        let relative = match.location == 0 ? (normalized as NSString).substring(from: NSMaxRange(match)) : normalized
+        guard relative.utf16.first != 47, Self.validSegments(relative, windows: windows),
+              windows || (!Self.hasDrive(relative) && !Self.hasNetworkRoot(relative)) else {
+            throw ClientError.invalidResponse("artifact path")
+        }
+        return relative
+    }
+
+    func native(_ value: String) -> String { windows ? value.replacingOccurrences(of: "/", with: "\\", options: .literal) : value }
+
+    private static func hasNetworkRoot(_ value: String) -> Bool {
+        value.utf16.starts(with: [92, 92]) || value.utf16.starts(with: [47, 47])
+    }
+
+    private static func hasDrive(_ value: String) -> Bool {
+        let start = Array(value.utf16.prefix(2))
+        return start.count == 2 && ((65...90).contains(start[0]) || (97...122).contains(start[0])) && start[1] == 58
+    }
+
+    private static func validText(_ value: String, maximum: Int) -> Bool {
+        !value.isEmpty && value.utf16.count <= maximum &&
+            !value.unicodeScalars.contains { $0.value <= 31 || (127...159).contains($0.value) }
+    }
+
+    private static func validSegments(_ value: String, windows: Bool) -> Bool {
+        // ASCII separators are code units: Swift Character splitting can hide "/" before a combining mark.
+        value.utf16.split(separator: 47, omittingEmptySubsequences: false).allSatisfy { units in
+            let part = String(decoding: units, as: UTF16.self)
+            guard !part.isEmpty, part != ".", part != ".." else { return false }
+            guard windows else { return true }
+            var base = Array(units.prefix(while: { $0 != 46 }))
+            while base.last == 32 { base.removeLast() }
+            let device = String(decoding: base, as: UTF16.self).uppercased()
+            let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(device) ||
+                (device.count == 4 && (device.hasPrefix("COM") || device.hasPrefix("LPT")) && "123456789¹²³".contains(device.last!))
+            return !units.contains { "<>:\"|?*".utf16.contains($0) } && units.last != 46 && units.last != 32 && !reserved
+        }
+    }
+}
+
+func aiArtifactRelativePath(directory: String, value: String, pathStyle: String = "") throws -> String {
+    try AIArtifactRoot(directory, pathStyle: pathStyle).relative(value)
+}
+
+struct AIArtifactLocation: Equatable {
+    let pcID: UUID
+    let sessionID: String
+    let directory: String
+    let filePath: String
+}
+
+func aiArtifactLocation(session: AIConversation, value: String) throws -> AIArtifactLocation {
+    let root = try AIArtifactRoot(session.directory, pathStyle: session.capabilities["pathStyle"].string), relative = try root.relative(value)
+    let parent = relative.utf16.split(separator: 47).dropLast().map { String(decoding: $0, as: UTF16.self) }.joined(separator: "/")
+    return AIArtifactLocation(pcID: session.pcID, sessionID: session.id,
+        directory: root.native(parent.isEmpty ? root.path : root.prefix + parent), filePath: root.native(root.prefix + relative))
+}
+
+
 struct AIWebConversation:UIViewRepresentable {
     @ObservedObject var workspace:AIWorkspace
     let session:AIConversation
@@ -27,7 +135,7 @@ struct AIWebConversation:UIViewRepresentable {
         let workspace:AIWorkspace
         var current:AIConversation
         private var ready=false,dark=true,scale=1.0,retired=false,generation=UUID()
-        private var tasks:[String:Task<Void,Never>]=[:],lastID=""
+        private var tasks:[String:Task<Void,Never>]=[:],lastID="",lastStream=""
         init(workspace:AIWorkspace,session:AIConversation){self.workspace=workspace;self.current=session}
         func retire(){retired=true;generation=UUID();tasks.values.forEach{$0.cancel()};tasks=[:]}
         func update(session:AIConversation,dark:Bool,scale:Double){if current.id != session.id || current.pcID != session.pcID{generation=UUID();tasks.values.forEach{$0.cancel()};tasks=[:]};current=session;self.dark=dark;self.scale=scale;publish()}
@@ -38,11 +146,11 @@ struct AIWebConversation:UIViewRepresentable {
             if current.raw["usage"].string.isEmpty,let usage=try? current.raw["usage"].data(){value["usage"] = .string(current.raw["usage"] == .null ? "":String(decoding:usage,as:UTF8.self))}
             value["busy"] = .bool(workspace.busy.contains(current.pcID));value["uncertain"] = .bool(workspace.uncertain[current.pcID] != nil)
             value["dark"] = .bool(dark);value["fontScale"] = .number(min(2,max(0.85,scale)));value["language"] = .string(Locale.current.language.languageCode?.identifier ?? "zh")
-            let c=current.capabilities;for k in ["artifacts","search","diffRead"]{value[k]=c[k]}
+            let c=current.capabilities;for k in ["artifacts","search","diffRead","agentFeatures","historyActions","pathStyle","hostPlatform"]{value[k]=c[k]}
             if let raw=try? JSONValue.decode(Data(value["plan"]?.string.utf8 ?? "".utf8)){value["plan"]=raw}else if value["plan"]?.array.isEmpty != false{value["plan"] = .array([])}
             let messages=current.messages.map{message->JSONValue in var result=message.object;for key in ["kind","text","title","summary","status"]{result[key] = .string(message[key].string)};result["fullLength"] = .number(Double(message["fullLength"].integer));return .object(result)}
-            let payload=JSONValue.object(["session":.object(value),"messages":.array(messages),"order":.array(current.messages.map{$0["id"]}),"reset":.bool(lastID != current.id),"uiState":workspace.webState(current)])
-            guard let json=try? payload.data() else{return};lastID=current.id
+            let payload=JSONValue.object(["session":.object(value),"messages":.array(messages),"order":.array(current.messages.map{$0["id"]}),"reset":.bool(lastID != current.id || lastStream != current.raw["streamId"].string),"uiState":workspace.webState(current)])
+            guard let json=try? payload.data() else{return};lastID=current.id;lastStream=current.raw["streamId"].string
             web.evaluateJavaScript("window.termlinkUpdate && window.termlinkUpdate(\(String(decoding:json,as:UTF8.self)))",completionHandler:nil)
         }
         func userContentController(_ userContentController:WKUserContentController,didReceive message:WKScriptMessage){
@@ -58,9 +166,7 @@ struct AIWebConversation:UIViewRepresentable {
         }
         private func reply(_ id:String,value:JSONValue = .null,error:String?=nil){var object:[String:JSONValue]=["id":.string(id)];if let error{object["error"] = .string(String(error.prefix(240)))}else{object["value"]=value};guard let data=try? JSONValue.object(object).data() else{return};web?.evaluateJavaScript("window.termlinkReply && window.termlinkReply(\(String(decoding:data,as:UTF8.self)))",completionHandler:nil)}
         private func relative(_ path:String,session:AIConversation) throws -> String {
-            let normalized=path.replacingOccurrences(of:"\\",with:"/"),root=session.directory.replacingOccurrences(of:"\\",with:"/").trimmingCharacters(in:CharacterSet(charactersIn:"/"))
-            let value=normalized.lowercased().hasPrefix(root.lowercased()+"/") ? String(normalized.dropFirst(root.count+1)):normalized
-            guard value.utf8.count<=4096,!value.isEmpty,!value.hasPrefix("/"),!value.contains(":"),!value.contains("\0"),!value.split(separator:"/",omittingEmptySubsequences:false).contains(where:{$0==".." || $0=="." || $0.isEmpty}) else{throw ClientError.invalidResponse("artifact path")};return value
+            try aiArtifactRelativePath(directory: session.directory, value: path, pathStyle: session.capabilities["pathStyle"].string)
         }
         private func perform(_ request:JSONValue,session:AIConversation) async throws -> JSONValue {
             let action=request["action"].string,text=request["text"].string
@@ -72,14 +178,22 @@ struct AIWebConversation:UIViewRepresentable {
             case "quote","edit":guard text.count<=65536 else{throw ClientError.limitExceeded};try workspace.appendDraft(session.id,action=="quote" ? "> "+text.replacingOccurrences(of:"\n",with:"\n> ")+"\n":text);return .bool(true)
             case "history":try await workspace.history(session);return .bool(true)
             case "message":return .string(try await workspace.fullMessage(session,id:request["messageId"].string))
+            case "history.actions":guard session.capabilities["historyActions"].bool else{throw ClientError.readOnly};let r=try await workspace.read(session,action:"history.actions");return r["historyActions"]
+            case "review","revert","fork":
+                guard session.capabilities["historyActions"].bool,session.canControl,session.state=="idle",session.pending.isEmpty,request["confirmed"].bool,request["turnId"].string.count<=256 else{throw ClientError.readOnly}
+                _=try await workspace.mutate(pc:session.pcID,action:action,session:session,extra:["requestId":request["turnId"]]);return .bool(true)
+            case "agent.features":guard session.capabilities["agentFeatures"].bool else{throw ClientError.readOnly};let r=try await workspace.read(session,action:"agent.features");return r["agentFeatures"]
             case "search","artifacts":guard request["query"].string.count<=200,request["offset"].integer>=0,request["offset"].integer<=1_000_000,session.capabilities[action=="search" ? "search":"artifacts"].bool else{throw ClientError.readOnly};let r=try await workspace.read(session,action:action,extra:["text":request["query"],"offset":request["offset"]]);return r[action=="search" ? "search":"artifacts"]
             case "diff.read":guard session.capabilities["diffRead"].bool,request["offset"].integer>=0,request["offset"].integer<=262145 else{throw ClientError.readOnly};let r=try await workspace.read(session,action:action,extra:["offset":request["offset"],"text":request["version"]]);return r["diff"]
             case "artifact.read","open-file":guard session.capabilities["artifacts"].bool,request["offset"].integer>=0,request["offset"].integer<=50*1024*1024 else{throw ClientError.readOnly};let file=try relative(request[action=="open-file" ? "path":"fileId"].string,session:session);let r=try await workspace.read(session,action:"artifact.read",extra:["requestId":.string(file),"offset":request["offset"],"cursor":request["version"]]);return r["artifacts"]
             case "interrupt":_=try await workspace.mutate(pc:session.pcID,action:action,session:session);return .bool(true)
             case "answer":let id=request["requestId"].string;guard let pending=session.pending.first(where:{$0["id"].string==id}),["allow","deny"].contains(request["decision"].string),request["decision"].string=="deny" || pending["canApprove"].bool,try request["answers"].data().count<=24000 else{throw ClientError.readOnly};_=try await workspace.mutate(pc:session.pcID,action:action,session:session,extra:["requestId":.string(id),"decision":request["decision"],"answers":request["answers"]]);return .bool(true)
             case "open-link":guard let url=URL(string:request["url"].string),["https","http"].contains(url.scheme),url.host != nil,url.user==nil,url.password==nil,url.absoluteString.count<=4096 else{throw ClientError.invalidURL};workspace.externalLink=url;return .bool(true)
-            case "open-directory":let file=try relative(request["fileId"].string,session:session);workspace.openDirectory(session,path:file);return .bool(true)
-            case "download":let file=try relative(request["fileId"].string,session:session);try await workspace.downloadArtifact(session,file:file,version:request["version"].string);return .bool(true)
+            case "open-directory":
+                guard session.capabilities["artifacts"].bool else{throw ClientError.readOnly}
+                let location=try aiArtifactLocation(session:session,value:request["fileId"].string)
+                workspace.directoryLocation=(location.pcID,location.directory);return .bool(true)
+            case "download":guard session.capabilities["artifacts"].bool else{throw ClientError.readOnly};let file=try relative(request["fileId"].string,session:session);try await workspace.downloadArtifact(session,file:file,version:request["version"].string);return .bool(true)
             default:throw ClientError.unavailable("不支持的 AI 页面操作。")
             }
         }

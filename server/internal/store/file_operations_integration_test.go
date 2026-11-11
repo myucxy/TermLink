@@ -409,6 +409,17 @@ func insertFileOperationFixture(t *testing.T, ctx context.Context, repository *P
 		pcID, accountID, agentID); err != nil {
 		t.Fatal(err)
 	}
+	// File/terminal commands require current MANAGE authority unless the server
+	// explicitly enables its same-account AutoTrust policy.
+	for _, id := range []uuid.UUID{requesterID, extraRequesterID} {
+		if id == uuid.Nil {
+			continue
+		}
+		if _, err := repository.Pool.Exec(ctx, `INSERT INTO device_grants(device_id,pc_id,permission,approved_by)
+			VALUES($1,$2,'MANAGE',$3)`, id, pcID, agentID); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func fileOperationLeaseHash(t *testing.T, token string) [32]byte {

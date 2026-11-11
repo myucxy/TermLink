@@ -1,3 +1,6 @@
+#if TERMLINK_PORTABLE_FILES
+#nullable disable
+#endif
 using System;
 
 namespace TermLink.Agent

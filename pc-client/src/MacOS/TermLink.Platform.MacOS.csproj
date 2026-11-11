@@ -3,8 +3,12 @@
     <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>TermLink.Platform.MacOS</AssemblyName>
     <RootNamespace>TermLink.Platform.MacOS</RootNamespace>
+    <DefineConstants Condition="'$(TermLinkDevelopmentBuild)' == 'true'">$(DefineConstants);TERMLINK_DEVELOPMENT_BUILD</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <AssemblyMetadata Include="TermLinkMacUpdatesEnabled" Value="$(TermLinkMacUpdatesEnabled)" />
+    <AssemblyMetadata Include="TermLinkMacSigningTeamId" Value="$(TermLinkMacSigningTeamId)" />
+    <AssemblyMetadata Include="TermLinkMacUpdateBaseUrl" Value="https://appship.kget.cc:8910" />
     <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\Unix\TermLink.Platform.Unix.csproj" />

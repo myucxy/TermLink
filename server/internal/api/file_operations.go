@@ -355,8 +355,8 @@ func validateOpenTerminalResult(result json.RawMessage, requestedShell *string, 
 	sessionID, err := uuid.Parse(value.SessionID)
 	legacyResult := value.TerminalCommandID == nil && value.ShellType == *requestedShell
 	commandResult := value.TerminalCommandID != nil && *value.TerminalCommandID == *requestedShell &&
-		(value.ShellType == "command-prompt" || value.ShellType == "windows-powershell" ||
-			value.ShellType == "powershell-7" || value.ShellType == "wsl" || value.ShellType == "custom")
+		(store.IsManagedShellType(value.ShellType) || value.ShellType == "custom") &&
+		(!(isPOSIXShellType(*value.TerminalCommandID) && isPOSIXShellType(value.ShellType)) || value.ShellType == *value.TerminalCommandID)
 	if err != nil || sessionID == uuid.Nil || sessionID.String() != value.SessionID ||
 		(!legacyResult && !commandResult) || value.CWD != requestedPath {
 		return errors.New("invalid terminal result")
@@ -400,8 +400,7 @@ func validateFileOperationRequestWithSearch(
 		}
 	case store.FileOperationOpenTerminal:
 		legacyShell := shellType != nil && terminalCommandID == nil &&
-			(*shellType == "command-prompt" || *shellType == "windows-powershell" ||
-				*shellType == "powershell-7" || *shellType == "wsl")
+			store.IsManagedShellType(*shellType)
 		standardCommand := shellType == nil && terminalCommandID != nil &&
 			terminalCommandIDPattern.MatchString(*terminalCommandID)
 		if path == "" || offset != nil || query != "" || (!legacyShell && !standardCommand) {

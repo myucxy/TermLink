@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #import "TLTerminalBridge.h"
+#include <string.h>
 #if __has_include(<TermLinkTerminalCore/termlink_terminal.h>)
 #include <TermLinkTerminalCore/termlink_terminal.h>
 #define TL_CORE_AVAILABLE 1
@@ -18,7 +19,9 @@ static BOOL TLCheck(uint32_t status, NSError **error) {
 @implementation TLTerminalBridge {
 #if TL_CORE_AVAILABLE
     TlTerminal *_terminal;
+    TlTerminalHistoryCaptureV1 _history;
 #endif
+    uint32_t _historyAvailableRows;
 }
 + (BOOL)available {
 #if TL_CORE_AVAILABLE
@@ -51,7 +54,7 @@ static BOOL TLCheck(uint32_t status, NSError **error) {
 - (BOOL)importSnapshot:(NSData *)snapshot error:(NSError **)error {
 #if TL_CORE_AVAILABLE
     TlTerminal *next=NULL; if (!TLCheck(tl_terminal_import_snapshot(snapshot.bytes,snapshot.length,&next),error)) return NO;
-    tl_terminal_destroy(_terminal); _terminal=next; return YES;
+    [self endHistory]; tl_terminal_destroy(_terminal); _terminal=next; return YES;
 #else
     return TLCheck(1000,error);
 #endif
@@ -94,8 +97,65 @@ static BOOL TLCheck(uint32_t status, NSError **error) {
     TLCheck(1000,error);return nil;
 #endif
 }
+- (uint32_t)historyAvailableRows { return _historyAvailableRows; }
+- (NSData *)beginHistory:(NSError **)error {
+#if TL_CORE_AVAILABLE
+    [self endHistory];
+    _history.abi_version=TL_TERMINAL_ABI_VERSION; _history.struct_size=sizeof(_history);
+    if (!TLCheck(tl_terminal_history_begin_v1(_terminal, &_history),error)) {
+        memset(&_history,0,sizeof(_history)); return nil;
+    }
+    NSData *frame=[self renderHistoryFrameAtOffset:0 error:error];
+    if (!frame) [self endHistory];
+    return frame;
+#else
+    TLCheck(1000,error); return nil;
+#endif
+}
+- (NSData *)renderHistoryFrameAtOffset:(uint32_t)offset error:(NSError **)error {
+#if TL_CORE_AVAILABLE
+    if (!_history.capture_id) { TLCheck(TL_STATUS_HISTORY_STALE_CAPTURE,error); return nil; }
+    TlTerminalBuffer frame={0}; frame.abi_version=TL_TERMINAL_ABI_VERSION; frame.struct_size=sizeof(frame);
+    uint32_t available=0; uint64_t generation=0;
+    if (!TLCheck(tl_terminal_history_viewport_v1(_history.capture_id,_history.owner_id,_history.revision,
+        offset,&frame,&available,&generation),error)) return nil;
+    NSData *data=[NSData dataWithBytes:frame.data length:(NSUInteger)frame.len];
+    tl_terminal_buffer_free(&frame); _historyAvailableRows=available; return data;
+#else
+    TLCheck(1000,error); return nil;
+#endif
+}
+- (NSNumber *)historyOffsetForLine:(uint64_t)line cellOffset:(uint32_t)cellOffset error:(NSError **)error {
+#if TL_CORE_AVAILABLE
+    if (!_history.capture_id) { TLCheck(TL_STATUS_HISTORY_STALE_CAPTURE,error); return nil; }
+    uint32_t offset=0;
+    if (!TLCheck(tl_terminal_history_resolve_anchor_v1(_history.capture_id,_history.owner_id,
+        _history.revision,line,cellOffset,&offset),error)) return nil;
+    return @(offset);
+#else
+    TLCheck(1000,error); return nil;
+#endif
+}
+- (void)endHistory {
+#if TL_CORE_AVAILABLE
+    if (_history.capture_id) tl_terminal_history_release_v1(_history.capture_id,_history.owner_id);
+    memset(&_history,0,sizeof(_history));
+#endif
+    _historyAvailableRows=0;
+}
+- (NSData *)shellState:(NSError **)error {
+#if TL_CORE_AVAILABLE
+    TlTerminalBuffer buffer={0};buffer.abi_version=TL_TERMINAL_ABI_VERSION;buffer.struct_size=sizeof(buffer);
+    if (!TLCheck(tl_terminal_get_shell_state_v1(_terminal,273696,&buffer),error)) return nil;
+    NSData *data=[NSData dataWithBytes:buffer.data length:(NSUInteger)buffer.len];
+    tl_terminal_buffer_free(&buffer);return data;
+#else
+    TLCheck(1000,error);return nil;
+#endif
+}
 - (void)dealloc {
 #if TL_CORE_AVAILABLE
+    if (_history.capture_id) tl_terminal_history_release_v1(_history.capture_id,_history.owner_id);
     if (_terminal) tl_terminal_destroy(_terminal);
 #endif
 }

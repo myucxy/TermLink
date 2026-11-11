@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>TermLink.RelayConnection.Validation</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Agent.Connection\TermLink.Agent.Connection.csproj" />
+    <ProjectReference Include="..\..\src\Agent.Host\TermLink.Agent.Host.csproj" />
+  </ItemGroup>
+</Project>

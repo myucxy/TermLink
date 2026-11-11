@@ -13,6 +13,12 @@ struct DeviceRecord: Identifiable, Sendable {
 struct PC: Identifiable, Sendable {
     let id: UUID, deviceID: UUID, name: String, version: String, online: Bool, routing: Bool, platform: String, capabilities: Set<String>, commands: [JSONValue]
     let keyEpoch: Int64
+    var canBrowseFiles: Bool { online && routing && capabilities.contains("file_operations_v1") }
+    var canCreateTerminal: Bool {
+        online && routing && !commands.isEmpty && capabilities.contains("terminal_commands_v1") &&
+            (capabilities.contains("file_operations_v1") ||
+             platform == "macos" && capabilities.contains("realtime_terminal_v1"))
+    }
     init(_ value: JSONValue) throws {
         guard let id = UUID(uuidString: value["id"].string), let device = UUID(uuidString: value["device_id"].string) else { throw ClientError.invalidResponse("pc.id") }
         self.id = id; deviceID = device; name = value["name"].string; version = value["agent_version"].string

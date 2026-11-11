@@ -1,6 +1,6 @@
 import type {Message,Pending} from './bridge';
 export type TimelineRow={id:string;messages:Message[]};
-export const questionSchema=(p:Pending)=>JSON.stringify(p.questions.map(q=>[q.id,q.text,q.options,q.multiSelect]));
+export const questionSchema=(p:Pending)=>JSON.stringify(p.questions.map(q=>[q.id,q.text,q.options,q.multiSelect,q.required!==false]));
 // Bound expanded groups so even a long tool-only transcript remains virtualized.
 export function timelineRows(messages:Message[]):TimelineRow[]{
   const rows:TimelineRow[]=[];

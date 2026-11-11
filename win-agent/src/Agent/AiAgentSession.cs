@@ -40,7 +40,7 @@ internal sealed partial class AiAgentSession : IDisposable
     // phone render a compact tool row without parsing provider-specific JSON.
     internal sealed record Message(string Id, string Role, string Text, string Kind = "text",
         string Title = "", string Summary = "", string Status = "", string Model = "", string Mode = "", int FullLength = 0);
-    internal sealed record Question(string Id, string Text, string[] Options, bool MultiSelect);
+    internal sealed record Question(string Id, string Text, string[] Options, bool MultiSelect, bool Required = true);
     private sealed record Pending(string Id, JsonElement RpcId, string Method, JsonElement Parameters,
         string Kind, string Detail, Question[] Questions, DateTime Expires);
 
@@ -61,7 +61,8 @@ internal sealed partial class AiAgentSession : IDisposable
                         approvalPolicy = CodexApproval(permissionMode), approvalsReviewer = CodexReviewer(permissionMode), sandbox = CodexSandbox(permissionMode), excludeTurns = true });
                 threadId = S(P(created, "thread"), "id");
                 if (importNative || nativePermissions != null) ReadNativeCodexPermissions(created);
-                if (importNative) {
+                if (nativeHistoryNeedsReload) { await LoadNativeCodexMessagesAsync(); nativeHistoryNeedsReload = false; }
+                else if (importNative) {
                     try { await LoadNativeCodexMessagesAsync(); }
                     catch (AiOperationException) { settingsNotice += " 最近消息摘要读取失败，原生上下文仍保留。"; }
                 }
@@ -121,14 +122,15 @@ internal sealed partial class AiAgentSession : IDisposable
                 await RpcAsync("initialize", new { clientInfo = new { name = "termlink", version = "1" }, capabilities = new { experimentalApi = true } });
                 await WriteAsync(new { method = "initialized" });
             } else if (agent.Protocol == "zcode") {
-                await RpcAsync("runtime/capabilities", new { });
+                CaptureAgentCapabilities(await RpcAsync("runtime/capabilities", new { }));
             } else if (agent.Protocol == "claude") {
                 var initialized = await ClaudeControlAsync(new { subtype = "initialize", hooks = new { } });
+                CaptureAgentCapabilities(initialized);
                 var commands = P(initialized, "commands");
                 if (commands.ValueKind == JsonValueKind.Array) slashCommands = commands.EnumerateArray().Select(c => S(c, "name")).Where(c => c.Length is > 0 and < 80 && !c.Any(char.IsControl)).Take(100).ToArray();
                 return initialized;
             } else if (agent.Protocol == "acp") {
-                return await InitializeAcpAsync();
+                var initialized = await InitializeAcpAsync(); CaptureAgentCapabilities(initialized); return initialized;
             } else throw new AiOperationException("AGENT_PROTOCOL_UNSUPPORTED");
             return default;
     }
@@ -215,7 +217,7 @@ internal sealed partial class AiAgentSession : IDisposable
                 pending = content ? pending.Values.Select(p => new { p.Id, p.Kind, p.Detail, p.Questions,
                     title = ToolPresentation(p.Parameters.GetRawText(), p.Method).Title,
                     summary = ToolPresentation(p.Parameters.GetRawText(), p.Method).Summary,
-                    canApprove = p.Parameters.GetRawText().Length <= 8000 && (p.Method != "session/request_permission" ||
+                    canApprove = AiStructuredInteractions.CanAnswer(p.Method, p.Parameters) && (p.Method != "session/request_permission" ||
                         P(p.Parameters, "options").ValueKind == JsonValueKind.Array && P(p.Parameters, "options").EnumerateArray().Any(o => S(o, "kind") == "allow_once" && ValidOption(S(o, "optionId"), 512))),
                     expiresAtMs = new DateTimeOffset(p.Expires).ToUnixTimeMilliseconds() }).ToArray() : null };
         }
@@ -235,6 +237,9 @@ internal sealed partial class AiAgentSession : IDisposable
                 if (request.Action == "release") { owner = Guid.Empty; controlVersion++; return; }
             }
             switch (request.Action) {
+                case "review": case "revert":
+                    lock (sync) { if (state != "idle" || pending.Count != 0) throw new AiOperationException("AGENT_BUSY"); }
+                    await ApplyHistoryActionAsync(request.Action, request.RequestId); break;
                 case "configure": await ConfigureAsync(request); break;
                 case "rename":
                     if (string.IsNullOrWhiteSpace(request.Text) || request.Text.Length > 80 || request.Text.Any(char.IsControl)) throw new AiOperationException("INVALID_TITLE");
@@ -250,6 +255,7 @@ internal sealed partial class AiAgentSession : IDisposable
                     if (request.Text.Length > 16000 || string.IsNullOrWhiteSpace(request.Text) && (request.AttachmentIds?.Length ?? 0) == 0 && (request.FileReferences?.Length ?? 0) == 0) throw new AiOperationException("INVALID_MESSAGE");
                     var references = request.FileReferences ?? Array.Empty<string>();
                     if (references.Length > 5 || references.Any(p => p == null || p.Length > 4096 || p.Any(char.IsControl) || !Path.IsPathFullyQualified(p) || p.StartsWith(@"\\", StringComparison.Ordinal) || !File.Exists(p))) throw new AiOperationException("INVALID_FILE_REFERENCE");
+                    foreach (var reference in references) { using var checkedFile = AiWorkspaceFiles.Read(reference); }
                     Attachment[] selectedAttachments;
                     lock (sync) {
                         if (state != "idle" || pending.Count != 0) throw new AiOperationException("AGENT_BUSY");
@@ -275,7 +281,7 @@ internal sealed partial class AiAgentSession : IDisposable
                             await SendAcpPromptAsync(prompt, selectedAttachments);
                         } else {
                             var content = new List<object> { new { type = "text", text = prompt } };
-                            content.AddRange(selectedAttachments.Where(a => a.IsImage).Select(a => (object)new { type = "image", source = new { type = "base64", media_type = a.Mime, data = Convert.ToBase64String(File.ReadAllBytes(a.Path)) } }));
+                            content.AddRange(selectedAttachments.Where(a => a.IsImage).Select(a => (object)new { type = "image", source = new { type = "base64", media_type = a.Mime, data = Convert.ToBase64String(AiWorkspaceFiles.ReadBytes(a.Path)) } }));
                             await WriteAsync(new { type = "user", session_id = threadId, message = new { role = "user", content }, parent_tool_use_id = (string)null });
                         }
                     } catch { Fail("SEND_OUTCOME_UNKNOWN"); throw; }
@@ -374,7 +380,7 @@ internal sealed partial class AiAgentSession : IDisposable
         if (agent.Protocol == "acp") { await ReceiveAcpAsync(value); return; }
         var id = P(value, "id"); var method = S(value, "method"); var parameters = P(value, "params");
         if (id.ValueKind != JsonValueKind.Undefined && method.Length == 0 && calls.TryGetValue(id.ToString(), out var call)) {
-            if (P(value, "error").ValueKind != JsonValueKind.Undefined) call.TrySetException(new AiOperationException("AGENT_REQUEST_REJECTED"));
+            if (P(value, "error").ValueKind is not (JsonValueKind.Undefined or JsonValueKind.Null)) call.TrySetException(new AiOperationException(AiToolPresentation.ErrorCode(P(value, "error"), "AGENT_REQUEST_REJECTED")));
             else call.TrySetResult(P(value, "result").Clone());
             return;
         }
@@ -392,8 +398,8 @@ internal sealed partial class AiAgentSession : IDisposable
                 return;
             }
             if (method is "item/commandExecution/requestApproval" or "item/fileChange/requestApproval" or
-                "item/tool/requestUserInput" or "interaction/requestPermission" or "interaction/requestUserInput") {
-                var kind = method.Contains("UserInput", StringComparison.Ordinal) ? "question" : "approval";
+                "item/tool/requestUserInput" or "interaction/requestPermission" or "interaction/requestUserInput" or AiStructuredInteractions.Permissions or AiStructuredInteractions.Elicitation) {
+                var kind = method.Contains("UserInput", StringComparison.Ordinal) || method == AiStructuredInteractions.Elicitation ? "question" : "approval";
                 AddPending(id, method, parameters, kind);
             } else await WriteAsync(new { id, error = new { code = -32601, message = "Unsupported interaction" } });
             return;
@@ -402,28 +408,41 @@ internal sealed partial class AiAgentSession : IDisposable
             var item = P(parameters, "item"); var type = S(item, "type"); var itemId = S(item, "id");
             switch (method) {
                 case "item/agentMessage/delta": Put(S(parameters, "itemId"), "assistant", S(parameters, "delta"), true); break;
+                case "item/plan/delta": Put(S(parameters, "itemId"), "assistant", S(parameters, "delta"), true, "plan", "running"); break;
                 case "item/reasoning/summaryTextDelta":
-                    var summaryIndex = P(parameters, "summaryIndex").ValueKind == JsonValueKind.Number ? P(parameters, "summaryIndex").GetInt32() : 0;
+                    var summaryIndex = P(parameters, "summaryIndex").ValueKind == JsonValueKind.Number && P(parameters, "summaryIndex").TryGetInt32(out var si) ? si : 0;
                     Put(S(parameters, "itemId") + "/summary/" + summaryIndex, "assistant", S(parameters, "delta"), true, "reasoning", "running"); break;
+                case "item/commandExecution/outputDelta":
+                case "item/fileChange/outputDelta":
+                    PutTool(S(parameters, "itemId"), default, method.Contains("commandExecution", StringComparison.Ordinal) ? "commandExecution" : "fileChange",
+                        "running", outputDelta: S(parameters, "delta")); break;
+                case "item/mcpToolCall/progress":
+                    PutTool(S(parameters, "itemId"), default, "mcpToolCall", "running", progress: S(parameters, "message")); break;
                 case "turn/plan/updated": ReadPlan(parameters); break;
                 case "item/started":
                     if (type == "contextCompaction") lock (sync) compacting = true;
-                    if (type is "commandExecution" or "fileChange" or "mcpToolCall" or "collabAgentToolCall") Put(itemId, "tool", item.GetRawText(), kind: type, status: "running");
+                    if (IsCodexTool(type)) PutTool(itemId, item, type, "running");
+                    else if (type == "plan") Put(itemId, "assistant", S(item, "text"), kind: "plan", status: "running");
                     break;
                 case "item/completed":
                     if (type == "contextCompaction") lock (sync) compacting = false;
                     if (type == "agentMessage") Put(itemId, "assistant", S(item, "text"));
+                    else if (type == "plan") Put(itemId, "assistant", S(item, "text"), kind: "plan", status: "completed");
                     else if (type == "reasoning") CodexReasoning(item);
-                    else if (type is "commandExecution" or "fileChange" or "mcpToolCall" or "collabAgentToolCall") Put(itemId, "tool", item.GetRawText(), kind: type);
+                    else if (IsCodexTool(type)) PutTool(itemId, item, type, "completed");
                     break;
                 case "turn/started": lock (sync) { BeginTurn(); turnId = S(P(parameters, "turn"), "id"); } break;
-                case "turn/completed": CompleteTurn(S(P(parameters, "turn"), "status") == "failed"); break;
+                case "turn/completed":
+                    var turn = P(parameters, "turn");
+                    CompleteTurn(S(turn, "status") == "failed", S(turn, "status") == "interrupted");
+                    if (S(turn, "status") == "failed") RecordAgentError(P(turn, "error"));
+                    break;
                 case "thread/tokenUsage/updated": lock (sync) usage = P(parameters, "tokenUsage").Clone(); break;
                 case "turn/diff/updated": UpdateDiff(S(parameters, "diff")); break;
+                case "thread/reverted": ObserveNativeRevert(); break;
                 case "thread/compacted": lock (sync) compacting = false; break;
-                case "error": lock (sync) error = "AGENT_REPORTED_ERROR"; break;
-                case "serverRequest/resolved":
-                    RemovePending(P(parameters, "requestId")); break;
+                case "error": RecordAgentError(P(parameters, "error"), retryable: P(parameters, "willRetry").ValueKind == JsonValueKind.True); break;
+                case "serverRequest/resolved": RemovePending(P(parameters, "requestId")); break;
             }
         } else if (method == "session/event") ReceiveZcodeEvent(parameters);
     }
@@ -454,25 +473,27 @@ internal sealed partial class AiAgentSession : IDisposable
                 var key = S(message, "id") + "/" + ClaudeFinalBlockIndex(value, message, part, index++, content.GetArrayLength());
                 if (S(part, "type") == "text") Put(key, "assistant", S(part, "text"));
                 else if (S(part, "type") == "thinking") Put(key, "assistant", S(part, "thinking"), kind: "reasoning", status: "completed");
-                else if (S(part, "type") == "tool_use") Put("tool-" + S(part, "id"), "tool", part.GetRawText(), kind: "tool_use", status: "running");
+                else if (S(part, "type") == "tool_use") PutTool("tool-" + S(part, "id"), part, "tool_use", "running");
             }
         } else if (type == "user") {
             var content = P(P(value, "message"), "content");
             if (content.ValueKind == JsonValueKind.Array) foreach (var part in content.EnumerateArray()) {
                 if (S(part, "type") != "tool_result") continue;
-                var key = "tool-" + S(part, "tool_use_id");
-                lock (sync) {
-                    EnsureMessageIndex();
-                    if (messageIndex.TryGetValue(key, out var index)) ReplaceMessage(index, messages[index] with {
-                        Text = Clip(messages[index].Text + "\n" + part.GetRawText(), 1024 * 1024),
-                        Status = P(part, "is_error").ValueKind == JsonValueKind.True ? "failed" : "completed" });
-                    TrimMessages();
-                }
+                var toolId = S(part, "tool_use_id");
+                if (toolId.Length > 0) PutTool("tool-" + toolId, part, "tool_result", P(part, "is_error").ValueKind == JsonValueKind.True ? "failed" : "completed");
             }
+        } else if (type == "tool_progress") {
+            var toolId = S(value, "tool_use_id");
+            if (toolId.Length > 0) PutTool("tool-" + toolId, value, "tool_use", "running", progress: "工具运行中");
+        } else if (type == "system" && S(value, "subtype") is "task_notification" or "task_started" or "task_progress" or "task_updated") {
+            ReceiveClaudeTask(value);
         } else if (type == "result") {
             lock (sync) { var reported = P(value, "usage"); if (reported.ValueKind == JsonValueKind.Object) usage = JsonSerializer.SerializeToElement(new { tokens = reported, costUsd = P(value, "total_cost_usd").ValueKind == JsonValueKind.Number ? P(value, "total_cost_usd").GetDecimal() : (decimal?)null }); }
-            CompleteTurn(P(value, "is_error").ValueKind == JsonValueKind.True);
+            var failed = P(value, "is_error").ValueKind == JsonValueKind.True;
+            CompleteTurn(failed);
+            if (failed) RecordAgentError(default);
         } else if (type == "system" && S(value, "subtype") == "init") {
+            CaptureAgentCapabilities(value);
             lock (sync) { var native = S(value, "session_id"); if (native.Length > 0) threadId = native; }
         } else if (type == "system" && S(value, "subtype") == "compact_boundary") {
             lock (sync) compacting = false;
@@ -488,7 +509,7 @@ internal sealed partial class AiAgentSession : IDisposable
         var type = S(value, "type"); var payload = P(value, "payload");
         if (type == "model.streaming" && S(payload, "kind") == "text_delta")
             Put(S(payload, "assistantMessageId"), "assistant", S(payload, "delta"), true);
-        if (type == "tool.updated") Put("tool-" + S(payload, "toolCallId"), "tool", payload.GetRawText(), kind: "tool");
+        if (type == "tool.updated" && S(payload, "toolCallId").Length > 0) PutTool("tool-" + S(payload, "toolCallId"), payload);
         if (type == "permission.resolved") {
             lock (sync) foreach (var item in pending.Values.Where(p =>
                 S(p.Parameters, "requestId") == S(payload, "requestId")).ToArray()) pending.Remove(item.Id);
@@ -496,8 +517,7 @@ internal sealed partial class AiAgentSession : IDisposable
         if (type == "turn.started") BeginTurn();
         if (type is "turn.completed" or "turn.failed") {
             CompleteTurn(type == "turn.failed");
-            lock (sync) { if (type == "turn.failed" && error != "AGENT_DESKTOP_AUTH_REQUIRED") error =
-                S(P(payload, "error"), "code") == "CONFIGURATION_ERROR" ? "AGENT_MODEL_REQUIRED" : "AGENT_REPORTED_ERROR"; }
+            if (type == "turn.failed") RecordAgentError(P(payload, "error"));
         }
         // The provider's message events carry authoritative text; unknown events never become user input.
         if (type == "message.upserted") {
@@ -514,7 +534,7 @@ internal sealed partial class AiAgentSession : IDisposable
     private void AddPending(JsonElement rpcId, string method, JsonElement parameters, string kind)
     {
         var questions = P(method == "claude/tool" ? P(parameters, "input") : parameters, "questions");
-        var parsed = new List<Question>();
+        var parsed = new List<Question>(AiStructuredInteractions.Questions(method, parameters));
         if (parameters.GetRawText().Length <= 8000 && questions.ValueKind == JsonValueKind.Array) foreach (var question in questions.EnumerateArray().Take(16)) {
             var text = S(question, "question");
             var key = method is "claude/tool" or "interaction/requestUserInput" ? text : S(question, "id");
@@ -542,6 +562,10 @@ internal sealed partial class AiAgentSession : IDisposable
     private async Task AnswerAsync(Pending item, bool allow, Dictionary<string, string[]> answers)
     {
         if (allow && item.Parameters.GetRawText().Length > 8000) throw new AiOperationException("INTERACTION_TOO_LARGE");
+        if (item.Method is AiStructuredInteractions.Permissions or AiStructuredInteractions.Elicitation) {
+            var structured = AiStructuredInteractions.Response(item.Method, item.Parameters, allow, answers);
+            await WriteAsync(new { id = item.RpcId, result = structured }); return;
+        }
         if (allow && item.Kind == "question" && (answers == null || item.Questions.Length == 0 ||
             item.Questions.Any(q => !answers.TryGetValue(q.Id, out var a) || a == null || a.Length is < 1 or > 16 || a.Any(s => string.IsNullOrWhiteSpace(s) || s.Length > 4000))))
             throw new AiOperationException("ANSWER_REQUIRED");
@@ -597,12 +621,13 @@ internal sealed partial class AiAgentSession : IDisposable
         lock (sync) foreach (var item in pending.Values.Where(p => p.RpcId.ToString() == providerId.ToString()).ToArray()) pending.Remove(item.Id);
     }
 
-    private void CompleteTurn(bool failed)
+    private void CompleteTurn(bool failed, bool cancelled = false)
     {
         lock (sync) {
             if (disposed || state == "interrupted") return;
             state = "idle"; pending.Clear();
-            SettleUnconfirmedTools();
+            SettleUnconfirmedTools(cancelled ? "cancelled" : "unknown");
+            claudeStreams.Clear();
             if (failed) { if (error != "AGENT_DESKTOP_AUTH_REQUIRED") error = "AGENT_REPORTED_ERROR"; }
             else { error = ""; if (messages.Any(m => m.Role == "assistant")) authentication = "verified"; }
             EnsureMessageIndex(); phase = failed ? "failed" : "idle";
@@ -622,7 +647,7 @@ internal sealed partial class AiAgentSession : IDisposable
             var presentation = role == "tool" ? ToolPresentation(text, kind) : (Title: "", Summary: "", Status: "");
             var limit = 1024 * 1024;
             if (text.Length > limit) { text = Clip(text, limit); truncated = true; }
-            var message = new Message(id, role, text, role == "tool" ? "tool" : kind == "reasoning" ? "reasoning" : "text", presentation.Title, presentation.Summary,
+            var message = new Message(id, role, text, role == "tool" ? "tool" : kind is "reasoning" or "plan" or "error" ? kind : "text", presentation.Title, presentation.Summary,
                 status.Length > 0 ? status : presentation.Status, modelId, permissionMode);
             if (index < 0) { messageIndex[id] = messages.Count; messages.Add(message); messageCharacters += text.Length; messageRevisions[id] = PublishChange(); }
             else ReplaceMessage(index, message);
@@ -643,58 +668,61 @@ internal sealed partial class AiAgentSession : IDisposable
         }
     }
 
-    private void SettleUnconfirmedTools() {
+    private void SettleUnconfirmedTools(string status = "unknown") {
         EnsureMessageIndex();
         for (var i = 0; i < messages.Count; i++)
-                if (messages[i].Status == "running") ReplaceMessage(i, messages[i] with { Status = messages[i].Kind == "reasoning" ? "completed" : "unknown" });
+            if (messages[i].Status == "running") ReplaceMessage(i, messages[i] with { Status = messages[i].Kind is "reasoning" or "plan" ? "completed" : status });
     }
 
     internal static (string Title, string Summary, string Status) ToolPresentation(string text, string kind = "")
+        => AiToolPresentation.Describe(text, kind);
+
+    private static bool IsCodexTool(string type) => type is "commandExecution" or "fileChange" or "mcpToolCall" or
+        "collabAgentToolCall" or "collabToolCall" or "dynamicToolCall" or "webSearch" or "imageView" or "imageGeneration" or "functionCallOutput";
+
+    private void PutTool(string id, JsonElement value, string kind = "", string status = "", string outputDelta = null, string progress = null)
     {
-        try {
-            using var document = JsonDocument.Parse(text);
-            var value = document.RootElement;
-            var type = kind.Length == 0 ? S(value, "type") : kind;
-            if (type == "session/request_permission") value = P(value, "toolCall");
-            var name = First(value, "tool_name", "toolName", "name", "tool");
-            var title = type switch {
-                "acp" or "session/request_permission" => S(value, "title").Length > 0 ? S(value, "title") : "工具操作",
-                "commandExecution" => "运行命令",
-                "fileChange" => "修改文件",
-                "mcpToolCall" => "调用 MCP 工具",
-                "collabAgentToolCall" => "子 Agent 任务",
-                "item/commandExecution/requestApproval" => "运行命令",
-                "item/fileChange/requestApproval" => "修改文件",
-                _ => name.ToLowerInvariant() switch {
-                    "bash" or "shell" or "shell_command" => "运行命令",
-                    "read" or "read_file" => "读取文件",
-                    "edit" or "write" or "multiedit" or "apply_patch" => "修改文件",
-                    "glob" or "grep" => "搜索文件",
-                    _ => name.Length > 0 ? name : "工具操作",
-                },
-            };
-            var summary = First(value, "command", "cmd", "file_path", "path", "filePath", "pattern", "description", "reason");
-            if (summary.Length == 0 && P(value, "changes").ValueKind == JsonValueKind.Array)
-                summary = string.Join(" · ", P(value, "changes").EnumerateArray().Take(4).Select(c => S(c, "path")));
-            if (summary.Length == 0) summary = name;
-            var status = S(value, "status"); if (status.Length == 0) status = S(value, "state");
-            status = status switch {
-                "completed" or "success" or "succeeded" => "completed",
-                "failed" or "error" => "failed", "declined" or "denied" => "denied",
-                "cancelled" or "canceled" => "cancelled", "inProgress" or "running" or "pending" => "running", _ => "unknown",
-            };
-            var exitCode = P(value, "exitCode");
-            if (exitCode.ValueKind == JsonValueKind.Number && exitCode.TryGetInt32(out var code) && code != 0) status = "failed";
-            return (Clip(title.Replace('\r', ' ').Replace('\n', ' '), 80), Clip(summary.Replace('\r', ' ').Replace('\n', ' ').Trim(), 240), status);
-        } catch (JsonException) { return ("工具操作", "展开查看记录", "unknown"); }
+        if (string.IsNullOrEmpty(id)) return;
+        lock (sync) {
+            EnsureMessageIndex();
+            var previous = messageIndex.TryGetValue(id, out var index) ? messages[index] : null;
+            var text = AiToolPresentation.Normalize(value, kind, previous?.Text ?? "");
+            if (outputDelta != null || progress != null) {
+                using var parsed = JsonDocument.Parse(text);
+                var patch = new Dictionary<string, object> { ["schema"] = AiToolPresentation.Schema };
+                if (outputDelta != null) {
+                    var old = S(parsed.RootElement, "output");
+                    patch["output"] = AiToolPresentation.Prefix(old + outputDelta, AiToolPresentation.OutputLimit);
+                    if (old.Length + outputDelta.Length > AiToolPresentation.OutputLimit) patch["truncated"] = true;
+                }
+                if (progress != null) patch["progress"] = progress;
+                text = AiToolPresentation.Normalize(JsonSerializer.SerializeToElement(patch), previous: text);
+            }
+            var next = AiToolPresentation.Status(value, status.Length > 0 ? status : previous?.Status ?? "unknown");
+            // Late progress/start frames must not turn a completed/failed tool back
+            // into a spinner. A final failure may correct an earlier success.
+            if (previous?.Status is "completed" or "failed" or "denied" or "cancelled" && next is "running" or "unknown") next = previous.Status;
+            using var normalized = JsonDocument.Parse(text);
+            next = AiToolPresentation.Status(normalized.RootElement, next);
+            Put(id, "tool", text, status: next);
+        }
+    }
+
+    private void RecordAgentError(JsonElement failure, string fallback = "AGENT_REPORTED_ERROR", bool retryable = false)
+    {
+        lock (sync) {
+            if (error != "AGENT_DESKTOP_AUTH_REQUIRED") error = AiToolPresentation.ErrorCode(failure, fallback);
+            if (retryable) phase = "retrying";
+            Put("agent-error/" + turnStartedAtMs, "system", AiToolPresentation.ErrorText(error, retryable), kind: "error", status: retryable ? "running" : "failed");
+        }
     }
 
     private static string First(JsonElement value, params string[] names)
     {
         foreach (var name in names) {
             var text = S(value, name); if (text.Length > 0) return text;
-            var nested = P(value, "input"); text = S(nested, name); if (text.Length > 0) return text;
-            nested = P(value, "item"); text = S(nested, name); if (text.Length > 0) return text;
+            text = S(P(value, "input"), name); if (text.Length > 0) return text;
+            text = S(P(value, "item"), name); if (text.Length > 0) return text;
         }
         return "";
     }

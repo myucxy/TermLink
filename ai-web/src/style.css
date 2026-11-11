@@ -19,3 +19,49 @@ summary{cursor:pointer;min-height:36px;padding:6px 0;color:var(--muted)}.tool,.r
 .tool-links{display:flex;align-items:center;gap:2px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
 .tool-links::-webkit-scrollbar{display:none}
 .tools button{flex:none;min-height:36px;min-width:44px;padding:4px 8px;font-size:.86rem;line-height:1.25;white-space:nowrap}
+
+/* Tool text is inert. Keep long paths, command output and diffs inside the row. */
+.tool-card{min-width:0;max-width:100%;font-size:.9rem}
+.tool-card>summary{color:var(--fg);list-style:none}
+.tool-card>summary::-webkit-details-marker{display:none}
+.tool-heading{display:flex;align-items:flex-start;gap:6px;min-width:0}
+.tool-heading strong{flex:1;min-width:0;font-weight:600;overflow-wrap:anywhere}
+.tool-symbol{flex:none;color:var(--accent);width:1em}
+.tool-state{flex:none;font-size:.8rem;color:var(--muted)}
+.tool-card[data-tool-status=failed] .tool-symbol,.tool-card[data-tool-status=failed] .tool-state{color:var(--error)}
+.tool-card>summary small{margin:2px 0 0 1.7em}
+.tool-body{border-top:1px solid var(--line);padding:6px 0;min-width:0}
+.tool-meta{display:flex;gap:4px 10px;flex-wrap:wrap;color:var(--muted);font-size:.8rem}
+.tool-meta code{overflow-wrap:anywhere;min-width:0}
+.tool-section{min-width:0;margin:8px 0}
+.tool-section h4{font-size:.8rem;font-weight:500;color:var(--muted);margin:4px 0}
+.tool-section pre,.tool-raw pre{max-height:28vh;overflow:auto;overscroll-behavior:contain;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);border-radius:5px;padding:7px}
+.tool-section pre:focus-visible,.tool-raw pre:focus-visible{outline:2px solid var(--accent)}
+.tool-cwd{font-size:.8rem;overflow-wrap:anywhere}.tool-cwd span{color:var(--muted)}
+.tool-metrics{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:.8rem;margin:8px 0}
+.tool-metrics dt{color:var(--muted)}.tool-metrics dd{margin:0;font-variant-numeric:tabular-nums}
+.tool-reference{display:block;text-align:left;width:100%;min-width:0;min-height:44px;padding:6px 0;overflow-wrap:anywhere;white-space:normal}
+.tool-reference small{display:block;overflow-wrap:anywhere}
+.tool-file{border-top:1px solid var(--line);padding:3px 0;min-width:0}
+.tool-file-diff>summary{font-size:.8rem}.tool-file-diff .tool-diff{white-space:pre;max-width:100%}
+.tool-children ul,.tool-urls ul{list-style:none;padding:0;margin:0}
+.tool-children li,.tool-urls li{border-top:1px solid var(--line);padding:5px 0;min-width:0}
+.tool-child-heading{display:flex;align-items:flex-start;flex-wrap:wrap;gap:4px 8px}
+.tool-child-heading code{flex:1;min-width:0;overflow-wrap:anywhere}.tool-child-heading span{font-size:.8rem;color:var(--muted)}
+.tool-urls code,.tool-urls small{display:block;overflow-wrap:anywhere}
+.tool-progress{border-left:2px solid var(--accent);padding-left:8px;font-size:.85rem}
+.tool-raw>summary{font-size:.8rem}.tool-full{width:100%;text-align:left;min-height:44px}
+@media(max-width:360px){.tool-heading{flex-wrap:wrap}.tool-state{margin-left:auto}.tool-heading strong{flex-basis:65%}}
+
+.tool-heading strong,.tool-child-heading code{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.tool-file .tool-reference{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
+
+.agent-features{font-size:.88rem;min-width:0;overflow-wrap:anywhere}
+.feature-toolbar{display:flex;align-items:center;gap:8px;min-width:0}.feature-toolbar p{flex:1}
+.feature-toolbar button{flex:none;min-height:44px}
+.feature-section h3{font-size:.9rem;font-weight:600;margin:12px 0 5px}
+.feature-section ul{list-style:none;padding:0;margin:0}.feature-section li{padding:8px 0;border-top:1px solid var(--line);min-width:0}
+.feature-section p{margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.feature-heading{display:flex;align-items:flex-start;flex-wrap:wrap;gap:5px 12px;min-width:0}
+.feature-heading strong{flex:1;min-width:0;font-weight:500;overflow-wrap:anywhere}
+.feature-heading span{font-size:.82rem;color:var(--muted);flex:none}

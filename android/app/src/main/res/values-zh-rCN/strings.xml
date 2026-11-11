@@ -98,10 +98,10 @@
     <string name="terminal_error_http_status">（HTTP %1$d）</string>
     <string name="terminal_error_diagnostic_code">（Agent 诊断：%1$s）</string>
     <string name="terminal_error_session_unavailable">服务器会话列表中已找不到此会话。</string>
-    <string name="terminal_error_session_offline">Windows 会话已离线或暂时不可达。</string>
+    <string name="terminal_error_session_offline">电脑上的会话已离线或暂时不可达。</string>
     <string name="terminal_error_session_ended">Windows 命令行会话已经结束。</string>
-    <string name="terminal_error_pc_unavailable">Windows PC 记录不可用。</string>
-    <string name="terminal_error_pc_not_trusted">此 Windows PC 不是当前账号的可信设备。</string>
+    <string name="terminal_error_pc_unavailable">电脑记录或当前会话目录暂时不可用。</string>
+    <string name="terminal_error_pc_not_trusted">此电脑不是当前账号的可信设备。</string>
     <string name="terminal_error_authentication_expired">登录状态已过期，无法打开会话。</string>
     <string name="terminal_error_access_denied">服务器拒绝当前设备访问此会话。</string>
     <string name="terminal_error_service_timeout">TermLink 服务未在规定时间内响应。</string>
@@ -128,14 +128,14 @@
     <string name="terminal_error_native_core_unavailable">应用内置的 terminal-core 库不可用，或与当前 App 版本不匹配。</string>
     <string name="terminal_error_native_renderer_failed_closed">terminal-core 拒绝了终端状态，并已关闭当前渲染代，防止显示错误输出。</string>
     <string name="terminal_error_unsupported_terminal_capability">当前 Android 与 Windows 安装的 terminal-core 版本不支持此终端能力。</string>
-    <string name="terminal_error_host_history_required">此 Windows Agent 不支持必需的 host_history_v1 历史协议。请升级 Windows 客户端后再打开会话。</string>
+    <string name="terminal_error_host_history_required">此电脑尚未声明必需的 host_history_v1 历史协议。请更新电脑客户端、刷新设备列表后重试。</string>
     <string name="terminal_error_history_core_rebuild_failed">terminal-core 无法通过已验证且连续的加密历史重建实时终端。</string>
     <string name="terminal_error_gap_recovery_required">实时终端检测到有序事件缺失，需要通过完整加密历史重新构建。</string>
     <string name="terminal_error_realtime_connection">无法建立实时会话通道。</string>
     <string name="terminal_error_control_lease">另一个客户端正在控制此会话。</string>
     <string name="terminal_error_unknown">由于未分类的本地或传输故障，无法打开会话。</string>
     <string name="terminal_error_action_refresh">建议：刷新设备列表后重新打开会话。</string>
-    <string name="terminal_error_action_wait_online">建议：保持 Windows PC 和 Agent 在线，然后重试。</string>
+    <string name="terminal_error_action_wait_online">建议：保持电脑和 Agent 在线，然后重试。</string>
     <string name="terminal_error_action_close_tab">建议：关闭此本地标签页，打开仍在运行的会话。</string>
     <string name="terminal_error_action_check_trust">建议：确认此 PC 与 Android 使用同一账号且处于可信状态。</string>
     <string name="terminal_error_action_sign_in">建议：重新登录后再打开会话。</string>
@@ -147,7 +147,7 @@
     <string name="terminal_error_action_republish_history">建议：保持 Windows 在线并产生新的终端输出；若缺口仍存在，请更新 Windows Agent 并反馈此错误码。</string>
     <string name="terminal_error_action_republish">建议：保持 Windows 和 Agent 在线，为此设备重新发布快照。</string>
     <string name="terminal_error_action_refresh_keys">建议：刷新可信设备；若密钥已更新，请让 Windows 发布新快照。</string>
-    <string name="terminal_error_action_update">建议：将 Android 和 Windows TermLink 更新到兼容版本。</string>
+    <string name="terminal_error_action_update">建议：将 Android 和电脑上的 TermLink 更新到兼容版本。</string>
     <string name="terminal_error_action_wait_lease">建议：等待其他控制端释放，或等待 30 秒租约超时后重试。</string>
     <string name="terminal_error_action_free_storage">建议：释放一些 Android 存储空间后重新打开会话；已缓存的加密历史仍可继续复用。</string>
     <string name="terminal_waiting_lease">获得控制权限前，终端保持只读。</string><string name="terminal_key_escape">Esc</string><string name="terminal_key_tab">Tab</string><string name="terminal_key_enter">Enter</string><string name="terminal_key_ctrl_c">Ctrl+C</string><string name="arrow_left">左箭头</string><string name="arrow_up">上箭头</string><string name="arrow_down">下箭头</string><string name="arrow_right">右箭头</string>
@@ -307,7 +307,7 @@
     <string name="confirm_close_inactive_sessions_copy">将永久删除 %1$s 上 %2$d 个已结束或已中断的会话及其保存的历史。运行中的会话会保留，此操作无法撤销。</string>
     <string name="close_inactive_sessions_progress">已处理 %1$d / %2$d 个会话…</string>
     <string name="close_inactive_sessions_result">已删除 %1$d 个，失败 %2$d 个，跳过 %3$d 个。剩余失效会话可刷新后重试。</string>
-    <string name="agent_update_action">升级 Windows 客户端</string>
+    <string name="agent_update_action">升级 Agent</string>
     <string name="agent_update_dismiss_notice">关闭升级提示</string>
     <string name="agent_update_available">Agent 有新版本，点击查看升级详情</string>
     <string name="pc_agent_version">Agent %1$s</string>
@@ -320,17 +320,17 @@
     <string name="agent_update_target_version">目标版本：%1$s</string>
     <string name="agent_update_status_refreshing">升级状态暂未更新，正在恢复连接并重新查询。</string>
     <string name="agent_update_status_unavailable">暂时无法确认升级状态</string>
-    <string name="agent_update_waiting_reconnect">电脑暂时离线，等待重新连接。</string>
+    <string name="agent_update_waiting_reconnect">电脑端暂时离线，等待 Agent 重新连接。</string>
     <string name="agent_update_cancel">取消升级</string>
     <string name="agent_update_cancelling">正在请求取消…</string>
     <string name="agent_update_cancelled">升级已取消</string>
-    <string name="agent_update_installed_version">电脑已更新至 %1$s</string>
+    <string name="agent_update_installed_version">Agent 已更新至 %1$s</string>
     <string name="agent_update_checking">正在检查 Agent 更新</string>
     <string name="agent_update_checking_copy">正在读取 Agent %1$s 对应的签名稳定版更新。</string>
     <string name="agent_update_confirm_title">升级 %1$s？</string>
     <string name="agent_update_unavailable_title">当前无法升级 Agent</string>
     <string name="agent_update_starting">正在发起 Agent 升级</string>
-    <string name="agent_update_in_progress">正在升级 Windows Agent</string>
+    <string name="agent_update_in_progress">正在升级 Agent</string>
     <string name="agent_update_succeeded">Agent 升级完成</string>
     <string name="agent_update_rolled_back">已恢复原 Agent</string>
     <string name="agent_update_rollback_failed">Agent 回滚需要处理</string>
@@ -338,7 +338,7 @@
     <string name="agent_update_request_failed">无法管理 Agent 升级</string>
     <string name="agent_update_versions">%1$s 升级到 %2$s（构建 %3$d）</string>
     <string name="agent_update_session_warning">将关闭 %1$d 个由 TermLink 管理的活动会话，以及其中的 CLI 子进程。</string>
-    <string name="agent_update_rollback_copy">Windows 将自行下载、验签、静默安装并自动启动，无需操作安装向导；连接成功前保留旧版本以便回滚。请先完成正在运行或等待审批的 AI 任务。</string>
+    <string name="agent_update_rollback_copy">电脑端 Agent 将自行下载、验签并静默安装更新；在对应 Agent 支持时会自动启动。若电脑端提示系统权限，请在电脑端确认。请先完成正在运行或等待审批的 AI 任务。</string>
     <string name="agent_update_current_version">当前 Agent：%1$s</string>
     <string name="agent_update_creating_job">正在创建由服务端授权的升级事务。</string>
     <string name="agent_update_progress">%1$s · %2$d%%</string>
@@ -348,17 +348,17 @@
     <string name="agent_update_cannot_cancel">安装已经开始；连接验证或回滚期间不能取消。</string>
     <string name="agent_update_server_error">服务端请求失败：HTTP %1$d · %2$s · trace %3$s</string>
     <string name="agent_update_unknown_error">Agent 升级失败，但没有返回诊断信息。</string>
-    <string name="agent_update_confirm">升级 Windows 客户端</string>
+    <string name="agent_update_confirm">升级 Agent</string>
     <string name="agent_update_reason_offline">该 PC 当前离线。</string>
     <string name="agent_update_reason_routing_disabled">该 PC 已关闭远程路由。</string>
     <string name="agent_update_reason_unsupported">该 Agent 尚未声明事务式远程升级能力。</string>
-    <string name="agent_update_reason_seed_required">请先在 Windows 上手动安装一次引导版本，之后才能由 Android 自动升级。</string>
+    <string name="agent_update_reason_seed_required">请先在电脑端手动安装一次引导版本，之后才能由手机自动升级。</string>
     <string name="agent_update_reason_current">该 Agent 已是最新稳定构建。</string>
     <string name="agent_update_reason_unknown">服务端拒绝升级资格：%1$s</string>
-    <string name="agent_update_phase_requested">等待 Windows Agent 领取任务</string>
+    <string name="agent_update_phase_requested">等待电脑端 Agent 领取任务</string>
     <string name="agent_update_phase_prechecking">正在检查升级前置条件</string>
-    <string name="agent_update_phase_downloading">正在下载已签名 Setup</string>
-    <string name="agent_update_phase_verified">Setup 签名校验完成</string>
+    <string name="agent_update_phase_downloading">正在下载已签名 Agent 安装包</string>
+    <string name="agent_update_phase_verified">Agent 安装包校验完成</string>
     <string name="agent_update_phase_draining">正在关闭受管命令行会话</string>
     <string name="agent_update_phase_installing">正在安装目标 Agent</string>
     <string name="agent_update_phase_starting_agent">正在启动目标 Agent</string>
@@ -382,7 +382,7 @@
     <string name="settings_terminal_font_error_unsupported">请选择受支持的 TTF 或 OTF 字体文件。</string>
     <string name="settings_terminal_font_error_invalid">Android 无法加载这个字体，已保留原字体。</string>
     <string name="settings_terminal_font_error_unreadable">无法读取所选字体，已保留原字体。</string>
-<string name="session_direct_policy_failed">获取传输策略失败，正在自动重试。</string><string name="session_direct_unavailable">直连暂不可用。</string><string name="pc_catalog_upgrade_required">请升级 Windows 客户端以读取会话列表。</string><string name="pc_catalog_unavailable">暂时无法读取 Windows 会话列表，正在自动重试。</string>
+<string name="session_direct_policy_failed">获取传输策略失败，正在自动重试。</string><string name="session_direct_unavailable">直连暂不可用。</string><string name="pc_catalog_upgrade_required">电脑端尚未提供终端会话列表，请检查版本和支持的功能。</string><string name="pc_catalog_unavailable">暂时无法读取电脑端会话列表，正在自动重试。</string>
     <string name="pc_catalog_timeout">暂时无法确认会话状态，正在重试；已连接的会话会保留。</string>
     <string name="session_status_unconfirmed">状态待确认</string>
     <string name="session_catalog_retry">重新确认</string>
@@ -488,6 +488,7 @@
     <string name="ai_ui_oversize_request">操作内容超过显示范围，请在电脑端处理。</string>
     <string name="ai_ui_cap_failed">读取电脑能力失败，请重试。</string>
     <string name="ai_ui_cap_loading">正在读取电脑能力…</string>
+    <string name="ai_native_upgrade_required">此电脑尚未提供 ZCode 原生接入，请升级电脑端后重新检测 Agent。</string>
     <string name="ai_ui_no_agents">当前电脑暂无可用 Agent，请在 Windows 设置中检测或配置。</string>
     <string name="ai_ui_pc_workdir">电脑工作目录</string>
     <string name="ai_ui_browse">浏览选择</string>
@@ -508,7 +509,6 @@
     <string name="ai_back_list">返回 AI 列表</string>
     <string name="ai_chat_menu">AI 对话菜单</string>
     <string name="ai_group_count">%1$d 个会话</string>
-    <string name="ai_remote_strategy">桌面远控</string>
     <string name="ai_group_open">查看 %1$s 的 %2$s 会话</string>
     <string name="ai_status_unknown">状态待确认</string>
     <string name="ai_status_pending">待处理</string>
@@ -537,7 +537,7 @@
     <string name="terminal_error_history_profile_mismatch">这份历史的终端协议与当前版本不兼容。原文件已保留，已停止重放。</string>
     <string name="terminal_error_action_new_session">请新建会话；无需因这个错误删除旧历史。</string>
     <string name="terminal_error_protocol_client">此会话需要更新的安卓终端能力，需要升级安卓客户端。</string>
-    <string name="terminal_error_negotiation_timeout">等待 Windows 确认终端能力超时，请检查网络连接和 Windows 客户端版本。</string>
+    <string name="terminal_error_negotiation_timeout">等待电脑确认终端能力超时，请检查网络连接和电脑客户端版本。</string>
     <string name="terminal_error_negotiation_invalid">对端返回的终端能力协商信息无效。</string>
     <string name="terminal_error_state_mismatch">认证后的终端协议与本会话绑定的协议不一致，已停止恢复。</string>
     <string name="terminal_error_history_memory_limit">这份终端历史超出应用当前内存预算，已在继续分配大块内存前停止恢复。</string>
@@ -572,4 +572,6 @@
     <string name="terminal_frozen_history_check">检测并浏览冻结历史</string>
     <string name="terminal_frozen_history_close">关闭冻结历史</string>
     <string name="terminal_frozen_history_error">冻结历史不可用（%1$s）</string>
+    <string name="terminal_session_restore_pending">正在确认连接并恢复会话内容… 若迟迟未显示，请重试。</string>
+    <string name="terminal_session_restore_offline">电脑已离线，尚未恢复会话内容。请让电脑重新连接后重试。</string>
 </resources>

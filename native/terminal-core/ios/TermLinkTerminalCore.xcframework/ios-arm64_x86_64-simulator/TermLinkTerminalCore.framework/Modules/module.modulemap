@@ -1,0 +1,5 @@
+framework module TermLinkTerminalCore {
+    umbrella header "termlink_terminal.h"
+    export *
+    module * { export * }
+}

@@ -5,7 +5,7 @@ import UIKit
 struct TerminalSurface: UIViewRepresentable {
     @ObservedObject var controller:TerminalController
     var fontSize:CGFloat
-    func makeUIView(context:Context)->NativeTerminalView{let v=NativeTerminalView();v.sessionID=controller.session.id;v.onResize={columns,rows,w,h in controller.fit(columns:columns,rows:rows,cellWidth:w,cellHeight:h)};v.sendText={text in Task{do{try await controller.text(text)}catch{controller.present(error)}}};v.sendKey={key,mods in Task{do{try await controller.key(key,modifiers:mods)}catch{controller.present(error)}}};return v}
+    func makeUIView(context:Context)->NativeTerminalView{let v=NativeTerminalView();v.sessionID=controller.session.id;v.onHistoryScroll={rows in controller.browseHistory(by:rows)};v.onResize={columns,rows,w,h in controller.fit(columns:columns,rows:rows,cellWidth:w,cellHeight:h)};v.sendText={text in Task{do{try await controller.text(text)}catch{controller.present(error)}}};v.sendKey={key,mods in Task{do{try await controller.key(key,modifiers:mods)}catch{controller.present(error)}}};return v}
     func updateUIView(_ view:NativeTerminalView,context:Context){view.frameValue=controller.frame;view.inputAllowed=controller.canInput;view.fontSize=fontSize;view.setNeedsDisplay()}
 }
 
@@ -16,6 +16,8 @@ final class NativeTerminalView:UIView,UITextViewDelegate {
     var sessionID: UUID?
     var sendText:((String)->Void)?,sendKey:((UInt32,UInt32)->Void)?
     var onResize:((Int,Int,Int,Int)->Void)?
+    var onHistoryScroll: ((Int) -> Void)?
+    private var historyTranslation: CGFloat = 0
     private var lastLayout:CGSize = .zero
     private let input=TerminalInputTextView()
     private var selectionStart:CGPoint?,selectionEnd:CGPoint?
@@ -24,6 +26,9 @@ final class NativeTerminalView:UIView,UITextViewDelegate {
         input.onDelete={ [weak self] in self?.sendKey?(3,0) };input.onInterrupt={ [weak self] in self?.sendText?("\u{3}") };input.onKey={ [weak self] key,mods in self?.sendKey?(key,mods) };addSubview(input)
         addGestureRecognizer(UITapGestureRecognizer(target:self,action:#selector(focus)))
         let long=UILongPressGestureRecognizer(target:self,action:#selector(selectText(_:)));addGestureRecognizer(long)
+        let historyPan=UIPanGestureRecognizer(target:self,action:#selector(scrollHistory(_:)))
+        historyPan.minimumNumberOfTouches=2;historyPan.maximumNumberOfTouches=2;addGestureRecognizer(historyPan)
+        accessibilityHint="双指上下滑动浏览历史，长按可复制。"
         addInteraction(UIContextMenuInteraction(delegate:self))
         NotificationCenter.default.addObserver(self,selector:#selector(showKeyboard(_:)),name:.terminalShowKeyboard,object:nil)
     }
@@ -50,6 +55,12 @@ final class NativeTerminalView:UIView,UITextViewDelegate {
         setNeedsLayout()
     }
     @objc private func focus(){if inputAllowed{input.becomeFirstResponder()}}
+    @objc private func scrollHistory(_ gesture: UIPanGestureRecognizer) {
+        if gesture.state == .began { historyTranslation = 0 }
+        let translation = gesture.translation(in: self).y
+        let rows = Int((translation - historyTranslation) / cell.height)
+        if rows != 0 { historyTranslation += CGFloat(rows) * cell.height; onHistoryScroll?(rows) }
+    }
     @objc private func showKeyboard(_ notification:Notification){if notification.object as? UUID == sessionID { focus() }}
     func textViewDidChange(_ textView:UITextView){guard inputAllowed,textView.markedTextRange==nil else{return};let text=textView.text.replacingOccurrences(of:"\u{200B}",with:"");if !text.isEmpty{sendText?(text)};textView.text="\u{200B}"}
     @objc private func selectText(_ gesture:UILongPressGestureRecognizer){if gesture.state == .began{selectionStart=gesture.location(in:self)};selectionEnd=gesture.location(in:self);if gesture.state == .ended{UIAccessibility.post(notification:.announcement,argument:"长按菜单可复制所选终端文本。")}}

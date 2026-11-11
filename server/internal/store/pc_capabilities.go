@@ -12,6 +12,7 @@ const (
 	PCArchitectureArm64   = "arm64"
 	PCArchitectureUnknown = "unknown"
 
+	PCCapabilityAIAgentV1           = "ai_agent_v1"
 	PCCapabilityRealtimeTerminalV1  = "realtime_terminal_v1"
 	PCCapabilityTerminalSnapshotV1  = "terminal_snapshot_v1"
 	PCCapabilityTerminalSnapshotV2  = "terminal_snapshot_v2"

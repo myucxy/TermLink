@@ -1,13 +1,13 @@
 import {t} from './i18n';
 export interface Message { id: string; role: string; kind: string; text: string; title: string; summary: string; status: string; fullLength: number }
-export interface Question { id: string; text: string; options: string[]; multiSelect: boolean }
+export interface Question { id: string; text: string; options: string[]; multiSelect: boolean; required?: boolean }
 export interface Pending { id: string; kind: string; title: string; summary: string; detail: string; canApprove: boolean; questions: Question[] }
 export interface Session {
   id: string; agent: string; state: string; phase: string; turnStartedAtMs: number; lastActivityAtMs: number;
   canControl: boolean; busy: boolean; uncertain: boolean; historyBefore: number; truncated: boolean;
   pending: Pending[]; plan: {step: string; status: string}[]; usage: string; diff: string; error: string;
   artifacts: boolean; search: boolean; dark: boolean; fontScale: number;
-  diffLength?: number; diffTruncated?: boolean; diffRead?: boolean; language?: string;
+  diffLength?: number; diffTruncated?: boolean; diffRead?: boolean; language?: string; agentFeatures?: boolean; historyActions?:boolean; pathStyle?: string; hostPlatform?: string;
 }
 export type QuestionDraft = {schema:string;answers:Record<string,string[]>;extra:Record<string,string>};
 export type UiState = {tail?:boolean;anchor?:{id:string;offset:number};expanded?:string[];questions?:Record<string,QuestionDraft>};

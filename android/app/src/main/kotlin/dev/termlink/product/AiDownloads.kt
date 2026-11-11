@@ -19,9 +19,11 @@ internal class AiDownloads(
     private val preferences: SharedPreferences,
     private val seal: (String) -> String,
     private val unseal: (String) -> String,
+    // Resolve only the original PC/host/session, never whichever conversation is selected now.
+    private val currentSession: (pcId: UUID, hostId: String, sessionId: String) -> AiConversation? = { _, _, _ -> null },
 ) {
     private val resolver = context.applicationContext.contentResolver
-    private data class Source(val host: String, val session: String, val file: String, val version: String)
+    private data class Source(val host: String, val session: String, val file: String, val version: String, val directory: String? = null)
     private val sources = mutableMapOf<UUID, Source>()
     val records = mutableStateMapOf<UUID, RemoteDownloadRecord>()
     private val jobs = mutableMapOf<UUID, Job>()
@@ -34,7 +36,8 @@ internal class AiDownloads(
                 val item = items.getJSONObject(index)
                 val id = UUID.fromString(item.getString("id"))
                 val status = RemoteDownloadStatus.valueOf(item.getString("status"))
-                sources[id] = Source(item.getString("host"), item.getString("session"), item.getString("file"), item.getString("version"))
+                sources[id] = Source(item.getString("host"), item.getString("session"), item.getString("file"), item.getString("version"),
+                    if (item.has("directory") && !item.isNull("directory")) item.getString("directory") else null)
                 records[id] = RemoteDownloadRecord(id, UUID.fromString(item.getString("pc")), item.getString("name"),
                     item.getString("path"), item.getString("filename"), false,
                     if (status.isActive) RemoteDownloadStatus.FAILED else status, item.getString("uri"),
@@ -47,9 +50,10 @@ internal class AiDownloads(
 
     fun start(session: AiConversation, host: String, pcName: String, file: AiArtifactDownload, uri: Uri) {
         check(!retired && jobs.size < 3 && records.size < MAX_REMOTE_DOWNLOAD_RECORDS) { "请先完成当前下载或清理下载记录" }
+        val artifactId = aiArtifactRelativePath(session.directory, file.id, session.capabilities.pathStyle)
         retainDocument(uri)
         val id = UUID.randomUUID()
-        sources[id] = Source(host, session.id, file.id, file.version)
+        sources[id] = Source(host, session.id, artifactId, file.version, session.directory)
         records[id] = RemoteDownloadRecord(id, session.pcId, repository.snapshot.value.pcs.firstOrNull { it.id == session.pcId }?.name ?: pcName, "${session.title.ifBlank { session.agent }} · ${file.name}",
             file.name, false, RemoteDownloadStatus.PREPARING, uri.toString())
         try { persist() } catch (error: Exception) { records.remove(id); sources.remove(id); throw error }
@@ -58,6 +62,13 @@ internal class AiDownloads(
 
     fun retry(id: UUID, uri: Uri) {
         check(!retired && jobs.size < 3 && records[id]?.status in setOf(RemoteDownloadStatus.FAILED, RemoteDownloadStatus.CANCELLED))
+        val record = records.getValue(id); val source = sources.getValue(id)
+        val session = checkNotNull(currentSession(record.pcId, source.host, source.session)) { "请重新连接原电脑并打开原会话后重试。" }
+        check(session.pcId == record.pcId && session.id == source.session)
+        check(source.directory == null || source.directory == session.directory) { "会话目录已变化，请重新选择文件。" }
+        // Legacy records have no style/directory: validate against the current, exactly matched host session.
+        val artifactId = aiArtifactRelativePath(session.directory, source.file, session.capabilities.pathStyle)
+        check(artifactId == source.file) { "文件路径规则已变化，请重新选择文件。" }
         retainDocument(uri)
         update(id) { it.copy(status = RemoteDownloadStatus.PREPARING, targetUri = uri.toString(), downloadedBytes = 0, error = null) }
         launch(id)
@@ -129,7 +140,7 @@ internal class AiDownloads(
             items.put(JSONObject().put("id", r.id).put("pc", r.pcId).put("name", r.pcName).put("path", r.remotePath)
                 .put("filename", r.filename).put("uri", r.targetUri).put("status", r.status.name).put("total", r.totalBytes ?: -1)
                 .put("bytes", r.downloadedBytes).put("created", r.createdAt).put("error", r.error.orEmpty())
-                .put("host", s.host).put("session", s.session).put("file", s.file).put("version", s.version))
+                .put("host", s.host).put("session", s.session).put("file", s.file).put("version", s.version).put("directory", s.directory))
         }
         check(preferences.edit().putString("downloads", seal(items.toString())).commit()) { "无法保存下载记录" }
     }

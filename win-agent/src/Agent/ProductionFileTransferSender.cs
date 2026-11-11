@@ -1,3 +1,6 @@
+#if TERMLINK_PORTABLE_FILES
+#nullable disable
+#endif
 using System;
 using System.Buffers;
 using System.IO;
@@ -137,7 +140,11 @@ namespace TermLink.Agent
             try
             {
                 socket.Options.AddSubProtocol("termlink.file-transfer.v2");
+                #if TERMLINK_PORTABLE_FILES
+                socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+#else
                 ProductionTls.ConfigureWebSocket(socket.Options, serverUrl);
+#endif
                 await authenticate(socket.Options, "/v1/file-transfers", token).ConfigureAwait(false);
                 var root = new Uri(serverUrl + "/");
                 var builder = new UriBuilder(root)
@@ -511,7 +518,7 @@ namespace TermLink.Agent
         private static void ValidateTarget(FileOperationUploadTarget target, Stream content)
         {
             if (target == null || target.TransferId == Guid.Empty || target.RequesterDeviceId == Guid.Empty ||
-                target.SizeBytes < 0 || target.SizeBytes > FileTransferPreparer.MaximumTransferBytes ||
+                target.SizeBytes < 0 || target.SizeBytes > 5L * 1024 * 1024 * 1024 ||
                 target.Sha256 == null || target.Sha256.Length != 32 || string.IsNullOrWhiteSpace(target.Filename) ||
                 content == null || !content.CanRead || !content.CanSeek)
             {

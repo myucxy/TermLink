@@ -6,6 +6,8 @@
 
 应用只需检出 `termlink/`，终端核心以 `native/terminal-core/` 下的 DLL/SO 提供，SHA-256 固定在 `terminal-core.lock.json`；不需要同级 core 源码。核心维护者的编译/导出入口见[双仓库说明](REPOSITORY_LAYOUT.md)。
 
+iOS 使用同目录下的预编译 XCFramework 与独立 `terminal-core.ios.lock.json`，Xcode 自动选择设备或模拟器切片。构建和验收范围见 [iOS 原生核心导入](IOS_NATIVE_CORE.md)，应用构建同样不读取或编译同级 core 源码。
+
 | 工具 | 仓库要求/依据 |
 | --- | --- |
 | .NET SDK | `8.0.303`，以 `pc-client/global.json`、`win-agent/global.json` 和各自 rollForward 策略为准 |

@@ -6,12 +6,16 @@ import UIKit
 
 @MainActor final class ProductStore: ObservableObject {
     @Published var tab: ProductTab = .devices
-    @Published private(set) var pcs: [PC] = [], devices: [DeviceRecord] = [], sessions: [TerminalSession] = []
-    @Published private(set) var signedIn = false, refreshing = false
+    @Published private(set) var pcs: [PC] = []
+    @Published private(set) var devices: [DeviceRecord] = []
+    @Published private(set) var sessions: [TerminalSession] = []
+    @Published private(set) var signedIn = false
+    @Published private(set) var refreshing = false
     @Published private(set) var signingIn = false
     private(set) var active=true
     @Published private(set) var catalogErrors: [UUID:String] = [:]
-    @Published var error: String?, selectedCLI: UUID?
+    @Published var error: String?
+    @Published var selectedCLI: UUID?
     @Published var server = UserDefaults.standard.string(forKey:"server") ?? "https://termlink.kget.cc:8910"
     @Published private(set) var relay: RelayClient?
     @Published private(set) var terminals: [UUID:TerminalController] = [:]
@@ -20,6 +24,7 @@ import UIKit
     let notifications = StatusNotifications()
     private(set) var api: APIClient?, identity: DeviceIdentity?, tokens: TokenStore?
     private var loop: Task<Void,Never>?, epoch=UUID(), restoring=false, reconnecting=false
+    private var terminatingSessions = Set<UUID>()
     private let network=NWPathMonitor(), networkQueue=DispatchQueue(label:"dev.termlink.network")
     lazy var ai = AIWorkspace(product:self)
     lazy var updates = AgentUpdateStore(product:self)
@@ -74,7 +79,7 @@ import UIKit
         let account = localScope
         self.api=api;self.identity=identity;self.tokens=tokens;self.accountID=account;self.signedIn=true
         self.relay=RelayClient(api:api,identity:identity)
-        ai.restore();updates.restore();files.restore()
+        await ai.restore();guard owner==epoch else{throw CancellationError()};updates.restore();files.restore()
         try await refresh();try await relay?.connect();await refreshCatalogs()
         beginPolling()
         activityStore.record("signed-in","已登录并连接 \(root.host ?? root.absoluteString)")
@@ -129,6 +134,7 @@ import UIKit
     func signOut() async { authentication.cancel();let store=tokens;notifications.reset();activityStore.record("signed-out","已退出登录并断开本机连接");stopRuntime();do{try await store?.clear()}catch{report(error)} }
     private func stopRuntime(){epoch=UUID();loop?.cancel();loop=nil;relay?.disconnect();relay=nil;terminals.values.forEach{$0.close()};terminals=[:];api=nil;identity=nil;tokens=nil;accountID="";signedIn=false;refreshing=false;reconnecting=false;pcs=[];devices=[];sessions=[];catalogErrors=[:];ai.reset();updates.reset();files.reset()}
     func open(_ session:TerminalSession) async {
+        guard !terminatingSessions.contains(session.id) else { error="正在确认会话终止结果，请稍后重新查询。";return }
         guard let relay,let api,let identity,let pc=pcs.first(where:{$0.id==session.pcID && $0.online && $0.routing}),catalogErrors[pc.id]==nil else{error="先重新确认电脑会话状态。";return}
         do {
             let controller=TerminalController(session:session,pc:pc,relay:relay,api:api,identity:identity,state:privateState)
@@ -140,12 +146,23 @@ import UIKit
     func closeView(_ id:UUID){terminals.removeValue(forKey:id)?.close();if selectedCLI==id{selectedCLI=terminals.keys.first}}
     func terminate(_ session:TerminalSession) async throws {
         guard let relay,let pc=pcs.first(where:{$0.id==session.pcID && $0.online && $0.routing}),catalogErrors[pc.id]==nil else{throw ClientError.readOnly}
+        guard !terminatingSessions.contains(session.id) else { throw ClientError.unavailable("正在确认会话终止结果，请稍后重新查询。") }
+        terminatingSessions.insert(session.id);defer{terminatingSessions.remove(session.id)}
         let owner=epoch
         if let terminal=terminals[session.id]{try await terminal.terminate()}
         else{
+            guard let api,let identity else{throw ClientError.readOnly}
             try relay.bindSession(session.id,pcID:pc.id){_ in};defer{relay.unbindSession(session.id)}
-            let reply=try await relay.request(route:session.id,type:.terminate,response:.terminateResponse,capability:"host_history_v1"){id in var p=ProtoMessage();p.set(1,id.bytes);p.set(2,"USER_FORCE_CLOSE");return p}
-            guard reply.uint(2)==1,try reply.text(3).isEmpty else{throw ClientError.unavailable("电脑尚未确认结束会话。")}
+            try await TerminalSessionControl.terminateUnopened(
+                reset:{_=try await relay.send(route:session.id,type:.unsubscribe,payload:ProtoMessage())},
+                authorize:{_=try await api.request("/v1/sessions/\(session.id)/subscribe",method:"POST",body:.object([:]),idempotency:UUID())},
+                attach:{try await relay.request(route:session.id,type:.subscribe,response:.attachResult,capability:"terminal_attach_v1",timeout:.seconds(15)){id in
+                    try TerminalSessionControl.subscription(requestID:id,exchangeKey:identity.publicExchange)
+                }},
+                terminate:{try await relay.request(route:session.id,type:.terminate,response:.terminateResponse,capability:"host_history_v1"){id in
+                    var p=ProtoMessage();p.set(1,id.bytes);p.set(2,"USER_FORCE_CLOSE");return p
+                }},
+                unsubscribe:{_=try? await relay.send(route:session.id,type:.unsubscribe,payload:ProtoMessage())})
         }
         guard owner==epoch else{throw CancellationError()};closeView(session.id);activityStore.record("session-ended","结束了电脑上的「\(session.title.isEmpty ? session.shell:session.title)」");await refreshCatalogs()
     }

@@ -324,6 +324,32 @@ class AgentUpdateCoordinatorTest {
         }
     }
 
+    @Test fun updateOffersAndRecoveryFollowCapabilityRatherThanPlatform() {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val advertised = first.copy(platform = "macos")
+        val unsupported = second.copy(capabilities = emptySet())
+        val checks = mutableListOf<UUID>()
+        val recovery = mutableListOf<UUID>()
+        val repository = object : ProductRepository by UnavailableProductRepository() {
+            override suspend fun agentUpdateEligibility(pcId: UUID): AgentUpdateEligibility {
+                checks += pcId
+                return AgentUpdateEligibility(pcId, true, currentVersion = advertised.agentVersion,
+                    currentBuild = 140, targetVersion = "0.3.11", targetBuild = 141)
+            }
+            override suspend fun activeAgentUpdate(pcId: UUID): AgentUpdateProgress? {
+                recovery += pcId
+                return null
+            }
+        }
+        val coordinator = AgentUpdateCoordinator(repository, scope)
+        try {
+            coordinator.recover(listOf(advertised, unsupported))
+            assertEquals(listOf(advertised.id), checks)
+            assertEquals(listOf(advertised.id), recovery)
+            assertTrue(coordinator.state.value.offers.getValue(advertised.id).isUpdateAvailableFor(advertised, null))
+        } finally { coordinator.close(); scope.cancel() }
+    }
+
     @Test fun updateBadgeUsesConfirmedBuildAndSilentlyCachesChecks() {
         val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
         var time = 0L
@@ -340,7 +366,7 @@ class AgentUpdateCoordinatorTest {
         }
         val coordinator = AgentUpdateCoordinator(repository, scope, nowMillis = { time })
         try {
-            coordinator.refreshOffers(listOf(first, second.copy(platform = "linux")))
+            coordinator.refreshOffers(listOf(first, second.copy(platform = "linux", capabilities = emptySet())))
             assertEquals(1, checks)
             assertTrue(coordinator.state.value.offers.getValue(first.id).isUpdateAvailableFor(first, null))
             coordinator.refreshOffers(listOf(first))

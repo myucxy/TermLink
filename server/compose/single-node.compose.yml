@@ -13,6 +13,9 @@ services:
     environment:
       TERMLINK_RUNTIME_MODE: single-node
       TERMLINK_IDENTITY_PROVIDER: embedded
+      # iOS remains disabled unless an explicit, distinct client ID is supplied.
+      TERMLINK_IOS_OIDC_CLIENT_ID: ${TERMLINK_IOS_OIDC_CLIENT_ID:-}
+      TERMLINK_IOS_OIDC_REDIRECT_URI: ${TERMLINK_IOS_OIDC_REDIRECT_URI:-dev.termlink.ios:/oauth2redirect}
       TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
       TERMLINK_DIRECT_ROUTING_PERMITTED: ${TERMLINK_DIRECT_ROUTING_PERMITTED:-false}
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}

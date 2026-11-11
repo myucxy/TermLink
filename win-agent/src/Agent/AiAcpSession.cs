@@ -16,7 +16,7 @@ internal sealed partial class AiAgentSession
     private string acpPromptId = "", acpChunkKind = "", acpChunkId = "";
     private string acpTurnKey = "";
     private int acpChunkIndex;
-    private readonly Dictionary<string, JsonElement> acpTools = new(StringComparer.Ordinal);
+    private readonly HashSet<string> acpTools = new(StringComparer.Ordinal);
 
     private async Task<JsonElement> InitializeAcpAsync()
     {
@@ -157,7 +157,7 @@ internal sealed partial class AiAgentSession
         var sequence = Interlocked.Increment(ref nextCall); var id = sequence.ToString(CultureInfo.InvariantCulture);
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         var prompt = new List<object> { new { type = "text", text } };
-        if (acpImages) prompt.AddRange(attachments.Where(a => a.IsImage).Select(a => (object)new { type = "image", mimeType = a.Mime, data = Convert.ToBase64String(System.IO.File.ReadAllBytes(a.Path)) }));
+        if (acpImages) prompt.AddRange(attachments.Where(a => a.IsImage).Select(a => (object)new { type = "image", mimeType = a.Mime, data = Convert.ToBase64String(AiWorkspaceFiles.ReadBytes(a.Path)) }));
         calls[id] = completion;
         lock (sync) { acpPromptId = id; acpTurnKey = Guid.NewGuid().ToString("N"); acpChunkKind = ""; acpChunkIndex = 0; acpCancelling = false; acpTools.Clear(); }
         try { await WriteAsync(new { jsonrpc = "2.0", id = sequence, method = "session/prompt", @params = new { sessionId = threadId, prompt } }); }
@@ -174,14 +174,14 @@ internal sealed partial class AiAgentSession
             lock (sync) {
                 if (acpPromptId != id || disposed || lifetime.IsCancellationRequested) return;
                 var reason = S(result, "stopReason");
-                CompleteTurn(reason is not ("end_turn" or "cancelled" or "max_tokens" or "max_turn_requests" or "refusal"));
+                CompleteTurn(reason is not ("end_turn" or "cancelled" or "max_tokens" or "max_turn_requests" or "refusal"), reason == "cancelled");
                 acpPromptId = ""; acpTools.Clear(); PublishChange();
             }
         } catch (OperationCanceledException) { }
         catch (AiOperationException e) {
             lock (sync) {
                 if (disposed || lifetime.IsCancellationRequested) return;
-                CompleteTurn(true); error = e.Code; acpPromptId = ""; acpTools.Clear(); PublishChange();
+                CompleteTurn(true); RecordAgentError(default, e.Code); acpPromptId = ""; acpTools.Clear(); PublishChange();
             }
         } finally { calls.TryRemove(id, out _); }
     }
@@ -212,9 +212,8 @@ internal sealed partial class AiAgentSession
         if (id.ValueKind is JsonValueKind.String or JsonValueKind.Number && method.Length == 0) {
             if (!calls.TryGetValue(id.ToString(), out var call)) return;
             var failure = P(value, "error");
-            if (failure.ValueKind != JsonValueKind.Undefined) {
-                var message = S(failure, "message");
-                call.TrySetException(new AiOperationException(message.Contains("Authentication required", StringComparison.OrdinalIgnoreCase) ? "AGENT_AUTH_REQUIRED" : "AGENT_REQUEST_REJECTED"));
+            if (failure.ValueKind is not (JsonValueKind.Undefined or JsonValueKind.Null)) {
+                call.TrySetException(new AiOperationException(AiToolPresentation.ErrorCode(failure, "AGENT_REQUEST_REJECTED")));
             } else if (P(value, "result").ValueKind == JsonValueKind.Object) call.TrySetResult(P(value, "result").Clone());
             else call.TrySetException(new AiOperationException("AGENT_PROTOCOL_INCOMPATIBLE"));
             return;
@@ -256,7 +255,7 @@ internal sealed partial class AiAgentSession
                 return;
             }
             if (kind == "config_option_update") { ReadAcpConfiguration(update); settingsVersion++; SaveArchive(); return; }
-            if (kind == "available_commands_update") { ReadAcpCommands(P(update, "availableCommands")); return; }
+            if (kind == "available_commands_update") { CaptureAgentCapabilities(update); ReadAcpCommands(P(update, "availableCommands")); return; }
             if (acpPromptId.Length == 0 || state != "running") return;
             if (kind is "agent_message_chunk" or "agent_thought_chunk") {
                 var content = P(update, "content"); if (S(content, "type") != "text") return;
@@ -268,18 +267,13 @@ internal sealed partial class AiAgentSession
                 acpChunkKind = "";
                 var toolId = S(update, "toolCallId"); if (!ValidOption(toolId, 512)) return;
                 if (error is "AGENT_RATE_LIMITED" or "AGENT_NETWORK_RETRY") error = "";
-                if (!acpTools.ContainsKey(toolId) && acpTools.Count >= 256) throw new System.IO.IOException("Too many ACP tools.");
-                var fields = acpTools.TryGetValue(toolId, out var old) ? JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(old.GetRawText()) : new();
-                foreach (var property in update.EnumerateObject())
-                    if (property.Name is "title" or "kind" or "status" or "rawInput" or "rawOutput" or "content" or "locations") fields[property.Name] = property.Value.Clone();
-                var merged = JsonSerializer.SerializeToElement(fields);
-                if (merged.GetRawText().Length > 1024 * 1024 || acpTools.Where(t => t.Key != toolId).Sum(t => t.Value.GetRawText().Length) + merged.GetRawText().Length > 4 * 1024 * 1024)
-                    throw new System.IO.IOException("ACP tool detail exceeds its bound.");
-                acpTools[toolId] = merged;
-                var status = S(merged, "status") switch { "completed" => "completed", "failed" => "failed", "pending" or "in_progress" => "running", _ => "unknown" };
-                Put("acp/tool/" + acpTurnKey + "/" + toolId, "tool", merged.GetRawText(), kind: "acp", status: status);
+                if (!acpTools.Contains(toolId) && acpTools.Count >= 256) throw new System.IO.IOException("Too many ACP tools.");
+                acpTools.Add(toolId);
+                // ACP updates replace only supplied non-null fields. Keeping the
+                // normalized message as the merge base avoids retaining raw blobs.
+                PutTool("acp/tool/" + acpTurnKey + "/" + toolId, update, "acp", kind == "tool_call" ? "running" : "");
             } else if (kind == "plan" && P(update, "entries").ValueKind == JsonValueKind.Array) {
-                plan = JsonSerializer.SerializeToElement(P(update, "entries").EnumerateArray().Take(64).Select(e => new { step = Clip(S(e, "content"), 2000), status = S(e, "status") }).ToArray());
+                ReadPlan(JsonSerializer.SerializeToElement(new { plan = P(update, "entries") }));
             }
         }
     }

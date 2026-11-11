@@ -14,6 +14,17 @@ public static class Program
     [STAThread]
     public static void Main(string[] args)
     {
+#if DEBUG && !WINDOWS
+        if (OperatingSystem.IsMacOS() && args.Length == 1 && args[0] == "--inspect-authorizations")
+        {
+            var options = TermLink.Platform.MacOS.MacPlatformOptions.CreateDefault();
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            var checks = new TermLink.Platform.MacOS.MacDesktopOperations(options)
+                .DetectAuthorizationsAsync(deadline.Token).AsTask().GetAwaiter().GetResult();
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(checks));
+            return;
+        }
+#endif
 #if WINDOWS
         if (args.Length == 1 && args[0] == "--shutdown-agent") {
             try {
@@ -43,8 +54,12 @@ public static class Program
         // An older Updater starts the new desktop without --start-hidden.
         StartHidden |= TermLink.UpdateCore.RemoteUpdateTransactionStore.IsVerifyingInstallation(AppContext.BaseDirectory);
 #endif
-        using var singleInstance = new SingleInstanceCoordinator(
-            UsePreviewFixture ? "preview-fixture" : "control-ui");
+        var instanceScope = UsePreviewFixture ? "preview-fixture" : "control-ui";
+#if !WINDOWS
+        if (OperatingSystem.IsMacOS() && TermLink.Platform.MacOS.MacPlatformOptions.IsDevelopmentBuild)
+            instanceScope += "-development";
+#endif
+        using var singleInstance = new SingleInstanceCoordinator(instanceScope);
         if (!singleInstance.TryAcquire())
         {
             _ = singleInstance.SignalPrimaryAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();

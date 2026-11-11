@@ -37,35 +37,90 @@ internal fun aiWebRequest(raw: String): JSONObject {
     val request = JSONObject(raw)
     require(request.optString("id").matches(Regex("[0-9]{1,16}")))
     require(request.optString("action") in setOf("ready", "history", "interrupt", "answer", "copy", "quote", "edit",
-        "search", "artifacts", "artifact.read", "diff.read", "message", "open-link", "open-file", "open-directory", "download", "ui-state", "back-state"))
+        "search", "artifacts", "agent.features", "history.actions", "review", "revert", "fork", "artifact.read", "diff.read", "message", "open-link", "open-file", "open-directory", "download", "ui-state", "back-state"))
     return request
 }
 
-internal fun aiArtifactRelativePath(directory: String, value: String): String {
-    require(value.length in 1..2048 && value.none(Char::isISOControl))
-    val path = value.replace('\\', '/')
-    val root = directory.replace('\\', '/').trimEnd('/') + "/"
-    val relative = if (path.startsWith(root, ignoreCase = true)) path.substring(root.length) else path
-    require(!relative.startsWith('/') && ':' !in relative && relative.split('/').none { it == ".." })
-    return relative
+/** The host's advertised path style is authoritative; old hosts fall back only to their directory syntax. */
+private data class AiArtifactRoot(val path: String, val windows: Boolean) {
+    val prefix: String get() = path.trimEnd('/') + "/"
+    fun native(value: String): String = if (windows) value.replace('/', '\\') else value
+
+    fun relative(value: String): String {
+        require(value.length in 1..2048 && value.none(Char::isISOControl))
+        // A foreign absolute path must not become a relative filename on a POSIX host.
+        require(windows || (!aiArtifactHasDrive(value) && !value.startsWith("\\\\") && !value.startsWith("//")))
+        val normalized = if (windows) value.replace('\\', '/') else value
+        val relative = if (normalized.startsWith(prefix, ignoreCase = windows)) normalized.substring(prefix.length) else normalized
+        require(!relative.startsWith('/') && aiArtifactSegmentsValid(relative, windows))
+        require(windows || (!aiArtifactHasDrive(relative) && !relative.startsWith("\\\\")))
+        return relative
+    }
 }
+
+private fun aiArtifactHasDrive(path: String): Boolean = path.length >= 2 &&
+    (path[0] in 'A'..'Z' || path[0] in 'a'..'z') && path[1] == ':'
+
+private fun aiArtifactSegmentsValid(path: String, windows: Boolean): Boolean = path.split('/').all { part ->
+    val device = part.substringBefore('.').trimEnd(' ').uppercase(java.util.Locale.ROOT)
+    val reserved = device in setOf("CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$") ||
+        (device.length == 4 && (device.startsWith("COM") || device.startsWith("LPT")) && device.last() in "123456789¹²³")
+    part.isNotEmpty() && part != "." && part != ".." && (!windows ||
+        (part.none { it in "<>:\"|?*" } && !part.endsWith('.') && !part.endsWith(' ') && !reserved))
+}
+
+private fun aiArtifactRoot(directory: String, pathStyle: String): AiArtifactRoot {
+    require(directory.length in 1..4096 && directory.none(Char::isISOControl))
+    val drive = aiArtifactHasDrive(directory)
+    val network = directory.startsWith("\\\\") || directory.startsWith("//")
+    val windows = when (pathStyle) {
+        "windows" -> true
+        "posix" -> false
+        "" -> drive || network
+        else -> throw IllegalArgumentException("主机未提供支持的路径规则")
+    }
+    require(if (windows) drive || network else !drive && !network)
+    val normalized = if (windows) directory.replace('\\', '/') else directory
+    val root = normalized.trimEnd('/')
+    val path = when {
+        drive -> {
+            require(normalized.length >= 3 && normalized[2] == '/')
+            require(root.length == 2 || aiArtifactSegmentsValid(root.substring(3), true))
+            if (root.length == 2) "$root/" else root
+        }
+        windows -> {
+            require(root.startsWith("//"))
+            val share = root.substring(2)
+            require(share.split('/').size >= 2 && aiArtifactSegmentsValid(share, true))
+            root
+        }
+        else -> {
+            require(normalized.startsWith('/') && (root.isEmpty() || aiArtifactSegmentsValid(root.substring(1), false)))
+            root.ifEmpty { "/" }
+        }
+    }
+    return AiArtifactRoot(path, windows)
+}
+
+internal fun aiArtifactRelativePath(directory: String, value: String, pathStyle: String = ""): String =
+    aiArtifactRoot(directory, pathStyle).relative(value)
 
 internal data class AiFileLocation(val pcId: java.util.UUID, val sessionId: String, val directory: String, val filePath: String)
 internal fun aiArtifactLocation(session: AiConversation, value: String): AiFileLocation {
-    val relative = aiArtifactRelativePath(session.directory, value)
-    require(relative.split('/').all { it.isNotBlank() && it != "." && it.none { c -> c in "<>\"|?*" } })
-    val absolute = session.directory.replace('\\', '/')
-    require(absolute.matches(Regex("[A-Za-z]:/.*")) && absolute.none(Char::isISOControl))
-    val root = absolute.trimEnd('/')
-    val path = "$root/$relative".replace('/', '\\')
-    return AiFileLocation(session.pcId, session.id, path.substringBeforeLast('\\').let { if (it.endsWith(':')) "$it\\" else it }, path)
+    val root = aiArtifactRoot(session.directory, session.capabilities.pathStyle)
+    val relative = root.relative(value)
+    val parent = relative.substringBeforeLast('/', "")
+    return AiFileLocation(session.pcId, session.id,
+        root.native(if (parent.isEmpty()) root.path else root.prefix + parent), root.native(root.prefix + relative))
 }
 
 /** Sends changed messages only; host revisions and native state remain authoritative. */
 internal class AiWebUpdates {
     private var previous = emptyList<AiMessage>()
     private var initialized = false
+    private var lastStream = ""
     fun encode(session: AiConversation, busy: Boolean, uncertain: Boolean, dark: Boolean, scale: Float): JSONObject {
+        if (lastStream != session.streamId) { initialized = false; previous = emptyList(); lastStream = session.streamId }
         val old = previous.associateBy { it.id }
         val changed = session.messages.filter { old[it.id] != it }
         val result = JSONObject().put("reset", !initialized)
@@ -76,13 +131,15 @@ internal class AiWebUpdates {
                 .put("diff", session.diff).put("usage", session.usage).put("error", session.error)
                 .put("diffLength", session.diffLength).put("diffTruncated", session.diffTruncated).put("diffRead", session.capabilities.diffRead)
                 .put("artifacts", session.capabilities.artifacts).put("search", session.capabilities.search)
+                .put("agentFeatures", session.capabilities.agentFeatures).put("historyActions", session.capabilities.historyActions)
+                .put("pathStyle", session.capabilities.pathStyle).put("hostPlatform", session.capabilities.hostPlatform)
                 .put("dark", dark).put("fontScale", scale).put("language", java.util.Locale.getDefault().language)
                 .put("plan", runCatching { JSONArray(session.plan) }.getOrElse { JSONArray() })
                 .put("pending", JSONArray().apply { session.pending.forEach { pending -> put(JSONObject()
                     .put("id", pending.id).put("kind", pending.kind).put("title", pending.title).put("summary", pending.summary)
                     .put("detail", pending.detail).put("canApprove", pending.canApprove)
                     .put("questions", JSONArray().apply { pending.questions.forEach { q -> put(JSONObject().put("id", q.id)
-                        .put("text", q.text).put("options", JSONArray(q.options)).put("multiSelect", q.multiSelect)) } })) } }))
+                        .put("text", q.text).put("options", JSONArray(q.options)).put("multiSelect", q.multiSelect).put("required", q.required)) } })) } }))
             .put("messages", JSONArray().apply { changed.forEach { m -> put(JSONObject().put("id", m.id).put("role", m.role)
                 .put("kind", m.kind).put("text", m.text).put("title", m.title).put("summary", m.summary)
                 .put("status", m.status).put("fullLength", m.fullLength)) } })
@@ -166,7 +223,7 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
                         val request = runCatching { aiWebRequest(message.data.orEmpty()) }.getOrNull() ?: return@addWebMessageListener
                         val id = request.getString("id")
                         if (id in activeRequests) return@addWebMessageListener
-                        val command = request.getString("action") in setOf("interrupt", "answer")
+                        val command = request.getString("action") in setOf("interrupt", "answer", "review", "revert", "fork")
                         if (activeRequests.values.count { it == command } >= if (command) 1 else 4) {
                             reply(web, id, error = "请等待当前操作完成"); return@addWebMessageListener
                         }
@@ -191,19 +248,24 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
                                         require(offset in 0..262145 && version.length <= 100)
                                         workspace.readFeature(active, "diff.read", JSONObject().put("offset", offset).put("text", version))
                                     }
+                                    "history.actions" -> { check(active.capabilities.historyActions); workspace.readFeature(active, "history.actions", JSONObject()) }
+                                    "agent.features" -> {
+                                        check(active.capabilities.agentFeatures)
+                                        workspace.readFeature(active, "agent.features", JSONObject())
+                                    }
                                     "search", "artifacts" -> { val query = request.optString("query"); require(query.length <= 200)
                                         val offset = request.optLong("offset"); require(offset in 0..1000000)
                                         check(if (action == "search") active.capabilities.search else active.capabilities.artifacts)
                                         workspace.readFeature(active, action, JSONObject().put("text", query).put("offset", offset)) }
                                     "artifact.read", "open-file" -> {
                                         check(active.capabilities.artifacts)
-                                        val file = aiArtifactRelativePath(active.directory, request.getString(if (action == "open-file") "path" else "fileId"))
+                                        val file = aiArtifactRelativePath(active.directory, request.getString(if (action == "open-file") "path" else "fileId"), active.capabilities.pathStyle)
                                         val offset = request.optLong("offset"); val version = request.optString("version")
                                         require(offset in 0..50L * 1024 * 1024 && version.length <= 100)
                                         workspace.readFeature(active, "artifact.read", JSONObject().put("requestId", file).put("offset", offset).put("cursor", version))
                                     }
                                     "download" -> { check(active.capabilities.artifacts)
-                                        val file = aiArtifactRelativePath(active.directory, request.getString("fileId"))
+                                        val file = aiArtifactRelativePath(active.directory, request.getString("fileId"), active.capabilities.pathStyle)
                                         val version = request.getString("version"); require(version.length in 1..100)
                                         download(AiArtifactDownload(file, version, file.substringAfterLast('/'))); true }
                                     "open-directory" -> {
@@ -214,6 +276,12 @@ internal fun AiWebConversation(workspace: AiWorkspace, session: AiConversation, 
                                     "open-link" -> { val url = request.getString("url"); val uri = Uri.parse(url)
                                         require(url.length <= 4096 && uri.scheme in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.userInfo == null)
                                         external = url; true }
+                                    "review", "revert", "fork" -> {
+                                        check(active.capabilities.historyActions && active.canControl && active.state == "idle" && active.pending.isEmpty() && !workspace.busy && !workspace.uncertain)
+                                        require(request.optBoolean("confirmed"))
+                                        val turnId = request.optString("turnId"); require(turnId.length <= 256)
+                                        check(workspace.mutate(active.pcId, action, active, JSONObject().put("requestId", turnId))?.await() == true) { workspace.error.ifBlank { "操作尚未完成，请确认电脑回执。" } }; true
+                                    }
                                     "interrupt", "answer" -> {
                                         check(active.canControl && !workspace.busy && !workspace.uncertain)
                                         val extra = JSONObject()

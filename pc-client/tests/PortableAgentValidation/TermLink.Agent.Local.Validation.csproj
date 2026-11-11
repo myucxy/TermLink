@@ -10,5 +10,6 @@
     <ProjectReference Include="..\..\src\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\..\src\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\Unix\TermLink.Platform.Unix.csproj" />
+    <ProjectReference Include="..\..\src\MacOS\TermLink.Platform.MacOS.csproj" />
   </ItemGroup>
 </Project>

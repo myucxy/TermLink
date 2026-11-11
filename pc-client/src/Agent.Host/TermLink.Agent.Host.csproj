@@ -6,7 +6,11 @@
     <RootNamespace>TermLink.Agent.Host</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../Agent.Files/TermLink.Agent.Files.csproj" />
     <ProjectReference Include="..\Agent.Local\TermLink.Agent.Local.csproj" />
+    <ProjectReference Include="..\Agent.Connection\TermLink.Agent.Connection.csproj" />
+    <ProjectReference Include="../Agent.Terminal/TermLink.Agent.Terminal.csproj" />
+    <ProjectReference Include="..\Agent.AI\TermLink.Agent.AI.csproj" />
     <ProjectReference Include="..\Contracts\TermLink.Pc.Contracts.csproj" />
     <ProjectReference Include="..\Platform.Abstractions\TermLink.Platform.Abstractions.csproj" />
     <ProjectReference Include="..\Linux\TermLink.Platform.Linux.csproj" />

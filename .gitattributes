@@ -1,6 +1,10 @@
 * text=auto eol=lf
 # Preserve copied upstream license text, including its original trailing whitespace.
 /server/licenses/THIRD_PARTY_NOTICES.txt -whitespace
+/ios/TermLink/Resources/terminal-core-THIRD-PARTY-NOTICES.txt -whitespace
+# Keep already shared migration bytes immutable, including final blank lines.
+/server/migrations/000052_posix_shell_metadata.*.sql whitespace=-blank-at-eof
+/server/migrations/000054_portable_pwsh_metadata.*.sql whitespace=-blank-at-eof
 *.bat text eol=crlf
 *.cmd text eol=crlf
 

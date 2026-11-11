@@ -173,7 +173,51 @@ public sealed record PcAgentIdentity(
 
 public sealed record AiAgentCapability(string Id, string Name, string Path, string Version, string Status, string Strategy = "native")
 {
-    public string Detail => Strategy == "desktop_remote" ? (Status == "available" ? "桌面远控 · 已配置地址" : "桌面远控 · 请重新保存地址") : $"{Version} · " + (Status switch {
+    public string Protocol { get; init; } = "";
+    public string ProtocolStatus { get; init; } = "not_checked";
+    public string AuthenticationStatus { get; init; } = "not_checked";
+    public string DetectionCode { get; init; } = "";
+    public bool RemoteExecutionAvailable { get; init; }
+    public string DetectionSummary => DetectionCode switch
+    {
+        "AI_RUNTIME_MISSING" => "缺少 CLI 需要的运行时，请检查 Node / Bun 等安装。",
+        "AI_RUNTIME_BLOCKED" => "系统拒绝执行此 CLI，请检查安装、文件权限或 macOS 安全提示。",
+        "AI_SHIM_UNSUPPORTED" => "启动脚本不能安全解析，请使用直接 CLI 或标准运行时入口。",
+        "AI_VERSION_MISMATCH" => "命令返回的版本或品牌不匹配，请确认安装路径。",
+        "AI_PROBE_TIMEOUT" or "AI_DISCOVERY_TIMEOUT" => "检测超时，探测进程已停止，可修复 CLI 后重试。",
+        "AI_PROBE_OUTPUT_LIMIT" => "检测输出超出安全上限，探测进程已停止。",
+        "AI_PROTOCOL_UNSUPPORTED" => "CLI 可启动，但当前版本未提供所需结构化接口。",
+        "AI_PROBE_FAILED" or "AI_EXECUTABLE_INVALID" => "CLI 检测失败，请检查安装路径与运行环境。",
+        _ => "",
+    };
+    public bool HasDetectionIssue => DetectionSummary.Length > 0;
+    public string ProtocolSummary => ProtocolStatus switch
+    {
+        "available" => $"{Protocol} · 结构化协议检测通过",
+        "incompatible" => "当前安装未提供所需结构化协议",
+        "probe_failed" => "协议检测未完成 · 可重试",
+        _ => "协议尚未检测",
+    };
+    public string AuthenticationSummary => AuthenticationStatus switch
+    {
+        "verified" => "当前会话已验证认证",
+        "required" => "需要在对应 Agent 中登录或配置授权",
+        "isolated_required" => "TermLink 独立 Codex 运行时需单独配置授权；不会复用已有 Codex 登录",
+        _ => "模型授权待确认 · 检测不会读取第三方凭据",
+    };
+    public string RemoteSummary => RemoteExecutionAvailable
+        ? "原生远程链路已接入 · 模型调用仍需单独验证"
+        : "当前构建尚未接入此 Agent 的远程执行";
+    public string Detail => Strategy == "local_cli" ? (Status switch
+    {
+        "detected" => $"{Version} · 本机 CLI 可启动 · 远程 AI 尚未接通",
+        "missing" => "未检测到本机 CLI",
+        "desktop_only" => "已安装桌面应用 · 未检测到公共 CLI",
+        "runtime_missing" => "已找到 CLI · 缺少所需运行时",
+        "runtime_blocked" => "已找到 CLI · 系统阻止启动",
+        _ => "CLI 检测未通过 · 可重新检测或查看官方说明",
+    }) : InstallationDetail;
+    private string InstallationDetail => Strategy == "desktop_remote" ? "旧版网页接入已停用 · 请升级电脑端" : $"{Version} · " + (Status switch {
         "available" => "协议可用 · 认证尚未验证",
         "missing" => "未检测到安装",
         "runtime_missing" => "缺少运行时",
@@ -182,6 +226,69 @@ public sealed record AiAgentCapability(string Id, string Name, string Path, stri
         "incompatible" => "结构化协议未支持",
         _ => "检测失败，可重试"
     });
+}
+
+public enum CapabilityCheckStatus
+{
+    Unknown = 0,
+    Available = 1,
+    Limited = 2,
+    Missing = 3,
+    NotIntegrated = 4,
+    NeedsAuthorization = 5,
+    NotRequired = 6,
+}
+
+/// <summary>Local diagnostics only. Never inferred as a server wire capability.</summary>
+public sealed record CapabilityCheck(string Id, string Category, string Title, CapabilityCheckStatus Status, string Detail, string Action = "")
+{
+    public string StatusText => Status switch
+    {
+        CapabilityCheckStatus.Available => "可用",
+        CapabilityCheckStatus.Limited => "部分可用",
+        CapabilityCheckStatus.Missing => "缺失",
+        CapabilityCheckStatus.NotIntegrated => "尚未接入",
+        CapabilityCheckStatus.NeedsAuthorization => "需要授权",
+        CapabilityCheckStatus.NotRequired => "当前无需",
+        _ => "待确认",
+    };
+    public bool HasAction => Action.Length > 0;
+}
+
+public sealed record CapabilityDetectionReport(DateTimeOffset ObservedAt, PcPlatform Platform,
+    IReadOnlyList<CapabilityCheck> Checks, IReadOnlyList<AiAgentCapability> Agents);
+
+public static class CapabilityDetectionValidator
+{
+    public static void Validate(CapabilityDetectionReport report)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+        if (!Enum.IsDefined(report.Platform) || report.Platform == PcPlatform.Unknown || report.ObservedAt == default ||
+            report.Checks is null || report.Agents is null || report.Checks.Count > 64 || report.Agents.Count > 16)
+            throw new InvalidDataException("CAPABILITY_REPORT_INVALID");
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var check in report.Checks)
+        {
+            if (check is null || !ids.Add(check.Id) || !Enum.IsDefined(check.Status)) throw new InvalidDataException("CAPABILITY_REPORT_INVALID");
+            Text(check.Id, 64, false); Text(check.Category, 64, false); Text(check.Title, 160, false);
+            Text(check.Detail, 2048, true); Text(check.Action, 64, true);
+        }
+        ids.Clear();
+        foreach (var agent in report.Agents)
+        {
+            if (agent is null || !ids.Add(agent.Id)) throw new InvalidDataException("CAPABILITY_REPORT_INVALID");
+            Text(agent.Id, 64, false); Text(agent.Name, 160, false); Text(agent.Path, 4096, true);
+            Text(agent.Version, 512, true); Text(agent.Status, 64, false); Text(agent.Strategy, 64, false);
+            Text(agent.Protocol, 64, true); Text(agent.ProtocolStatus, 64, false);
+            Text(agent.AuthenticationStatus, 64, false); Text(agent.DetectionCode, 64, true);
+        }
+    }
+
+    private static void Text(string text, int max, bool empty)
+    {
+        if (text is null || (!empty && string.IsNullOrWhiteSpace(text)) || text.Any(char.IsControl) ||
+            System.Text.Encoding.UTF8.GetByteCount(text) > max) throw new InvalidDataException("CAPABILITY_REPORT_INVALID");
+    }
 }
 
 public sealed record TerminalCommandCapability(

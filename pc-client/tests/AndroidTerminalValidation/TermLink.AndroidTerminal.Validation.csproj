@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><NoWarn>$(NoWarn);CS0649</NoWarn></PropertyGroup><ItemGroup><ProjectReference Include="../../src/Agent.Terminal/TermLink.Agent.Terminal.csproj" /><ProjectReference Include="../../src/Unix/TermLink.Platform.Unix.csproj" /></ItemGroup></Project>

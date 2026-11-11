@@ -367,14 +367,6 @@ public sealed class WindowsDesktopOperations : IDesktopOperations
         return ValueTask.FromResult(PresentationText.Pick("已打开官方安装与登录说明", "Official installation and sign-in instructions opened"));
     }
 
-    public ValueTask<string> OpenZcodeRemoteAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        var url = TermLink.Ai.ZcodeRemoteAddressStore.Default.Read();
-        if (string.IsNullOrWhiteSpace(url)) throw new InvalidOperationException("请先保存有效的 ZCode 远控地址。");
-        Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
-        return ValueTask.FromResult(PresentationText.Pick("已在浏览器打开，请确认远控可用；地址失效时重新保存。", "Opened in the browser. Confirm remote access works; save a new address if it has expired."));
-    }
 
     public ValueTask<string> OpenDiagnosticsDirectoryAsync(CancellationToken cancellationToken)
     {

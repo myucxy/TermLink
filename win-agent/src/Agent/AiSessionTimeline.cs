@@ -11,14 +11,26 @@ namespace TermLink.Agent;
 
 internal sealed partial class AiAgentSession
 {
-    private readonly string streamId = Guid.NewGuid().ToString("D");
+    private string streamId = Guid.NewGuid().ToString("D");
     private readonly Dictionary<string, int> messageIndex = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> messageRevisions = new(StringComparer.Ordinal);
     private long revision, historyFloor, historyBase, messageCharacters, turnStartedAtMs, lastActivityAtMs;
-    private string phase = "idle", claudeStreamingMessage = "";
-    private readonly Dictionary<int, string> claudeStreamBlocks = new();
-    private readonly Dictionary<string, int> claudeFinalBlocks = new(StringComparer.Ordinal);
-    private int claudeStoppedBlock = -1;
+    private string phase = "idle";
+    private readonly Dictionary<string, ClaudeStreamState> claudeStreams = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> claudeTaskOwners = new(StringComparer.Ordinal);
+    private sealed class ClaudeStreamState
+    {
+        internal string MessageId = "";
+        internal int StoppedBlock = -1;
+        internal readonly Dictionary<int, string> Blocks = new();
+        internal readonly Dictionary<int, ClaudeToolInput> Tools = new();
+        internal readonly Dictionary<string, int> Finals = new(StringComparer.Ordinal);
+    }
+    private sealed class ClaudeToolInput
+    {
+        internal string Id = "", Input = "";
+        internal bool Truncated;
+    }
     private JsonElement? plan;
     private string diffVersion = "";
     private bool diffTruncated;
@@ -108,6 +120,7 @@ internal sealed partial class AiAgentSession
 
     private void BeginTurn()
     {
+        InvalidateHistoryActions();
         lock (sync) {
             if (state != "running" || turnStartedAtMs == 0) turnStartedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             state = "running"; phase = "waiting";
@@ -147,49 +160,114 @@ internal sealed partial class AiAgentSession
 
     private void ReceiveClaudeStream(JsonElement value)
     {
-        var e = P(value, "event"); var type = S(e, "type");
-        if (type == "message_start") {
-            claudeStreamingMessage = S(P(e, "message"), "id");
-            claudeStreamBlocks.Clear(); claudeFinalBlocks.Clear(); claudeStoppedBlock = -1;
-            return;
+        lock (sync) {
+            var e = P(value, "event"); var type = S(e, "type");
+            var parent = S(value, "parent_tool_use_id");
+            if (type == "error") { RecordAgentError(P(e, "error")); return; }
+            if (type == "message_start") {
+                var id = S(P(e, "message"), "id"); if (id.Length == 0) return;
+                if (!claudeStreams.ContainsKey(parent) && claudeStreams.Count >= 64) return;
+                claudeStreams[parent] = new ClaudeStreamState { MessageId = id };
+                return;
+            }
+            if (!claudeStreams.TryGetValue(parent, out var stream)) return;
+            var index = P(e, "index").ValueKind == JsonValueKind.Number && P(e, "index").TryGetInt32(out var number) ? number : -1;
+            if (index is < 0 or > 1024) return;
+            var key = stream.MessageId + "/" + index;
+            if (type == "content_block_start") {
+                var block = P(e, "content_block"); var blockType = S(block, "type");
+                stream.StoppedBlock = -1; stream.Blocks[index] = blockType;
+                if (blockType == "text") Put(key, "assistant", S(block, "text"));
+                else if (blockType == "thinking") Put(key, "assistant", S(block, "thinking"), kind: "reasoning", status: "running");
+                else if (blockType == "tool_use" && S(block, "id").Length > 0) {
+                    stream.Tools[index] = new ClaudeToolInput { Id = S(block, "id") };
+                    PutTool("tool-" + S(block, "id"), block, "tool_use", "running");
+                }
+            } else if (type == "content_block_delta") {
+                var delta = P(e, "delta"); var deltaType = S(delta, "type");
+                if (deltaType == "text_delta") { stream.Blocks[index] = "text"; Put(key, "assistant", S(delta, "text"), true); }
+                else if (deltaType == "thinking_delta") { stream.Blocks[index] = "thinking"; Put(key, "assistant", S(delta, "thinking"), true, "reasoning", "running"); }
+                else if (deltaType == "input_json_delta" && stream.Tools.TryGetValue(index, out var tool)) {
+                    var addition = S(delta, "partial_json");
+                    var remaining = Math.Max(0, Math.Min(32768 - tool.Input.Length,
+                        4 * 1024 * 1024 - claudeStreams.Values.Sum(s => s.Tools.Values.Sum(t => t.Input.Length))));
+                    if (addition.Length > remaining) tool.Truncated = true;
+                    tool.Input += AiToolPresentation.Prefix(addition, remaining);
+                    PublishClaudeInput(tool);
+                }
+                // Signatures and redacted thinking are never exposed as thoughts.
+            } else if (type == "content_block_stop") {
+                stream.StoppedBlock = index;
+                if (stream.Tools.TryGetValue(index, out var tool)) {
+                    PublishClaudeInput(tool);
+                    // End of tool INPUT is not end of tool EXECUTION.
+                } else {
+                    EnsureMessageIndex();
+                    if (messageIndex.TryGetValue(key, out var at)) ReplaceMessage(at, messages[at] with { Status = "completed" });
+                }
+            }
         }
-        if (claudeStreamingMessage.Length == 0) return;
-        var index = P(e, "index").ValueKind == JsonValueKind.Number ? P(e, "index").GetInt32() : -1;
-        if (index is < 0 or > 1024) return;
-        var key = claudeStreamingMessage + "/" + index;
-        if (type == "content_block_start") {
-            var block = P(e, "content_block");
-            claudeStoppedBlock = -1;
-            claudeStreamBlocks[index] = S(block, "type");
-            if (S(block, "type") == "text") Put(key, "assistant", S(block, "text"));
-            else if (S(block, "type") == "thinking") Put(key, "assistant", S(block, "thinking"), kind: "reasoning", status: "running");
-        } else if (type == "content_block_delta") {
-            var delta = P(e, "delta");
-            // Some compatible providers omit block_start; retain the stream index anyway.
-            if (S(delta, "type") == "text_delta") claudeStreamBlocks[index] = "text";
-            else if (S(delta, "type") == "thinking_delta") claudeStreamBlocks[index] = "thinking";
-            if (S(delta, "type") == "text_delta") Put(key, "assistant", S(delta, "text"), true);
-            else if (S(delta, "type") == "thinking_delta") Put(key, "assistant", S(delta, "thinking"), true, "reasoning", "running");
-            // Signatures/redacted blocks and private protocol metadata are not thoughts.
-        } else if (type == "content_block_stop") {
-            claudeStoppedBlock = index;
-            lock (sync) { EnsureMessageIndex(); if (messageIndex.TryGetValue(key, out var at)) ReplaceMessage(at, messages[at] with { Status = "completed" }); }
+    }
+
+    private void PublishClaudeInput(ClaudeToolInput tool)
+    {
+        JsonElement input = default;
+        if (!tool.Truncated && tool.Input.Length > 0) {
+            try { using var document = JsonDocument.Parse(tool.Input); input = document.RootElement.Clone(); }
+            catch (JsonException) { /* A partial JSON fragment is expected until input finishes. */ }
         }
+        // Avoid publishing half a secret-bearing JSON string before it can be
+        // inspected structurally. Progress still changes with every input delta.
+        if (input.ValueKind != JsonValueKind.Undefined)
+            PutTool("tool-" + tool.Id, JsonSerializer.SerializeToElement(new { input }), "tool_use", "running", progress: "");
+        else PutTool("tool-" + tool.Id, JsonSerializer.SerializeToElement(new {
+            schema = AiToolPresentation.Schema, truncated = tool.Truncated,
+        }), "tool_use", "running", progress: tool.Truncated ? "工具参数超过显示限制" : "正在接收工具参数（" + tool.Input.Length + " 字符）");
     }
 
     private int ClaudeFinalBlockIndex(JsonElement value, JsonElement message, JsonElement part, int index, int count)
     {
-        // Claude stream-json emits an assistant envelope for EACH completed block.
-        // Its singleton content[0] still belongs to the original stream index (e.g.
-        // thinking /0, text /1). Full multi-block snapshots retain their own indices.
-        if (count != 1 || S(message, "id") != claudeStreamingMessage) return index;
+        // Singleton assistant envelopes still refer to the original stream index.
+        if (count != 1 || !claudeStreams.TryGetValue(S(value, "parent_tool_use_id"), out var stream) || S(message, "id") != stream.MessageId) return index;
         var uuid = S(value, "uuid");
-        if (uuid.Length > 0 && claudeFinalBlocks.TryGetValue(uuid, out var known)) return known;
+        if (uuid.Length > 0 && stream.Finals.TryGetValue(uuid, out var known)) return known;
         var type = S(part, "type");
-        var resolved = claudeStreamBlocks.GetValueOrDefault(claudeStoppedBlock) == type ? claudeStoppedBlock
-            : claudeStreamBlocks.Where(b => b.Value == type).Select(b => b.Key).DefaultIfEmpty(index).Max();
-        if (uuid.Length > 0 && claudeFinalBlocks.Count < 1025) claudeFinalBlocks[uuid] = resolved;
+        var resolved = stream.Blocks.GetValueOrDefault(stream.StoppedBlock) == type ? stream.StoppedBlock
+            : stream.Blocks.Where(b => b.Value == type).Select(b => b.Key).DefaultIfEmpty(index).Max();
+        if (uuid.Length > 0 && stream.Finals.Count < 1025) stream.Finals[uuid] = resolved;
         return resolved;
+    }
+
+    private void ReceiveClaudeTask(JsonElement value)
+    {
+        var taskId = S(value, "task_id"); if (taskId.Length is 0 or > 512) return;
+        var toolId = S(value, "tool_use_id");
+        lock (sync) {
+            var key = toolId.Length > 0 ? "tool-" + toolId : claudeTaskOwners.GetValueOrDefault(taskId, "claude/task/" + taskId);
+            if (!claudeTaskOwners.ContainsKey(taskId) && claudeTaskOwners.Count >= 256) claudeTaskOwners.Remove(claudeTaskOwners.Keys.First());
+            claudeTaskOwners[taskId] = key;
+            EnsureMessageIndex();
+            var children = new List<JsonElement>(); JsonElement prior = default;
+            if (messageIndex.TryGetValue(key, out var index)) {
+                using var document = JsonDocument.Parse(messages[index].Text);
+                var old = P(document.RootElement, "children");
+                if (old.ValueKind == JsonValueKind.Array) {
+                    children.AddRange(old.EnumerateArray().Where(c => S(c, "id") != taskId).Take(63).Select(c => c.Clone()));
+                    var found = old.EnumerateArray().FirstOrDefault(c => S(c, "id") == taskId);
+                    if (found.ValueKind != JsonValueKind.Undefined) prior = found.Clone();
+                }
+            }
+            var update = S(value, "subtype") == "task_updated" ? P(value, "patch") : value;
+            var oldStatus = S(prior, "status");
+            var status = AiToolPresentation.Status(update, oldStatus.Length > 0 ? oldStatus : S(value, "subtype") == "task_notification" ? "unknown" : "running");
+            if (oldStatus is "completed" or "failed" or "cancelled" && status is "running" or "unknown") status = oldStatus;
+            var prompt = S(value, "description"); if (prompt.Length == 0) prompt = S(prior, "prompt");
+            children.Add(JsonSerializer.SerializeToElement(new { id = taskId, status, prompt }));
+            var patch = new Dictionary<string, object> { ["schema"] = AiToolPresentation.Schema, ["kind"] = "agent", ["children"] = children };
+            var progress = S(value, "summary").Length > 0 ? S(value, "summary") : S(value, "description");
+            if (progress.Length > 0) patch["progress"] = progress;
+            PutTool(key, JsonSerializer.SerializeToElement(patch), status: key.StartsWith("claude/task/", StringComparison.Ordinal) ? status : "");
+        }
     }
 
     private void CodexReasoning(JsonElement item)
@@ -207,7 +285,8 @@ internal sealed partial class AiAgentSession
         if (steps.ValueKind != JsonValueKind.Array) return;
         lock (sync) {
             plan = JsonSerializer.SerializeToElement(steps.EnumerateArray().Take(64).Select(step => new {
-                step = Clip(S(step, "step"), 1000), status = S(step, "status") is "completed" or "in_progress" ? S(step, "status") : "pending"
+                step = Clip(S(step, "step").Length > 0 ? S(step, "step") : S(step, "content"), 1000),
+                status = S(step, "status") is "completed" or "in_progress" ? S(step, "status") : "pending"
             }).ToArray());
             PublishChange();
         }

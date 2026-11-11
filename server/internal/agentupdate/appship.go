@@ -45,10 +45,22 @@ type Offer struct {
 	SHA256            [32]byte
 	SHA256Hex         string
 	SignerFingerprint *string
+	// Platform metadata is explicit for the downstream installer/job contract.
+	// AppleTeamID is independent of the Windows Authenticode thumbprint.
+	Platform     string
+	Architecture string
+	ArtifactType string
+	AppleTeamID  string
 }
 
 type Catalog interface {
 	LatestWindowsStable(context.Context, int64) (Offer, error)
+}
+
+// PlatformCatalog is optional so existing Windows-only catalog implementations
+// remain source compatible. Consumers must reject platforms they cannot resolve.
+type PlatformCatalog interface {
+	LatestStable(context.Context, string, string, int64) (Offer, error)
 }
 
 type AppShipCatalog struct {
@@ -60,6 +72,7 @@ type AppShipCatalog struct {
 	// without it, or with a different signer, are rejected before they can
 	// reach agents (including REQUIRED/forced upgrade decisions).
 	signerFingerprintAnchor string
+	appleTeamIDAnchor       string
 }
 
 type appShipResolver interface {
@@ -175,15 +188,22 @@ func newAppShipCatalog(baseURL string, client *http.Client, network appShipNetwo
 }
 
 func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild int64) (Offer, error) {
+	return c.latestStable(ctx, ApplicationSlug, "windows", "x64", currentBuild, func(body []byte) (Offer, error) {
+		return parseOffer(body, currentBuild, c.baseURL, c.signerFingerprintAnchor)
+	})
+}
+
+func (c *AppShipCatalog) latestStable(ctx context.Context, slug, platform, architecture string, currentBuild int64,
+	parse func([]byte) (Offer, error)) (Offer, error) {
 	if c == nil || c.baseURL == nil || c.client == nil || ctx == nil || currentBuild < 0 {
 		return Offer{}, ErrUnavailable
 	}
-	baseURL, client, signerAnchor := c.baseURL, c.client, c.signerFingerprintAnchor
+	baseURL, client := c.baseURL, c.client
 	endpoint := *baseURL
-	endpoint.Path = "/api/v1/apps/" + ApplicationSlug + "/updates"
+	endpoint.Path = "/api/v1/apps/" + slug + "/updates"
 	query := url.Values{}
-	query.Set("platform", "windows")
-	query.Set("arch", "x64")
+	query.Set("platform", platform)
+	query.Set("arch", architecture)
 	query.Set("channel", "stable")
 	query.Set("build", strconv.FormatInt(currentBuild, 10))
 	endpoint.RawQuery = query.Encode()
@@ -219,7 +239,7 @@ func (c *AppShipCatalog) LatestWindowsStable(ctx context.Context, currentBuild i
 	if len(body) == 0 || len(body) > maximumResponseBytes {
 		return Offer{}, fmt.Errorf("%w: response size is invalid", ErrUnavailable)
 	}
-	return parseOffer(body, currentBuild, baseURL, signerAnchor)
+	return parse(body)
 }
 
 func appShipDialContext(resolver appShipResolver, dial appShipDialFunc, allowedPrivateIPs ...net.IP) appShipDialFunc {
@@ -454,6 +474,7 @@ func parseOffer(body []byte, currentBuild int64, trustedOrigin *url.URL, signerF
 		ReleaseNotes: stringAt(release, "releaseNotes", "release_notes", "notes"),
 		DownloadURL:  downloadURL, ArtifactFilename: filename, SizeBytes: size,
 		SHA256: digest, SHA256Hex: hashText, SignerFingerprint: signerPointer,
+		Platform: "windows", Architecture: "x64", ArtifactType: "exe",
 	}, nil
 }
 
