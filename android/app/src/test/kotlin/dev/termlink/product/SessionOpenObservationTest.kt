@@ -72,6 +72,6 @@ class SessionOpenObservationTest {
             }
             fail("Open failure was swallowed")
         } catch (_: SessionOpenException) { }
-        assertTrue(published.isEmpty(), "A previous account must not replace the successor's UI state")
+        assertTrue("A previous account must not replace the successor's UI state", published.isEmpty())
     }
 }

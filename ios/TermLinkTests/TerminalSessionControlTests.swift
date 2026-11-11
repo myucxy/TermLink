@@ -20,16 +20,18 @@ import XCTest
     func testTerminateWaitsForAuthorizationAndConfirmedAttachThenUnsubscribes() async throws {
         var events: [String] = []
         try await TerminalSessionControl.terminateUnopened(
+            reset: { events.append("reset") },
             authorize: { events.append("authorize") },
             attach: { events.append("attach"); return self.attachResult() },
             terminate: { events.append("terminate"); return self.terminateResult() },
             unsubscribe: { events.append("unsubscribe") })
-        XCTAssertEqual(events, ["authorize", "attach", "terminate", "unsubscribe"])
+        XCTAssertEqual(events, ["reset", "authorize", "attach", "terminate", "unsubscribe"])
     }
     func testRejectedAuthorizationNeverAttachesOrTerminates() async {
         var events: [String] = []
         do {
             try await TerminalSessionControl.terminateUnopened(
+                reset: {},
                 authorize: { throw ClientError.authentication },
                 attach: { events.append("attach"); return self.attachResult() },
                 terminate: { events.append("terminate"); return self.terminateResult() },
@@ -41,7 +43,7 @@ import XCTest
         for response in [attachResult(error: "TERMINAL_STATE_UNSUPPORTED"), attachResult(state: "future_state")] {
             var events: [String] = []
             do {
-                try await TerminalSessionControl.terminateUnopened(authorize: {}, attach: { response },
+                try await TerminalSessionControl.terminateUnopened(reset: {}, authorize: {}, attach: { response },
                     terminate: { events.append("terminate"); return self.terminateResult() },
                     unsubscribe: { events.append("unsubscribe") })
                 XCTFail("Unconfirmed attach must fail closed")
@@ -52,7 +54,7 @@ import XCTest
         for failAttach in [true, false] {
             var unsubscribed = false
             do {
-                try await TerminalSessionControl.terminateUnopened(authorize: {},
+                try await TerminalSessionControl.terminateUnopened(reset: {}, authorize: {},
                     attach: { if failAttach { throw ClientError.cancelled }; return self.attachResult() },
                     terminate: { self.terminateResult(accepted: false) },
                     unsubscribe: { unsubscribed = true })
