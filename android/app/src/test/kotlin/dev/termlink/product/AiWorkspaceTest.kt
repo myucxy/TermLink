@@ -241,15 +241,19 @@ class AiWorkspaceTest {
             workspace.mutate(pc, "send", value, JSONObject().put("text", "hello"))
             assertTrue(workspace.uncertain)
             assertEquals("hello", workspace.drafts[sessionId])
+            val uncertainRequest = requests.last()
             workspace.refresh(pc)
-            assertTrue(workspace.error.isNotEmpty())
+            // Catalog refresh is read-only and must neither clear nor duplicate the pending mutation.
+            assertTrue(workspace.uncertain)
+            assertEquals("catalog", JSONObject(requests.last()).getString("action"))
+            val afterDiscovery = requests.size
             workspace.mutate(pc, "send", value, JSONObject().put("text", "another"))
-            assertEquals(2, requests.size)
+            assertEquals(afterDiscovery, requests.size)
             // Process recreation recovers the exact encrypted request instead of inventing a new operation ID.
             val restored = AiWorkspace(repository, scope, prefs)
             assertTrue(restored.uncertain)
             restored.retryUncertain()
-            assertEquals(requests[1], requests[2])
+            assertEquals(uncertainRequest, requests.last())
             assertFalse(restored.uncertain)
             val before = requests.size
             workspace.closeView(sessionId)
