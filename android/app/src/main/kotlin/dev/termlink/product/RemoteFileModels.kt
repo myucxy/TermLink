@@ -108,12 +108,17 @@ enum class RemoteShellType(val wireValue: String) {
     COMMAND_PROMPT("command-prompt"),
     WINDOWS_POWERSHELL("windows-powershell"),
     POWERSHELL_7("powershell-7"),
-    WSL("wsl");
+    WSL("wsl"),
+    BASH("bash"),
+    ZSH("zsh"),
+    SH("sh"),
+    FISH("fish"),
+    PWSH("pwsh");
 
     companion object {
         fun fromWireValue(value: String): RemoteShellType =
             entries.firstOrNull { it.wireValue == value }
-                ?: error("Unsupported Windows shell type")
+                ?: error("Unsupported shell type")
     }
 }
 
@@ -140,6 +145,11 @@ internal fun supportedRemoteTerminalCommands(pc: PcSummary): List<TerminalComman
                     RemoteShellType.WINDOWS_POWERSHELL -> "Windows PowerShell"
                     RemoteShellType.POWERSHELL_7 -> "PowerShell 7"
                     RemoteShellType.WSL -> "WSL"
+                    RemoteShellType.BASH -> "Bash"
+                    RemoteShellType.ZSH -> "Zsh"
+                    RemoteShellType.SH -> "sh"
+                    RemoteShellType.FISH -> "Fish"
+                    RemoteShellType.PWSH -> "PowerShell"
                 },
                 shellType = shell.wireValue,
                 source = "legacy",
@@ -204,7 +214,8 @@ internal fun remoteDirectoryFavoriteAccountScope(serverUrl: String?, accountLabe
 }
 
 private fun remoteFavoritePathKey(path: String): String =
-    path.replace('/', '\\').trimEnd('\\').lowercase(Locale.ROOT)
+    if (path.startsWith('/')) path.trimEnd('/').ifEmpty { "/" }
+    else path.replace('/', '\\').trimEnd('\\').lowercase(Locale.ROOT)
 
 internal interface RemoteDirectoryFavoriteStore {
     fun load(accountScope: String): List<RemoteDirectoryFavorite>

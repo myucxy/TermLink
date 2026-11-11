@@ -6,6 +6,8 @@ namespace TermLink.Desktop;
 
 public sealed class PreviewAgentClient : IAgentClient
 {
+    public bool SupportsTerminalCommandEditing => false;
+    public bool SupportsRemoteSessions => false;
     private readonly PlatformDescriptor descriptor;
     private readonly bool fixtureEnabled;
     private long revision = 1;
@@ -86,7 +88,7 @@ public sealed class PreviewAgentClient : IAgentClient
             descriptor.Platform,
             descriptor.Architecture,
             descriptor.PlatformVersion,
-            "0.2.0-preview.1");
+            DesktopProductInfo.Version);
         if (!fixtureEnabled)
         {
             return AgentStatusSnapshot.Disconnected(
@@ -99,6 +101,7 @@ public sealed class PreviewAgentClient : IAgentClient
         }
 
         var observedAt = DateTimeOffset.UtcNow;
+        var windows = descriptor.Platform == PcPlatform.Windows;
         return new AgentStatusSnapshot(
             Volatile.Read(ref revision),
             observedAt,
@@ -118,17 +121,21 @@ public sealed class PreviewAgentClient : IAgentClient
                 PcCapabilityIds.FileOperationsV1,
                 PcCapabilityIds.TerminalCommandsV1,
             },
-            new[]
+            windows ? new[]
             {
                 new TerminalCommandCapability("pwsh", "PowerShell", "pwsh", Array.Empty<string>(), true),
                 new TerminalCommandCapability("wsl", "WSL", "wsl", Array.Empty<string>(), true),
+            } : new[]
+            {
+                new TerminalCommandCapability("zsh", "Z shell", "/bin/zsh", new[] { "-l" }, true, false),
+                new TerminalCommandCapability("sh", "POSIX shell", "/bin/sh", Array.Empty<string>(), true, false),
             },
             new[]
             {
                 new ManagedSessionSnapshot(
                     Guid.Parse("72a67cd4-ee16-499b-b479-ce00ecae6694"),
-                    "PowerShell · Avalonia preview",
-                    "pwsh",
+                    windows ? "PowerShell · Avalonia preview" : "Z shell · Avalonia preview",
+                    windows ? "pwsh" : "zsh",
                     ManagedSessionState.Connected,
                     1,
                     observedAt,

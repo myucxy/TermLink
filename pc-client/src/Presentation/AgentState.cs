@@ -8,12 +8,22 @@ namespace TermLink.Presentation;
 
 public interface IAgentClient
 {
+    bool SupportsAiAgentDetection => false;
+    bool SupportsCapabilityDetection => false;
+    ValueTask<CapabilityDetectionReport> DetectCapabilitiesAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromException<CapabilityDetectionReport>(new PlatformNotSupportedException("Capability detection is unavailable."));
+    bool SupportsTerminalCommandEditing => true;
+    bool SupportsRemoteSessions => true;
+    bool SupportsTerminalCreation => false;
+    ValueTask<Guid> StartTerminalAsync(string commandId, string directory, CancellationToken token) =>
+        ValueTask.FromException<Guid>(new PlatformNotSupportedException());
+    bool SupportsBrowserAuthorizationCancellation => SupportsBrowserAuthorizationControls;
+    bool SupportsCompleteShutdown => false;
+    ValueTask ShutdownCompletelyAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromException(new PlatformNotSupportedException("Complete Agent shutdown is unavailable on this platform."));
     bool SupportsBrowserAuthorizationControls => false;
     ValueTask ControlBrowserAuthorizationAsync(bool cancel, CancellationToken cancellationToken) =>
         ValueTask.FromException(new PlatformNotSupportedException("Browser authorization controls are unavailable."));
-    bool SupportsZcodeRemoteConfiguration => false;
-    ValueTask ConfigureZcodeRemoteAsync(string url, CancellationToken cancellationToken) =>
-        ValueTask.FromException(new PlatformNotSupportedException("ZCode remote configuration is unavailable on this platform."));
     ValueTask<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken cancellationToken) =>
         ValueTask.FromResult<IReadOnlyList<AiAgentCapability>>(Array.Empty<AiAgentCapability>());
     ValueTask<AgentStatusSnapshot> GetStatusAsync(bool forceRefresh, CancellationToken cancellationToken);
@@ -151,6 +161,7 @@ public sealed class AgentStateStore : IAsyncDisposable
     private Task? activeRefresh;
     private Task? polling;
     private AgentStatusSnapshot? current;
+    private bool refreshFailed;
     private bool disposed;
 
     public AgentStateStore(IAgentClient client, TimeSpan? interval = null)
@@ -167,6 +178,7 @@ public sealed class AgentStateStore : IAsyncDisposable
     }
 
     public event EventHandler<AgentStatusSnapshot>? Changed;
+    public event EventHandler<Exception>? RefreshFailed;
 
     public Task RefreshAsync(bool forceRefresh = false, CancellationToken cancellationToken = default)
     {
@@ -174,7 +186,10 @@ public sealed class AgentStateStore : IAsyncDisposable
         {
             ObjectDisposedException.ThrowIf(disposed, this);
             if (activeRefresh is { IsCompleted: false }) return activeRefresh.WaitAsync(cancellationToken);
-            activeRefresh = RefreshCoreAsync(forceRefresh, lifetime.Token);
+            // IAgentClient may enter a synchronous platform credential API
+            // before its first await. Keep every refresh off the caller/UI
+            // thread while retaining this one owned request across callers.
+            activeRefresh = Task.Run(() => RefreshCoreAsync(forceRefresh, lifetime.Token), lifetime.Token);
             return activeRefresh.WaitAsync(cancellationToken);
         }
     }
@@ -184,22 +199,25 @@ public sealed class AgentStateStore : IAsyncDisposable
         lock (synchronization)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
-            polling ??= PollAsync(lifetime.Token);
+            polling ??= Task.Run(() => PollAsync(lifetime.Token), lifetime.Token);
         }
     }
 
     private async Task RefreshCoreAsync(bool forceRefresh, CancellationToken cancellationToken)
     {
         var next = await client.GetStatusAsync(forceRefresh, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
         PcContractValidator.Validate(next);
         var publish = false;
         lock (synchronization)
         {
-            if (current is null || current.Revision != next.Revision)
+            cancellationToken.ThrowIfCancellationRequested();
+            if (current is null || current.Revision != next.Revision || refreshFailed)
             {
                 current = next;
                 publish = true;
             }
+            refreshFailed = false;
         }
         if (publish) Changed?.Invoke(this, next);
     }
@@ -209,9 +227,20 @@ public sealed class AgentStateStore : IAsyncDisposable
         using var timer = new PeriodicTimer(interval);
         try
         {
-            await RefreshAsync(false, cancellationToken).ConfigureAwait(false);
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
-                await RefreshAsync(false, cancellationToken).ConfigureAwait(false);
+            do
+            {
+                try { await RefreshAsync(false, cancellationToken).ConfigureAwait(false); }
+                catch (AgentClientOperationException error) when (error.Code == "PC_AGENT_EXITING") { }
+                catch (Exception error) when (!cancellationToken.IsCancellationRequested &&
+                    error is IOException or InvalidOperationException or UnauthorizedAccessException or
+                    System.Security.Cryptography.CryptographicException or System.Net.Sockets.SocketException or TimeoutException)
+                {
+                    // An unavailable Agent is recoverable. Keep polling so a
+                    // restart or a transient IPC failure does not freeze the UI.
+                    lock (synchronization) refreshFailed = true;
+                    RefreshFailed?.Invoke(this, error);
+                }
+            } while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -226,12 +255,25 @@ public sealed class AgentStateStore : IAsyncDisposable
             if (disposed) return;
             disposed = true;
             lifetime.Cancel();
-            wait = polling;
+            // Cancelling a caller's WaitAsync does not cancel a pending
+            // native authorization. Drain the owned refresh as well as the
+            // polling loop before its client/credential store can be disposed.
+            var pendingRefresh = activeRefresh is { IsCompleted: false } ? activeRefresh : null;
+            wait = polling is null ? pendingRefresh : pendingRefresh is null ? polling : Task.WhenAll(polling, pendingRefresh);
         }
         if (wait is not null)
         {
             try { await wait.ConfigureAwait(false); }
             catch (OperationCanceledException) { }
+            catch (AgentClientOperationException error) when (error.Code == "PC_AGENT_EXITING") { }
+            catch (Exception error) when (lifetime.IsCancellationRequested &&
+                error is IOException or InvalidOperationException or UnauthorizedAccessException or
+                    System.Security.Cryptography.CryptographicException or System.Net.Sockets.SocketException or TimeoutException)
+            {
+                // The native authorization may finish with a refusal after
+                // shutdown was requested. It has settled; there is no active
+                // UI to publish that expected refresh failure to.
+            }
         }
         lifetime.Dispose();
     }

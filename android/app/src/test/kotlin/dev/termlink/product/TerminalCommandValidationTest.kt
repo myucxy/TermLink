@@ -8,7 +8,7 @@ import org.junit.Test
 
 class TerminalCommandValidationTest {
     @Test fun acceptsLegacyDetectedExactEnhancedAndManualCustom() {
-        listOf("command-prompt", "windows-powershell", "powershell-7", "wsl")
+        listOf("command-prompt", "windows-powershell", "powershell-7", "wsl", "bash", "zsh", "sh", "fish", "pwsh")
             .forEach { assertTrue(valid(it, it, "detected")) }
         assertTrue(valid("powershell-7-enhanced", "powershell-7", "detected"))
         assertTrue(valid("my-command", "custom", "manual"))
@@ -21,6 +21,9 @@ class TerminalCommandValidationTest {
             Triple("powershell-7-enhanced", "powershell-7", "manual"),
             Triple("powershell-7", "custom", "detected"),
             Triple("unknown", "unknown", "detected"),
+            Triple("bash", "sh", "detected"),
+            Triple("pwsh", "powershell-7", "detected"),
+            Triple("zsh", "zsh", "manual"),
             Triple("my-command", "powershell-7", "manual"),
             Triple("my-command", "custom", "unknown"),
         ).forEach { (id, shell, source) -> assertFalse(valid(id, shell, source)) }

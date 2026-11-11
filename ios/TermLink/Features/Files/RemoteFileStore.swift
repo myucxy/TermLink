@@ -4,8 +4,15 @@ import Foundation
 import Combine
 
 @MainActor final class RemoteFileStore: ObservableObject {
-    @Published private(set) var entries:[RemoteEntry]=[],downloads:[DownloadRecord]=[]
-    @Published var pcID:UUID?,path="",query="",busy=false,error:String?,nextOffset:Int64?,parentPath:String?
+    @Published private(set) var entries:[RemoteEntry]=[]
+    @Published private(set) var downloads:[DownloadRecord]=[]
+    @Published var pcID:UUID?
+    @Published var path=""
+    @Published var query=""
+    @Published var busy=false
+    @Published var error:String?
+    @Published var nextOffset:Int64?
+    @Published var parentPath:String?
     private var jobs:[UUID:Task<Void,Never>]=[:]
     private var favorites:[String:[String]]=[:]
     private unowned let product:ProductStore
@@ -31,6 +38,8 @@ import Combine
     }
     func operation(pc:UUID,kind:String,path:String,extra:[String:JSONValue]=[:]) async throws -> JSONValue {
         guard let api=product.api,path.utf8.count<=4096,!path.contains("\0"),query.utf8.count<=512 else{throw ClientError.limitExceeded}
+        guard let target=product.pcs.first(where:{$0.id==pc}),
+              kind == "OPEN_TERMINAL" ? target.canCreateTerminal:target.canBrowseFiles else{throw ClientError.readOnly}
         let owner=epoch
         var body=extra;body["operation"] = .string(kind);body["path"] = .string(path)
         let created=try await api.request("/v1/pcs/\(pc)/file-operations",method:"POST",body:.object(body),idempotency:UUID())
@@ -54,11 +63,14 @@ import Combine
         throw ClientError.unavailable("文件操作结果待确认。")
     }
     func openShell(pc:UUID,path:String,command:String) async throws {
+        guard !path.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,
+              product.pcs.first(where:{$0.id==pc})?.commands.contains(where:{$0["id"].string==command}) == true else{throw ClientError.readOnly}
         let owner=epoch,result=try await operation(pc:pc,kind:"OPEN_TERMINAL",path:path,extra:["terminal_command_id":.string(command)])
         guard owner==epoch,let id=UUID(uuidString:result["result"]["session_id"].string) else{throw ClientError.invalidResponse("created session")}
         await product.refreshCatalogs();guard owner==epoch else{throw CancellationError()};if let s=product.sessions.first(where:{$0.pcID==pc && $0.id==id}){await product.open(s)}
     }
     func download(_ entry:RemoteEntry,pc:PC) async throws {
+        guard pc.canBrowseFiles else{throw ClientError.readOnly}
         guard let api=product.api,let identity=product.identity,let device=product.devices.first(where:{$0.id==pc.deviceID}) else{throw ClientError.authentication}
         let owner=epoch
         let created=try await api.request("/v1/pcs/\(pc.id)/file-operations",method:"POST",body:.object(["operation":.string("DOWNLOAD"),"path":.string(entry.id)]),idempotency:UUID())
@@ -108,11 +120,25 @@ import Combine
             }
         },onCancel:{socket.cancel(with:.goingAway,reason:nil)})
     }
+    private func waitUntilPrepared() async throws -> FileTransferDescriptor {
+        for _ in 0..<120 {
+            try Task.checkCancellation()
+            let value=try await api.request("/v1/pcs/\(pc.id)/file-operations/\(record.operationID)")
+            if let descriptor=try FileTransferDescriptor.prepared(value,record:record,requester:identity.id) { return descriptor }
+            try await Task.sleep(for:.milliseconds(500))
+        }
+        throw ClientError.unavailable("电脑仍在准备文件，可重新查询并续传。")
+    }
     func receive(progress:(DownloadRecord)->Void) async throws {
+        // A ZIP can be PROCESSING while the host is still preparing it. The
+        // server only authorizes its file socket after publishing REALTIME_V2.
+        let descriptor=try await waitUntilPrepared()
+        record.expectedBytes=descriptor.size;record.digest=descriptor.digest;progress(record)
         let id=record.operationID,keyID=Data("file-transfer-v2:\(id.uuidString.replacingOccurrences(of:"-",with:"").lowercased()):\(pc.keyEpoch)".utf8)
         let pair=try SessionCrypto.pairwise(identity:identity,peer:device.exchangeKey,pc:device.id,mobile:identity.id,epoch:pc.keyEpoch)
-        func transferKey(_ direction:UInt8)->SymmetricKey{SessionCrypto.derive(pair,info:Data("TERMLINK-FILE-TRANSFER-KEY-V2\0".utf8)+id.bytes+Data([direction])+.bigEndian(UInt64(pc.keyEpoch))+keyID)}
-        var request=try await api.signedRequest(path:"/v1/file-transfers",method:"GET");var c=URLComponents(url:request.url!,resolvingAgainstBaseURL:false)!;c.scheme="wss";request.url=c.url;request.setValue("termlink.filetransfer.v2",forHTTPHeaderField:"Sec-WebSocket-Protocol")
+        func transferKey(_ direction:UInt8)->SymmetricKey{SessionCrypto.derive(pair,info:Data("TERMLINK-FILE-TRANSFER-KEY-V2\0".utf8)+id.bytes+Data([direction]) + Data.bigEndian(UInt64(pc.keyEpoch))+keyID)}
+        let signed=try await api.signedRequest(path:"/v1/file-transfers",method:"GET")
+        let request=try MobileRelayProtocol.webSocketRequest(signed,channel:.files)
         let delegate=NoRedirectDelegate(),session=URLSession(configuration:.ephemeral,delegate:delegate,delegateQueue:nil)
         let socket=session.webSocketTask(with:request);socket.maximumMessageSize=1_048_575;socket.resume();defer{socket.cancel(with:.goingAway,reason:nil);session.invalidateAndCancel()}
         let hello=JSONValue.object(["role":.string("android"),"transfer_id":.string(id.uuidString.lowercased()),"protocol_versions":.array([.number(2)]),"capabilities":.array([.string("e2ee"),.string("resume_offset_v2")])])
@@ -123,7 +149,7 @@ import Combine
         var committed=try file.seekToEnd(),incoming:UInt64=0,outgoing:UInt64=UInt64(Date().timeIntervalSince1970*1000)*1024
         var offered=false
         func send(_ type:UInt64,_ body:ProtoMessage) async throws {
-            outgoing+=1;var payload=ProtoMessage();payload.set(Int(type),body.encoded());var m=ProtoMessage();m.set(1,UInt64(2));m.set(2,id.bytes);m.set(3,identity.id.bytes);m.set(4,pc.deviceID.bytes);m.set(5,type);m.set(6,outgoing);m.set(7,UInt64(pc.keyEpoch));m.set(8,keyID);m.set(9,try SessionCrypto.random(12));m.set(10,try SessionCrypto.seal(payload.encoded(),key:transferKey(2),nonce:m.bytes(9),aad:m.encoded()));try await socket.send(.data(m.encoded()))
+            outgoing+=1;let payload=try FileTransferWire.payload(type:type,body:body);var m=ProtoMessage();m.set(1,UInt64(2));m.set(2,id.bytes);m.set(3,identity.id.bytes);m.set(4,pc.deviceID.bytes);m.set(5,type);m.set(6,outgoing);m.set(7,UInt64(pc.keyEpoch));m.set(8,keyID);m.set(9,try SessionCrypto.random(12));m.set(10,try SessionCrypto.seal(payload.encoded(),key:transferKey(2),nonce:m.bytes(9),aad:m.encoded()));try await socket.send(.data(m.encoded()))
         }
         while !Task.isCancelled {
             guard case .data(let data)=try await receive(socket) else{throw ClientError.protocolViolation("file frame")}
@@ -133,7 +159,7 @@ import Combine
             let type=m.uint(5);guard (1...8).contains(type) else{throw ClientError.protocolViolation("file type")};let body=try ProtoMessage(payload.bytes(Int(type)))
             switch type {
             case 1:
-                let name=try body.text(1);guard !name.isEmpty,!name.contains("/"),!name.contains("\\"),body.uint(2)<=5<<30,body.bytes(3).count==32,body.uint(5)==256*1024,body.uint(4)==(record.directoryZIP ? 1:0),committed<=body.uint(2) else{throw ClientError.protocolViolation("file offer")}
+                let name=try body.text(1);guard name==descriptor.filename,body.uint(2)==descriptor.size,body.bytes(3)==descriptor.digest,body.uint(5)==256*1024,body.uint(4)==(record.directoryZIP ? 1:0),committed<=body.uint(2) else{throw ClientError.protocolViolation("file offer")}
                 if !record.digest.isEmpty{guard record.digest==body.bytes(3),record.expectedBytes==body.uint(2) else{throw ClientError.protocolViolation("resume content changed")}}
                 record.expectedBytes=body.uint(2);record.digest=body.bytes(3);record.received=committed;record.status="DOWNLOADING";progress(record);offered=true
                 var response=ProtoMessage();response.set(1,committed);try await send(2,response)
@@ -151,5 +177,49 @@ import Combine
             }
         }
         throw CancellationError()
+    }
+}
+
+/// Protobuf oneof presence is meaningful even when a nested message contains
+/// only default values (in particular Resume { committed_offset: 0 }).
+enum FileTransferWire {
+    static func payload(type: UInt64, body: ProtoMessage) throws -> ProtoMessage {
+        guard (1...8).contains(type) else { throw ClientError.protocolViolation("file type") }
+        var payload = ProtoMessage()
+        payload.add(Int(type), body.encoded())
+        return payload
+    }
+}
+
+struct FileTransferDescriptor {
+    let filename: String, size: UInt64, digest: Data
+    static func prepared(_ response: JSONValue, record: DownloadRecord, requester: UUID) throws -> Self? {
+        let value=response["file_operation"],transfer=response["transfer"]
+        guard value["id"].string.lowercased()==record.operationID.uuidString.lowercased(),
+              value["pc_id"].string.lowercased()==record.pcID.uuidString.lowercased(),
+              value["requester_device_id"].string.lowercased()==requester.uuidString.lowercased(),
+              value["operation"].string=="DOWNLOAD",value["path"].string==record.path else {
+            throw ClientError.protocolViolation("file operation identity")
+        }
+        guard ["PENDING","PROCESSING"].contains(value["status"].string) else {
+            throw ClientError.unavailable("文件任务已结束，不能重新连接传输。")
+        }
+        if transfer == .null { return nil }
+        guard value["status"].string=="PROCESSING",transfer["protocol"].string=="REALTIME_V2",
+              transfer["transfer_id"].string.lowercased()==record.operationID.uuidString.lowercased(),
+              case .number(let size)=transfer["size_bytes"],size.isFinite,size>=0,size<=Double(5<<30),size.rounded(.towardZero)==size,
+              transfer["directory_zip"] == .bool(record.directoryZIP),
+              let digest=try? Data(base64URL:transfer["sha256"].string),digest.count==32 else {
+            throw ClientError.protocolViolation("file transfer descriptor")
+        }
+        let filename=transfer["filename"].string
+        guard !filename.isEmpty,filename.utf8.count<=1024,filename != ".",filename != "..",
+              !filename.contains("/"),!filename.contains("\\"),!filename.contains("\0") else {
+            throw ClientError.protocolViolation("file transfer filename")
+        }
+        if !record.digest.isEmpty {
+            guard record.digest==digest,record.expectedBytes==UInt64(size) else { throw ClientError.protocolViolation("resume content changed") }
+        }
+        return .init(filename:filename,size:UInt64(size),digest:digest)
     }
 }

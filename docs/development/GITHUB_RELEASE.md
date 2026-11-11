@@ -1,6 +1,7 @@
 # GitHub 客户端发布管道
 
-GitHub Release 分发同一批正式签名 APK、Windows x64 Setup 和带 core Rust vendor 的完整对应源码。
+GitHub Release 支持两种严格的正式制品批次：Android APK＋完整对应源码，或 Android APK＋Windows x64 Setup＋完整对应源码。
+`artifact-manifest.json` 必须明确列出一个 APK，可选一个 Setup；未知、重复或缺失 APK 的批次会在本地和 CI 拒绝。
 构建和签名在维护者本机完成，私钥与口令不上传 Actions；GitHub 托管 Windows runner 下载草稿附件，
 核验哈希、源码、双端原生签名、版本、Windows 载荷及 RFC3161 时间戳。stage 命令等待这次
 验证成功，再使用仍在本机进程内的 GitHub 凭据发布原草稿。
@@ -17,8 +18,9 @@ Docker 正式发布仍由本机直接推送 Docker Hub；本管道不发布 Dock
 1. 按[运行手册](../RELEASE_RUNBOOK.md#dev-与正式发布版本规则)查询 AppShip、Docker Hub、GitHub
    实际版本，固定严格递增的 version/build。本轮后续重试复用同一组值。
 2. 提交并推送源码和发布说明，等待该 commit 最新一次 `Repository checks` 全部通过。
-3. 使用 `scripts/Build-Release.ps1 -WindowsSetup -AndroidApk -ReleaseMode Production` 构建；
-   调用 `release/Verify-LocalRelease.ps1 -RequireSourceIdentity -RequireWindowsTimestamp` 独立验证。
+3. 按本轮平台范围使用 `scripts/Build-Release.ps1 -AndroidApk`，或追加 `-WindowsSetup`；
+   调用 `release/Verify-LocalRelease.ps1 -RequireSourceIdentity` 独立验证。包含 Setup 时再要求
+   `-RequireWindowsTimestamp` 和 Windows signer；Android-only 批次不要求 Windows 证书。
    显式传入 `release/github-release-policy.json` 中的连续性指纹和本机工具路径。
 4. 用 `scripts/New-CorrespondingSourceArchive.ps1 -IncludeCoreVendor` 导出选定 commit 的对应源码，
    文件名固定为 `TermLink-<version>-<build>-source.zip`，与 sidecar 一起放在同批 `artifacts/release/<version>-<build>/`。
@@ -32,7 +34,8 @@ python scripts/github_release.py stage `
   --notes docs/RELEASE_<version>_<build>.md
 ```
 
-命令生成 `SHA256SUMS`、`github-release.json`，上传七个附件，再触发 `GitHub client release` 并等待验证完成。
+命令生成 `SHA256SUMS`、`github-release.json`，Android-only 上传六个附件，双端上传七个附件，
+再触发 `GitHub client release` 并等待验证完成。两种批次都包含专用对应源码 ZIP 和 sidecar。
 `github-release.json` 的 SHA-256、源码 commit 和 Release ID 固定到 dispatch 输入。
 Actions 仅在 `main` 上手动调度，串行校验；运行标题绑定 Release ID 和完整 metadata SHA-256。
 本机最终核验成功运行的 workflow 路径、main 分支、dispatch 事件和标题，再复核同源码的 CI、tag 和远端附件 digest，才解除 draft。

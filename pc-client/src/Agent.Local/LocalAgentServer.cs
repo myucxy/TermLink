@@ -93,7 +93,9 @@ public sealed class LocalAgentServer : IAsyncDisposable
                 LocalAgentCommandResult result;
                 try
                 {
-                    result = await handler.HandleAsync(request.Command, request.Payload, cancellationToken).ConfigureAwait(false);
+                    result = request.Command is LocalAgentCommand.DetectCapabilities or LocalAgentCommand.DetectAiAgents
+                        ? await HandleDetectionAsync(stream, request, cancellationToken).ConfigureAwait(false)
+                        : await handler.HandleAsync(request.Command, request.Payload, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception error) when (error is InvalidDataException or ArgumentException)
                 {
@@ -104,7 +106,14 @@ public sealed class LocalAgentServer : IAsyncDisposable
                 }
                 var response = LocalAgentProtocol.CreateResponse(
                     request, result.Success, result.Code, result.Payload, key, DateTimeOffset.UtcNow);
-                await LocalAgentProtocol.WriteAsync(stream, response, cancellationToken).ConfigureAwait(false);
+                try { await LocalAgentProtocol.WriteAsync(stream, response, cancellationToken).ConfigureAwait(false); }
+                finally
+                {
+                    // Cleanup has completed in the authenticated handler. Send
+                    // its receipt before stopping the listener and other clients.
+                    // A lost receipt must not leave an already-stopped Host alive.
+                    if (request.Command == LocalAgentCommand.Shutdown && result.Success) shutdown.Cancel();
+                }
             }
             catch (Exception error) when (error is InvalidDataException or CryptographicException or ArgumentException)
             {
@@ -113,7 +122,35 @@ public sealed class LocalAgentServer : IAsyncDisposable
                 _ = error;
                 return;
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+            catch (OperationCanceledException) when (request?.Command is LocalAgentCommand.DetectCapabilities or LocalAgentCommand.DetectAiAgents) { }
+            catch (IOException) { }
         }
+    }
+
+    private async ValueTask<LocalAgentCommandResult> HandleDetectionAsync(Stream stream, LocalAgentEnvelope request, CancellationToken token)
+    {
+        using var detection = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var disconnected = WatchDetectionConnectionAsync(stream, detection);
+        try { return await handler.HandleAsync(request.Command, request.Payload, detection.Token).ConfigureAwait(false); }
+        finally
+        {
+            detection.Cancel();
+            await disconnected.ConfigureAwait(false);
+        }
+    }
+
+    private static async Task WatchDetectionConnectionAsync(Stream stream, CancellationTokenSource detection)
+    {
+        try
+        {
+            // IPC is exactly one request/response per connection. EOF (or any
+            // unsolicited extra request data) cancels only this read-only probe.
+            await stream.ReadAsync(new byte[1], detection.Token).ConfigureAwait(false);
+            detection.Cancel();
+        }
+        catch (OperationCanceledException) when (detection.IsCancellationRequested) { }
+        catch (IOException) { detection.Cancel(); }
     }
 
     public async ValueTask DisposeAsync()

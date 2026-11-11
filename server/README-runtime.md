@@ -44,6 +44,8 @@ TLS 由宿主机或云平台的反向代理终止。反向代理必须保留 Hos
 
 ## 配置
 
+iOS 使用独立公共 PKCE 客户端，设置 `TERMLINK_IOS_OIDC_CLIENT_ID=termlink-ios` 后启用，固定回调为 `dev.termlink.ios:/oauth2redirect`。受管旧部署须先升级新版安装器／镜像与 migration 51；完整配置及测试边界见 [iOS 接入说明](IOS_ACCESS.md)。
+
 Compose 部署的最小配置包括：
 
 ```text
@@ -133,3 +135,7 @@ Caddy
 ```
 
 验收 Compose、LAN 测试、分布式 Compose 和外部监控 Compose 应从生产发布包中排除。
+
+Mac 更新目录使用独立 `TERMLINK_APPSHIP_MACOS_TEAM_ID`，空值关闭 Mac offer。需升级至 schema54；正式 Team ID、客户端实际 PKG 验签及远程任务消费者仍是上线前提。参见 [Mac 接入说明](MACOS_ACCESS.md)。
+
+可选 iOS 后台推送服务端（APNs注册、状态事件、重试队列及升级结果）见 [后台通知契约](PUSH_NOTIFICATIONS.md)。需schema55和显式私钥配置，默认关闭；客户端与真机接入仍待验收。

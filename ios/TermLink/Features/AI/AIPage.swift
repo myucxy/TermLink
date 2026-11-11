@@ -7,14 +7,15 @@ import UniformTypeIdentifiers
 struct AIPage:View {
     @ObservedObject var workspace:AIWorkspace
     @EnvironmentObject var product:ProductStore
-    @State private var create=false,history=false
-    var body:some View{Group{if let id=workspace.selected,let session=workspace.conversations[id],!workspace.unavailable.contains(session.pcID){AIConversationView(workspace:workspace,session:session)}else{List{
+    @State private var create=false
+    @State private var history=false
+    var body:some View{Group{if let id=workspace.selected,let session=workspace.conversations[id],!workspace.unavailable.contains(session.pcID),!workspace.requiresHostUpgrade(session.pcID,agent:session.raw["agentId"].string){AIConversationView(workspace:workspace,session:session)}else{List{
         ForEach(product.pcs.filter{$0.capabilities.contains("ai_agent_v1")}){pc in Section(pc.name){
             ForEach(workspace.conversations.values.filter{$0.pcID==pc.id && (!workspace.attentionOnly || !$0.pending.isEmpty) && (workspace.search.isEmpty || ($0.title+$0.directory+$0.agent).localizedCaseInsensitiveContains(workspace.search))}.sorted{a,b in let ap=workspace.pinned.contains(a.id),bp=workspace.pinned.contains(b.id);return ap != bp ? ap:a.title<b.title}){session in
-                Button{workspace.open(session)}label:{HStack{AgentIcon(agent:session.raw["agentId"].string);VStack(alignment:.leading){Text(session.title);Text(session.agent+" · "+session.state).font(.caption).foregroundStyle(.secondary)};Spacer();if !session.pending.isEmpty{Image(systemName:"exclamationmark.bubble").foregroundStyle(.orange)}}}.disabled(workspace.unavailable.contains(pc.id))
+                Button{workspace.open(session)}label:{HStack{AgentIcon(agent:session.raw["agentId"].string);VStack(alignment:.leading){Text(session.title);Text(session.agent+" · "+session.state).font(.caption).foregroundStyle(.secondary)};Spacer();if !session.pending.isEmpty{Image(systemName:"exclamationmark.bubble").foregroundStyle(.orange)}}}.disabled(workspace.unavailable.contains(pc.id) || workspace.requiresHostUpgrade(pc.id,agent:session.raw["agentId"].string))
             }
-            if workspace.catalogs[pc.id]?["agents"].array.contains(where:{$0["id"].string=="zcode" && $0["strategy"].string=="desktop_remote" && AgentBrand.available($0)})==true{
-                NavigationLink{AIRemoteView(workspace:workspace,pc:pc.id)}label:{Label{Text("ZCode · 桌面远控")}icon:{AgentIcon(agent:"zcode")}}.disabled(workspace.unavailable.contains(pc.id))
+            if workspace.requiresHostUpgrade(pc.id){
+                Label{Text("请升级电脑端以使用 ZCode 原生会话。").font(.caption).foregroundStyle(.secondary)}icon:{AgentIcon(agent:"zcode")}
             }
         }}
         if workspace.catalogs.isEmpty{ContentUnavailableView("开始一段 AI 对话",systemImage:"sparkles",description:Text("从在线电脑中选择已检测的 AI Agent。"))}
@@ -32,8 +33,16 @@ struct AIConversationView:View {
     @ObservedObject var workspace:AIWorkspace
     let session:AIConversation
     @EnvironmentObject var product:ProductStore
-    @State private var showFiles=false,showModels=false,confirmEnd=false,rename=false,title="",confirmForget=false
-    @State private var showPhotos=false,showCamera=false,showComputerFiles=false,photo:PhotosPickerItem?
+    @State private var showFiles=false
+    @State private var showModels=false
+    @State private var confirmEnd=false
+    @State private var rename=false
+    @State private var title=""
+    @State private var confirmForget=false
+    @State private var showPhotos=false
+    @State private var showCamera=false
+    @State private var showComputerFiles=false
+    @State private var photo:PhotosPickerItem?
     @State private var pendingMode:JSONValue?
     private var blocked:Bool{!session.canControl || workspace.busy.contains(session.pcID) || workspace.uncertain[session.pcID] != nil}
     var body:some View{VStack(spacing:0){HStack{Button{workspace.selected=nil}label:{Image(systemName:"arrow.left").frame(width:36,height:36)};VStack(alignment:.leading,spacing:1){Text(session.title).font(.subheadline).lineLimit(1);Text(session.agent+" · "+(product.pcs.first{$0.id==session.pcID}?.name ?? "电脑")+" · "+session.directory).font(.caption2).foregroundStyle(.secondary).lineLimit(1)};Spacer();Menu{
@@ -51,7 +60,12 @@ struct AIConversationView:View {
         VStack(spacing:0){
             ForEach(workspace.queued[session.id] ?? []){item in HStack{Text(item.restored ? "已恢复 · 请取回后发送":item.failed ? "发送待确认 · 请取回":"待发送 · "+item.text).lineLimit(1).font(.caption);Spacer();Button("取回"){do{try workspace.recoverQueued(session.id,id:item.id)}catch{product.report(error)}}}}
             ScrollView(.horizontal){HStack{ForEach(workspace.references[session.id] ?? [],id:\.self){path in HStack{Text("@"+(path as NSString).lastPathComponent);Button("移除",systemImage:"xmark"){workspace.references[session.id]?.removeAll{$0==path};workspace.persist()}}.font(.caption).padding(6).background(.quaternary,in:Capsule())}}}
-            ScrollView(.horizontal){HStack{ForEach(workspace.attachments[session.id] ?? []){item in HStack{Text(item.name+" · "+(item.status=="ready" ? "就绪":item.status=="failed" ? "失败":"\(item.sent*100/max(1,item.size))%"));Button("移除",systemImage:"xmark"){Task{do{try await workspace.removeAttachment(session,id:item.id)}catch{product.report(error)}}}}.font(.caption).padding(6).background(.quaternary,in:Capsule())}}}
+            ScrollView(.horizontal){HStack{ForEach(workspace.attachments[session.id] ?? []){item in
+                AIAttachmentChip(item:item,canRetry:workspace.canRetryUpload(session,id:item.id),
+                    canRemove:item.status != "uploading" && !workspace.busy.contains(session.pcID) && workspace.uncertain[session.pcID]==nil,
+                    retry:{Task{do{try await workspace.retryUpload(session,id:item.id)}catch{product.report(error)}}},
+                    remove:{Task{do{try await workspace.removeAttachment(session,id:item.id)}catch{product.report(error)}}})
+            }}}
             TextEditor(text:Binding(get:{workspace.drafts[session.id] ?? ""},set:{workspace.drafts[session.id]=String($0.prefix(16000));workspace.persist()})).frame(minHeight:44,maxHeight:100).padding(.horizontal,6).scrollContentBackground(.hidden).disabled(blocked).accessibilityLabel("输入消息")
             HStack(spacing:4){Menu{if session.capabilities["attachments"].bool{Button("文件"){showFiles=true};Button("照片"){showPhotos=true};if UIImagePickerController.isSourceTypeAvailable(.camera){Button("拍摄照片"){Task{if await AVCaptureDevice.requestAccess(for:.video){showCamera=true}else{product.report(ClientError.unavailable("未获得相机权限，可在系统设置中允许访问。"))}}}};Button("电脑文件"){showComputerFiles=true}};if session.state=="running"{Button("加入待发队列"){do{try workspace.enqueue(session)}catch{product.report(error)}};if session.capabilities["steer"].bool{Button("补充当前任务"){action("steer",extra:["text":.string(workspace.drafts[session.id] ?? "")])}}}}label:{Image(systemName:"plus").frame(width:32,height:36)}.disabled(blocked)
                 Menu{ForEach(session.capabilities["configuration"]["permissionModes"].array,id:\.self){mode in Button(mode["label"].string.isEmpty ? mode["id"].string:mode["label"].string){if mode["requiresConfirmation"] != .bool(false),mode["id"] != session.raw["permissionMode"]{pendingMode=mode}else{configure(mode)}}}}label:{Text(session.raw["permissionMode"].string.isEmpty ? "授权方式":session.raw["permissionMode"].string).font(.caption);Image(systemName:"chevron.down").font(.caption2)}.disabled(blocked || session.state != "idle" || !session.pending.isEmpty || !session.capabilities["configuration"]["permissionSwitch"].bool)
@@ -77,18 +91,67 @@ struct AIConversationView:View {
     private func uploadLocalPhoto(_ result:Result<URL,Error>) async{do{let url=try result.get();defer{try? FileManager.default.removeItem(at:url)};try await workspace.upload(session,url:url)}catch ClientError.cancelled{}catch{product.report(error)}}
     private func action(_ action:String,extra:[String:JSONValue]=[:]){Task{do{_=try await workspace.mutate(pc:session.pcID,action:action,session:session,extra:extra)}catch{product.report(error)}}}
 }
+private struct AIAttachmentChip: View {
+    let item: AIStagedAttachment
+    let canRetry: Bool
+    let canRemove: Bool
+    let retry: () -> Void
+    let remove: () -> Void
+    private var status: String {
+        switch item.status {
+        case "ready": return "就绪"
+        case "failed": return "上传失败"
+        case "paused": return "已暂停"
+        case "restored": return "已恢复 · 待重试"
+        default: return "\(item.sent * 100 / max(1, item.size))%"
+        }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(item.name + " · " + status).lineLimit(1)
+                if item.status != "ready" && item.status != "uploading" {
+                    Button("重试上传", action: retry).disabled(!canRetry)
+                }
+                Button("移除", systemImage: "xmark", action: remove).disabled(!canRemove)
+            }
+            if let error = item.error { Text(error).foregroundStyle(.secondary).lineLimit(2) }
+        }.font(.caption).frame(maxWidth: 300).padding(8).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
 struct AICreateView:View {
     @ObservedObject var workspace:AIWorkspace
+    var initialLocation: AICreateLocation?
+    var onCreated: (() -> Void)?
     @EnvironmentObject var product:ProductStore
     @Environment(\.dismiss) private var dismiss
-    @State private var pc:UUID?,agent="",directory="",managed=false,mode="",model="",provider="",effort="",confirmed="",loading=false,browse=false
-    @State private var candidate:JSONValue?,modelCatalog:JSONValue = .null
-    private var agents:[JSONValue]{workspace.catalogs[pc ?? UUID()]?["agents"].array.filter{AgentBrand.available($0,nativeOnly:true)} ?? []}
+    @State private var pc:UUID?
+    @State private var agent=""
+    @State private var directory=""
+    @State private var managed=false
+    @State private var mode=""
+    @State private var model=""
+    @State private var provider=""
+    @State private var effort=""
+    @State private var confirmed=""
+    @State private var loading=false
+    @State private var browse=false
+    @State private var candidate:JSONValue?
+    @State private var modelCatalog:JSONValue = .null
+    @State private var initialized = false
+    private var computers: [PC] { product.pcs.filter(AICreateLocation.eligible) }
+    private var agents:[JSONValue]{workspace.catalogs[pc ?? UUID()]?["agents"].array.filter{AgentBrand.available($0)} ?? []}
     private var configuration:JSONValue{agents.first(where:{$0["id"].string==agent})?["configuration"] ?? .null}
     var body:some View{
         Form{
-            Picker("电脑",selection:$pc){ForEach(product.pcs.filter{$0.online && $0.routing}){pc in Text(pc.name).tag(Optional(pc.id))}}
-            Picker("AI Agent",selection:$agent){ForEach(agents,id:\.self){a in Label{Text(a["name"].string)}icon:{AgentIcon(agent:a["id"].string)}.tag(a["id"].string)}}
+            Picker("电脑",selection:$pc){
+                Text("选择在线电脑").tag(Optional<UUID>.none)
+                if let pc, !computers.contains(where:{$0.id==pc}) { Text("所选电脑当前不可用").tag(Optional(pc)) }
+                ForEach(computers){pc in Text(pc.name).tag(Optional(pc.id))}
+            }
+            Picker("AI Agent",selection:$agent){Text("选择 AI Agent").tag("");ForEach(agents,id:\.self){a in Label{Text(a["name"].string)}icon:{AgentIcon(agent:a["id"].string)}.tag(a["id"].string)}}
+            if let pc,workspace.requiresHostUpgrade(pc){Text("请升级电脑端以使用 ZCode 原生会话。").font(.caption).foregroundStyle(.secondary)}
             Toggle("使用托管工作目录",isOn:$managed)
             if !managed{TextField("电脑工作目录",text:$directory).textInputAutocapitalization(.never).autocorrectionDisabled()}
             if !managed,pc != nil{Button("浏览电脑目录"){browse=true}}
@@ -106,19 +169,32 @@ struct AICreateView:View {
             }
             if let pc,workspace.uncertain[pc] != nil{Button("查询上次创建结果"){Task{do{try await workspace.retryUncertain(pc);dismiss()}catch{product.report(error)}}}}
             Button("创建对话"){guard let pc else{return};Task{do{
+                guard computers.contains(where:{$0.id==pc}) else{throw ClientError.readOnly}
                 var options:[String:JSONValue]=["directoryMode":.string(managed ? "managed":"custom"),"permissionMode":.string(mode),"modelId":.string(model),"providerId":.string(provider),"reasoningEffort":.string(effort)]
                 if !confirmed.isEmpty{options["confirmedPermissionMode"] = .string(confirmed)}
-                try await workspace.create(pc:pc,agent:agent,directory:managed ? "":directory.trimmingCharacters(in:.whitespacesAndNewlines),options:options);dismiss()
-            }catch{product.report(error)}}}.disabled(pc==nil || agent.isEmpty || (!managed && directory.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty) || pc.map{workspace.busy.contains($0) || workspace.uncertain[$0] != nil}==true)
+                try await workspace.create(pc:pc,agent:agent,directory:managed ? "":directory,options:options);onCreated?();dismiss()
+            }catch{product.report(error)}}}.disabled(pc==nil || !computers.contains(where:{$0.id==pc}) || agent.isEmpty || (!managed && directory.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty) || pc.map{workspace.busy.contains($0) || workspace.uncertain[$0] != nil}==true)
         }.navigationTitle("新建 AI 对话").toolbar{Button("取消"){dismiss()}}
-        .onAppear{pc=product.pcs.first{$0.online && $0.routing}?.id;selectPC()}.onChange(of:pc){_,_ in selectPC()}.onChange(of:agent){_,_ in resetOptions()}
+        .task {
+            guard !initialized else{return};initialized=true
+            await workspace.refreshAll()
+            pc=initialLocation?.pcID ?? computers.first?.id;selectPC()
+        }.onChange(of:pc){_,_ in selectPC()}.onChange(of:agent){_,_ in resetOptions()}
+        .onChange(of:workspace.catalogs[pc ?? UUID()] ?? .null){_,_ in
+            if !agents.contains(where:{$0["id"].string==agent}){agent=agents.first?["id"].string ?? "";resetOptions()}
+        }
         .sheet(isPresented:$browse){if let pc{NavigationStack{AIComputerFilePicker(workspace:workspace,pc:pc,initialPath:directory,selectFile:false){directory=$0}}}}
         .alert("确认 Agent 授权范围",isPresented:Binding(get:{candidate != nil},set:{if !$0{candidate=nil}})){
             Button("取消",role:.cancel){candidate=nil};Button("确认使用"){guard let option=candidate else{return};mode=option["id"].string;confirmed=mode;candidate=nil}
         }message:{Text(candidate?["description"].string ?? "请确认 Agent 原生权限设置。")}
     }
     private var reasoning:JSONValue{let selected=modelCatalog["models"].array.first(where:{$0["modelId"].string==model && $0["providerId"].string==provider})?["reasoning"] ?? .null;return selected == .null ? modelCatalog["reasoning"]:selected}
-    private func selectPC(){agent=agents.first?["id"].string ?? "";directory=workspace.catalogs[pc ?? UUID()]?["defaultDirectory"].string ?? "";managed=workspace.catalogs[pc ?? UUID()]?["directoryMode"].string=="managed";resetOptions()}
+    private func selectPC(){
+        agent=agents.first?["id"].string ?? ""
+        if let initialLocation,initialLocation.pcID==pc{directory=initialLocation.directory;managed=false}
+        else{directory=workspace.catalogs[pc ?? UUID()]?["defaultDirectory"].string ?? "";managed=workspace.catalogs[pc ?? UUID()]?["directoryMode"].string=="managed"}
+        resetOptions()
+    }
     private func resetOptions(){mode="";confirmed="";model="";provider="";effort="";modelCatalog = .null}
     private func loadModels(){guard let pc else{return};let requested=agent;loading=true;Task{defer{loading=false};do{let value=try await workspace.modelCatalog(pc:pc,agent:requested);guard self.pc==pc,agent==requested else{return};modelCatalog=value}catch{product.report(error)}}}
 }
@@ -126,8 +202,12 @@ struct AINativeHistoryView:View {
     @ObservedObject var workspace:AIWorkspace
     @EnvironmentObject var product:ProductStore
     @Environment(\.dismiss) private var dismiss
-    @State private var pc:UUID?,agent="",entries:[JSONValue]=[],cursor="",loading=false
-    private var agents:[JSONValue]{workspace.catalogs[pc ?? UUID()]?["agents"].array.filter{$0["nativeHistory"].bool && AgentBrand.available($0,nativeOnly:true)} ?? []}
+    @State private var pc:UUID?
+    @State private var agent=""
+    @State private var entries:[JSONValue]=[]
+    @State private var cursor=""
+    @State private var loading=false
+    private var agents:[JSONValue]{workspace.catalogs[pc ?? UUID()]?["agents"].array.filter{$0["nativeHistory"].bool && AgentBrand.available($0)} ?? []}
     var body:some View{Form{Picker("电脑",selection:$pc){ForEach(product.pcs.filter{$0.online}){p in Text(p.name).tag(Optional(p.id))}};Picker("Agent",selection:$agent){ForEach(agents,id:\.self){a in Text(a["name"].string).tag(a["id"].string)}};Text("读取已选电脑与 Agent 的本机历史。继续对话会创建 TermLink 可管理的会话。").font(.caption).foregroundStyle(.secondary);Button("获取电脑历史"){load(next:false)}.disabled(loading || agent.isEmpty);ForEach(entries,id:\.self){entry in Button(entry["title"].string){guard let pc else{return};Task{do{let r=try await workspace.mutate(pc:pc,action:"import-native",extra:["agentId":.string(agent),"requestId":entry["nativeId"]]);if let s=workspace.conversations[r["session"]["id"].string]{workspace.open(s);dismiss()}}catch{product.report(error)}}}};if !cursor.isEmpty{Button("加载更多"){load(next:true)}.disabled(loading)}}.navigationTitle("电脑 AI 历史").toolbar{Button("关闭"){dismiss()}}.onAppear{pc=product.pcs.first{$0.online}?.id;agent=agents.first?["id"].string ?? ""}.onChange(of:pc){_,_ in agent=agents.first?["id"].string ?? "";entries=[];cursor=""}.onChange(of:agent){_,_ in entries=[];cursor=""}}
     private func load(next:Bool){guard let pc else{return};let requested=agent;loading=true;Task{defer{loading=false};do{let page=try await workspace.nativeHistory(pc:pc,agent:requested,cursor:next ? cursor:"");guard self.pc==pc,agent==requested,page["sessions"].array.count<=500 else{return};entries=next ? entries+page["sessions"].array:page["sessions"].array;cursor=page["nextCursor"].string}catch{product.report(error)}}}
 }

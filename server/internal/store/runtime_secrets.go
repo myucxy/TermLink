@@ -20,6 +20,17 @@ func (s *Postgres) EnsureRuntimeSecret(ctx context.Context, name string, size in
 	if _, err := rand.Read(value); err != nil {
 		return nil, fmt.Errorf("generate runtime secret: %w", err)
 	}
+	defer clear(value)
+	return s.EnsureRuntimeSecretValue(ctx, name, value)
+}
+
+// EnsureRuntimeSecretValue stores a caller-generated plain or wrapped value
+// only if absent, and returns the database winner. Concurrent first starts
+// must derive keys from that same value, never from their losing candidates.
+func (s *Postgres) EnsureRuntimeSecretValue(ctx context.Context, name string, value []byte) ([]byte, error) {
+	if s == nil || s.Pool == nil || len(name) < 3 || len(name) > 128 || len(value) < 32 || len(value) > 128 {
+		return nil, errors.New("invalid runtime secret request")
+	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -40,7 +51,7 @@ func (s *Postgres) EnsureRuntimeSecret(ctx context.Context, name string, size in
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	if len(stored) < 32 {
+	if len(stored) < 32 || len(stored) > 128 {
 		return nil, fmt.Errorf("runtime secret %q has invalid length", name)
 	}
 	return append([]byte(nil), stored...), nil

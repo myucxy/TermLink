@@ -43,7 +43,7 @@ class AiAgentIconsInstrumentedTest {
             connectionState = ProductConnectionState.CONNECTED, authenticationState = ProductAuthenticationState.AUTHENTICATED)
         val agents = JSONArray().apply {
             aiAgentBrands.forEach { (id, brand) -> put(JSONObject().put("id", id).put("name", brand.name)
-                .put("status", "available").put("strategy", if (id == "zcode") "desktop_remote" else "native")) }
+                .put("status", "available").put("strategy", "native")) }
         }
         var creates = 0
         val repository = object : ProductRepository by UnavailableProductRepository() {

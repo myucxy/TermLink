@@ -1,0 +1,43 @@
+{
+  "cargo": "/Users/myucxy/Library/Developer/TermLink/Env/Rust/1.97.1/toolchain/bin/cargo",
+  "driver": {
+    "path": "/Volumes/work/\u4ee3\u7801/AIObject/TermLink/terminal-core/scripts/build_ios.py",
+    "sha256": "eaaf04a55acd233f804677d1a951f5c53b49cfb12f5d403798e0fa81201592a2"
+  },
+  "host_tests": "passed",
+  "minimum_ios": "17.0",
+  "native_static_libs": {
+    "aarch64-apple-ios": [
+      "-lSystem",
+      "-lc",
+      "-lm"
+    ],
+    "aarch64-apple-ios-sim": [
+      "-lSystem",
+      "-lc",
+      "-lm"
+    ],
+    "x86_64-apple-ios": [
+      "-lSystem",
+      "-lc",
+      "-lm"
+    ]
+  },
+  "revision": "f51936441dea83fa2f9459386fb6c35b90102979",
+  "rustc": "/Users/myucxy/Library/Developer/TermLink/Env/Rust/1.97.1/toolchain/bin/rustc",
+  "sdk_roots": {
+    "iphoneos": "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.1.sdk",
+    "iphonesimulator": "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.1.sdk"
+  },
+  "source_dirty": false,
+  "source_fingerprint_sha256": "460ca904e00c0053221c2ce2aeda8892f90d5473324a84a6c71d8dfe2ce082ef",
+  "source_root": "/Users/myucxy/Library/Caches/termlink-core-build-alo5p0ru/terminal-core",
+  "source_status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "targets": [
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios"
+  ],
+  "toolchain": "1.97.1",
+  "xcode": "Xcode 27.1\nBuild version 27A9275"
+}

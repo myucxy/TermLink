@@ -1,0 +1,30 @@
+[
+  {
+    "file": "GraphemeBreakProperty.txt",
+    "sha256": "c29360bd6f7132811d701d29069541e827eb44bfc4c8fbde8c370d6982689dc1"
+  },
+  {
+    "file": "DerivedCoreProperties.txt",
+    "sha256": "39d35161f2954497f69e08bdb9e701493f476a3d30222de20028feda36c1dabd"
+  },
+  {
+    "file": "emoji-data.txt",
+    "sha256": "f1365a5173eee18e1f98b240cdc492e84a25f1ce7e0c9d1094eb29c41a22696a"
+  },
+  {
+    "file": "EastAsianWidth.txt",
+    "sha256": "43adc76c0686a42cb370764eb8cfe2b2a45b10b855e5572a2db4a0eecce15d5b"
+  },
+  {
+    "file": "GraphemeBreakTest.txt",
+    "sha256": "ee2b9354d270ac061b29f09662cafea06341d77e704b8cc6bd72aaeeda363cb5"
+  },
+  {
+    "file": "ReadMe.txt",
+    "sha256": "14cafa23788d3a20dd21d6b0cdcb8d6dab520781fcd9ad9392f3b88ea607e633"
+  },
+  {
+    "file": "LICENSE.txt",
+    "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96"
+  }
+]

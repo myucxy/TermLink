@@ -8,7 +8,13 @@ struct AIComputerFilePicker: View {
     var selectFile = true
     var selected: (String) -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var path = "", parent: String?, offset: Int64 = 0, next: Int64?, entries: [RemoteEntry] = [], busy = false, error: String?
+    @State private var path = ""
+    @State private var parent: String?
+    @State private var offset: Int64 = 0
+    @State private var next: Int64?
+    @State private var entries: [RemoteEntry] = []
+    @State private var busy = false
+    @State private var error: String?
 
     var body: some View {
         List {

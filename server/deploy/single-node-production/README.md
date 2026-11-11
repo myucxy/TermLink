@@ -124,6 +124,63 @@ new release into a clean data directory when replacing an older Keycloak-based
 installation; identity migration is intentionally outside the supported
 runtime.
 
+## Optional iOS identity
+
+iOS login remains disabled by default. An iOS-capable Server release can enable
+its distinct public PKCE client without changing Android, Windows, or Web client
+IDs. Its callback is fixed to `dev.termlink.ios:/oauth2redirect`.
+
+For a new managed install, supply the opt-in ID through `sudo env`:
+
+```bash
+sudo env TERMLINK_IOS_OIDC_CLIENT_ID=termlink-ios \
+  bash ./termlink-deploy install --domain termlink.example.com
+```
+
+For an existing deployment, first download the newer iOS-capable release's
+installer and upgrade with it. This updates the Server image, applies migration
+51, and re-renders the Compose mappings; an older installed script cannot enable
+iOS just by receiving a new environment variable:
+
+```bash
+sudo env TERMLINK_IOS_OIDC_CLIENT_ID=termlink-ios \
+  bash ./termlink-deploy upgrade
+```
+
+After that upgrade, its installed tool can change the setting:
+
+```bash
+sudo env TERMLINK_IOS_OIDC_CLIENT_ID=termlink-ios \
+  /opt/termlink/termlink-deploy config
+```
+
+The installer saves the iOS ID, fixed callback, and optional allowed-party list
+in `config.env`. Later `config` and `upgrade` operations preserve them when the
+environment variables are absent; an explicit empty iOS ID disables the client.
+To disable iOS and return to automatically derived allowed parties:
+
+```bash
+sudo env TERMLINK_IOS_OIDC_CLIENT_ID= TERMLINK_OIDC_ALLOWED_PARTIES= \
+  /opt/termlink/termlink-deploy config
+```
+
+Leaving `TERMLINK_OIDC_ALLOWED_PARTIES` empty lets Server derive the Android and
+Windows parties plus the enabled iOS ID. If you set a manual list, include every
+configured native client, for example
+`TERMLINK_OIDC_ALLOWED_PARTIES=termlink-android,termlink-windows,termlink-ios`.
+Other saved managed settings remain unchanged. This does not configure Apple
+signing, APNs, or publish a client.
+
+For repository Compose deployments, all entry points accept optional
+`TERMLINK_IOS_OIDC_CLIENT_ID` and `TERMLINK_IOS_OIDC_REDIRECT_URI`. The root
+`server/compose.yml` relies on Server's derived allowed parties. When using
+`server/compose/core.compose.yml` (with or without the single-node overlay),
+its explicit `TERMLINK_OIDC_ALLOWED_PARTIES` must also include the iOS ID; see
+`server/.env.example`. Docker Compose does not forward arbitrary `.env` keys
+unless the Compose file references them. External identity deployments must
+also register the same public authorization-code/refresh client with S256 PKCE,
+the exact callback, and the Server audience; do not enable the password grant.
+
 ## Encrypted backup and restore
 
 Create and protect an age identity outside the server. Configure its public

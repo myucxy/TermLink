@@ -48,7 +48,10 @@ actor APIClient {
             request.setValue(nonce, forHTTPHeaderField: "X-TermLink-Nonce")
             request.setValue(try identity.sign(Data(canonical.utf8)).base64URL, forHTTPHeaderField: "X-TermLink-Signature")
         }
-        if path == "/v1/pcs" { request.setValue("powershell-7-enhanced", forHTTPHeaderField: "X-TermLink-PC-Command-Capabilities") }
+        if method == "GET", path == "/v1/pcs" {
+            request.setValue("powershell-7-enhanced", forHTTPHeaderField: "X-TermLink-PC-Command-Capabilities")
+            request.setValue("posix-shells-v1", forHTTPHeaderField: "X-TermLink-PC-Shell-Capabilities")
+        }
         return request
     }
     private func tokenValue(_ value: String?) async throws -> String { if let value { return value }; return try await tokens.accessToken() }

@@ -16,7 +16,8 @@ func TestNormalizeSupportedShells(t *testing.T) {
 	}{
 		{name: "old agent", input: nil, want: []string{}},
 		{name: "ordered and unique", input: []string{"wsl", "windows-powershell", "powershell-7", "command-prompt", "wsl"}, want: []string{"command-prompt", "windows-powershell", "powershell-7", "wsl"}},
-		{name: "unknown rejected", input: []string{"pwsh"}, wantErr: true},
+		{name: "known posix shells", input: []string{"fish", "bash", "zsh", "sh", "bash"}, want: []string{"bash", "zsh", "sh", "fish"}},
+		{name: "unknown rejected", input: []string{"tcsh"}, wantErr: true},
 		{name: "case variants rejected", input: []string{"COMMAND-PROMPT"}, wantErr: true},
 	}
 	for _, test := range tests {
@@ -38,6 +39,11 @@ func TestNormalizeTerminalCommands(t *testing.T) {
 		{ID: "windows-powershell", DisplayName: "Windows PowerShell", ShellType: "windows-powershell", Source: "detected"},
 		{ID: "powershell-7", DisplayName: "PowerShell 7", ShellType: "powershell-7", Source: "detected"},
 		{ID: "wsl", DisplayName: "WSL", ShellType: "wsl", Source: "detected"},
+		{ID: "bash", DisplayName: "Bash", ShellType: "bash", Source: "detected"},
+		{ID: "zsh", DisplayName: "Zsh", ShellType: "zsh", Source: "detected"},
+		{ID: "sh", DisplayName: "POSIX shell", ShellType: "sh", Source: "detected"},
+		{ID: "fish", DisplayName: "Fish", ShellType: "fish", Source: "detected"},
+		{ID: "pwsh", DisplayName: "PowerShell", ShellType: "pwsh", Source: "detected"},
 		{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "powershell-7", Source: "detected"},
 		{ID: "custom-123", DisplayName: "Project CLI", ShellType: "custom", Source: "manual"},
 	}
@@ -54,6 +60,7 @@ func TestNormalizeTerminalCommands(t *testing.T) {
 		{{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "wsl", Source: "detected"}},
 		{{ID: "powershell-7-enhanced", DisplayName: "PowerShell 7（增强终端）", ShellType: "powershell-7", Source: "manual"}},
 		{{ID: "other-enhanced", DisplayName: "Other Enhanced", ShellType: "powershell-7", Source: "detected"}},
+		{{ID: "bash", DisplayName: "Bash", ShellType: "sh", Source: "detected"}},
 		{{ID: "custom-1", DisplayName: "One", ShellType: "custom", Source: "manual"}, {ID: "custom-1", DisplayName: "Two", ShellType: "custom", Source: "manual"}},
 	} {
 		if _, err := normalizeTerminalCommands(invalid); err == nil {

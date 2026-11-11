@@ -36,3 +36,13 @@ func TestApplyLegacyPCDefaultsPreservesExplicitCapabilities(t *testing.T) {
 		t.Fatalf("explicit capabilities = %#v, want %#v", item.Capabilities, want)
 	}
 }
+
+func TestApplyLegacyPCDefaultsPreservesControlOnlyPortablePC(t *testing.T) {
+	for _, platform := range []string{PCPlatformMacOS, PCPlatformLinux} {
+		item := PCRecord{Platform: platform, Architecture: PCArchitectureArm64, PlatformVersion: "validation", Capabilities: []string{}}
+		applyLegacyPCDefaults(&item)
+		if item.Platform != platform || item.Capabilities == nil || len(item.Capabilities) != 0 {
+			t.Fatalf("control-only PC inherited legacy capabilities: %#v", item)
+		}
+	}
+}

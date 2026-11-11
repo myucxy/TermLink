@@ -8,6 +8,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
@@ -17,7 +19,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 
 fun interface AccessTokenProvider { fun accessToken(): String }
 
-class TermLinkApiException(val status: Int, val code: String, val traceId: String?) : Exception("TermLink API $status: $code")
+class TermLinkApiException(val status: Int, val code: String, val traceId: String?,
+    val stage: String? = null, val messageKey: String? = null) : Exception("TermLink API $status: $code")
 
 class ProductionApiClient(
     rootUrl: String,
@@ -82,6 +85,7 @@ class ProductionApiClient(
         val builder = Request.Builder().url(root + path).header("Authorization", "Bearer $token")
         if (method == "GET" && path == "/v1/pcs") {
             builder.header("X-TermLink-PC-Command-Capabilities", "powershell-7-enhanced")
+            builder.header("X-TermLink-PC-Shell-Capabilities", "posix-shells-v1")
         }
         if (idempotencyKey != null) builder.header("Idempotency-Key", idempotencyKey)
         if (includeDeviceProof) {
@@ -105,7 +109,11 @@ class ProductionApiClient(
                 // A proxy may return HTML or an empty body. Preserve the HTTP status either way.
                 val decoded = runCatching { json.parseToJsonElement(raw) }.getOrNull() as? JsonObject
                 val error = decoded?.get("error") as? JsonObject
-                throw TermLinkApiException(response.code, error?.get("code")?.toString()?.trim('"') ?: "HTTP_${response.code}", error?.get("trace_id")?.toString()?.trim('"'))
+                val stage = (error?.get("stage") as? JsonPrimitive)?.contentOrNull?.takeIf { it in CONNECTION_ERROR_STAGES }
+                val messageKey = (error?.get("message_key") as? JsonPrimitive)?.contentOrNull
+                    ?.takeIf { it.length <= 128 && it.matches(Regex("[a-z][a-z0-9._-]*")) }
+                throw TermLinkApiException(response.code, error?.get("code")?.toString()?.trim('"') ?: "HTTP_${response.code}",
+                    error?.get("trace_id")?.toString()?.trim('"'), stage, messageKey)
             }
             return if (raw.isBlank()) JsonNull else json.parseToJsonElement(raw)
         }
@@ -115,6 +123,8 @@ class ProductionApiClient(
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        val CONNECTION_ERROR_STAGES = setOf("configuration", "device_registration", "device_identity", "pc_metadata",
+            "push_registration", "relay_handshake", "file_transfer_handshake")
         fun normalizeRoot(value: String, allowCleartext: Boolean): String {
             val uri = URI(value.trimEnd('/'))
             require(uri.scheme == "https" || allowCleartext && uri.scheme == "http")

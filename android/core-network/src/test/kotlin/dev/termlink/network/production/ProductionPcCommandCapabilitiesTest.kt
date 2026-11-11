@@ -21,10 +21,13 @@ class ProductionPcCommandCapabilitiesTest {
                 api.get("/v1/pcs?limit=1")
                 api.get("/v1/devices")
                 api.post("/v1/pcs", buildJsonObject { })
-                assertEquals("powershell-7-enhanced",
-                    server.takeRequest().getHeader("X-TermLink-PC-Command-Capabilities"))
+                val request = server.takeRequest()
+                assertEquals("powershell-7-enhanced", request.getHeader("X-TermLink-PC-Command-Capabilities"))
+                assertEquals("posix-shells-v1", request.getHeader("X-TermLink-PC-Shell-Capabilities"))
                 repeat(3) {
-                    assertNull(server.takeRequest().getHeader("X-TermLink-PC-Command-Capabilities"))
+                    val other = server.takeRequest()
+                    assertNull(other.getHeader("X-TermLink-PC-Command-Capabilities"))
+                    assertNull(other.getHeader("X-TermLink-PC-Shell-Capabilities"))
                 }
             }
         } finally { identity.destroy() }

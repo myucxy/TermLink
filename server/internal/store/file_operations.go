@@ -105,6 +105,32 @@ const fileOperationReturningColumns = `
 	operation.filename,operation.size_bytes,operation.sha256,operation.directory_zip,operation.transfer_protocol,
 	operation.expires_at,operation.completed_at,operation.cancelled_at,operation.created_at,operation.updated_at`
 
+// fileOperationCapabilitySQL keeps the terminal-only Mac exception scoped to
+// OPEN_TERMINAL at every lifecycle step. Its expressions are fixed by callers
+// in this file, never supplied by a request.
+func fileOperationCapabilitySQL(operation, shell, pc string) string {
+	return `((` + operation + `='OPEN_TERMINAL'
+		AND 'terminal_commands_v1'=ANY(` + pc + `.capabilities)
+		AND ('file_operations_v1'=ANY(` + pc + `.capabilities)
+		  OR (` + pc + `.platform='macos' AND 'realtime_terminal_v1'=ANY(` + pc + `.capabilities)))
+		AND (` + shell + `=ANY(` + pc + `.supported_shells) OR EXISTS (
+			SELECT 1 FROM jsonb_array_elements(` + pc + `.terminal_commands) command
+			WHERE command->>'id'=` + shell + `)))
+		OR (` + operation + ` IN ('LIST','DOWNLOAD') AND 'file_operations_v1'=ANY(` + pc + `.capabilities)))`
+}
+
+// A queued job never preserves authority after its mobile requester loses
+// trust/MANAGE. AutoTrust follows the existing same-account policy only.
+func fileOperationRequesterSQL(account, pc, requester, autoTrust string) string {
+	return `EXISTS (SELECT 1 FROM users account JOIN devices requester ON requester.user_id=account.id
+		WHERE account.id=` + account + ` AND account.status='ACTIVE' AND requester.id=` + requester + `
+		  AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED'
+		  AND requester.disabled_at IS NULL AND requester.revoked_at IS NULL
+		  AND (` + autoTrust + ` OR EXISTS (SELECT 1 FROM device_grants g
+			WHERE g.pc_id=` + pc + ` AND g.device_id=requester.id AND g.permission='MANAGE'
+			  AND (g.expires_at IS NULL OR g.expires_at>now()))))`
+}
+
 type rowScanner interface {
 	Scan(...any) error
 }
@@ -129,7 +155,7 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var lockedAccountID uuid.UUID
-	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&lockedAccountID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 AND status='ACTIVE' FOR UPDATE`, userID).Scan(&lockedAccountID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return FileOperationRecord{}, ErrDenied
 		}
@@ -149,17 +175,16 @@ func (s *Postgres) CreateFileOperation(ctx context.Context, userID, requesterID,
 		FROM pcs p
 		JOIN devices requester ON requester.id=$3 AND requester.user_id=$2
 			AND requester.device_type IN ('ANDROID','IOS') AND requester.trust_state='TRUSTED'
+			AND requester.disabled_at IS NULL AND requester.revoked_at IS NULL
 		JOIN devices agent ON agent.id=p.device_id AND agent.user_id=$2
 			AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
-		WHERE p.id=$10 AND p.owner_user_id=$2
-		  AND 'file_operations_v1'=ANY(p.capabilities)
+			AND agent.disabled_at IS NULL AND agent.revoked_at IS NULL
+		WHERE p.id=$10 AND p.owner_user_id=$2 AND p.remote_routing_enabled
+		  AND `+fileOperationCapabilitySQL("$4", "$8", "p")+`
 		  AND ($7='' OR 'file_operation_name_filter_v1'=ANY(p.capabilities))
-		  AND ($4<>'OPEN_TERMINAL' OR ('terminal_commands_v1'=ANY(p.capabilities) AND ($8=ANY(p.supported_shells) OR EXISTS (
-			SELECT 1 FROM jsonb_array_elements(p.terminal_commands) command
-			WHERE command->>'id'=$8
-		  ))))
+		  AND `+fileOperationRequesterSQL("$2", "p.id", "$3", "$11")+`
 		RETURNING `+fileOperationColumns,
-		itemID, userID, requesterID, input.Operation, input.Path, input.Offset, input.Query, input.ShellType, input.ExpiresAt, pcID)
+		itemID, userID, requesterID, input.Operation, input.Path, input.Offset, input.Query, input.ShellType, input.ExpiresAt, pcID, s.AutoTrustDevices)
 	item, err := scanFileOperation(row)
 	if errors.Is(err, ErrNotFound) {
 		return FileOperationRecord{}, ErrDenied
@@ -267,10 +292,13 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 	var authorized bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM pcs p JOIN devices agent ON agent.id=p.device_id
-			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-			  AND 'file_operations_v1'=ANY(p.capabilities)
+			SELECT 1 FROM pcs p JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+			JOIN devices agent ON agent.id=p.device_id
+			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3 AND p.remote_routing_enabled
+			  AND ('file_operations_v1'=ANY(p.capabilities) OR
+			    (p.platform='macos' AND 'realtime_terminal_v1'=ANY(p.capabilities) AND 'terminal_commands_v1'=ANY(p.capabilities)))
 			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
+			  AND agent.disabled_at IS NULL AND agent.revoked_at IS NULL
 		)`, pcID, userID, agentDeviceID).Scan(&authorized); err != nil {
 		return nil, "", err
 	}
@@ -283,26 +311,34 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 		WHERE operation.pc_id=$1 AND operation.account_id=$2
 		  AND operation.status IN ('PENDING','PROCESSING') AND operation.expires_at<=now()
 		  AND EXISTS (
-			SELECT 1 FROM pcs p JOIN devices agent ON agent.id=p.device_id
-			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-			  AND 'file_operations_v1'=ANY(p.capabilities)
+			SELECT 1 FROM pcs p JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+			JOIN devices agent ON agent.id=p.device_id
+			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3 AND p.remote_routing_enabled
+			  AND ('file_operations_v1'=ANY(p.capabilities) OR
+			    (p.platform='macos' AND 'realtime_terminal_v1'=ANY(p.capabilities) AND 'terminal_commands_v1'=ANY(p.capabilities)))
 			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
+			  AND agent.disabled_at IS NULL AND agent.revoked_at IS NULL
+			  AND `+fileOperationCapabilitySQL("operation.operation", "operation.shell_type", "p")+`
 		  )`, pcID, userID, agentDeviceID); err != nil {
 		return nil, "", err
 	}
 
 	row := tx.QueryRow(ctx, `
 		WITH authority AS (
-			SELECT 'file_operation_name_filter_v1'=ANY(p.capabilities) AS search_capable
-			FROM pcs p JOIN devices agent ON agent.id=p.device_id
-			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3
-			  AND 'file_operations_v1'=ANY(p.capabilities)
+			SELECT p.platform,p.capabilities,p.supported_shells,p.terminal_commands,
+			  'file_operation_name_filter_v1'=ANY(p.capabilities) AS search_capable
+			FROM pcs p JOIN users account ON account.id=p.owner_user_id AND account.status='ACTIVE'
+			JOIN devices agent ON agent.id=p.device_id
+			WHERE p.id=$1 AND p.owner_user_id=$2 AND p.device_id=$3 AND p.remote_routing_enabled
 			  AND agent.user_id=$2 AND agent.device_type IN ('WINDOWS_PC','PC_AGENT') AND agent.trust_state='TRUSTED'
+			  AND agent.disabled_at IS NULL AND agent.revoked_at IS NULL
 		), candidate AS (
 			SELECT operation.id
 			FROM pc_file_operations operation, authority
 			WHERE operation.pc_id=$1 AND operation.account_id=$2 AND operation.expires_at>now()
 			  AND (operation.list_query='' OR authority.search_capable)
+			  AND `+fileOperationCapabilitySQL("operation.operation", "operation.shell_type", "authority")+`
+			  AND `+fileOperationRequesterSQL("$2", "$1", "operation.requester_device_id", "$6")+`
 			  AND (operation.status='PENDING'
 			       OR (operation.status='PROCESSING' AND operation.lease_expires_at<=now()))
 			ORDER BY operation.created_at,operation.id
@@ -315,7 +351,7 @@ func (s *Postgres) ClaimFileOperation(ctx context.Context, userID, agentDeviceID
 		FROM candidate
 		WHERE operation.id=candidate.id
 		RETURNING `+fileOperationReturningColumns,
-		pcID, userID, agentDeviceID, tokenHash[:], leaseDuration.Milliseconds())
+		pcID, userID, agentDeviceID, tokenHash[:], leaseDuration.Milliseconds(), s.AutoTrustDevices)
 	item, err := scanFileOperation(row)
 	if errors.Is(err, ErrNotFound) {
 		if err := tx.Commit(ctx); err != nil {
@@ -444,10 +480,12 @@ func (s *Postgres) AgentFileOperation(ctx context.Context, userID, agentDeviceID
 		FROM pc_file_operations operation
 		WHERE id=$1 AND account_id=$2 AND pc_id=$3 AND lease_token_hash=$4
 		  AND EXISTS (SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
-			WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$5
-			  AND 'file_operations_v1'=ANY(p.capabilities)
-			  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')`,
-		operationID, userID, pcID, leaseHash[:], agentDeviceID))
+			WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$5 AND p.remote_routing_enabled
+			  AND `+fileOperationCapabilitySQL("operation.operation", "operation.shell_type", "p")+`
+			  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED'
+			  AND d.disabled_at IS NULL AND d.revoked_at IS NULL)
+		  AND `+fileOperationRequesterSQL("$2", "$3", "operation.requester_device_id", "$6"),
+		operationID, userID, pcID, leaseHash[:], agentDeviceID, s.AutoTrustDevices))
 	return item, err
 }
 
@@ -530,10 +568,12 @@ func (s *Postgres) getAgentFileOperationForUpdate(ctx context.Context, tx pgx.Tx
 		FROM pc_file_operations operation
 		WHERE id=$1 AND account_id=$2 AND pc_id=$3
 		  AND EXISTS (SELECT 1 FROM pcs p JOIN devices d ON d.id=p.device_id
-			WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$4
-			  AND 'file_operations_v1'=ANY(p.capabilities)
-			  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED')
-		FOR UPDATE`, operationID, userID, pcID, agentDeviceID))
+			WHERE p.id=$3 AND p.owner_user_id=$2 AND p.device_id=$4 AND p.remote_routing_enabled
+			  AND `+fileOperationCapabilitySQL("operation.operation", "operation.shell_type", "p")+`
+			  AND d.user_id=$2 AND d.device_type IN ('WINDOWS_PC','PC_AGENT') AND d.trust_state='TRUSTED'
+			  AND d.disabled_at IS NULL AND d.revoked_at IS NULL)
+		  AND `+fileOperationRequesterSQL("$2", "$3", "operation.requester_device_id", "$5")+`
+		FOR UPDATE`, operationID, userID, pcID, agentDeviceID, s.AutoTrustDevices))
 	return item, err
 }
 

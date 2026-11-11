@@ -23,9 +23,8 @@ public sealed partial class App : Application
     private MainWindowViewModel? mainWindowViewModel;
     private IAsyncDisposable? agentClientLifetime;
     private IAsyncDisposable? platformLifetime;
-#if WINDOWS
-    private WindowsAgentClient? windowsAgentClient;
-#endif
+    private IAgentClient? completeExitClient;
+    private readonly CompleteExitCoordinator completeExit = new();
     private MainWindow? mainWindow;
     private TrayIcon? trayIcon;
     private IClassicDesktopStyleApplicationLifetime? desktopLifetime;
@@ -54,7 +53,6 @@ public sealed partial class App : Application
             {
                 var windowsClient = new WindowsAgentClient(WindowsAgentClientOptions.CreateDefault(descriptor));
                 client = windowsClient;
-                windowsAgentClient = windowsClient;
                 agentClientLifetime = windowsClient;
                 desktopOperations = WindowsDesktopOperations.CreateDefault();
             }
@@ -79,6 +77,7 @@ public sealed partial class App : Application
                     platformServices = mac;
                     platformLifetime = mac;
                     endpoint = options.IpcEndpoint;
+                    desktopOperations = new MacDesktopOperations(options);
                 }
                 else
                 {
@@ -91,11 +90,30 @@ public sealed partial class App : Application
                     platformServices.Processes);
                 client = portableClient;
                 agentClientLifetime = portableClient;
+                if (OperatingSystem.IsMacOS() && desktopOperations is MacDesktopOperations macOperations &&
+                    MacUpdateOptions.CreateDefault() is { } updates &&
+                    string.Equals(Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar),
+                        Path.Combine(updates.ApplicationBundlePath, "Contents", "MacOS"), StringComparison.Ordinal))
+                {
+                    var updateDirectory = Path.Combine(MacPlatformOptions.CreateDefault().DataDirectory, "updates");
+                    var runner = new MacCommandRunner();
+                    var installer = new MacPackageUpdateInstaller(updateDirectory, runner, updates.TrustedTeamId, updates.ApplicationBundlePath);
+                    macOperations.ConfigureUpdates(new MacUpdateService(updates, updateDirectory, installer,
+                        token => MacUpdateTrustBridge.VerifyCurrentAsync(runner, updates, token),
+                        portableClient.ShutdownCompletelyAsync, portableClient.ResumeAfterUpdateFailureAsync));
+                }
             }
             else
 #endif
             {
                 client = new PreviewAgentClient(descriptor, Program.UsePreviewFixture);
+            }
+            completeExitClient = client.SupportsCompleteShutdown ? client : null;
+            if (OperatingSystem.IsMacOS())
+            {
+#if !WINDOWS
+                desktopOperations ??= new MacDesktopOperations(MacPlatformOptions.CreateDefault());
+#endif
             }
             var stateStore = new AgentStateStore(client);
             var appearanceController = new AvaloniaAppearanceController();
@@ -110,6 +128,7 @@ public sealed partial class App : Application
                 DesktopProductInfo.Version,
                 DesktopProductInfo.Author);
             mainWindow = new MainWindow { DataContext = mainWindowViewModel };
+            mainWindowViewModel.UpdateInstalled += OnUpdateInstalled;
             mainWindow.Closing += OnMainWindowClosing;
             if (!Program.StartHidden) desktop.MainWindow = mainWindow;
             trayIcon = CreateTrayIcon();
@@ -134,11 +153,13 @@ public sealed partial class App : Application
         }
         if (mainWindowViewModel is not null)
         {
+            mainWindowViewModel.UpdateInstalled -= OnUpdateInstalled;
             mainWindowViewModel.DisposeAsync().AsTask().GetAwaiter().GetResult();
             mainWindowViewModel = null;
         }
         agentClientLifetime?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         agentClientLifetime = null;
+        completeExitClient = null;
         platformLifetime?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         platformLifetime = null;
         desktopLifetime = null;
@@ -147,39 +168,35 @@ public sealed partial class App : Application
     private void OnActivationRequested(object? sender, EventArgs e) =>
         Dispatcher.UIThread.Post(ShowMainWindow);
 
+    private void OnUpdateInstalled(object? sender, EventArgs e)
+    {
+#if !WINDOWS
+        if (OperatingSystem.IsMacOS())
+        {
+            try { MacApplicationRelaunch.AfterCurrentProcessExits(); ExitControlUi(); }
+            catch (Exception error)
+            {
+                if (completeExitClient is PortableAgentClient portable) _ = portable.ResumeAfterUpdateFailureAsync();
+                _ = mainWindowViewModel?.ReportFailureAsync(error);
+            }
+        }
+#endif
+    }
+
     private TrayIcon CreateTrayIcon()
     {
         var iconUri = new Uri("avares://TermLink/Assets/TermLink.ico");
         using var iconStream = AssetLoader.Open(iconUri);
-        var menu = new NativeMenu();
-        var openItem = new NativeMenuItem { Header = PresentationText.OpenTermLink };
-        openItem.Click += (_, _) => ShowMainWindow();
-        var updateItem = new NativeMenuItem { Header = PresentationText.CheckUpdates };
-        updateItem.Click += (_, _) =>
+        var menu = DesktopTrayMenu.Create(ShowMainWindow, () =>
         {
             ShowMainWindow();
             mainWindowViewModel?.CheckForUpdatesCommand.Execute(null);
-        };
-        var diagnosticsItem = new NativeMenuItem { Header = PresentationText.Diagnostics };
-        diagnosticsItem.Click += (_, _) =>
+        }, () =>
         {
             mainWindowViewModel?.Navigate("diagnostics");
             ShowMainWindow();
-        };
-        var exitItem = new NativeMenuItem { Header = PresentationText.ExitControlUi };
-        exitItem.Click += (_, _) => ExitControlUi();
-#if WINDOWS
-        var fullExitItem = new NativeMenuItem { Header = PresentationText.ExitTermLinkCompletely };
-        fullExitItem.Click += async (_, _) => await ExitTermLinkCompletelyAsync();
-#endif
-        menu.Items.Add(openItem);
-        menu.Items.Add(updateItem);
-        menu.Items.Add(diagnosticsItem);
-        menu.Items.Add(new NativeMenuItemSeparator());
-        menu.Items.Add(exitItem);
-#if WINDOWS
-        if (windowsAgentClient is not null) menu.Items.Add(fullExitItem);
-#endif
+        }, ExitControlUi, completeExitClient is null ? null : ExitTermLinkCompletelyAsync,
+            mainWindowViewModel?.SupportsAutomaticUpdates == true);
 
         var result = new TrayIcon
         {
@@ -209,41 +226,31 @@ public sealed partial class App : Application
 
     private void ExitControlUi()
     {
+        if (mainWindowViewModel?.IsInstallingUpdate == true) return;
         windowLifetime.RequestExit();
         trayIcon?.Dispose();
         trayIcon = null;
         desktopLifetime?.Shutdown();
     }
 
-#if WINDOWS
-    private int fullExitInFlight;
-
     private async Task ExitTermLinkCompletelyAsync()
     {
-        var client = windowsAgentClient;
+        var client = completeExitClient;
         var viewModel = mainWindowViewModel;
-        if (client is null || viewModel is null || Volatile.Read(ref fullExitInFlight) != 0) return;
-
-        ShowMainWindow();
-        if (!await viewModel.RequestConfirmationAsync(
+        if (client is null || viewModel is null || viewModel.IsInstallingUpdate) return;
+        await completeExit.ExitAsync(client, () =>
+        {
+            ShowMainWindow();
+            return viewModel.RequestConfirmationAsync(
                 PresentationText.ConfirmFullExitTitle,
                 PresentationText.ConfirmFullExitDetail,
-                CancellationToken.None)) return;
-        if (Interlocked.Exchange(ref fullExitInFlight, 1) != 0) return;
-
-        try
+                CancellationToken.None);
+        }, ExitControlUi, async error =>
         {
-            await client.ShutdownCompletelyAsync(CancellationToken.None);
-            ExitControlUi();
-        }
-        catch (Exception error)
-        {
-            Volatile.Write(ref fullExitInFlight, 0);
             await viewModel.ReportFailureAsync(error);
             ShowMainWindow();
-        }
+        });
     }
-#endif
 
     private static PlatformDescriptor CreatePlatformDescriptor()
     {

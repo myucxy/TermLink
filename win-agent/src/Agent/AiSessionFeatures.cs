@@ -30,10 +30,10 @@ internal sealed partial class AiAgentSession
         internal bool IsImage => Mime is "image/png" or "image/jpeg" or "image/webp" or "image/gif";
     }
     private object Capabilities() => new {
-        changes = true, watch = true, search = true, artifacts = true, diffRead = true, configure = CurrentConfiguration().ModelSwitch || CurrentConfiguration().PermissionSwitch,
+        changes = true, watch = true, search = true, artifacts = OperatingSystem.IsWindows(), diffRead = true, configure = CurrentConfiguration().ModelSwitch || CurrentConfiguration().PermissionSwitch,
         configuration = CurrentConfiguration(), steer = agent.Protocol == "codex",
         resume = (agent.Protocol is "codex" or "claude" || agent.Protocol == "acp" && acpLoadSession) && threadId.Length > 0,
-        fork = agent.Protocol == "codex", history = true, attachments = true, fileReferences = true,
+        fork = agent.Protocol == "codex", history = true, attachments = OperatingSystem.IsWindows(), fileReferences = OperatingSystem.IsWindows(),
         nativeImages = agent.Protocol is "codex" or "claude" || agent.Protocol == "acp" && acpImages,
         maxFileBytes = MaxFile, maxTotalBytes = MaxAttachments, maxFiles = 5, chunkBytes = 24 * 1024,
         modes = Modes(agent.Protocol)

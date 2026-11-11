@@ -3,27 +3,17 @@ package migrate
 import (
 	"context"
 	"crypto/sha256"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/termlink/termlink/server/migrations"
 )
 
 func TestGenericPCAgentMigrationRoundTripPreservesIdentityAndLegacyFallback(t *testing.T) {
-	databaseURL := os.Getenv("TERMLINK_INTEGRATION_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("TERMLINK_INTEGRATION_DATABASE_URL is required for the migration integration test")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
+	pool := isolatedMigrationPool(t, ctx)
 	if err := UpPool(ctx, pool); err != nil {
 		t.Fatal(err)
 	}

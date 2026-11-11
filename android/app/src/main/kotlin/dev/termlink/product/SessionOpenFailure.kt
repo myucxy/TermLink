@@ -10,6 +10,9 @@ import dev.termlink.terminal.nativecore.NativeTerminalException
 import dev.termlink.terminal.nativecore.NativeTerminalStatus
 import java.io.IOException
 import java.net.SocketTimeoutException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /** Stable, non-sensitive failure categories exposed by the Android session UI. */
 enum class SessionOpenFailureCode(
@@ -143,12 +146,35 @@ internal fun sessionOpenException(
     ), cause)
 }
 
+/** Early open preconditions need the same persistent safe error as Snapshot failures. */
+internal suspend fun <T> withSessionOpenFailureObservation(
+    observeFailure: (SessionOpenFailure) -> Unit,
+    open: suspend () -> T,
+): T = try {
+    open()
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Exception) {
+    // A cancelled or retired attempt must not replace a successor's UI state.
+    // The repository callback additionally fences account and exact PC identity.
+    currentCoroutineContext().ensureActive()
+    val classified = classifySessionOpenException(error, SessionFailureStage.PRECONDITION)
+    observeFailure(classified.failure)
+    throw classified
+}
+
 /** Converts implementation exceptions to a bounded public taxonomy without echoing exception text. */
 internal fun classifySessionOpenException(
     error: Throwable,
     stage: SessionFailureStage,
 ): SessionOpenException {
     if (error is SessionOpenException) return error
+    // A verified host range reports actual retained-history loss. Preserve
+    // H114 so the existing stale-bound-checkpoint path can fetch a newer V2
+    // snapshot; classifying it as generic replay failure stranded recovery.
+    if (error.findCause<dev.termlink.network.production.ProductionHostHistoryGapException>() != null) {
+        return sessionOpenException(SessionOpenFailureCode.HISTORY_GAP, error)
+    }
     error.findCause<dev.termlink.model.TerminalBufferLimitException>()?.let { limit ->
         return SessionOpenException(SessionOpenFailure(
             SessionOpenFailureCode.TERMINAL_HISTORY_MEMORY_LIMIT,

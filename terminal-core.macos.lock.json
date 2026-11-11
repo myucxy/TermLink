@@ -1,0 +1,221 @@
+{
+  "schema": 2,
+  "repository": "git@github.com:myucxy/terminal-core.git",
+  "revision": "f51936441dea83fa2f9459386fb6c35b90102979",
+  "source_dirty": false,
+  "source_method": "git_archive_HEAD",
+  "rust_toolchain": "1.97.1",
+  "platform": "macos",
+  "minimum_os": "13.0",
+  "crate_version": "0.1.0-rc.1",
+  "abi_version": 1,
+  "licenses": "GPL-3.0-only AND Unicode-3.0 AND MIT (see bundled notices)",
+  "libraries": [
+    {
+      "path": "native/terminal-core/macos/osx-arm64/libtermlink_terminal_ffi.dylib",
+      "size": 2058688,
+      "sha256": "82a561b12bf28293cbb5b3835d531000b55ae48e5138765412f4a46fa83ea7b0",
+      "platform": "macos",
+      "architecture": "arm64",
+      "rid": "osx-arm64",
+      "target": "aarch64-apple-darwin",
+      "crate_version": "0.1.0-rc.1",
+      "abi_version": 1,
+      "minimum_os": "13.0",
+      "signing": "ad_hoc_local_only",
+      "smoke_executed": true
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "native/terminal-core/macos/licenses/LICENSE",
+      "size": 35149,
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/NOTICE",
+      "size": 2319,
+      "sha256": "a8a9b2f284db933f35e5b53b4fce83204e2c171ed967a08ceaa1309bdf0ee5c8"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/legacy-charsets/LICENSE.txt",
+      "size": 1095,
+      "sha256": "ad0cf28f3381ca9bb0bf101d127402d44c17bfa0991e1a00bff7ae6679e9dada"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/legacy-charsets/README.md",
+      "size": 926,
+      "sha256": "0d75a7c5c84812d5c780645327ddaad61d130258f93dff435f78833693e752f8"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/legacy-charsets/tables.json",
+      "size": 18906,
+      "sha256": "816184fb20bb3ed71db9cd7a0f05f76129277c970524bd37a86b17d0f2f7df66"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/README.md",
+      "size": 1285,
+      "sha256": "77775a36a5cbba0a05bf4d420a7d31b74ec93ff1242d82cd747e5fcdced146c8"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/SOURCES.json",
+      "size": 3059,
+      "sha256": "af34589827eb243d1e2b71238b7216e46838aaf527532bb7d68bc5f27f92feb1"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/block-buffer-0.10.4/LICENSE-APACHE",
+      "size": 10849,
+      "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/block-buffer-0.10.4/LICENSE-MIT",
+      "size": 1082,
+      "sha256": "d5c22aa3118d240e877ad41c5d9fa232f9c77d757d4aac0c2f943afc0a95e0ef"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/cfg-if-1.0.5/LICENSE-APACHE",
+      "size": 10847,
+      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/cfg-if-1.0.5/LICENSE-MIT",
+      "size": 1057,
+      "sha256": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/cpufeatures-0.2.17/LICENSE-APACHE",
+      "size": 10849,
+      "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/cpufeatures-0.2.17/LICENSE-MIT",
+      "size": 1082,
+      "sha256": "ae9baa7beea910273c2f384c2a6b721fb7bd02bda3436074a1072e4ee689f985"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/crypto-common-0.1.7/LICENSE-APACHE",
+      "size": 10849,
+      "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/crypto-common-0.1.7/LICENSE-MIT",
+      "size": 1065,
+      "sha256": "3521672491a3479422d5fe1aca6645dd2984090f85da6e5205abfb18fb7a6897"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/digest-0.10.7/LICENSE-APACHE",
+      "size": 10849,
+      "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/digest-0.10.7/LICENSE-MIT",
+      "size": 1057,
+      "sha256": "9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/generic-array-0.14.7/LICENSE",
+      "size": 1087,
+      "sha256": "ad4fcfaf8d5b12b97409c137a03d4a4e4b21024c65c54f976cc3b609c1bd5b0f"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/libc-0.2.190/LICENSE-APACHE",
+      "size": 9723,
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/libc-0.2.190/LICENSE-MIT",
+      "size": 1066,
+      "sha256": "123a331b5dbf04c30097fa43b8f858bc85df671fe776de498d01f3d6b7c1f69e"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/sha2-0.10.9/LICENSE-APACHE",
+      "size": 10849,
+      "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/sha2-0.10.9/LICENSE-MIT",
+      "size": 1138,
+      "sha256": "b4eb00df6e2a4d22518fcaa6a2b4646f249b3a3c9814509b22bd2091f1392ff1"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/typenum-1.20.1/LICENSE",
+      "size": 17,
+      "sha256": "db11fec9946737df39ca3898d9cd8c10ec6f6c3a884a6802b0ad0b81b4e8f23a"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/typenum-1.20.1/LICENSE-APACHE",
+      "size": 10835,
+      "sha256": "516b24e051bf5630880ebbd55c40a25ce9552ebaf8970a53e8976eb70e522406"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/typenum-1.20.1/LICENSE-MIT",
+      "size": 1083,
+      "sha256": "a825bd853ab71619a4923d7b4311221427848070ff44d990da39b0b274c1683f"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/version_check-0.9.5/LICENSE-APACHE",
+      "size": 10847,
+      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/rust-dependencies/version_check-0.9.5/LICENSE-MIT",
+      "size": 1085,
+      "sha256": "b7e650f3fce5c53249d1cdc608b54df156a97edd636cf9d23498d0cfe7aec63e"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/DerivedCoreProperties.txt",
+      "size": 1115959,
+      "sha256": "39d35161f2954497f69e08bdb9e701493f476a3d30222de20028feda36c1dabd"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/EastAsianWidth.txt",
+      "size": 199042,
+      "sha256": "43adc76c0686a42cb370764eb8cfe2b2a45b10b855e5572a2db4a0eecce15d5b"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/GraphemeBreakProperty.txt",
+      "size": 98751,
+      "sha256": "c29360bd6f7132811d701d29069541e827eb44bfc4c8fbde8c370d6982689dc1"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/GraphemeBreakTest.txt",
+      "size": 171927,
+      "sha256": "ee2b9354d270ac061b29f09662cafea06341d77e704b8cc6bd72aaeeda363cb5"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/LICENSE.txt",
+      "size": 1995,
+      "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/ReadMe.txt",
+      "size": 693,
+      "sha256": "14cafa23788d3a20dd21d6b0cdcb8d6dab520781fcd9ad9392f3b88ea607e633"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/SHA256.json",
+      "size": 868,
+      "sha256": "9952dd95ab57f38cea9383f55f032753bf9c57b44e0a6a8210c57a25f1aeeca1"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/SOURCE.md",
+      "size": 1254,
+      "sha256": "0dcf6ac9e12698a1f037454af480a3fba00d83604bf595e83110ba190fe151ad"
+    },
+    {
+      "path": "native/terminal-core/macos/licenses/third_party/unicode/16.0.0/emoji-data.txt",
+      "size": 113024,
+      "sha256": "f1365a5173eee18e1f98b240cdc492e84a25f1ce7e0c9d1094eb29c41a22696a"
+    },
+    {
+      "path": "native/terminal-core/macos/osx-arm64/libtermlink_terminal_ffi.dylib",
+      "size": 2058688,
+      "sha256": "82a561b12bf28293cbb5b3835d531000b55ae48e5138765412f4a46fa83ea7b0"
+    }
+  ],
+  "provenance": {
+    "export_lock_sha256": "d6b04565706ecfa44f28241fcadcc48fb04d2c9d8d846de5237b6df8a8466a89",
+    "source_archive_sha256": "f0a42a1cc32f8e7db16c2795920a20b4d26282a863a5942810ca852afa3d5a7c",
+    "build_info_sha256": "42708608ef93213189e7fd7fd1ad2cd96f7e022caebde7e3710d30d4663cc555"
+  }
+}

@@ -4,16 +4,18 @@ import UserNotifications
 
 struct SettingsView: View {
     @EnvironmentObject private var product: ProductStore
+    @Environment(\.openURL) private var openURL
     @AppStorage("appearance") private var appearance = "system"
     @AppStorage("terminal-font-size") private var terminalFont = 14.0
     @AppStorage("ai-font-scale") private var aiScale = 1.0
     @AppStorage("notification-sound") private var sound = false
     @AppStorage("keep-screen-on") private var keepScreenOn = false
-    @State private var notifications = false, confirmSignOut = false
+    @State private var notifications = false
+    @State private var confirmSignOut = false
 
     var body: some View {
         Form {
-            Section("连接与账号") {
+            Section {
                 TextField("HTTPS 服务地址", text: $product.server)
                     .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
                     .disabled(product.signedIn || product.signingIn)
@@ -22,11 +24,17 @@ struct SettingsView: View {
                     LabeledContent("账号", value: product.accountID)
                     Button("重新确认连接") { Task { await product.reconnect() } }
                     NavigationLink("设备管理") { AccountDevicesView() }
+                    Button("账号安全与密码") { openAccountPage(.security) }
+                    Button("账号隐私与注销") { openAccountPage(.privacy) }
                     Button("退出登录", role: .destructive) { confirmSignOut = true }
                 } else {
                     Button(product.signingIn ? "等待授权…" : "授权登录") { Task { await product.signIn() } }
                         .disabled(product.signingIn)
+                    Button("注册账号") { openAccountPage(.registration) }.disabled(product.signingIn)
+                    Button("登录帮助与找回密码") { openAccountPage(.loginHelp) }.disabled(product.signingIn)
                 }
+            } header: { Text("连接与账号") } footer: {
+                Text("账号操作在当前服务的系统浏览器页面完成，可能需要再次登录。注册完成后返回应用授权登录。")
             }
             Section("显示") {
                 Picker("外观", selection: $appearance) {
@@ -66,6 +74,11 @@ struct SettingsView: View {
             Button("退出登录", role: .destructive) { Task { await product.signOut() } }
         } message: { Text("断开本机连接；电脑上的会话继续运行。") }
     }
+
+    private func openAccountPage(_ page: AccountWebPage) {
+        do { openURL(try page.url(server: product.server)) }
+        catch { product.report(error) }
+    }
 }
 
 struct AccountDevicesView: View {
@@ -92,9 +105,12 @@ struct AccountDevicesView: View {
 
 struct LicenseListView: View {
     private var files: [URL] {
-        guard let directory = Bundle.main.url(forResource: "licenses", withExtension: nil) else { return [] }
-        return ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
-            .filter { ["txt", "md"].contains($0.pathExtension) }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let directory = Bundle.main.url(forResource: "licenses", withExtension: nil)
+        let shared = directory.flatMap { try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil) } ?? []
+        let core = ["terminal-core-LICENSE", "terminal-core-NOTICE", "terminal-core-THIRD-PARTY-NOTICES"]
+            .compactMap { Bundle.main.url(forResource: $0, withExtension: "txt") }
+        return (shared + core).filter { ["txt", "md"].contains($0.pathExtension) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
     var body: some View {
         List(files, id: \.path) { file in

@@ -3,7 +3,8 @@ import Foundation
 import Combine
 
 @MainActor final class AgentUpdateStore: ObservableObject {
-    @Published private(set) var tasks:[UUID:AgentUpdate]=[:],errors:[UUID:String]=[:]
+    @Published private(set) var tasks:[UUID:AgentUpdate]=[:]
+    @Published private(set) var errors:[UUID:String]=[:]
     @Published var selected:UUID?
     @Published private(set) var offers:[UUID:JSONValue]=[:]
     private var retained:[UUID:String]=[:],hidden=Set<UUID>(),jobs:[UUID:Task<Void,Never>]=[:]

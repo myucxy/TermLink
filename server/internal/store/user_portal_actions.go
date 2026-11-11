@@ -343,6 +343,11 @@ func (s *Postgres) DisableUserPortalDevice(ctx context.Context, accountID, devic
 		if _, err = tx.Exec(ctx, userPortalDeleteDeviceGrantsSQL, deviceID, accountID); err != nil {
 			return result, err
 		}
+		// Invalidate existing transports in the same transaction as the disable.
+		// disabled_at remains separate from the device's trust/revocation state.
+		if _, err = tx.Exec(ctx, userPortalDeviceRevokedOutboxSQL, deviceID, accountID); err != nil {
+			return result, err
+		}
 		if _, err = tx.Exec(ctx, `INSERT INTO audit_events(user_id,action,target_type,target_id,result,trace_id) VALUES($1,'user_portal.device.disable','device',$2,'SUCCEEDED',$3)`, accountID, deviceID, traceID); err != nil {
 			return result, err
 		}

@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsAreOrderedAndStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load() error = %v", err)
 	}
-	if len(items) != 50 || items[0].version != 1 || items[0].name != "000001_production_core.up.sql" ||
+	if len(items) != 55 || items[0].version != 1 || items[0].name != "000001_production_core.up.sql" ||
 		items[1].version != 2 || items[1].name != "000002_pairing_grants.up.sql" ||
 		items[2].version != 3 || items[2].name != "000003_history_uploads.up.sql" ||
 		items[3].version != 4 || items[3].name != "000004_pc_key_epoch.up.sql" ||
@@ -59,7 +59,12 @@ func TestEmbeddedMigrationsAreOrderedAndStable(t *testing.T) {
 		items[43].version != 44 || items[43].name != "000044_file_operation_search.up.sql" ||
 		items[44].version != 45 || items[44].name != "000045_collaborative_pc_control_default.up.sql" || items[45].version != 46 || items[45].name != "000046_device_disable.up.sql" || items[46].version != 47 || items[46].name != "000047_server_runtime_secrets.up.sql" || items[47].version != 48 || items[47].name != "000048_default_registration_closed.up.sql" ||
 		items[48].version != 49 || items[48].name != "000049_direct_routing_policy.up.sql" ||
-		items[49].version != 50 || items[49].name != "000050_runtime_settings.up.sql" {
+		items[49].version != 50 || items[49].name != "000050_runtime_settings.up.sql" ||
+		items[50].version != 51 || items[50].name != "000051_ios_mobile_devices.up.sql" ||
+		items[51].version != 52 || items[51].name != "000052_posix_shell_metadata.up.sql" ||
+		items[52].version != 53 || items[52].name != "000053_platform_agent_updates.up.sql" ||
+		items[53].version != 54 || items[53].name != "000054_portable_pwsh_metadata.up.sql" ||
+		items[54].version != 55 || items[54].name != "000055_device_push_notifications.up.sql" {
 		t.Fatalf("unexpected migration set: %#v", items)
 	}
 	if items[len(items)-1].version != migrations.LatestVersion {

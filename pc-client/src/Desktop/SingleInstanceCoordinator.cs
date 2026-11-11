@@ -25,7 +25,11 @@ public sealed class SingleInstanceCoordinator : IDisposable
         var identity = string.Join('|', Environment.UserDomainName, Environment.UserName, instanceScope);
         var suffix = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..24];
         mutex = new Mutex(false, $"TermLink.Desktop.{suffix}");
-        pipeName = $"termlink-desktop-activate-{suffix.ToLowerInvariant()}";
+        // .NET prefixes Unix named pipes with the macOS temporary directory;
+        // its long per-user path leaves little of sockaddr_un's 104-byte limit.
+        pipeName = OperatingSystem.IsMacOS()
+            ? $"tl-ui-{suffix.ToLowerInvariant()}"
+            : $"termlink-desktop-activate-{suffix.ToLowerInvariant()}";
     }
 
     public bool TryAcquire()

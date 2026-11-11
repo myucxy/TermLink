@@ -12,6 +12,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SessionOpenFailureTest {
+    @Test fun explicitHostRangeGapKeepsSnapshotFallbackClassification() {
+        val error = IllegalStateException("wrapper", dev.termlink.network.production.ProductionHostHistoryGapException("EVENT_RANGE_GAP"))
+        assertEquals(SessionOpenFailureCode.HISTORY_GAP,
+            classifySessionOpenException(error, SessionFailureStage.HISTORY_REPLAY).failure.code)
+        assertEquals(SessionOpenFailureCode.HISTORY_REPLAY,
+            classifySessionOpenException(IllegalStateException("malformed event ordering"), SessionFailureStage.HISTORY_REPLAY).failure.code)
+    }
+
     @Test
     fun protocolDiagnosticSourceDefaultsToAndroidAndMapsHostContextSeparately() {
         val defaultFailure = SessionOpenFailure(SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY)

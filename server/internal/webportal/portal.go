@@ -64,6 +64,8 @@ type Config struct {
 	Issuer                    string
 	BackchannelIssuer         string
 	ClientID                  string
+	AndroidClientID           string
+	IOSClientID               string
 	WindowsClientID           string
 	StepUpClientID            string
 	RedirectURI               string
@@ -2032,7 +2034,13 @@ func normalizeRegistrationContinueURL(config Config, value string, requests ...*
 		return ""
 	}
 	clientID := strings.TrimSpace(query.Get("client_id"))
-	if clientID == "" || (clientID != windowsClientID && clientID != strings.TrimSpace(config.ClientID)) {
+	allowedClient := false
+	for _, configured := range []string{config.ClientID, config.AndroidClientID, config.IOSClientID, windowsClientID} {
+		if id := strings.TrimSpace(configured); id != "" && clientID == id {
+			allowedClient = true
+		}
+	}
+	if clientID == "" || !allowedClient {
 		return ""
 	}
 	return target.String()

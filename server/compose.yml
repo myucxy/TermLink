@@ -48,6 +48,9 @@ services:
       # INITIAL_ADMIN_PASSWORD_FILE, the HTTP binding, container logging,
       # ALLOW_LOCAL_HTTP, and DIRECT_TRANSPORT_ENABLED stay container or
       # bootstrap level and are intentionally not runtime-editable.
+      # iOS remains disabled unless an explicit, distinct client ID is supplied.
+      TERMLINK_IOS_OIDC_CLIENT_ID: ${TERMLINK_IOS_OIDC_CLIENT_ID:-}
+      TERMLINK_IOS_OIDC_REDIRECT_URI: ${TERMLINK_IOS_OIDC_REDIRECT_URI:-dev.termlink.ios:/oauth2redirect}
       TERMLINK_PUBLIC_URL: ${TERMLINK_PUBLIC_URL:-https://termlink.example.invalid}
       TERMLINK_DATABASE_URL: postgres://termlink:${TERMLINK_POSTGRES_PASSWORD:-TermLinkDbPass_2026}@postgres:5432/termlink?sslmode=disable
       TERMLINK_INITIAL_ADMIN_PASSWORD_FILE: ${TERMLINK_INITIAL_ADMIN_PASSWORD_FILE:-}
@@ -57,6 +60,7 @@ services:
       TERMLINK_DIRECT_TRANSPORT_ENABLED: "true"
       TERMLINK_DIRECT_STUN_SERVERS: ${TERMLINK_DIRECT_STUN_SERVERS:-stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302}
       TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS: ${TERMLINK_APPSHIP_ALLOWED_PRIVATE_IPS:-}
+      TERMLINK_APPSHIP_MACOS_TEAM_ID: ${TERMLINK_APPSHIP_MACOS_TEAM_ID:-}
       # Optional master-key at-rest wrap (audit #5). The passphrase transits
       # the compose environment; prefer a long random value and treat it as a
       # deployment secret (losing it makes the deployment unstartable).

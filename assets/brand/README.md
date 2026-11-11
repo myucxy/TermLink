@@ -26,6 +26,14 @@ Windows 导出资源由仓库内脚本从同一 01B 几何参数生成：
 .\assets\brand\Export-WindowsAssets.ps1
 ```
 
+macOS 应用包图标直接从同一 `termlink-app-icon.svg` 生成，包含 16～1024 像素的标准／Retina 尺寸：
+
+```bash
+bash assets/brand/Export-MacOSAssets.sh /absolute/output/TermLink.icns
+```
+
+macOS DEV 与 PKG 打包脚本自动生成 `Contents/Resources/TermLink.icns`，并在 `Info.plist` 中通过 `CFBundleIconFile` 声明，供 Finder 和 Dock 使用。
+
 ## 颜色
 
 | Token | Value | 用途 |

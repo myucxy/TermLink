@@ -48,9 +48,8 @@ import Combine
         if state == .connected || state == .connecting { return }
         disconnect(); state = .connecting; let owner = generation
         defer{if owner==generation,state != .connected{disconnect();state = .failed("Relay 握手未完成，请重新连接。")}}
-        var request = try await api.signedRequest(path:"/v1/realtime",method:"GET")
-        guard var parts = URLComponents(url:request.url!,resolvingAgainstBaseURL:false) else { throw ClientError.invalidURL }
-        parts.scheme = "wss"; request.url = parts.url; request.setValue("termlink.realtime.v1",forHTTPHeaderField:"Sec-WebSocket-Protocol")
+        let signed = try await api.signedRequest(path:"/v1/realtime",method:"GET")
+        let request = try MobileRelayProtocol.webSocketRequest(signed, channel: .realtime)
         let task = session.webSocketTask(with:request); task.maximumMessageSize = 1_048_575; socket = task; task.resume()
         // 'android' is the existing mobile endpoint wire role, also used by IOS identities.
         let supported = ["cumulative_ack","e2ee_x25519_chacha20poly1305","flow_control_v1","lease_v1","liveness_probe_v1","bounded_event_replay_v1","terminal_presentation_metadata_v1","terminal_typed_input_v1","terminal_attach_v1","terminal_host_geometry_v1","terminal_host_theme_v1","terminal_host_resize_v1","host_history_v1","host_session_catalog_v1","host_session_cleanup_v1","ai_agent_v1"]
@@ -67,7 +66,13 @@ import Combine
         capabilities = Set(welcome["capabilities"].array.map(\.string)).intersection(supported); state = .connected
         receiveTask = Task { [weak self] in
             do { while !Task.isCancelled { let message = try await task.receive(); guard let self, self.generation == owner else { return }; try await self.receive(message,owner:owner) } }
-            catch { guard let self, self.generation == owner else { return }; self.fail(ClientError.unavailable("Relay 连接中断，请重新确认。")) }
+            catch {
+                guard let self, self.generation == owner else { return }
+                // Keep bounded local validation reasons visible; otherwise a
+                // decoder error looks identical to a transient network failure.
+                if let validation = error as? ClientError { self.fail(validation) }
+                else { self.fail(ClientError.unavailable("Relay 连接中断，请重新确认。")) }
+            }
         }
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -75,7 +80,12 @@ import Combine
                     try await Task.sleep(for:.seconds(15));guard let self,self.generation == owner else { return }
                     if self.probe != nil{guard Date().timeIntervalSince(self.probeSent)<30 else{throw ClientError.unavailable("Relay 未回应状态确认。")}}
                     else{let id=UUID().uuidString.lowercased();self.probe=id;self.probeSent=Date();try await task.send(.string("{\"type\":\"ping\",\"probe_id\":\"\(id)\"}"))}
-                    try await task.sendPing()
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        task.sendPing { error in
+                            if let error { continuation.resume(throwing: error) }
+                            else { continuation.resume() }
+                        }
+                    }
                 }
                 catch { if self?.generation == owner { self?.fail(ClientError.unavailable("Relay 心跳中断。")) }; return }
             }
@@ -128,7 +138,7 @@ import Combine
         let key = SessionCrypto.session(pair,id:route,direction:1,keyID:m.bytes(9))
         let plain = try SessionCrypto.open(m.bytes(11),key:key,nonce:m.bytes(10),aad:m.encoded(excluding:[11]))
         let payload = try ProtoMessage(plain)
-        if [.aiResponse,.catalogResponse,.cleanupResponse,.terminateResponse,.resizeResponse].contains(type), let id = try? UUID(bytes:payload.bytes(1)), let item=pending[id] {
+        if [.aiResponse,.catalogResponse,.cleanupResponse,.terminateResponse,.resizeResponse,.attachResult].contains(type), let id = try? UUID(bytes:payload.bytes(1)), let item=pending[id] {
             guard item.route==route,item.response==type,item.sequence==m.uint(6),item.generation==owner else { return }
             complete(id,.success(payload)); return
         }
