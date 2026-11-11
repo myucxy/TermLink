@@ -10,6 +10,11 @@
     <Compile Include="../../src/Agent/AiAgentSession.cs" Link="AiAgentSession.cs" />
     <Compile Include="../../src/Agent/AiAcpSession.cs" Link="AiAcpSession.cs" />
     <Compile Include="../../src/Agent/AiSessionTimeline.cs" Link="AiSessionTimeline.cs" />
+    <Compile Include="../../src/Agent/AiStructuredInteractions.cs" Link="Shared/AiStructuredInteractions.cs" />
+    <Compile Include="../../src/Agent/AiHistoryActions.cs" Link="Shared/AiHistoryActions.cs" />
+    <Compile Include="../../src/Agent/AiAgentCapabilities.cs" Link="Shared/AiAgentCapabilities.cs" />
+    <Compile Include="../../src/Agent/AiWorkspaceFiles.cs" Link="AiWorkspaceFiles.cs" />
+    <Compile Include="../../src/Agent/AiToolPresentation.cs" Link="AiToolPresentation.cs" />
     <Compile Include="../../src/Agent/AiSessionArtifacts.cs" Link="AiSessionArtifacts.cs" />
     <Compile Include="../../src/Agent/AiSessionFeatures.cs" Link="AiSessionFeatures.cs" />
     <Compile Include="../../src/Agent/AiConfiguration.cs" Link="AiConfiguration.cs" />

@@ -152,7 +152,7 @@ internal fun AiModelPicker(
                     onClick = { expanded = false; custom = true },
                 )
                 val hint = when {
-                    !listing -> "Windows Agent 未提供模型列表，可手动输入。"
+                    !listing -> "电脑端 Agent 未提供模型列表，可手动输入。"
                     !online -> "电脑暂时不可用，模型列表无法读取。"
                     loading -> "正在读取模型…"
                     error.isNotEmpty() -> error

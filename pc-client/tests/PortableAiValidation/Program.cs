@@ -42,5 +42,12 @@ try {
     await PortableAiFixtureValidation.RunAsync(root);
     await PortableCodexValidation.RunAsync(Path.Combine(root, "codex"));
     await PortableAiDirectoryValidation.RunAsync(Path.Combine(root, "directories"));
+    await AiWorkspaceFilesValidation.RunAsync(Path.Combine(root, "files"));
+    await AiHistoryParityValidation.RunAsync(Path.Combine(root, "history"));
+    AiStructuredInteractionsValidation.Run();
+    await AiEventParityValidation.RunAsync();
+    await AiCapabilitiesValidation.RunAsync();
+    await AiHistoryActionsValidation.RunAsync();
+    await PortableAdditionalAiValidation.RunAsync(Path.Combine(root, "additional"));
 }
 finally { Directory.Delete(root, recursive: true); }

@@ -75,7 +75,7 @@ internal sealed class AiSessionManager : IDisposable
         Request request;
         try { request = JsonSerializer.Deserialize<Request>(body, Json) ?? throw new JsonException(); }
         catch (JsonException) { return Error("INVALID_REQUEST"); }
-        if (!OperatingSystem.IsWindows() && (request.Action != null && request.Action.StartsWith("attachment.", StringComparison.Ordinal) ||
+        if (!AiWorkspaceFiles.Available && (request.Action != null && request.Action.StartsWith("attachment.", StringComparison.Ordinal) ||
             request.Action is "artifacts" or "artifact.read" || request.AttachmentIds is { Length: > 0 } || request.FileReferences is { Length: > 0 }))
             return Error("AI_FILE_ACCESS_UNAVAILABLE");
         if (request.Action == null || request.HostId == null || request.SessionId == null || request.AgentId == null ||
@@ -173,6 +173,21 @@ internal sealed class AiSessionManager : IDisposable
                 try { return Encode(new { hostId = HostId, message = target.MessagePage(request.RequestId, request.Offset) }); }
                 catch (AiOperationException e) { return Error(e.Code); }
             }
+        }
+        if (request.Action is "agent.features" or "history.actions") {
+            AiAgentSession target;
+            lock (sync) {
+                if (disposed || request.HostId != HostId) return Error("HOST_CHANGED");
+                if (!sessions.TryGetValue(request.SessionId, out target)) return Error("SESSION_NOT_FOUND");
+            }
+            try {
+                var features = await (request.Action == "history.actions" ? target.HistoryActionsAsync() : target.AgentFeaturesAsync()).WaitAsync(token).ConfigureAwait(false);
+                if (authorized != null && !authorized()) return Error("AUTHORITY_CHANGED");
+                lock (sync) {
+                    if (disposed || request.HostId != HostId || !sessions.TryGetValue(request.SessionId, out var active) || active != target) return Error("HOST_CHANGED");
+                    return request.Action == "history.actions" ? Encode(new { hostId = HostId, historyActions = features }) : Encode(new { hostId = HostId, agentFeatures = features });
+                }
+            } catch (AiOperationException e) { return Error(e.Code); }
         }
         if (request.Action is "artifacts" or "artifact.read") {
             AiAgentSession target;
@@ -349,7 +364,7 @@ internal sealed class AiSessionManager : IDisposable
                     if (request.Action == "resume" && source.IsAlive) return Error("AGENT_BUSY");
                     if (request.Action == "resume" && !source.MatchesControl(request.ControlVersion)) return Error("CONTROL_CHANGED");
                 }
-                var record = request.Action == "fork" ? await source.ForkAsync(caller, request.ControlVersion) : source.ArchiveRecord();
+                var record = request.Action == "fork" ? await source.ForkAsync(caller, request.ControlVersion, request.RequestId) : source.ArchiveRecord();
                 var agent = (await catalog()).FirstOrDefault(a => a.Id == record.AgentId && a.Strategy == "native" && a.Status == "available");
                 if (agent == null || agent.Protocol is not ("codex" or "claude" or "acp") || record.NativeId.Length == 0) return Error("RESUME_UNAVAILABLE");
                 lock (sync) {

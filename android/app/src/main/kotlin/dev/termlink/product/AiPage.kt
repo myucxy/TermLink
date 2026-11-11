@@ -561,7 +561,7 @@ private fun AiInteraction(workspace: AiWorkspace, session: AiConversation, pendi
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 AiAction(stringResource(R.string.ai_ui_deny), enabled = enabled, onClick = { workspace.mutate(session.pcId, "answer", session, JSONObject().put("requestId", pending.id).put("decision", "deny")) })
                 AiAction(if (pending.kind == "question") "提交回答" else "允许本次", filled = true,
-                    enabled = enabled && pending.canApprove && (pending.kind != "question" || pending.questions.isNotEmpty() && pending.questions.all { answers[it.id].orEmpty().isNotBlank() || choices[it.id].orEmpty().isNotEmpty() }),
+                    enabled = enabled && pending.canApprove && (pending.kind != "question" || pending.questions.isNotEmpty() && pending.questions.all { !it.required || answers[it.id].orEmpty().isNotBlank() || choices[it.id].orEmpty().isNotEmpty() }),
                     onClick = {
                         val response = JSONObject()
                         pending.questions.forEach { q -> response.put(q.id, JSONArray((choices[q.id].orEmpty() + listOfNotNull(answers[q.id]?.takeIf(String::isNotBlank))).toList())) }
@@ -753,7 +753,7 @@ private fun AiAgentChoice(id: String, name: String, selected: Boolean, enabled: 
 
 @Composable
 private fun AiChoice(label: String, options: List<Pair<String, String>>, selected: String, enabled: Boolean,
-    icon: ImageVector = Icons.Default.LaptopWindows, onSelect: (String) -> Unit) {
+    icon: ImageVector = Icons.Default.Computer, onSelect: (String) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         Row(Modifier.heightIn(min = 48.dp).clickable(enabled = enabled && options.isNotEmpty(), role = Role.Button) { expanded = true }, verticalAlignment = Alignment.CenterVertically) {

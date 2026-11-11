@@ -43,3 +43,6 @@ server/termlink-server.exe
 win-agent/publish/
 # Local experiment scratch space (audit #30)
 zcodeDemo/
+
+# Isolated local Apple build output
+/.build/

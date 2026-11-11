@@ -30,10 +30,12 @@ internal sealed partial class AiAgentSession
         internal bool IsImage => Mime is "image/png" or "image/jpeg" or "image/webp" or "image/gif";
     }
     private object Capabilities() => new {
-        changes = true, watch = true, search = true, artifacts = OperatingSystem.IsWindows(), diffRead = true, configure = CurrentConfiguration().ModelSwitch || CurrentConfiguration().PermissionSwitch,
+        hostPlatform = OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsMacOS() ? "macos" : OperatingSystem.IsLinux() ? "linux" : "unknown",
+        pathStyle = OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsMacOS() || OperatingSystem.IsLinux() ? "posix" : "unsupported",
+        agentFeatures = true, historyActions = agent.Protocol == "codex", changes = true, watch = true, search = true, artifacts = AiWorkspaceFiles.Available, diffRead = true, configure = CurrentConfiguration().ModelSwitch || CurrentConfiguration().PermissionSwitch,
         configuration = CurrentConfiguration(), steer = agent.Protocol == "codex",
         resume = (agent.Protocol is "codex" or "claude" || agent.Protocol == "acp" && acpLoadSession) && threadId.Length > 0,
-        fork = agent.Protocol == "codex", history = true, attachments = OperatingSystem.IsWindows(), fileReferences = OperatingSystem.IsWindows(),
+        fork = agent.Protocol == "codex", history = true, attachments = AiWorkspaceFiles.Available, fileReferences = AiWorkspaceFiles.Available,
         nativeImages = agent.Protocol is "codex" or "claude" || agent.Protocol == "acp" && acpImages,
         maxFileBytes = MaxFile, maxTotalBytes = MaxAttachments, maxFiles = 5, chunkBytes = 24 * 1024,
         modes = Modes(agent.Protocol)
@@ -123,7 +125,7 @@ internal sealed partial class AiAgentSession
     private static Message PageMessage(Message message) {
         var length = Math.Min(message.Text.Length, 16000);
         if (length > 0 && length < message.Text.Length && char.IsHighSurrogate(message.Text[length - 1])) length--;
-        return message with { Text = message.Text[..length], FullLength = message.Text.Length };
+        return message with { Text = message.Role == "tool" ? AiToolPresentation.Preview(message.Text, 16000) : message.Text[..length], FullLength = message.Text.Length };
     }
     internal object History(long before, string expectedStream = "")
     {
@@ -146,14 +148,14 @@ internal sealed partial class AiAgentSession
             return new { id, offset, text = message.Text.Substring((int)offset, length), nextOffset = offset + length, length = message.Text.Length };
         }
     }
-    internal AiSessionArchive.Record ArchiveRecord() { lock (sync) return new(Id, agent.Id, directory, threadId, title, modelId, providerId, permissionMode, settingsVersion, messages.ToArray(), defaultModelId, reasoningEffort, nativePermissions, claudeTranscriptPath); }
+    internal AiSessionArchive.Record ArchiveRecord() { lock (sync) return new(Id, agent.Id, directory, threadId, title, modelId, providerId, permissionMode, settingsVersion, messages.ToArray(), defaultModelId, reasoningEffort, nativePermissions, claudeTranscriptPath, truncated, nativeHistoryNeedsReload); }
     internal void AttachArchive(AiSessionArchive store) { lock (sync) { archive = store; SaveArchive(); } }
     internal static AiAgentSession Restore(TermLink.Ai.AiAgentInstallation agent, AiSessionArchive.Record record, AiSessionArchive store, Guid caller = default)
     {
         var session = new AiAgentSession(agent, record.Directory, caller, record.Model, record.Provider) {
             Id = record.Id, threadId = record.NativeId, title = record.Title, permissionMode = record.Mode,
             settingsVersion = record.Version, state = caller == Guid.Empty ? "suspended" : "starting", archive = store, defaultModelId = record.DefaultModel ?? "", reasoningEffort = record.ReasoningEffort ?? "", nativePermissions = record.NativePermissions,
-            claudeTranscriptPath = record.ClaudeTranscriptPath ?? ""
+            claudeTranscriptPath = record.ClaudeTranscriptPath ?? "", truncated = record.Truncated, nativeHistoryNeedsReload = record.ReloadNativeHistory
         };
         // A restored Grok record can attempt load; initialize rechecks the native capability.
         session.acpLoadSession = agent.Protocol == "acp" && agent.Id is "grok" or "opencode";
@@ -164,7 +166,7 @@ internal sealed partial class AiAgentSession
     internal async Task ResumeAsync() { lock (sync) state = "starting"; await StartAsync(); }
     internal void AdvanceControlFrom(AiAgentSession previous) { lock (previous.sync) controlVersion = previous.controlVersion + 1; }
     internal bool MatchesControl(long version) { lock (sync) return version == controlVersion; }
-    internal async Task<AiSessionArchive.Record> ForkAsync(Guid caller, long version)
+    internal async Task<AiSessionArchive.Record> ForkAsync(Guid caller, long version, string selectedTurnId = "")
     {
         await actions.WaitAsync(lifetime.Token);
         try {
@@ -173,10 +175,19 @@ internal sealed partial class AiAgentSession
                 if (owner != caller || controlVersion != version) throw new AiOperationException("CONTROL_CHANGED");
                 if (agent.Protocol != "codex" || state != "idle" || pending.Count != 0) throw new AiOperationException("FORK_UNAVAILABLE");
             }
-            var result = await RpcAsync("thread/fork", new { threadId, persistExtendedHistory = true });
+            if (!string.IsNullOrEmpty(selectedTurnId)) ValidateHistoryTurn(selectedTurnId);
+            var result = await RpcAsync("thread/fork", string.IsNullOrEmpty(selectedTurnId)
+                ? (object)new { threadId, excludeTurns = true }
+                : new { threadId, lastTurnId = selectedTurnId, excludeTurns = true });
+            InvalidateHistoryActions();
             var nativeId = S(P(result, "thread"), "id");
             if (nativeId.Length == 0) throw new AiOperationException("AGENT_PROTOCOL_INCOMPATIBLE");
-            return ArchiveRecord() with { Id = Guid.NewGuid().ToString("D"), NativeId = nativeId, Title = Clip(title, 65) + " · 分支" };
+            var record = ArchiveRecord() with { Id = Guid.NewGuid().ToString("D"), NativeId = nativeId, Title = Clip(title, 65) + " · 分支" };
+            if (!string.IsNullOrEmpty(selectedTurnId)) {
+                var history = await CodexNativeHistory.ReadAsync(nativeId, RpcAsync, lifetime.Token);
+                record = record with { Messages = history.Messages, Truncated = history.Truncated, ReloadNativeHistory = false };
+            }
+            return record;
         } finally { actions.Release(); }
     }
     private void SaveArchive()
@@ -193,7 +204,7 @@ internal sealed partial class AiAgentSession
         if (!Guid.TryParseExact(request.AttachmentId, "D", out _)) throw new AiOperationException("INVALID_ATTACHMENT");
         if (removedAttachments.Count >= 4096) throw new AiOperationException("ATTACHMENT_LIMIT");
         foreach (var expired in attachments.Values.Where(a => !a.Used && a.Touched < DateTime.UtcNow.AddMinutes(-30)).ToArray()) {
-            CheckAttachmentPath(expired.Path); File.Delete(expired.Path); attachments.Remove(expired.Id); removedAttachments.Add(expired.Id);
+            AiWorkspaceFiles.Delete(expired.Path); attachments.Remove(expired.Id); removedAttachments.Add(expired.Id);
         }
         if (request.Action == "attachment.remove" && !attachments.ContainsKey(request.AttachmentId)) { removedAttachments.Add(request.AttachmentId); return; }
         if (removedAttachments.Contains(request.AttachmentId)) throw new AiOperationException("ATTACHMENT_NOT_FOUND");
@@ -208,26 +219,25 @@ internal sealed partial class AiAgentSession
             if (attachments.Values.Count(a => !a.Used) >= 5 || attachments.Values.Where(a => !a.Used).Sum(a => a.Size) + request.Size > MaxAttachments || attachments.Values.Sum(a => a.Size) + request.Size > 200 * 1024 * 1024) throw new AiOperationException("ATTACHMENT_LIMIT");
             if (request.Mime.StartsWith("image/", StringComparison.Ordinal) && agent.Protocol == "claude" && request.Size > 5 * 1024 * 1024) throw new AiOperationException("IMAGE_TOO_LARGE");
             var root = Path.Combine(directory, ".termlink", "attachments", Id);
-            CheckAttachmentPath(root);
-            Directory.CreateDirectory(root);
+            AiWorkspaceFiles.CreateAttachmentDirectory(directory, Id);
             var path = Path.Combine(root, request.AttachmentId + ".upload");
-            using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+            using (AiWorkspaceFiles.Write(path, true)) { }
             attachments.Add(request.AttachmentId, new() { Id = request.AttachmentId, Name = request.FileName, Mime = request.Mime, Size = request.Size, Hash = request.Sha256, Path = path, Owner = caller });
             return;
         }
         if (!attachments.TryGetValue(request.AttachmentId, out var file) || file.Owner != caller) throw new AiOperationException("ATTACHMENT_NOT_FOUND");
         file.Touched = DateTime.UtcNow;
-        CheckAttachmentPath(file.Path);
         if (request.Action == "attachment.remove") {
             if (file.Used) throw new AiOperationException("ATTACHMENT_IN_USE");
-            File.Delete(file.Path); attachments.Remove(file.Id); removedAttachments.Add(file.Id); return;
+            AiWorkspaceFiles.Delete(file.Path); attachments.Remove(file.Id); removedAttachments.Add(file.Id); return;
         }
+        CheckAttachmentPath(file.Path);
         if (request.Action == "attachment.chunk") {
             if (file.Ready || request.Data == null || request.Data.Length > 32768) throw new AiOperationException("INVALID_ATTACHMENT_CHUNK");
             byte[] bytes;
             try { bytes = Convert.FromBase64String(request.Data); } catch (FormatException) { throw new AiOperationException("INVALID_ATTACHMENT_CHUNK"); }
             if (bytes.Length is < 1 or > 24576 || request.Offset < 0 || request.Offset > file.Offset || request.Offset + bytes.Length > file.Size) throw new AiOperationException("ATTACHMENT_OFFSET");
-            using var stream = new FileStream(file.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            using var stream = AiWorkspaceFiles.Write(file.Path, false);
             stream.Position = request.Offset;
             if (request.Offset < file.Offset) {
                 if (request.Offset + bytes.Length > file.Offset) throw new AiOperationException("ATTACHMENT_OFFSET");
@@ -236,7 +246,7 @@ internal sealed partial class AiAgentSession
             } else { stream.Write(bytes); stream.Flush(true); file.Offset += bytes.Length; }
         } else if (request.Action == "attachment.commit") {
             if (file.Ready) return;
-            using (var stream = File.OpenRead(file.Path)) {
+            using (var stream = AiWorkspaceFiles.Read(file.Path)) {
                 if (file.Offset != file.Size || stream.Length != file.Size || !Convert.ToHexString(SHA256.HashData(stream)).Equals(file.Hash, StringComparison.OrdinalIgnoreCase)) throw new AiOperationException("ATTACHMENT_HASH");
                 if (file.IsImage) {
                     stream.Position = 0; var header = new byte[12]; var count = stream.Read(header);
@@ -248,18 +258,10 @@ internal sealed partial class AiAgentSession
                     if (!valid) throw new AiOperationException("INVALID_IMAGE");
                 }
             }
-            var completed = Path.ChangeExtension(file.Path, "ready"); File.Move(file.Path, completed); file.Path = completed; file.Ready = true;
+            var completed = Path.ChangeExtension(file.Path, "ready"); AiWorkspaceFiles.Complete(file.Path, completed); file.Path = completed; file.Ready = true;
         }
     }
-    private void CheckAttachmentPath(string path)
-    {
-        var root = Path.GetPathRoot(Path.GetFullPath(path));
-        var current = root;
-        foreach (var part in Path.GetFullPath(path)[root.Length..].Split(Path.DirectorySeparatorChar)) {
-            current = Path.Combine(current, part);
-            if ((File.Exists(current) || Directory.Exists(current)) && (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new AiOperationException("ATTACHMENT_PATH_UNSAFE");
-        }
-    }
+    private void CheckAttachmentPath(string path) => AiWorkspaceFiles.ValidatePath(path);
     internal object AttachmentSnapshot(string id) { lock (sync) return attachments.TryGetValue(id ?? "", out var a) ? new { id = a.Id, offset = a.Offset, ready = a.Ready } : null; }
     private Attachment[] ResolveAttachments(Guid caller, string[] ids)
     {
@@ -269,7 +271,7 @@ internal sealed partial class AiAgentSession
             if (id == null || !attachments.TryGetValue(id, out var a) || !a.Ready || a.Owner != caller) throw new AiOperationException("ATTACHMENT_NOT_READY");
             CheckAttachmentPath(a.Path);
             if (!File.Exists(a.Path)) throw new AiOperationException("ATTACHMENT_NOT_FOUND");
-            using (var input = File.OpenRead(a.Path)) if (input.Length != a.Size || !Convert.ToHexString(SHA256.HashData(input)).Equals(a.Hash, StringComparison.OrdinalIgnoreCase)) throw new AiOperationException("ATTACHMENT_HASH");
+            using (var input = AiWorkspaceFiles.Read(a.Path)) if (input.Length != a.Size || !Convert.ToHexString(SHA256.HashData(input)).Equals(a.Hash, StringComparison.OrdinalIgnoreCase)) throw new AiOperationException("ATTACHMENT_HASH");
             return a;
         }).ToArray();
         if (files.Sum(a => a.Size) > MaxAttachments) throw new AiOperationException("ATTACHMENT_LIMIT");
@@ -279,7 +281,7 @@ internal sealed partial class AiAgentSession
     private void RemoveUnusedAttachments()
     {
         foreach (var file in attachments.Values.Where(a => !a.Used)) {
-            try { CheckAttachmentPath(file.Path); File.Delete(file.Path); }
+            try { AiWorkspaceFiles.Delete(file.Path); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or AiOperationException) { }
         }
     }
@@ -293,7 +295,7 @@ internal sealed class AiSessionArchive(string root)
 {
     internal sealed record Record(string Id, string AgentId, string Directory, string NativeId, string Title,
         string Model, string Provider, string Mode, long Version, AiAgentSession.Message[] Messages, string DefaultModel = "", string ReasoningEffort = "", AiAgentSession.NativePermissions NativePermissions = null,
-        string ClaudeTranscriptPath = "");
+        string ClaudeTranscriptPath = "", bool Truncated = false, bool ReloadNativeHistory = false);
     internal void Delete(string id) {
         if (!Guid.TryParseExact(id, "D", out _)) throw new AiOperationException("SESSION_NOT_FOUND");
         File.Delete(Path.Combine(root, id + ".bin"));

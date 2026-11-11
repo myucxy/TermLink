@@ -15,7 +15,7 @@ internal sealed partial class AiAgentSession
     internal object Artifacts(string query)
     {
         if (query == null || query.Length > 200) throw new AiOperationException("INVALID_SEARCH");
-        var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var root = AiWorkspaceFiles.Canonical(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         CheckAttachmentPath(root);
         var queue = new Queue<(string Path, int Depth)>(); queue.Enqueue((root, 0));
         var files = new List<object>(); var visited = 0; var scanned = 0; var truncatedFiles = false;
@@ -37,7 +37,7 @@ internal sealed partial class AiAgentSession
                         if (query.Length > 0 && !relative.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
                         using var input = OpenArtifact(relative);
                         var modified = File.GetLastWriteTimeUtc(input.SafeFileHandle);
-                        files.Add(new { id = relative.Replace('\\', '/'), name = Path.GetFileName(path), size = input.Length,
+                        files.Add(new { id = OperatingSystem.IsWindows() ? relative.Replace('\\', '/') : relative, name = Path.GetFileName(path), size = input.Length,
                             mime = ArtifactMime(Path.GetExtension(path)), version = ArtifactVersion(input), modifiedAtMs = new DateTimeOffset(modified).ToUnixTimeMilliseconds() });
                     }
                 }
@@ -62,15 +62,17 @@ internal sealed partial class AiAgentSession
 
     private FileStream OpenArtifact(string id)
     {
-        if (id == null || id.Length is < 1 or > 2048 || id.Any(char.IsControl) || Path.IsPathRooted(id) || id.Contains(':'))
+        if (id == null || id.Length is < 1 or > 2048 || id.Any(char.IsControl) || Path.IsPathRooted(id) || OperatingSystem.IsWindows() && id.Contains(':') ||
+            id.Split(OperatingSystem.IsWindows() ? new[] { '/', '\\' } : new[] { '/' }).Any(part => part is "" or "." or ".."))
             throw new AiOperationException("INVALID_ARTIFACT");
-        var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var root = AiWorkspaceFiles.Canonical(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var path = Path.GetFullPath(Path.Combine(root, id));
-        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
+        if (!path.StartsWith(root, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) ||
             Path.GetRelativePath(root, path).Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Any(ArtifactSkipDirectories.Contains))
             throw new AiOperationException("ARTIFACT_OUTSIDE_WORKSPACE");
         CheckAttachmentPath(path);
-        var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var input = AiWorkspaceFiles.Read(path);
+        if (OperatingSystem.IsMacOS()) return input;
         // Validate the opened handle as well as the requested path: a directory could have
         // been replaced with a junction between validation and FileStream.Open.
         try {

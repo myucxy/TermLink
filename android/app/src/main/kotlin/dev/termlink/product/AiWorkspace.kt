@@ -61,8 +61,8 @@ internal data class AiCapabilities(val configure: Boolean = false, val steer: Bo
     val fork: Boolean = false, val history: Boolean = false, val attachments: Boolean = false,
     val nativeImages: Boolean = false, val modes: List<String> = emptyList(), val maxFileBytes: Long = 0,
     val maxTotalBytes: Long = 0, val maxFiles: Int = 0, val chunkBytes: Int = 0,
-    val configuration: AiAgentConfiguration = AiAgentConfiguration(), val changes: Boolean = false, val search: Boolean = false, val artifacts: Boolean = false, val watch: Boolean = false, val diffRead: Boolean = false)
-internal data class AiQuestion(val id: String, val text: String, val options: List<String>, val multiSelect: Boolean)
+    val configuration: AiAgentConfiguration = AiAgentConfiguration(), val changes: Boolean = false, val search: Boolean = false, val artifacts: Boolean = false, val watch: Boolean = false, val diffRead: Boolean = false, val agentFeatures: Boolean = false, val pathStyle: String = "", val hostPlatform: String = "", val historyActions: Boolean = false)
+internal data class AiQuestion(val id: String, val text: String, val options: List<String>, val multiSelect: Boolean, val required: Boolean = true)
 internal data class AiPending(val id: String, val kind: String, val detail: String, val questions: List<AiQuestion>, val canApprove: Boolean,
     val title: String = "", val summary: String = "")
 internal class AiReadingState {
@@ -129,9 +129,12 @@ internal class AiWorkspace(
     private val uploadDirectory: java.io.File? = null,
     context: Context? = null,
 ) {
-    val downloads = context?.let { AiDownloads(it, repository, scope, preferences, seal, unseal) }
     val catalogs = mutableStateMapOf<UUID, AiCatalog>()
     val conversations = mutableStateMapOf<String, AiConversation>()
+    val downloads = context?.let { AiDownloads(it, repository, scope, preferences, seal, unseal,
+        currentSession = { pcId, hostId, sessionId -> conversations[sessionId]?.takeIf {
+            it.pcId == pcId && catalogs[pcId]?.hostId == hostId
+        } }) }
     val drafts = mutableStateMapOf<String, String>()
     val questionDrafts = mutableMapOf<Pair<String, String>, AiQuestionDraft>()
     val reading = mutableMapOf<String, AiReadingState>()
@@ -372,7 +375,10 @@ internal class AiWorkspace(
             val page = result.getJSONObject("history")
             val older = page.getJSONArray("messages").objects().map(::parseAiMessage)
             require(older.size <= 64 && page.getLong("before") < session.historyBefore)
-            conversations[session.id]?.let { current -> conversations[session.id] = current.copy(messages = (older + current.messages).distinctBy { it.id }, historyBefore = page.getLong("before")) }
+            conversations[session.id]?.let { current ->
+                check(current.pcId == session.pcId && current.streamId == session.streamId && page.optString("streamId") == session.streamId)
+                conversations[session.id] = current.copy(messages = (older + current.messages).distinctBy { it.id }, historyBefore = page.getLong("before"))
+            }
         } catch (failure: Exception) { if (failure is CancellationException) throw failure; error = "读取历史失败，请重试。" }
     }
     suspend fun exportMarkdown(session: AiConversation): String {
@@ -621,7 +627,7 @@ internal class AiWorkspace(
 
     /** Read-only Web operations: host and session are chosen by native code, never by JavaScript. */
     suspend fun readFeature(session: AiConversation, action: String, extra: JSONObject = JSONObject()): JSONObject {
-        require(action in setOf("search", "artifacts", "artifact.read", "diff.read"))
+        require(action in setOf("search", "artifacts", "artifact.read", "diff.read", "agent.features", "history.actions"))
         val host = checkNotNull(catalogs[session.pcId]).hostId
         check(!retired && conversations[session.id]?.pcId == session.pcId)
         val result = JSONObject(nativeRequest(session.pcId, extra.put("action", action).put("hostId", host)
@@ -629,7 +635,7 @@ internal class AiWorkspace(
         check(!retired && catalogs[session.pcId]?.hostId == host && conversations[session.id]?.pcId == session.pcId)
         if (result.optString("error").isNotEmpty()) throw java.io.IOException(aiErrorLabel(result.getString("error")))
         check(result.getString("hostId") == host)
-        return result.getJSONObject(if (action == "search") "search" else if (action == "diff.read") "diff" else "artifacts")
+        return result.getJSONObject(if (action == "search") "search" else if (action == "diff.read") "diff" else if (action == "agent.features") "agentFeatures" else if (action == "history.actions") "historyActions" else "artifacts")
     }
 
     suspend fun refresh(pcId: UUID, sessionId: String? = null) {
@@ -817,9 +823,9 @@ internal class AiWorkspace(
             val listed = sessions.mapTo(hashSetOf()) { it.id }
             conversations.entries.removeAll { it.value.pcId == pcId && it.key !in listed }
             sessions.forEach { metadata ->
-                val old = conversations[metadata.id]
+                val old = conversations[metadata.id]?.takeIf { it.streamId == metadata.streamId || metadata.streamId.isEmpty() }
                 conversations[metadata.id] = metadata.copy(messages = old?.messages.orEmpty(), historyBefore = if (old?.messages?.isNotEmpty() == true) old.historyBefore else metadata.historyBefore,
-                    pending = if (metadata.pendingCount == 0) emptyList() else old?.pending.orEmpty(), streamId = old?.streamId.orEmpty(), cursor = old?.cursor ?: "0")
+                    pending = if (metadata.pendingCount == 0) emptyList() else old?.pending.orEmpty(), streamId = old?.streamId ?: metadata.streamId, cursor = old?.cursor ?: "0")
             }
         }
         result.optJSONObject("session")?.let {
@@ -917,7 +923,7 @@ internal fun parseConversation(pcId: UUID, value: JSONObject): AiConversation {
             AiPending(pending.getString("id"), pending.getString("kind"), pending.getString("detail"),
                 pending.getJSONArray("questions").objects().map { q ->
                     val options = q.getJSONArray("options")
-                    AiQuestion(q.getString("id"), q.getString("text"), (0 until options.length()).map(options::getString), q.getBoolean("multiSelect"))
+                    AiQuestion(q.getString("id"), q.getString("text"), (0 until options.length()).map(options::getString), q.getBoolean("multiSelect"), q.optBoolean("required", true))
                 }, pending.optBoolean("canApprove", false), pending.optString("title").take(80), pending.optString("summary").take(240))
         }, value.optBoolean("truncated"), value.optString("title"), value.optString("preview"),
         value.optInt("pendingCount", value.optJSONArray("pending")?.length() ?: 0).coerceIn(0, 64),
@@ -929,7 +935,7 @@ internal fun parseConversation(pcId: UUID, value: JSONObject): AiConversation {
             AiCapabilities(c.optBoolean("configure"), c.optBoolean("steer"), c.optBoolean("resume"), c.optBoolean("fork"), c.optBoolean("history"),
                  c.optBoolean("attachments"), c.optBoolean("nativeImages"), legacyModes,
                  c.optLong("maxFileBytes").coerceIn(0, 20L * 1024 * 1024), c.optLong("maxTotalBytes").coerceIn(0, 50L * 1024 * 1024), c.optInt("maxFiles").coerceIn(0, 5), c.optInt("chunkBytes").coerceIn(0, 24576), configuration,
-                 c.optBoolean("changes"), c.optBoolean("search"), c.optBoolean("artifacts"), c.optBoolean("watch"), c.optBoolean("diffRead"))
+                 c.optBoolean("changes"), c.optBoolean("search"), c.optBoolean("artifacts"), c.optBoolean("watch"), c.optBoolean("diffRead"), c.optBoolean("agentFeatures"), c.optString("pathStyle"), c.optString("hostPlatform"), c.optBoolean("historyActions"))
          } ?: AiCapabilities(), value.optLong("historyBefore"), value.optInt("historyCount"), value.optString("diff"), value.optJSONObject("usage")?.toString().orEmpty(), value.optBoolean("compacting"),
          value.optJSONArray("slashCommands")?.let { a -> (0 until minOf(a.length(), 100)).map(a::getString) }.orEmpty(), value.optString("archiveError"),
          value.optString("reasoningEffort"), parseReasoning(value.optJSONObject("reasoning")), value.optString("settingsNotice"),
@@ -981,6 +987,10 @@ internal fun aiErrorLabel(code: String): String = when (code) {
     "SESSION_CAPACITY", "RECEIPT_CAPACITY" -> "电脑端已达到本轮容量限制，请结束不用的任务或重启 Agent。"
     "INTERACTION_TOO_LARGE" -> "操作详情过长，请在电脑端处理。"
     "ANSWER_REQUIRED" -> "请完成问题回答。"
+    "HISTORY_OUTCOME_UNKNOWN", "HISTORY_CHANGED" -> "历史已变化或操作结果待确认，请恢复会话重新读取电脑记录；不会自动重发回退操作。"
+    "INVALID_HISTORY_TURN" -> "历史轮次已变化，请刷新后重新选择。"
+    "HISTORY_ACTION_UNSUPPORTED", "AGENT_METHOD_NOT_FOUND" -> "当前 Agent 版本不支持此操作。"
+    "INVALID_ANSWER", "AGENT_INVALID_PARAMS", "INTERACTION_UNSUPPORTED" -> "当前请求或回答格式不受支持，请检查后重试。"
     "AGENT_TIMEOUT", "SEND_OUTCOME_UNKNOWN" -> "Agent 未及时确认操作；请检查电脑端状态。"
     "AGENT_REPORTED_ERROR", "AGENT_REQUEST_REJECTED" -> "Agent 返回错误，请检查电脑端模型、认证或网络。"
     "AGENT_DESKTOP_AUTH_REQUIRED" -> "此模型需要 ZCode 桌面授权；当前桥接仅支持电脑上独立配置的 CLI API 模型。"

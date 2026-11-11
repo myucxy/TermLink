@@ -40,7 +40,7 @@ internal static class PortableAiFixtureValidation
         await ExpectError(manager, caller, create with { OperationId = "" }, "INVALID_OPERATION_ID");
         var forbidden = Parse(await manager.ExecuteAsync(caller, Encode(create), CancellationToken.None, () => false));
         Require(Text(forbidden, "error") == "AUTHORITY_CHANGED", "Unauthorized create reached the Agent.");
-        if (!OperatingSystem.IsWindows())
+        if (!AiWorkspaceFiles.Available)
             await ExpectError(manager, caller, new("attachment.begin", manager.HostId, Guid.NewGuid().ToString(), AttachmentId: Guid.NewGuid().ToString()), "AI_FILE_ACCESS_UNAVAILABLE");
         Require(fixture.Pids.Length == 0, "Catalog, retired URL requests, or rejected mutations started a worker.");
         Console.WriteLine("PASS fixture catalog: native-only, retired URL rejected, host/authority fencing and no worker on rejected requests");

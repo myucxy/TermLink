@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using TermLink.Agent;
@@ -13,10 +14,13 @@ public sealed class PortableAiHost : IRelayAiHost
     private readonly AiSessionManager sessions;
     private readonly PortableAiDirectories directories;
 
-    public PortableAiHost(string accountDirectory) : this(accountDirectory, null, null) { }
+    public PortableAiHost(string accountDirectory) : this(accountDirectory, null, null,
+        () => new PortableAdditionalAiDiscovery(accountDirectory).DiscoverAsync(CancellationToken.None)) { }
 
+    // Injected discovery stays deterministic: callers that supply only the two
+    // existing fixtures do not probe the machine's other installed CLIs.
     internal PortableAiHost(string accountDirectory, Func<Task<AiAgentInstallation>> codexDiscovery,
-        Func<Task<AiAgentInstallation>> zcodeDiscovery)
+        Func<Task<AiAgentInstallation>> zcodeDiscovery, Func<Task<AiAgentInstallation[]>> additionalDiscovery = null)
     {
         if (!Path.IsPathFullyQualified(accountDirectory)) throw new ArgumentException("An account directory is required.");
         Directory.CreateDirectory(accountDirectory);
@@ -27,14 +31,18 @@ public sealed class PortableAiHost : IRelayAiHost
         var codex = new PortableCodexDiscovery(accountDirectory);
         codexDiscovery ??= () => codex.DiscoverAsync(CancellationToken.None);
         zcodeDiscovery ??= () => ZcodeDesktopRuntime.DetectMacAsync(CancellationToken.None);
+        additionalDiscovery ??= () => Task.FromResult(Array.Empty<AiAgentInstallation>());
         if (OperatingSystem.IsMacOS()) directories = new PortableAiDirectories(accountDirectory);
         sessions = new AiSessionManager(installRoot: accountDirectory,
             listDirectories: directories == null ? null : directories.ListAsync,
             createCliWorkspace: directories == null ? null : directories.CreateCliWorkspace, catalog: async () => {
             var codexTask = codexDiscovery();
             var zcodeTask = zcodeDiscovery();
-            await Task.WhenAll(codexTask, zcodeTask).ConfigureAwait(false);
-            return new[] { await codexTask.ConfigureAwait(false), (await zcodeTask.ConfigureAwait(false)) with { SessionDataDirectory = runtime } };
+            var additionalTask = additionalDiscovery();
+            await Task.WhenAll(codexTask, zcodeTask, additionalTask).ConfigureAwait(false);
+            return new[] { await codexTask.ConfigureAwait(false) }
+                .Concat(await additionalTask.ConfigureAwait(false))
+                .Append((await zcodeTask.ConfigureAwait(false)) with { SessionDataDirectory = runtime }).ToArray();
         });
     }
 

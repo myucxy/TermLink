@@ -42,7 +42,15 @@ enum AIMessageContent {
     }
 }
 
+struct AIRefreshFence {
+    private var generations:[UUID:UInt64]=[:]
+    func version(_ pc:UUID)->UInt64{generations[pc,default:0]}
+    mutating func invalidate(_ pc:UUID){generations[pc,default:0] &+= 1}
+    func accepts(_ pc:UUID,version:UInt64)->Bool{self.version(pc)==version}
+}
+
 @MainActor final class AIWorkspace: ObservableObject {
+    private var refreshFence=AIRefreshFence()
     struct Opened: Codable,Identifiable,Equatable {
         let pcID:UUID,id:String,agentID:String,strategy:String
         var isNative:Bool{strategy=="native" && !id.hasPrefix("remote:")}
@@ -157,12 +165,12 @@ enum AIMessageContent {
         }
     }
     func refresh(_ pc:UUID,session:String?=nil) async throws {
-        guard let relay=product.relay else{throw ClientError.readOnly};let owner=epoch
+        guard let relay=product.relay else{throw ClientError.readOnly};let owner=epoch,version=refreshFence.version(pc)
         if let session,session.hasPrefix("remote:") || conversations[session].map({requiresHostUpgrade(pc,agent:$0.raw["agentId"].string)})==true{throw ClientError.readOnly}
         let slot=pc.uuidString+":"+(session ?? "catalog");guard !reading.contains(slot) else{return};reading.insert(slot);defer{if owner==epoch{reading.remove(slot)}}
         var body:[String:JSONValue]=["action":.string("catalog")]
         if let session,let host=catalogs[pc]?["hostId"].string,!host.isEmpty{body=["action":.string("poll"),"hostId":.string(host),"sessionId":.string(session)]}
-        let value=try await relay.ai(pc:pc,body:.object(body));try check(value);guard owner==epoch else{throw CancellationError()}
+        let value=try await relay.ai(pc:pc,body:.object(body));guard owner==epoch,refreshFence.accepts(pc,version:version) else{throw CancellationError()};try check(value)
         if body["action"] == .string("catalog") {
             guard UUID(uuidString:value["hostId"].string) != nil,value["agents"].array.count<=16,value["sessions"].array.count<=64 else{throw ClientError.invalidResponse("AI catalog")}
             if let old=catalogs[pc],old["hostId"] != value["hostId"]{
@@ -183,7 +191,7 @@ enum AIMessageContent {
         if let session,let current=conversations[session]{await drain(current)}
     }
     private func merge(_ raw:JSONValue,pc:UUID,metadata:Bool=false){guard UUID(uuidString:raw["id"].string) != nil,raw["kind"].string=="ai",raw["messages"].array.count<=8192,raw["pending"].array.count<=64 else{return};var object=raw.object
-        if metadata,let old=conversations[raw["id"].string]{object["messages"] = .array(old.messages);object["pending"] = .array(old.pending);object["historyBefore"]=old.raw["historyBefore"]}
+        if metadata,let old=conversations[raw["id"].string],old.raw["streamId"]==raw["streamId"]{object["messages"] = .array(old.messages);object["pending"] = .array(old.pending);object["historyBefore"]=old.raw["historyBefore"]}
         if let old=conversations[raw["id"].string],!raw["reset"].bool,old.raw["streamId"]==raw["streamId"],raw["capabilities"]["history"].bool{
             var ids=Set<String>();let latest=Dictionary(raw["messages"].array.map{($0["id"].string,$0)},uniquingKeysWith:{_,new in new});object["messages"] = .array(Array((old.messages.map{latest[$0["id"].string] ?? $0}+raw["messages"].array).filter{ids.insert($0["id"].string).inserted}.suffix(8192)))
             object["historyBefore"] = .number(Double(min(old.raw["historyBefore"].integer,raw["historyBefore"].integer)))
@@ -218,8 +226,8 @@ enum AIMessageContent {
         if let session{body["sessionId"] = .string(session.id);body["controlVersion"] = session.raw["controlVersion"]}
         let mutation=Mutation(id:id,pcID:pc,body:.object(body)),owner=epoch
         var retained=uncertain;retained[pc]=mutation;try product.privateState.save(retained,name:"ai-pending")
-        uncertain=retained;busy.insert(pc);defer{if owner==epoch{busy.remove(pc)}}
-        do{let result=try await relay.ai(pc:pc,body:mutation.body);guard owner==epoch,result["hostId"].string==host else{throw ClientError.readOnly};uncertain.removeValue(forKey:pc);persist();try check(result);if result["session"] != .null{merge(result["session"],pc:pc)}
+        refreshFence.invalidate(pc);uncertain=retained;busy.insert(pc);defer{if owner==epoch{refreshFence.invalidate(pc);busy.remove(pc)}}
+        do{let result=try await relay.ai(pc:pc,body:mutation.body);guard owner==epoch,result["hostId"].string==host else{throw ClientError.readOnly};uncertain.removeValue(forKey:pc);persist();if result["session"] != .null{merge(result["session"],pc:pc)};try check(result)
             if action=="fork",let created=conversations[result["session"]["id"].string]{open(created)}
             if action=="end",let session{closeView(session.id)}
             if action=="steer",let session,drafts[session.id]==extra["text"]?.string{drafts[session.id]="";persist()}
@@ -231,11 +239,11 @@ enum AIMessageContent {
         if ["create","import-native"].contains(mutation.body["action"].string){try requireNativeAgent(pc,agent:mutation.body["agentId"].string,history:mutation.body["action"].string=="import-native")}
         let sessionID=mutation.body["sessionId"].string,agent=conversations[sessionID]?.raw["agentId"].string ?? opened.first(where:{$0.id==sessionID})?.agentID ?? mutation.body["agentId"].string
         if requiresHostUpgrade(pc,agent:agent){throw ClientError.unavailable("请升级电脑端以使用 ZCode 原生会话。")}
-        let owner=epoch;busy.insert(pc);defer{if owner==epoch{busy.remove(pc)}}
+        let owner=epoch;refreshFence.invalidate(pc);busy.insert(pc);defer{if owner==epoch{refreshFence.invalidate(pc);busy.remove(pc)}}
         // Retry exactly the original host-bound operation ID and body, never a new mutation.
         let result=try await relay.ai(pc:pc,body:mutation.body)
         guard owner==epoch,result["hostId"]==mutation.body["hostId"] else{throw ClientError.readOnly}
-        uncertain.removeValue(forKey:pc);persist();try check(result);if result["session"] != .null{merge(result["session"],pc:pc)}
+        uncertain.removeValue(forKey:pc);persist();if result["session"] != .null{merge(result["session"],pc:pc)};try check(result)
         let session=mutation.body["sessionId"].string,queue=mutation.body["queueId"].string
         if !queue.isEmpty{queued[session]?.removeAll{$0.id==queue}}
         else if mutation.body["action"].string=="send"{applySendAcknowledgement(session,request:mutation.body)}
@@ -284,7 +292,7 @@ enum AIMessageContent {
         guard s.raw["historyBefore"].integer>0 else{return}
         let value=try await read(s,action:"history",extra:["offset":s.raw["historyBefore"],"streamId":s.raw["streamId"]]),page=value["history"]
         guard case .array = page["messages"],case .number = page["before"] else{throw ClientError.invalidResponse("AI history page")}
-        guard let current=conversations[s.id],current.raw["streamId"]==s.raw["streamId"],page["messages"].array.count<=64,page["before"].integer>=0,page["before"].integer<s.raw["historyBefore"].integer else{throw ClientError.invalidResponse("AI history cursor")}
+        guard let current=conversations[s.id],current.raw["streamId"]==s.raw["streamId"],page["streamId"]==s.raw["streamId"],page["messages"].array.count<=64,page["before"].integer>=0,page["before"].integer<s.raw["historyBefore"].integer else{throw ClientError.invalidResponse("AI history cursor")}
         var ids=Set<String>(),object=current.raw.object
         object["messages"] = .array((page["messages"].array+current.messages).filter{ids.insert($0["id"].string).inserted});object["historyBefore"]=page["before"]
         conversations[s.id] = .init(raw:AIConfiguration.conversation(.object(object)),pcID:s.pcID)

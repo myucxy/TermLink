@@ -20,6 +20,11 @@
     <Compile Include="../../../win-agent/src/Agent/AiSessionManager.cs" Link="Shared/AiSessionManager.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiAcpSession.cs" Link="Shared/AiAcpSession.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiSessionTimeline.cs" Link="Shared/AiSessionTimeline.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiStructuredInteractions.cs" Link="Shared/AiStructuredInteractions.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiHistoryActions.cs" Link="Shared/AiHistoryActions.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiAgentCapabilities.cs" Link="Shared/AiAgentCapabilities.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiWorkspaceFiles.cs" Link="Shared/AiWorkspaceFiles.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiToolPresentation.cs" Link="Shared/AiToolPresentation.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiSessionArtifacts.cs" Link="Shared/AiSessionArtifacts.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiSessionFeatures.cs" Link="Shared/AiSessionFeatures.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiConfiguration.cs" Link="Shared/AiConfiguration.cs" />
