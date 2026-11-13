@@ -4,7 +4,7 @@ namespace TermLink.Pc.Contracts;
 public static class CapabilityReportFactory
 {
     public static CapabilityDetectionReport Create(AgentStatusSnapshot state, IReadOnlyList<AiAgentCapability> agents,
-        bool remoteSessions, bool commandEditing)
+        bool remoteSessions, bool commandEditing, bool? aiFileAccessAvailable = null)
     {
         var portable = state.Identity.Platform is PcPlatform.MacOS or PcPlatform.Linux;
         var checks = new List<CapabilityCheck>();
@@ -35,10 +35,18 @@ public static class CapabilityReportFactory
             portable ? "当前构建未接入 macOS / Linux 的图形核心、Broker 捕获和远程渲染链路。" : "此状态接口没有完整会话协商结果，需在具体终端会话中确认。"));
         checks.Add(new("semantic_input", "终端", "高级键鼠与终端副作用", portable ? CapabilityCheckStatus.NotIntegrated : CapabilityCheckStatus.Unknown,
             portable ? "远程键鼠语义、进度、提示音和剪贴板策略尚未接入本构建。" : "键鼠、提示音和剪贴板受会话能力与平台策略限制，需单独验证。"));
-        checks.Add(new("ai_attachments", "AI", "AI 附件与产物文件", portable ? CapabilityCheckStatus.NotIntegrated : CapabilityCheckStatus.Limited,
-            portable ? "此构建未提供 AI 附件上传、电脑文件引用和产物读取；安装 CLI 不会开启这些能力。" : "Windows 已有文件接口，具体 Agent 和会话是否支持以实际能力为准。"));
-        checks.Add(new("ai_persistence", "AI", "AI 归档、原生历史与续聊", portable ? CapabilityCheckStatus.Limited : CapabilityCheckStatus.Limited,
-            portable ? "当前接入仅保留运行期间的消息；持久化归档、原生历史导入和续聊需后续适配。" : "能力随 Agent 和会话变化，本次静态检测不打开用户历史或创建会话验证。"));
+        var aiFiles = state.Identity.Platform == PcPlatform.Windows || state.Identity.Platform == PcPlatform.MacOS && aiFileAccessAvailable == true;
+        var fileStatus = state.Identity.Platform == PcPlatform.Windows ? CapabilityCheckStatus.Limited :
+            state.Identity.Platform == PcPlatform.MacOS && aiFileAccessAvailable is null ? CapabilityCheckStatus.Unknown :
+            aiFiles ? CapabilityCheckStatus.Available : CapabilityCheckStatus.NotIntegrated;
+        checks.Add(new("ai_attachments", "AI", "AI 附件与产物文件", fileStatus,
+            state.Identity.Platform == PcPlatform.Windows ? "Windows 已有文件接口，具体 Agent 和会话是否支持以实际能力为准。" :
+            aiFiles ? "此构建已加载附件、电脑文件引用和产物文件后端；目录权限及具体 Agent 支持仍以会话能力和实际操作结果为准。" :
+            fileStatus == CapabilityCheckStatus.Unknown ? "AI 文件后端状态未提供，请重新检测。" : "此构建没有可用的 AI 文件后端；原生文件库缺失或缺少所需导出时不会启用附件。"));
+        checks.Add(new("ai_native_history", "AI", "Agent 原生历史与续聊", agents.Any(a => a.Strategy == "native" && a.Status == "available") ? CapabilityCheckStatus.Limited : CapabilityCheckStatus.Unknown,
+            "按 Agent 原生协议和版本提供有界历史读取、导入或续聊；安装和协议检测不读取历史，也不保证每个 Agent 支持。"));
+        checks.Add(new("ai_persistence", "AI", "TermLink AI 持久归档", portable ? CapabilityCheckStatus.NotIntegrated : CapabilityCheckStatus.Limited,
+            portable ? "当前 Mac / Linux Host 未接入 TermLink 持久归档；原生 Agent 数据目录与手机缓存不等于 Host 重启后自动恢复。" : "Windows 已接入账号范围内的归档；保存、恢复及原生续聊仍需逐会话验证。"));
         if (portable)
             checks.Add(new("routing_policy", "连接", "本机开关与服务端路由", CapabilityCheckStatus.Limited,
                 "本机开关控制后台连接，当前客户端尚未同步新的服务端路由开关接口；还需确认管理中心的远程路由与接收设备权限。"));

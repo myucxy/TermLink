@@ -21,6 +21,7 @@
     <Compile Include="../../../win-agent/src/Agent/AiAcpSession.cs" Link="Shared/AiAcpSession.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiSessionTimeline.cs" Link="Shared/AiSessionTimeline.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiStructuredInteractions.cs" Link="Shared/AiStructuredInteractions.cs" />
+    <Compile Include="../../../win-agent/src/Agent/AiRuntimeAuthentication.cs" Link="Shared/AiRuntimeAuthentication.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiHistoryActions.cs" Link="Shared/AiHistoryActions.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiAgentCapabilities.cs" Link="Shared/AiAgentCapabilities.cs" />
     <Compile Include="../../../win-agent/src/Agent/AiWorkspaceFiles.cs" Link="Shared/AiWorkspaceFiles.cs" />

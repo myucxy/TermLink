@@ -73,7 +73,7 @@ public static class ExecutableLocator
     }
 }
 
-public sealed class PosixTerminalCommandDiscovery : ITerminalCommandDiscovery
+public sealed class PosixTerminalCommandDiscovery(PosixTerminalCommandStore? store = null) : ITerminalCommandDiscovery
 {
     private static readonly (string Id, string Name, string Executable, string[] Arguments)[] KnownCommands =
     [
@@ -87,10 +87,14 @@ public sealed class PosixTerminalCommandDiscovery : ITerminalCommandDiscovery
     public ValueTask<IReadOnlyList<TerminalCommandCapability>> DiscoverAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        return store is null ? ValueTask.FromResult(DetectBuiltIns()) : store.DiscoverAsync(cancellationToken);
+    }
+
+    internal static IReadOnlyList<TerminalCommandCapability> DetectBuiltIns()
+    {
         var result = new List<TerminalCommandCapability>(KnownCommands.Length);
         foreach (var command in KnownCommands)
         {
-            cancellationToken.ThrowIfCancellationRequested();
             var path = ExecutableLocator.Find(command.Executable);
             if (path is null) continue;
             result.Add(new TerminalCommandCapability(
@@ -101,7 +105,7 @@ public sealed class PosixTerminalCommandDiscovery : ITerminalCommandDiscovery
                 true,
                 RunAsAdministrator: false));
         }
-        return ValueTask.FromResult<IReadOnlyList<TerminalCommandCapability>>(result);
+        return Array.AsReadOnly(result.ToArray());
     }
 
     internal static (string Executable, IReadOnlyList<string> Arguments) Resolve(string commandId)

@@ -52,7 +52,7 @@ public sealed class PortableAgentClient : IAgentClient, IAsyncDisposable
         CapabilityDetectionValidator.Validate(report);
         return report;
     }
-    public bool SupportsTerminalCommandEditing => false;
+    public bool SupportsTerminalCommandEditing => OperatingSystem.IsMacOS();
     public bool SupportsRemoteSessions => OperatingSystem.IsMacOS();
     public bool SupportsTerminalCreation => OperatingSystem.IsMacOS();
     public async ValueTask<Guid> StartTerminalAsync(string commandId, string directory, CancellationToken token) =>
@@ -182,7 +182,9 @@ public sealed class PortableAgentClient : IAgentClient, IAsyncDisposable
     public ValueTask SaveTerminalCommandsAsync(
         IReadOnlyList<TerminalCommandCapability> commands,
         CancellationToken cancellationToken) =>
-        ValueTask.FromException(new AgentClientOperationException("PORTABLE_COMMAND_EDITING_UNAVAILABLE"));
+        OperatingSystem.IsMacOS()
+            ? SendEmptyAsync(LocalAgentCommand.SaveTerminalCommands, new { Commands = commands }, cancellationToken)
+            : ValueTask.FromException(new AgentClientOperationException("PORTABLE_COMMAND_EDITING_UNAVAILABLE"));
 
     private async ValueTask SendEmptyAsync(
         LocalAgentCommand command,

@@ -10,6 +10,7 @@ internal static class PortableAiFixtureValidation
     {
         Require(!string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase),
             "Run this validation through its apphost (dotnet run), not dotnet <assembly.dll>.");
+        await PortableCatalogValidation.RunAsync(Path.Combine(root, "unified-catalog"));
         await CatalogAndAuthorityAsync(Path.Combine(root, "catalog"));
         await OperationReceiptsAsync(Path.Combine(root, "receipts"));
         await PermissionsAndQuestionsAsync(Path.Combine(root, "permissions"));
@@ -228,7 +229,7 @@ internal static class PortableAiFixtureValidation
         private string[] Lines => File.Exists(trace) ? File.ReadAllLines(trace) : [];
         public FixtureScope(string root, int startDelay = 0)
         {
-            Directory.CreateDirectory(root); Workspace = Path.Combine(root, "workspace with spaces"); Directory.CreateDirectory(Workspace);
+            Directory.CreateDirectory(root); if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) File.SetUnixFileMode(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute); Workspace = Path.Combine(root, "workspace with spaces"); Directory.CreateDirectory(Workspace);
             trace = Path.Combine(root, "protocol-trace.txt");
             Environment.SetEnvironmentVariable(PortableAiFixture.TraceVariable, trace);
             Environment.SetEnvironmentVariable(PortableAiFixture.DelayVariable, startDelay.ToString(System.Globalization.CultureInfo.InvariantCulture));

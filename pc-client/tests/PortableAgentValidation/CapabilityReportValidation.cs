@@ -21,6 +21,16 @@ internal static class CapabilityReportValidation
             "Local detection invented remote capabilities.");
         Require(report.Checks.Single(x => x.Id == "ai_auth").Status == CapabilityCheckStatus.Unknown && !report.Agents[0].RemoteExecutionAvailable,
             "A protocol help probe implied model authorization or remote integration.");
+        var filesReady = CapabilityReportFactory.Create(state, new[] { codex }, false, false, aiFileAccessAvailable: true);
+        var filesMissing = CapabilityReportFactory.Create(state, new[] { codex }, false, false, aiFileAccessAvailable: false);
+        Require(filesReady.Checks.Single(x => x.Id == "ai_attachments").Status == CapabilityCheckStatus.Available &&
+            filesMissing.Checks.Single(x => x.Id == "ai_attachments").Status == CapabilityCheckStatus.NotIntegrated &&
+            report.Checks.Single(x => x.Id == "ai_attachments").Status == CapabilityCheckStatus.Unknown, "Mac file export availability was hardcoded or an old response invented support.");
+        var linux = CapabilityReportFactory.Create(state with { Identity = id with { Platform = PcPlatform.Linux } }, new[] { codex }, false, false, true);
+        Require(linux.Checks.Single(x => x.Id == "ai_attachments").Status == CapabilityCheckStatus.NotIntegrated, "Linux gained an unimplemented AI file backend.");
+        Require(filesReady.Checks.Any(x => x.Id == "ai_native_history") && filesReady.Checks.Single(x => x.Id == "ai_persistence").Detail.Contains("未接入"), "Native history and archive support were conflated.");
+        var windows = CapabilityReportFactory.Create(state with { Identity = id with { Platform = PcPlatform.Windows } }, new[] { codex }, false, false);
+        Require(windows.Checks.Single(x => x.Id == "ai_attachments").Status == CapabilityCheckStatus.Limited, "Windows file capability presentation changed");
         var unknown = CapabilityReportFactory.Create(state with { StatusKnown = false }, new[] { codex }, false, false);
         Require(unknown.Checks.Where(x => x.Id is "remote_cli" or "files" or "remote_update").All(x => x.Status == CapabilityCheckStatus.Unknown),
             "Unknown backend state was confused with a missing implementation.");

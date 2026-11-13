@@ -268,8 +268,8 @@
                   <TextBlock Text="创建远程 CLI" FontWeight="SemiBold" />
                   <TextBlock Text="选择本机 Shell 和工作目录，创建后从手机 CLI 页面连接。" Classes="muted" TextWrapping="Wrap" />
                   <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
-                    <ComboBox Width="100" SelectedItem="{Binding TerminalShell, Mode=TwoWay}">
-                      <x:String>zsh</x:String><x:String>bash</x:String><x:String>fish</x:String><x:String>pwsh</x:String><x:String>sh</x:String>
+                    <ComboBox Width="140" ItemsSource="{Binding AvailableTerminalCommands}" SelectedValue="{Binding TerminalShell, Mode=TwoWay}" SelectedValueBinding="{Binding Id}">
+                      <ComboBox.ItemTemplate><DataTemplate x:DataType="contracts:TerminalCommandCapability"><TextBlock Text="{Binding DisplayName}" /></DataTemplate></ComboBox.ItemTemplate>
                     </ComboBox>
                     <TextBox Grid.Column="1" Text="{Binding TerminalDirectory, Mode=TwoWay}" PlaceholderText="工作目录的绝对路径" />
                     <Button Grid.Column="2" Content="新建终端" Command="{Binding StartTerminalCommand}" />
@@ -717,6 +717,8 @@
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandDisplayName}" /><TextBox x:Name="NewCommandName" Text="{Binding Settings.NewCommandName}" AutomationProperties.Name="命令显示名称" /></StackPanel>
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandExecutable}" /><TextBox Text="{Binding Settings.NewExecutable}" AutomationProperties.Name="命令可执行文件" /></StackPanel>
           <StackPanel Spacing="5"><TextBlock Text="{x:Static text:PresentationText.CommandArguments}" /><TextBox Text="{Binding Settings.NewArguments}" AutomationProperties.Name="命令参数" /></StackPanel>
+          <TextBlock Text="{Binding CommandArgumentsHelp}" IsVisible="{Binding UsesPosixCommandArguments}" TextWrapping="Wrap" Classes="muted" />
+          <CheckBox x:Name="NewCommandEnabledToggle" Content="{x:Static text:PresentationText.CommandEnabled}" IsChecked="{Binding Settings.NewCommandEnabled}" IsVisible="{Binding UsesPosixCommandArguments}" />
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
             <Button Classes="subtle" Content="{x:Static text:PresentationText.Cancel}" Command="{Binding CancelTerminalCommandEditorCommand}" />
             <Button Classes="primary" Content="{x:Static text:PresentationText.Add}" Command="{Binding AddTerminalCommandCommand}" />

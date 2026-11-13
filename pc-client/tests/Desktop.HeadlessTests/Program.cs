@@ -585,6 +585,7 @@ public static class Program
             "Explicit control-UI exit did not allow the window to close.");
 
         VerifySingleInstanceActivation();
+        await MacCommandEditingValidation.RunAsync();
         await CompleteExitValidation.ValidateAsync();
         await MacUsabilityValidation.ValidateAsync();
         await MacUsabilityValidation.ValidateUpdaterAsync();

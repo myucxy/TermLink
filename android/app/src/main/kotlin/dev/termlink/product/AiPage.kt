@@ -590,6 +590,7 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
     val managed = perSession && !customDirectory
     val directory = if (managed) "" else directoryOverride ?: workspace.preferredDirectory(pcId)
     var browseDirectory by rememberSaveable(pcKey) { mutableStateOf(false) }
+    var showRuntimeAuth by rememberSaveable(pcKey) { mutableStateOf(false) }
     var model by rememberSaveable(pcKey, catalog?.hostId, agent?.id, agent?.strategy) { mutableStateOf("") }
     var provider by rememberSaveable(pcKey, catalog?.hostId, agent?.id, agent?.strategy) { mutableStateOf("") }
     var mode by rememberSaveable(pcKey, catalog?.hostId, agent?.id, agent?.strategy) { mutableStateOf("ask") }
@@ -601,6 +602,7 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
     val editable = !workspace.isBlocked(pcId)
     val scope = rememberCoroutineScope()
     LaunchedEffect(pcId) { workspace.refresh(pcId) }
+    if (showRuntimeAuth && agent != null) AiRuntimeAuthenticationDialog(workspace, pcId, agent) { showRuntimeAuth = false }
     ModalBottomSheet(onDismissRequest = { if (!workspace.busy) workspace.createPc = null },
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = MaterialTheme.colorScheme.surface, dragHandle = null) {
         val view = LocalView.current
@@ -632,6 +634,10 @@ private fun AiCreateSheet(workspace: AiWorkspace, pcs: List<PcSummary>, initialP
                         options.forEach { option -> AiAgentChoice(option.id, option.name, selected = option.id == agent?.id,
                             enabled = ready && editable, onClick = { agentId = option.id }) }
                     }
+                }
+                if (agent != null) {
+                    Text(aiRuntimeAuthenticationSummary(workspace.runtimeAuthentications[pcId to agent.id] ?: agent.runtimeAuthentication), style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = { showRuntimeAuth = true }, enabled = ready && editable) { Text("检查模型授权") }
                 }
                 if (catalog?.requiresNativeUpgrade() == true)
                     Text(stringResource(R.string.ai_native_upgrade_required), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

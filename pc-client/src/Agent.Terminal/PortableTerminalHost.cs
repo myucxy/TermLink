@@ -13,7 +13,7 @@ using TermLink.TerminalCore;
 namespace TermLink.Agent.Terminal;
 
 /// <summary>Mac PTY and native core authority. Network/UI reconnects do not own these processes.</summary>
-public sealed class PortableTerminalHost : IRelayTerminalHost
+public sealed partial class PortableTerminalHost : IRelayTerminalHost
 {
     private readonly ITerminalSessionHost pty;
     private readonly ConcurrentDictionary<Guid, Session> sessions = new();
@@ -24,6 +24,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
     private int disposed;
     private readonly string? stateDirectory;
     private readonly byte[]? stateKey;
+    private readonly PortableTerminalDeletionStore? deletions;
     private static readonly object nativeSync = new();
     private static bool loaded;
 
@@ -47,7 +48,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
     public PortableTerminalHost(ITerminalSessionHost pty, IReadOnlyList<TerminalCommandCapability> commands, string? stateDirectory = null, byte[]? stateKey = null)
     {
         this.pty = pty;
-        Commands = commands.Where(x => x.Enabled && x.Detected).ToArray();
+        UpdateCommands(commands);
         NativeTerminalCoreV2.ValidateAbi();
         if ((stateDirectory is null) != (stateKey is null) || (stateKey is not null && stateKey.Length != 32)) throw new ArgumentException("Invalid terminal state store");
         this.stateDirectory = stateDirectory;
@@ -56,11 +57,22 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         {
             Directory.CreateDirectory(stateDirectory);
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(stateDirectory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            deletions = new PortableTerminalDeletionStore(stateDirectory, this.stateKey!);
+            foreach (var deleted in deletions.Records)
+                if (deleted.OperationId != Guid.Empty) launches.Add(deleted.OperationId, deleted.SessionId);
             Restore();
         }
         clock = AdvanceClockAsync();
     }
-    public IReadOnlyList<TerminalCommandCapability> Commands { get; }
+    private IReadOnlyList<TerminalCommandCapability> commands = Array.Empty<TerminalCommandCapability>();
+    public IReadOnlyList<TerminalCommandCapability> Commands => Volatile.Read(ref commands);
+    public void UpdateCommands(IReadOnlyList<TerminalCommandCapability> values) => Volatile.Write(ref commands,
+        values.Where(x =>
+        {
+            try { return x.Enabled && Path.IsPathFullyQualified(x.Executable) && File.Exists(x.Executable) &&
+                (OperatingSystem.IsWindows() || (File.GetUnixFileMode(x.Executable) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
+        }).ToArray());
     public IReadOnlyList<RelayTerminalSession> Sessions => sessions.Values.Select(s => s.View).OrderBy(s => s.CreatedAt).ToArray();
 
     public async Task<Guid> StartAsync(string command, string directory, Guid operationId, CancellationToken token)
@@ -71,20 +83,22 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
             ObjectDisposedException.ThrowIf(disposed != 0, this);
             if (operationId != Guid.Empty && launches.TryGetValue(operationId, out var prior)) return prior;
             if (sessions.Count >= 64) throw new InvalidOperationException("TERMINAL_SESSION_LIMIT");
-            if (!Commands.Any(c => c.Id == command)) throw new InvalidDataException("TERMINAL_COMMAND_UNAVAILABLE");
+            var profile = Commands.SingleOrDefault(c => c.Id == command) ?? throw new InvalidDataException("TERMINAL_COMMAND_UNAVAILABLE");
             if (directory.Length > 4096 || directory.Contains('\0') || !Path.IsPathFullyQualified(directory))
                 throw new InvalidDataException("TERMINAL_DIRECTORY_INVALID");
             var core = NativeTerminalCoreV2.Create(100, 30, 1, 10000);
             TerminalLaunchResult launch;
             try { launch = await pty.LaunchAsync(new(command, directory, 100, 30, new Dictionary<string, string>()), token).ConfigureAwait(false); }
             catch { core.Dispose(); throw; }
-            var session = new Session(launch.SessionId, command, core) { OperationId = operationId };
+            var shell = profile.Detected ? command : "custom";
+            var session = new Session(launch.SessionId, shell, core) { OperationId = operationId, PtyAttached = true };
+            session.View = session.View with { Title = profile.DisplayName };
             // Seed sequence one even for a shell which has not produced a prompt.
             core.ApplyAdvance(1, 0);
             session.View = session.View with { Sequence = 1 };
             // Android can attach a newly-created terminal from sequence zero.
             // The seed advance must exist in the replay log as well as the core.
-            var seed = new SessionUpsertPayload { ShellType = command, Lifecycle = "RUNNING", Columns = 100, Rows = 30 }.ToByteArray();
+            var seed = new SessionUpsertPayload { ShellType = shell, Lifecycle = "RUNNING", Columns = 100, Rows = 30 }.ToByteArray();
             session.Events.Enqueue(new(1, MessageType.SessionStarted, seed));
             session.EventBytes = seed.Length;
             sessions[launch.SessionId] = session;
@@ -108,6 +122,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         await s.Gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
             var checkpoint = s.Checkpoint ?? throw new IOException("TERMINAL_CHECKPOINT_UNAVAILABLE");
             return checkpoint with { Bytes = checkpoint.Bytes.ToArray() };
         }
@@ -120,6 +135,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         await s.Gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
             var committed = s.Checkpoint?.Sequence ?? 0;
             if (after > committed || (after < committed && (s.Events.Count == 0 || after + 1 < s.Events.Peek().Sequence))) return null;
             var events = s.Events.Where(e => e.Sequence > after && e.Sequence <= committed).Take(64).ToArray();
@@ -138,6 +154,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         await s.Gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
             var committed = s.Checkpoint?.Sequence ?? 0;
             if (after > committed || (after < committed && (s.Events.Count == 0 || after + 1 < s.Events.Peek().Sequence))) return null;
             if (after < s.SnapshotRequiredThrough && committed >= s.SnapshotRequiredThrough) return null;
@@ -220,6 +237,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         await s.Gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
             s.Core.ApplyAdvance(s.View.Sequence + 1, s.Core.GetPresentationInfo().LogicalTimeMicros);
             Add(s, result.Accepted ? MessageType.InputAccepted : MessageType.InputRejected, result.ToByteArray(), recipient);
         }
@@ -231,6 +249,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         await s.Gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
             if (s.Checkpoint?.Sequence != s.View.Sequence || after >= s.View.Sequence) return null;
             s.Core.ApplyAdvance(s.View.Sequence + 1, s.Core.GetPresentationInfo().LogicalTimeMicros);
             Add(s, MessageType.Gap, new GapPayload { Start = after + 1, End = s.View.Sequence, ReasonCode = "HISTORY_GAP" }.ToByteArray(), recipient);
@@ -244,9 +263,11 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         await s.StopGate.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            if (s.Deleted) return;
             s.Cancellation.Cancel();
             try { await s.Reader.ConfigureAwait(false); } catch (OperationCanceledException) { }
             await pty.StopAsync(id, token).ConfigureAwait(false);
+            s.PtyAttached = false;
             await EndAsync(s, "EXITED").ConfigureAwait(false);
         }
         finally { s.StopGate.Release(); }
@@ -382,6 +403,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
         {
             if (!Guid.TryParseExact(Path.GetFileNameWithoutExtension(path), "N", out var id) || new FileInfo(path).LinkTarget is not null || new FileInfo(path).Length > 24 * 1024 * 1024 + 28)
                 throw new IOException("TERMINAL_STATE_INVALID");
+            if (deletions?.Contains(id) == true) { deletions.RemoveStateFile(id); continue; }
             var blob = File.ReadAllBytes(path);
             if (blob.Length < 28) throw new IOException("TERMINAL_STATE_INVALID");
             var plain = new byte[blob.Length - 28];
@@ -420,6 +442,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
             lifetime.Cancel();
             try { await clock.ConfigureAwait(false); } catch (OperationCanceledException) { }
             foreach (var s in sessions.Values) { s.Core.Dispose(); if (s.Checkpoint is { } checkpoint) CryptographicOperations.ZeroMemory(checkpoint.Bytes); }
+            deletions?.Dispose();
             if (stateKey is not null) CryptographicOperations.ZeroMemory(stateKey);
         }
         finally { lifecycle.Release(); }
@@ -433,6 +456,7 @@ public sealed class PortableTerminalHost : IRelayTerminalHost
             View = new(id, shell, shell, "RUNNING", 100, 30, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
         }
         public RelayTerminalSession View;
+        public bool Deleted, PtyAttached;
         public NativeTerminal Core;
         public Guid OperationId;
         public RelayTerminalCheckpoint? Checkpoint;

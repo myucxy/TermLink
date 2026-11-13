@@ -50,6 +50,7 @@ struct AIRefreshFence {
 }
 
 @MainActor final class AIWorkspace: ObservableObject {
+    let artifactDownloads = AIArtifactDownloadStore()
     private var refreshFence=AIRefreshFence()
     struct Opened: Codable,Identifiable,Equatable {
         let pcID:UUID,id:String,agentID:String,strategy:String
@@ -77,6 +78,9 @@ struct AIRefreshFence {
     }
     typealias Attachment = AIStagedAttachment
     @Published private(set) var catalogs:[UUID:JSONValue]=[:]
+    @Published private(set) var runtimeAuthentications:[UUID:[String:JSONValue]]=[:]
+    private var authenticationVersions:[UUID:UInt64]=[:]
+    private var authenticationReads:[UUID:[String:UInt64]]=[:]
     @Published private(set) var conversations:[String:AIConversation]=[:]
     @Published private(set) var opened:[Opened]=[]
     @Published private(set) var uncertain:[UUID:Mutation]=[:]
@@ -119,6 +123,16 @@ struct AIRefreshFence {
             guard owner == epoch else { throw CancellationError() }
             try saveAttachments()
         } catch { product.report(error) }
+        do {
+            guard owner == epoch, product.signedIn else { throw CancellationError() }
+            let cache = try AIArtifactDownloadCache.open(scope: product.privateState.scope)
+            try await artifactDownloads.activate(cache: cache, confirm: { [weak self] source in
+                guard let self else { throw CancellationError() }; try await self.confirmArtifactSource(source)
+            }, read: { [weak self] source, offset in
+                guard let self else { throw CancellationError() }; return try await self.readArtifact(source, offset: offset)
+            })
+            guard owner == epoch else { artifactDownloads.retire(); throw CancellationError() }
+        } catch { product.report(error) }
     }
     func persist() {
         do {
@@ -148,9 +162,11 @@ struct AIRefreshFence {
         // already bound to the original account and only these random IDs.
         Task { for id in ids { try? await cache.remove(id) } }
     }
-    func reset(){epoch=UUID();catalogs=[:];conversations=[:];opened=[];uncertain=[:];selected=nil;drafts=[:];references=[:];attachments=[:];attachmentCache=nil;queued=[:];pinned=[];busy=[];unavailable=[];reading=[];preparingUploads=[];polling=false;externalLink=nil;directoryLocation=nil;exportURL=nil}
-    func markUnavailable(_ pc:UUID){unavailable.insert(pc);conversations=conversations.filter{$0.value.pcID != pc}}
+    func reset(){artifactDownloads.retire();epoch=UUID();runtimeAuthentications=[:];authenticationVersions=[:];authenticationReads=[:];catalogs=[:];conversations=[:];opened=[];uncertain=[:];selected=nil;drafts=[:];references=[:];attachments=[:];attachmentCache=nil;queued=[:];pinned=[];busy=[];unavailable=[];reading=[];preparingUploads=[];polling=false;externalLink=nil;directoryLocation=nil;exportURL=nil}
+    func markUnavailable(_ pc:UUID){runtimeAuthentications.removeValue(forKey:pc);authenticationVersions[pc,default:0] &+= 1;unavailable.insert(pc);conversations=conversations.filter{$0.value.pcID != pc}}
     func invalidate(){
+        runtimeAuthentications=[:];authenticationVersions=[:];authenticationReads=[:]
+        artifactDownloads.pauseAll()
         for session in Array(attachments.keys) {
             attachments[session] = attachments[session]?.map { item in
                 var next=item;if next.status=="uploading"{next.status="paused";next.error="连接已暂停，请重新确认会话后重试。"};return next
@@ -174,6 +190,7 @@ struct AIRefreshFence {
         if body["action"] == .string("catalog") {
             guard UUID(uuidString:value["hostId"].string) != nil,value["agents"].array.count<=16,value["sessions"].array.count<=64 else{throw ClientError.invalidResponse("AI catalog")}
             if let old=catalogs[pc],old["hostId"] != value["hostId"]{
+                runtimeAuthentications.removeValue(forKey:pc);authenticationVersions[pc,default:0] &+= 1
                 conversations=conversations.filter{$0.value.pcID != pc}
                 for session in Array(attachments.keys) {
                     attachments[session] = attachments[session]?.map { item in
@@ -227,7 +244,7 @@ struct AIRefreshFence {
         let mutation=Mutation(id:id,pcID:pc,body:.object(body)),owner=epoch
         var retained=uncertain;retained[pc]=mutation;try product.privateState.save(retained,name:"ai-pending")
         refreshFence.invalidate(pc);uncertain=retained;busy.insert(pc);defer{if owner==epoch{refreshFence.invalidate(pc);busy.remove(pc)}}
-        do{let result=try await relay.ai(pc:pc,body:mutation.body);guard owner==epoch,result["hostId"].string==host else{throw ClientError.readOnly};uncertain.removeValue(forKey:pc);persist();if result["session"] != .null{merge(result["session"],pc:pc)};try check(result)
+        do{let result=try await relay.ai(pc:pc,body:mutation.body);guard owner==epoch,result["hostId"].string==host,catalogs[pc]?["hostId"].string==host else{throw ClientError.readOnly};try AIRuntimeAuthentication.validateReceipt(action:action,agent:extra["agentId"]?.string ?? "",response:result);uncertain.removeValue(forKey:pc);persist();if result["session"] != .null{merge(result["session"],pc:pc)};try check(result)
             if action=="fork",let created=conversations[result["session"]["id"].string]{open(created)}
             if action=="end",let session{closeView(session.id)}
             if action=="steer",let session,drafts[session.id]==extra["text"]?.string{drafts[session.id]="";persist()}
@@ -242,7 +259,8 @@ struct AIRefreshFence {
         let owner=epoch;refreshFence.invalidate(pc);busy.insert(pc);defer{if owner==epoch{refreshFence.invalidate(pc);busy.remove(pc)}}
         // Retry exactly the original host-bound operation ID and body, never a new mutation.
         let result=try await relay.ai(pc:pc,body:mutation.body)
-        guard owner==epoch,result["hostId"]==mutation.body["hostId"] else{throw ClientError.readOnly}
+        guard owner==epoch,result["hostId"]==mutation.body["hostId"],catalogs[pc]?["hostId"]==mutation.body["hostId"] else{throw ClientError.readOnly}
+        try AIRuntimeAuthentication.validateReceipt(action:mutation.body["action"].string,agent:mutation.body["agentId"].string,response:result)
         uncertain.removeValue(forKey:pc);persist();if result["session"] != .null{merge(result["session"],pc:pc)};try check(result)
         let session=mutation.body["sessionId"].string,queue=mutation.body["queueId"].string
         if !queue.isEmpty{queued[session]?.removeAll{$0.id==queue}}
@@ -256,6 +274,27 @@ struct AIRefreshFence {
         }
         persist()
         if ["create","fork","import-native"].contains(mutation.body["action"].string),let created=conversations[result["session"]["id"].string]{open(created)}
+    }
+    func runtimeAuthentication(pc:UUID,agent:String,action:String) async throws -> JSONValue {
+        guard ["authentication","authentication.start","authentication.cancel"].contains(action),
+              let relay=product.relay,let host=catalogs[pc]?["hostId"],!host.string.isEmpty,
+              !unavailable.contains(pc),!busy.contains(pc),
+              catalogs[pc]?["agents"].array.contains(where:{$0["id"].string==agent}) == true else{throw ClientError.readOnly}
+        guard let selected=catalogs[pc]?["agents"].array.first(where:{$0["id"].string==agent}),
+              action == "authentication.cancel" || (action == "authentication" ? selected["runtimeAuthentication"]["canCheck"].bool:selected["runtimeAuthentication"]["canStart"].bool) else{throw ClientError.readOnly}
+        if action != "authentication"{authenticationVersions[pc,default:0] &+= 1}
+        authenticationReads[pc,default:[:]][agent,default:0] &+= 1
+        let owner=epoch,version=authenticationVersions[pc] ?? 0,reading=authenticationReads[pc]?[agent] ?? 0
+        let result:JSONValue
+        if action == "authentication" {
+            result=try await relay.ai(pc:pc,body:.object(["action":.string(action),"hostId":host,"agentId":.string(agent)]))
+        } else {result=try await mutate(pc:pc,action:action,extra:["agentId":.string(agent)])}
+        guard owner==epoch,(authenticationVersions[pc] ?? 0) == version,authenticationReads[pc]?[agent]==reading,catalogs[pc]?["hostId"]==host,result["hostId"]==host else{throw ClientError.readOnly}
+        try check(result)
+        guard result["authentication"]["agentId"].string==agent else{throw ClientError.invalidResponse("runtime authorization")}
+        if action == "authentication.start" {return try await runtimeAuthentication(pc:pc,agent:agent,action:"authentication")}
+        runtimeAuthentications[pc,default:[:]][agent]=result["authentication"]
+        return result["authentication"]
     }
     func create(pc:UUID,agent:String,directory:String,options:[String:JSONValue]=[:]) async throws {
         try requireNativeAgent(pc,agent:agent)
@@ -489,15 +528,45 @@ struct AIRefreshFence {
         try product.privateState.save(next,name:"ai-attachments");attachments=next
         cleanAttachmentCache([id])
     }
-    func downloadArtifact(_ s:AIConversation,file:String,version:String) async throws{
-        guard !version.isEmpty,version.count<=100 else{throw ClientError.invalidResponse("artifact version")}
-        var offset:Int64=0,data=Data(),expected:Int64?;let returnedVersion=version
-        repeat{let r=try await read(s,action:"artifact.read",extra:["requestId":.string(file),"offset":.number(Double(offset)),"cursor":.string(returnedVersion)]);let a=r["artifacts"];let chunk=try Data(base64URL:a["data"].string)
-            guard a["id"].string==file,a["version"].string==returnedVersion,a["offset"].integer==offset,a["size"].integer>=0,a["size"].integer<=50*1024*1024,chunk.count<=65536,a["nextOffset"].integer==offset+Int64(chunk.count),a["nextOffset"].integer<=a["size"].integer,!chunk.isEmpty || offset==a["size"].integer else{throw ClientError.protocolViolation("artifact range")}
-            if let expected{guard expected==a["size"].integer else{throw ClientError.readOnly}}else{expected=a["size"].integer};data.append(chunk);offset+=Int64(chunk.count)
-        }while offset<(expected ?? 0)
-        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString,isDirectory:true);try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
-        let name=(file as NSString).lastPathComponent;guard !name.isEmpty,name != ".",name != ".." else{throw ClientError.invalidResponse("artifact name")};let target=root.appendingPathComponent(name);try data.write(to:target,options:[.atomic,.completeFileProtection]);exportURL=target
+    func downloadArtifact(_ s:AIConversation,file:String,version:String) async throws {
+        guard let host=catalogs[s.pcID]?["hostId"].string,let current=conversations[s.id],
+              current.pcID==s.pcID,current.directory==s.directory,
+              current.capabilities["pathStyle"]==s.capabilities["pathStyle"] else{throw ClientError.readOnly}
+        let source=try AIArtifactSource(session:current,hostID:host,artifactID:file,version:version)
+        _=try await artifactDownloads.start(source:source)
+    }
+    private func artifactContext(_ source:AIArtifactSource) throws -> RelayClient {
+        guard product.active,product.signedIn,let relay=product.relay,relay.state == .connected,
+              product.pcs.contains(where:{$0.id==source.pcID && $0.online && $0.routing}),
+              catalogs[source.pcID]?["hostId"].string==source.hostID,
+              let session=conversations[source.sessionID],source.matches(session,host:source.hostID) else {
+            throw ClientError.readOnly
+        }
+        return relay
+    }
+    /// Retry always asks the original PC for an authoritative catalog and session.
+    /// The currently selected computer/conversation is never consulted.
+    private func confirmArtifactSource(_ source:AIArtifactSource) async throws {
+        try source.validate();let owner=epoch
+        guard product.active,product.signedIn,let relay=product.relay,relay.state == .connected else{throw ClientError.readOnly}
+        try await product.refresh()
+        guard owner==epoch,product.pcs.contains(where:{$0.id==source.pcID && $0.online && $0.routing}) else{throw ClientError.readOnly}
+        let catalog=try await relay.ai(pc:source.pcID,body:.object(["action":.string("catalog")]))
+        guard owner==epoch,catalog["hostId"] == .string(source.hostID) else{throw ClientError.readOnly};try check(catalog)
+        let reply=try await relay.ai(pc:source.pcID,body:.object(["action":.string("poll"),"hostId":.string(source.hostID),"sessionId":.string(source.sessionID)]))
+        guard owner==epoch,reply["hostId"] == .string(source.hostID),reply["session"]["id"] == .string(source.sessionID) else{throw ClientError.readOnly};try check(reply)
+        let current=AIConversation(raw:AIConfiguration.conversation(reply["session"]),pcID:source.pcID)
+        guard source.matches(current,host:source.hostID) else{throw ClientError.readOnly}
+        catalogs[source.pcID]=AIConfiguration.catalog(catalog);merge(reply["session"],pc:source.pcID)
+        _=try artifactContext(source)
+    }
+    private func readArtifact(_ source:AIArtifactSource,offset:Int64) async throws -> JSONValue {
+        let relay=try artifactContext(source),owner=epoch
+        let reply=try await relay.ai(pc:source.pcID,body:.object(["action":.string("artifact.read"),
+            "hostId":.string(source.hostID),"sessionId":.string(source.sessionID),"requestId":.string(source.artifactID),
+            "cursor":.string(source.version),"offset":.number(Double(offset))]))
+        guard owner==epoch,reply["hostId"] == .string(source.hostID) else{throw ClientError.readOnly}
+        _=try artifactContext(source);try check(reply);return reply["artifacts"]
     }
     private func check(_ result:JSONValue) throws {if !result["error"].string.isEmpty{throw ClientError.unavailable(result["error"].string)};if result["ok"] == .bool(false){throw ClientError.unavailable(result["errorCode"].string)}}
 }

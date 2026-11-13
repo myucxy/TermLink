@@ -375,6 +375,7 @@ internal sealed partial class AiAgentSession : IDisposable
 
     private async Task ReceiveAsync(JsonElement value)
     {
+        if (ReceiveRuntimeAuthentication(value)) return;
         lock (sync) if (disposed || state == "interrupted") return;
         if (agent.Protocol == "claude") { await ReceiveClaudeAsync(value); return; }
         if (agent.Protocol == "acp") { await ReceiveAcpAsync(value); return; }

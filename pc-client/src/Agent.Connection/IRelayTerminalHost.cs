@@ -12,7 +12,12 @@ public sealed record RelayTerminalCheckpoint(ulong Sequence, uint Columns, uint 
 public interface IRelayTerminalHost : IAsyncDisposable
 {
     IReadOnlyList<TerminalCommandCapability> Commands { get; }
+    void UpdateCommands(IReadOnlyList<TerminalCommandCapability> commands) { }
     IReadOnlyList<RelayTerminalSession> Sessions { get; }
+    bool SupportsCleanup => false;
+    IReadOnlyList<Guid> DeletedSessions => Array.Empty<Guid>();
+    Task<SessionCleanupResponsePayload> CleanupAsync(SessionCleanupRequestPayload request, Func<Task<bool>> authorized, CancellationToken token) =>
+        Task.FromResult(new SessionCleanupResponsePayload { RequestId = request.RequestId, ErrorCode = "SESSION_CLEANUP_UNSUPPORTED" });
     Task<Guid> StartAsync(string command, string directory, Guid operationId, CancellationToken token);
     Task StopAsync(Guid id, CancellationToken token);
     Task RecordInputResultAsync(Guid id, Guid recipient, InputResultPayload result, CancellationToken token);

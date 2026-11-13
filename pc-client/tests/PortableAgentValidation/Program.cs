@@ -34,6 +34,7 @@ try
     ValidateAuthentication(key);
     await ValidateFramesAsync(key);
     await PortableStatusValidation.RunAsync(key);
+    await PortableCommandEditingValidation.RunAsync();
     CapabilityReportValidation.Run();
     if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
     {
@@ -158,7 +159,7 @@ static async Task ValidateShutdownAsync(byte[] key)
         }
         Require(!running.IsCompleted, "UI-only exit stopped the Agent.");
         await using var client = new PortableAgentClient(new(endpoint, TimeSpan.FromSeconds(2)), secrets, transport, supervisor);
-        Require(client.SupportsAiAgentDetection && client.SupportsBrowserAuthorizationCancellation && !client.SupportsTerminalCommandEditing,
+        Require(client.SupportsAiAgentDetection && client.SupportsBrowserAuthorizationCancellation && client.SupportsTerminalCommandEditing == OperatingSystem.IsMacOS(),
             "Portable client feature support is inaccurate.");
         await client.ControlBrowserAuthorizationAsync(true, CancellationToken.None); // Establish the explicit authenticated connection first.
         Require((await client.DetectAiAgentsAsync(CancellationToken.None)).Single().Id == "codex", "AI detection did not cross authenticated IPC.");

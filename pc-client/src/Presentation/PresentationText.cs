@@ -174,6 +174,11 @@ public static class PresentationText
     public static string RegisterMode => Pick("创建账户", "Create account");
     public static string Platform => Pick("平台", "Platform");
     public static string AvailableCommands => Pick("可用命令", "Available commands");
+    public static string PosixCommandsDetail => Pick("名称会显示在手机的打开终端菜单中。使用绝对可执行路径；工作目录在每次创建时选择，命令以当前用户运行。", "Names appear in the phone's Open terminal menu. Use an absolute executable path; choose the working directory when creating a session. Commands run as the current user.");
+    public static string PosixCommandArgumentsHelp => Pick("参数填写 JSON 字符串数组，例如 [\"--flag\", \"value with spaces\"]；每项按原值传递，不执行 Shell 字符串。", "Enter a JSON string array, for example [\"--flag\", \"value with spaces\"]. Each argument is passed literally, without evaluating a shell command.");
+    public static string CommandArgumentsInvalid => Pick("参数必须是有效的 JSON 字符串数组。", "Arguments must be a valid JSON string array.");
+    public static string CommandInvalid => Pick("启动项无效，请检查名称、绝对可执行路径及参数长度。", "Invalid command. Check the name, absolute executable path and argument limits.");
+    public static string CommandEnabled => Pick("启用此启动项", "Enable this command");
     public static string CommandsDetail => Pick("这些名称会显示在 Android 文件页面的“打开终端”菜单中。", "These names appear in Android's Open terminal menu.");
     public static string CommandDisplayName => Pick("手机端显示名称", "Mobile display name");
     public static string CommandExecutable => Pick("可执行文件或绝对路径", "Executable or absolute path");

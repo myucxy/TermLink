@@ -27,7 +27,7 @@ internal static class PortableAdditionalAiValidation
     {
         if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("Additional CLI fixtures require POSIX executable permissions.");
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var fixture = await BuildFixtureAsync(Path.Combine(root, "fixtures with spaces ; $(literal)"));
         await DiscoveryStatusesAsync(Path.Combine(root, "statuses"), fixture);
         await LauncherAndIsolationAsync(Path.Combine(root, "isolation"), fixture);
@@ -77,7 +77,7 @@ internal static class PortableAdditionalAiValidation
 
     private static async Task LauncherAndIsolationAsync(string root, string fixture)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var paths = Ids.ToDictionary(id => id, id => CopyFixture(fixture, root, id + "-valid"));
         var originalHome = Environment.GetEnvironmentVariable("HOME");
         var originalVariables = ExcludedEnvironment.ToDictionary(key => key, Environment.GetEnvironmentVariable);
@@ -155,7 +155,7 @@ internal static class PortableAdditionalAiValidation
 
     private static async Task ShimAndPathValidationAsync(string root, string fixture)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var runtime = CopyFixture(fixture, root, "fixture-node");
         foreach (var id in Ids)
         {
@@ -204,7 +204,7 @@ internal static class PortableAdditionalAiValidation
 
     private static async Task CatalogAsync(string root, string fixture)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var paths = Ids.ToDictionary(id => id, id => CopyFixture(fixture, root, id + "-valid"));
         var codex = new AiAgentInstallation("codex", "Codex", "", "", "", "codex", "missing");
         var zcode = new AiAgentInstallation("zcode", "ZCode", "", "", "", "zcode", "missing");
@@ -228,10 +228,10 @@ internal static class PortableAdditionalAiValidation
 
     private static async Task DirectorySafetyAsync(string root, string fixture)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var account = Path.Combine(root, "account");
         var foreign = Path.Combine(root, "foreign");
-        Directory.CreateDirectory(account);
+        PrivateDirectory(account);
         Directory.CreateDirectory(foreign);
         var link = Path.Combine(account, "claude-runtime");
         Directory.CreateSymbolicLink(link, foreign);
@@ -266,7 +266,7 @@ internal static class PortableAdditionalAiValidation
 
     private static async Task<string> BuildFixtureAsync(string root)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var compiler = File.Exists("/usr/bin/cc") ? "/usr/bin/cc" : ExecutableLocator.Find("cc") ?? throw new InvalidOperationException("Native fixture requires an installed C compiler");
         var path = Path.Combine(root, "native-fixture");
         var start = new ProcessStartInfo(compiler)
@@ -282,7 +282,7 @@ internal static class PortableAdditionalAiValidation
 
     private static string CopyFixture(string fixture, string root, string name)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var path = Path.Combine(root, name);
         File.Copy(fixture, path);
         Executable(path);
@@ -362,4 +362,9 @@ internal static class PortableAdditionalAiValidation
             return 0;
         }
         """;
+    private static void PrivateDirectory(string path) {
+        Directory.CreateDirectory(path);
+        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
 }

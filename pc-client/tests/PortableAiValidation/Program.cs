@@ -9,6 +9,11 @@ if (args.Contains("app-server", StringComparer.Ordinal))
     await PortableAiFixture.RunAsync();
     return;
 }
+if (args.Length == 2 && args[0] == "--real-device-code")
+{
+    await RealRuntimeAuthenticationValidation.RunAsync(args[1]);
+    return;
+}
 if (args.Length == 2 && args[0] == "--real-codex")
 {
     await RealCodexValidation.RunSandboxedAsync(args[1]);
@@ -41,6 +46,7 @@ Directory.CreateDirectory(root);
 try {
     await PortableAiFixtureValidation.RunAsync(root);
     await PortableCodexValidation.RunAsync(Path.Combine(root, "codex"));
+    await AiRuntimeAuthenticationValidation.RunAsync(Path.Combine(root, "authentication"));
     await PortableAiDirectoryValidation.RunAsync(Path.Combine(root, "directories"));
     await AiWorkspaceFilesValidation.RunAsync(Path.Combine(root, "files"));
     await AiHistoryParityValidation.RunAsync(Path.Combine(root, "history"));
@@ -49,5 +55,6 @@ try {
     await AiCapabilitiesValidation.RunAsync();
     await AiHistoryActionsValidation.RunAsync();
     await PortableAdditionalAiValidation.RunAsync(Path.Combine(root, "additional"));
+    await PortableCatalogValidation.RunAsync(Path.Combine(root, "catalog"));
 }
 finally { Directory.Delete(root, recursive: true); }

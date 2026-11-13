@@ -11,6 +11,7 @@
     <Compile Include="../../src/Agent/AiAcpSession.cs" Link="AiAcpSession.cs" />
     <Compile Include="../../src/Agent/AiSessionTimeline.cs" Link="AiSessionTimeline.cs" />
     <Compile Include="../../src/Agent/AiStructuredInteractions.cs" Link="Shared/AiStructuredInteractions.cs" />
+    <Compile Include="../../src/Agent/AiRuntimeAuthentication.cs" Link="Shared/AiRuntimeAuthentication.cs" />
     <Compile Include="../../src/Agent/AiHistoryActions.cs" Link="Shared/AiHistoryActions.cs" />
     <Compile Include="../../src/Agent/AiAgentCapabilities.cs" Link="Shared/AiAgentCapabilities.cs" />
     <Compile Include="../../src/Agent/AiWorkspaceFiles.cs" Link="AiWorkspaceFiles.cs" />

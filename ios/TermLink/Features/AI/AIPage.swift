@@ -22,7 +22,8 @@ struct AIPage:View {
     }.searchable(text:$workspace.search).refreshable{await workspace.refreshAll()}.toolbar{Button(workspace.attentionOnly ? "全部":"待处理",systemImage:"exclamationmark.bubble"){workspace.attentionOnly.toggle()};Button("历史",systemImage:"clock"){history=true};Button("新建",systemImage:"plus"){create=true}}}}
     .navigationTitle("AI").navigationBarTitleDisplayMode(.inline).task{await workspace.refreshAll()}
     .sheet(isPresented:$create){NavigationStack{AICreateView(workspace:workspace)}}
-    .sheet(isPresented:$history){NavigationStack{AINativeHistoryView(workspace:workspace)}}}
+    .sheet(isPresented:$history){NavigationStack{AINativeHistoryView(workspace:workspace)}}
+    .aiArtifactDownloads(workspace:workspace)}
 }
 struct AgentIcon:View {
     let agent:String
@@ -140,6 +141,7 @@ struct AICreateView:View {
     @State private var candidate:JSONValue?
     @State private var modelCatalog:JSONValue = .null
     @State private var initialized = false
+    @State private var showRuntimeAuthentication=false
     private var computers: [PC] { product.pcs.filter(AICreateLocation.eligible) }
     private var agents:[JSONValue]{workspace.catalogs[pc ?? UUID()]?["agents"].array.filter{AgentBrand.available($0)} ?? []}
     private var configuration:JSONValue{agents.first(where:{$0["id"].string==agent})?["configuration"] ?? .null}
@@ -151,6 +153,10 @@ struct AICreateView:View {
                 ForEach(computers){pc in Text(pc.name).tag(Optional(pc.id))}
             }
             Picker("AI Agent",selection:$agent){Text("选择 AI Agent").tag("");ForEach(agents,id:\.self){a in Label{Text(a["name"].string)}icon:{AgentIcon(agent:a["id"].string)}.tag(a["id"].string)}}
+            if let selected=agents.first(where:{$0["id"].string==agent}) {
+                Text(AIRuntimeAuthentication.summary(pc.flatMap{workspace.runtimeAuthentications[$0]?[agent]} ?? selected["runtimeAuthentication"])).font(.caption).foregroundStyle(.secondary)
+                Button("检查模型授权"){showRuntimeAuthentication=true}.disabled(pc==nil)
+            }
             if let pc,workspace.requiresHostUpgrade(pc){Text("请升级电脑端以使用 ZCode 原生会话。").font(.caption).foregroundStyle(.secondary)}
             Toggle("使用托管工作目录",isOn:$managed)
             if !managed{TextField("电脑工作目录",text:$directory).textInputAutocapitalization(.never).autocorrectionDisabled()}
@@ -184,6 +190,7 @@ struct AICreateView:View {
             if !agents.contains(where:{$0["id"].string==agent}){agent=agents.first?["id"].string ?? "";resetOptions()}
         }
         .sheet(isPresented:$browse){if let pc{NavigationStack{AIComputerFilePicker(workspace:workspace,pc:pc,initialPath:directory,selectFile:false){directory=$0}}}}
+        .sheet(isPresented:$showRuntimeAuthentication){if let pc,let selected=agents.first(where:{$0["id"].string==agent}){NavigationStack{AIRuntimeAuthenticationView(workspace:workspace,pc:pc,agent:agent,descriptor:selected["runtimeAuthentication"])}}}
         .alert("确认 Agent 授权范围",isPresented:Binding(get:{candidate != nil},set:{if !$0{candidate=nil}})){
             Button("取消",role:.cancel){candidate=nil};Button("确认使用"){guard let option=candidate else{return};mode=option["id"].string;confirmed=mode;candidate=nil}
         }message:{Text(candidate?["description"].string ?? "请确认 Agent 原生权限设置。")}

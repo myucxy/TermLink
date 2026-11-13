@@ -10,7 +10,7 @@ internal static class PortableAiDirectoryValidation
     private static readonly UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
     internal static async Task RunAsync(string root)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         await DefaultManagerAsync(Path.Combine(root, "default"));
         await ReceiptFencesAsync(Path.Combine(root, "receipts"));
         await CancelledReceiptAsync(Path.Combine(root, "cancelled"));
@@ -45,7 +45,7 @@ internal static class PortableAiDirectoryValidation
 
     private static async Task ReceiptFencesAsync(string root)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var count = 0;
         using var manager = new AiSessionManager(installRoot: root, catalog: EmptyCatalog, createCliWorkspace: () =>
         {
@@ -73,7 +73,7 @@ internal static class PortableAiDirectoryValidation
 
     private static async Task CancelledReceiptAsync(string root)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim(false);
         var count = 0;
@@ -152,7 +152,7 @@ internal static class PortableAiDirectoryValidation
     [SupportedOSPlatform("macos")]
     private static async Task RealMacDirectoriesAsync(string account)
     {
-        Directory.CreateDirectory(account);
+        PrivateDirectory(account);
         var missing = new AiAgentInstallation("codex", "Codex", "", "", "", "codex", "missing");
         using var host = new PortableAiHost(account, () => Task.FromResult(missing), () => Task.FromResult(missing with { Id = "zcode" }));
         var owner = Guid.NewGuid(); var catalog = Parse(await host.ExecuteAsync(owner, "{\"action\":\"catalog\"}", CancellationToken.None, () => true));
@@ -205,11 +205,11 @@ internal static class PortableAiDirectoryValidation
 
     private static void SymlinkFences(string root)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         var outside = Path.Combine(root, "outside"); Directory.CreateDirectory(outside);
         var linkedAccount = Path.Combine(root, "account-link"); Directory.CreateSymbolicLink(linkedAccount, outside);
         ExpectIOException(() => { using var ignored = new PortableAiDirectories(linkedAccount); });
-        var account = Path.Combine(root, "account"); Directory.CreateDirectory(account);
+        var account = Path.Combine(root, "account"); PrivateDirectory(account);
         Directory.CreateSymbolicLink(Path.Combine(account, "AiWorkspaces"), outside);
         ExpectIOException(() => { using var ignored = new PortableAiDirectories(account); });
         Directory.Delete(Path.Combine(account, "AiWorkspaces"));
@@ -233,4 +233,9 @@ internal static class PortableAiDirectoryValidation
     private static void ExpectIOException(Action action) { try { action(); throw new InvalidOperationException("A symlink root was accepted"); } catch (IOException) { } }
     private static async Task Error(AiSessionManager manager, Guid caller, AiSessionManager.Request request, string code) =>
         Require(Text(Parse(await manager.ExecuteAsync(caller, Encode(request), CancellationToken.None)), "error") == code, "Expected safe directory error " + code);
+    private static void PrivateDirectory(string path) {
+        Directory.CreateDirectory(path);
+        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
 }

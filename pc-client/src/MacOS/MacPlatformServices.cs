@@ -55,10 +55,11 @@ public sealed class MacPlatformServices : IPlatformServices, IAsyncDisposable
             true);
         SecretStore = new MacKeychainSecretStore(MacPlatformOptions.AgentServiceName);
         LocalIpc = new UnixDomainSocketTransport();
-        terminalHost = new PosixTerminalSessionHost();
+        TerminalCommandStore = new PosixTerminalCommandStore(Path.Combine(options.DataDirectory, "terminal-commands-v1.json"));
+        terminalHost = new PosixTerminalSessionHost(TerminalCommandStore.Resolve);
         TerminalHost = terminalHost;
         FileSystem = new PosixFileSystemOperations();
-        TerminalCommands = new PosixTerminalCommandDiscovery();
+        TerminalCommands = new PosixTerminalCommandDiscovery(TerminalCommandStore);
         var arguments = new[] { "--agent", "--ipc", options.IpcEndpoint };
         Autostart = new MacLaunchdAutostartManager(new MacLaunchdOptions(
             MacPlatformOptions.AgentServiceName,
@@ -80,6 +81,7 @@ public sealed class MacPlatformServices : IPlatformServices, IAsyncDisposable
     public ITerminalSessionHost TerminalHost { get; }
     public IFileSystemOperations FileSystem { get; }
     public ITerminalCommandDiscovery TerminalCommands { get; }
+    public PosixTerminalCommandStore TerminalCommandStore { get; }
     public IAutostartManager Autostart { get; }
     public IUpdateInstaller Updates { get; }
     public IProcessSupervisor Processes { get; }
@@ -149,7 +151,12 @@ public sealed class MacProcessSupervisor(string agentExecutable, string ipcEndpo
                 // require this installation's executable. Never kill by name.
                 try
                 {
-                    if (!string.Equals(Path.GetFullPath(agentExecutable), process.MainModule?.FileName, StringComparison.Ordinal) && !process.HasExited)
+                    var executable = process.MainModule?.FileName;
+                    // macOS can stop exposing the executable while HasExited is
+                    // still false. An unknown path is not a foreign identity:
+                    // keep observing this authenticated PID until it really exits.
+                    if (!string.IsNullOrEmpty(executable) &&
+                        !string.Equals(Path.GetFullPath(agentExecutable), executable, StringComparison.Ordinal) && !process.HasExited)
                         throw new InvalidDataException("PC_AGENT_PROCESS_IDENTITY_MISMATCH");
                 }
                 catch (InvalidOperationException) when (process.HasExited) { }

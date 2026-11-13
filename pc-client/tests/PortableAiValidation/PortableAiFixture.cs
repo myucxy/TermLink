@@ -10,6 +10,10 @@ internal static class PortableAiFixture
 
     public static async Task RunAsync()
     {
+        if (Environment.GetEnvironmentVariable("TERMLINK_FILE_CAPABILITY_PROBE") is { } expected) {
+            if (TermLink.Agent.AI.PortableAiCatalog.FileAccessAvailable != (expected == "true")) throw new InvalidOperationException("Native export capability mismatch");
+            Console.WriteLine("PASS native file export gate"); return;
+        }
         var trace = Environment.GetEnvironmentVariable(TraceVariable) ?? throw new InvalidOperationException("Fixture trace directory required.");
         var model = "fixture-model"; var provider = "fixture-provider"; var mode = "build";
         var pid = Environment.ProcessId;

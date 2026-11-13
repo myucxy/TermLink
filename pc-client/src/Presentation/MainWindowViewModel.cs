@@ -191,6 +191,7 @@ public sealed class SettingsPageViewModel : PageViewModel
     private string newArguments = string.Empty;
     private string? editingCommandId;
     private bool commandEditorOpen;
+    private bool newCommandEnabled = true;
     private bool hasUnsavedCommands;
     private string releaseNotes = string.Empty;
     private string releaseNotesTitle = PresentationText.AppShipReleaseNotes;
@@ -206,6 +207,7 @@ public sealed class SettingsPageViewModel : PageViewModel
     public string NewCommandName { get => newCommandName; set => SetProperty(ref newCommandName, value); }
     public string NewExecutable { get => newExecutable; set => SetProperty(ref newExecutable, value); }
     public string NewArguments { get => newArguments; set => SetProperty(ref newArguments, value); }
+    public bool NewCommandEnabled { get => newCommandEnabled; set => SetProperty(ref newCommandEnabled, value); }
     public string ApplicationVersion { get; internal set; } = "1.0.0.0";
     public string Author { get; internal set; } = "清风惹尘丶";
     public string ReleaseNotes
@@ -506,6 +508,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand OpenCapabilityActionCommand { get; }
     public bool SupportsCapabilityDetection => client.SupportsCapabilityDetection;
     public bool SupportsTerminalCommandEditing => client.SupportsTerminalCommandEditing;
+    public bool UsesPosixCommandArguments => platform == PcPlatform.MacOS;
+    public string CommandArgumentsHelp => PresentationText.PosixCommandArgumentsHelp;
     public bool SupportsAutomaticUpdates => desktopOperations?.SupportsAutomaticUpdates == true;
     public bool SupportsWindowsTerminalIntegration => platform == PcPlatform.Windows && desktopOperations?.SupportsWindowsTerminalIntegration == true;
     public bool SupportsMacIntegration => platform == PcPlatform.MacOS && desktopOperations?.SupportsMacIntegration == true;
@@ -517,7 +521,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public string EmptySessionsDetail => platform == PcPlatform.MacOS
         ? PresentationText.Pick("创建终端后从手机 CLI 页面连接；ZCode 会话在手机 AI 页面管理。", "Create a terminal here, then connect from the phone CLI page. Manage ZCode on the phone AI page.")
         : IsPortableHost ? PresentationText.PortableSessionsDetail : PresentationText.NoSessionsDetail;
-    public string CommandsDetail => SupportsTerminalCommandEditing ? PresentationText.CommandsDetail : PresentationText.PortableCommandsDetail;
+    public string CommandsDetail => UsesPosixCommandArguments && SupportsTerminalCommandEditing ? PresentationText.PosixCommandsDetail :
+        SupportsTerminalCommandEditing ? PresentationText.CommandsDetail : PresentationText.PortableCommandsDetail;
     public string AiDetectionDetail => platform == PcPlatform.MacOS
         ? PresentationText.Pick("ZCode 复用本机 App 的内置 Agent，通过原生会话接入；模型授权仍需验证。Codex 已接入公共 CLI 的独立原生运行时，需要单独配置授权；其余 Agent 暂为本机检测。", "ZCode uses the installed app's Agent for native sessions; model authorization requires validation. Codex uses an isolated public CLI runtime that requires its own authorization. Other Agents are detection only.")
         : IsPortableHost ? PresentationText.PortableDetectionDetail : PresentationText.AgentDetectionDetail;
@@ -533,6 +538,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand StopSessionCommand { get; }
     public AsyncCommand StartTerminalCommand { get; }
     public bool SupportsTerminalCreation => platform == PcPlatform.MacOS && client.SupportsTerminalCreation;
+    public ObservableCollection<TerminalCommandCapability> AvailableTerminalCommands { get; } = new();
     private string terminalShell = "zsh";
     public string TerminalShell { get => terminalShell; set => SetProperty(ref terminalShell, value); }
     private string terminalDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -743,6 +749,17 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         RaisePropertyChanged(nameof(IsDarkAppearance));
     }
 
+    private bool CanLaunchCommand(TerminalCommandCapability command)
+    {
+        if (!command.Enabled) return false;
+        if (platform == PcPlatform.Windows) return true;
+        if (!Path.IsPathFullyQualified(command.Executable) || !File.Exists(command.Executable)) return false;
+        if (OperatingSystem.IsWindows()) return false;
+        try { return (File.GetUnixFileMode(command.Executable) &
+            (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
+    }
+
     private void StateChanged(object? sender, AgentStatusSnapshot snapshot) =>
         _ = dispatcher.InvokeAsync(() => Apply(snapshot));
 
@@ -804,6 +821,9 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Sessions.Filter();
         var deviceItems = snapshot.Devices.Select(CreateDeviceItem).ToArray();
         ObservableCollectionDiff.Apply(Devices.Items, deviceItems, item => item.DeviceId);
+        ObservableCollectionDiff.Apply(AvailableTerminalCommands, snapshot.TerminalCommands.Where(CanLaunchCommand).ToArray(), item => item.Id);
+        if (!AvailableTerminalCommands.Any(command => command.Id == TerminalShell))
+            TerminalShell = AvailableTerminalCommands.FirstOrDefault()?.Id ?? string.Empty;
         if (!Settings.HasUnsavedCommands && !Settings.CommandEditorOpen)
             ObservableCollectionDiff.Apply(
                 Settings.TerminalCommands,
@@ -1339,23 +1359,33 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.EditingCommandId = command?.Id;
         Settings.NewCommandName = command?.DisplayName ?? string.Empty;
         Settings.NewExecutable = command?.Executable ?? string.Empty;
-        Settings.NewArguments = command is null ? string.Empty : string.Join(' ', command.Arguments);
+        Settings.NewArguments = command is null ? (UsesPosixCommandArguments ? "[]" : string.Empty) :
+            UsesPosixCommandArguments ? PosixTerminalCommandRules.FormatArguments(command.Arguments) : string.Join(' ', command.Arguments);
+        Settings.NewCommandEnabled = command?.Enabled ?? true;
         Settings.CommandEditorOpen = true;
     }
 
     private void CommitTerminalCommandEditor()
     {
         var name = Settings.NewCommandName.Trim();
-        var executable = Settings.NewExecutable.Trim();
+        var executable = UsesPosixCommandArguments ? Settings.NewExecutable : Settings.NewExecutable.Trim();
         if (name.Length == 0 || executable.Length == 0)
         {
             ShowNotice(UiNoticeSeverity.Warning, PresentationText.CommandRequired, PresentationText.CommandsDetail);
             return;
         }
-        var arguments = string.IsNullOrWhiteSpace(Settings.NewArguments)
-            ? Array.Empty<string>()
-            : new[] { Settings.NewArguments.Trim() };
+        IReadOnlyList<string> arguments;
+        try { arguments = UsesPosixCommandArguments ? PosixTerminalCommandRules.ParseArguments(Settings.NewArguments) :
+            string.IsNullOrWhiteSpace(Settings.NewArguments) ? Array.Empty<string>() : new[] { Settings.NewArguments.Trim() }; }
+        catch (InvalidDataException) { ShowNotice(UiNoticeSeverity.Warning, PresentationText.CommandArgumentsInvalid, PresentationText.PosixCommandArgumentsHelp); return; }
         var editingIndex = Settings.EditingCommandId is null ? -1 : FindCommandIndex(Settings.EditingCommandId);
+        if (UsesPosixCommandArguments)
+        {
+            try { _ = PosixTerminalCommandRules.Validate(new TerminalCommandCapability(
+                editingIndex >= 0 ? Settings.TerminalCommands[editingIndex].Id : "custom-validation", name, executable, arguments,
+                editingIndex >= 0 && Settings.TerminalCommands[editingIndex].Detected, false, Settings.NewCommandEnabled)); }
+            catch (InvalidDataException) { ShowNotice(UiNoticeSeverity.Warning, PresentationText.CommandInvalid, PresentationText.PosixCommandsDetail); return; }
+        }
         if (editingIndex >= 0)
         {
             var existing = Settings.TerminalCommands[editingIndex];
@@ -1364,6 +1394,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 DisplayName = name,
                 Executable = executable,
                 Arguments = arguments,
+                RunAsAdministrator = UsesPosixCommandArguments ? false : existing.RunAsAdministrator,
+                Enabled = UsesPosixCommandArguments ? Settings.NewCommandEnabled : existing.Enabled,
             };
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandUpdated, string.Empty);
         }
@@ -1375,7 +1407,8 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
                 executable,
                 arguments,
                 false,
-                true));
+                !UsesPosixCommandArguments,
+                UsesPosixCommandArguments ? Settings.NewCommandEnabled : true));
             ShowNotice(UiNoticeSeverity.Info, PresentationText.CommandAdded, string.Empty);
         }
         Settings.HasUnsavedCommands = true;
@@ -1398,7 +1431,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         await MutateAsync(
             token => client.SaveTerminalCommandsAsync(
                 Settings.TerminalCommands
-                    .Concat(Settings.RemovedTerminalCommands)
+                    .Concat(Settings.RemovedTerminalCommands.Where(command => !UsesPosixCommandArguments || command.Detected))
                     .ToArray(),
                 token),
             PresentationText.CommandsSaved,
@@ -1421,6 +1454,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
         Settings.NewCommandName = string.Empty;
         Settings.NewExecutable = string.Empty;
         Settings.NewArguments = string.Empty;
+        Settings.NewCommandEnabled = true;
         Settings.CommandEditorOpen = false;
     }
 

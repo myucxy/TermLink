@@ -15,10 +15,10 @@ public sealed partial class RelayConnectionService
     private static readonly string[] TerminalCapabilities = ["realtime_terminal_v1", "terminal_snapshot_v1", "terminal_snapshot_v2", "host_history_v1", "host_session_catalog_v1", "terminal_commands_v1", "terminal_window_resize_v1", "terminal_host_resize_v1"];
     private static readonly string[] TerminalTransportCapabilities = ["host_history_v1", "host_session_catalog_v1", "terminal_attach_v1", "terminal_snapshot_v1", "terminal_snapshot_v2", "bounded_event_replay_v1", "terminal_window_resize_v1", "terminal_host_resize_v1"];
     private readonly Func<string, IRelayTerminalHost>? terminalHostFactory;
-    private readonly IReadOnlyList<TerminalCommandCapability> terminalCommands;
+    private IReadOnlyList<TerminalCommandCapability> terminalCommands;
     private IRelayTerminalHost? terminalHost;
     public bool SupportsTerminal => terminalHostFactory is not null;
-    public IReadOnlySet<string> Capabilities => (SupportsAi ? new[] { "ai_agent_v1" } : []).Concat(SupportsTerminal ? TerminalCapabilities : []).Concat(SupportsFiles ? new[] { "file_operations_v1", "file_operation_name_filter_v1" } : []).ToHashSet(StringComparer.Ordinal);
+    public IReadOnlySet<string> Capabilities => (terminalHost?.SupportsCleanup == true ? new[] { "host_session_cleanup_v1" } : []).Concat(SupportsAi ? new[] { "ai_agent_v1" } : []).Concat(SupportsTerminal ? TerminalCapabilities : []).Concat(SupportsFiles ? new[] { "file_operations_v1", "file_operation_name_filter_v1" } : []).ToHashSet(StringComparer.Ordinal);
     public IReadOnlyList<ManagedSessionSnapshot> TerminalSessions => terminalHost?.Sessions.Select(s => new ManagedSessionSnapshot(s.Id, s.Title, s.Shell,
         s.State == "RUNNING" ? (Snapshot.State == AgentConnectionState.Connected ? ManagedSessionState.Connected : ManagedSessionState.Disconnected) :
         s.State == "EXITED" ? ManagedSessionState.Ended : ManagedSessionState.Interrupted, 0, s.ActivityAt, s.Sequence)).ToArray() ?? [];
@@ -37,6 +37,29 @@ public sealed partial class RelayConnectionService
         }
         finally { operations.Release(); }
     }
+    private static IReadOnlyList<TerminalCommandCapability> LaunchableCommands(IReadOnlyList<TerminalCommandCapability> commands) => commands.Where(command =>
+    {
+        try { return command.Enabled && Path.IsPathFullyQualified(command.Executable) && File.Exists(command.Executable) &&
+            (OperatingSystem.IsWindows() || (File.GetUnixFileMode(command.Executable) & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
+    }).ToArray();
+    public async Task UpdateTerminalCommandsAsync(IReadOnlyList<TerminalCommandCapability> commands, CancellationToken token)
+    {
+        await operations.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            var available = LaunchableCommands(commands);
+            Volatile.Write(ref terminalCommands, available);
+            terminalHost?.UpdateCommands(available);
+            if (account is { } current && Snapshot.State == AgentConnectionState.Connected)
+            {
+                using var device = OpenIdentity(current.Identity);
+                await UpsertAsync(current, device, token).ConfigureAwait(false);
+            }
+        }
+        finally { operations.Release(); }
+    }
     public Task StopTerminalAsync(Guid id, CancellationToken token) => terminalHost?.StopAsync(id, token) ?? Task.CompletedTask;
     private async Task RetireTerminalHostAsync()
     {
@@ -46,13 +69,23 @@ public sealed partial class RelayConnectionService
     private async Task PublishTerminalSessionsAsync(Account current, DeviceIdentity device, CancellationToken token)
     {
         if (terminalHost is null) return;
-        foreach (var s in terminalHost.Sessions)
+        try { await RetrySessionDeletionsAsync(current, device, token).ConfigureAwait(false); }
+        catch (Exception error) when (!token.IsCancellationRequested && error is HttpRequestException or IOException or RelayOperationException or OperationCanceledException)
+        { /* A durable local deletion can retry without blocking the live terminal. */ }
+        await sessionMetadata.WaitAsync(token).ConfigureAwait(false);
+        try
         {
-            var body = JsonSerializer.SerializeToUtf8Bytes(new { pc_id = current.Identity.PcId, shell_type = s.Shell, state = s.State,
-                columns = s.Columns, rows = s.Rows, last_output_seq = s.Sequence, session_heartbeat_capable = false });
-            using var response = await SendAsync(current, device, HttpMethod.Put, "/v1/sessions/" + s.Id.ToString("D"), body, true, token).ConfigureAwait(false);
-            RelayHttp.RequireSuccess(response);
+            var host = terminalHost;
+            if (host is null) return;
+            foreach (var s in host.Sessions)
+            {
+                var body = JsonSerializer.SerializeToUtf8Bytes(new { pc_id = current.Identity.PcId, shell_type = s.Shell, state = s.State,
+                    columns = s.Columns, rows = s.Rows, last_output_seq = s.Sequence, session_heartbeat_capable = false });
+                using var response = await SendAsync(current, device, HttpMethod.Put, "/v1/sessions/" + s.Id.ToString("D"), body, true, token).ConfigureAwait(false);
+                RelayHttp.RequireSuccess(response);
+            }
         }
+        finally { sessionMetadata.Release(); }
     }
 
     private sealed class TerminalPlane : IAsyncDisposable
@@ -100,6 +133,16 @@ public sealed partial class RelayConnectionService
                         response.Sessions.AddRange(host.Sessions.Select(s => new SessionCatalogEntry { SessionId = Id(s.Id), ShellType = s.Shell, Title = s.Title,
                             Lifecycle = s.State, Columns = (uint)s.Columns, Rows = (uint)s.Rows, LastOutputSeq = s.Sequence, CreatedAtMs = s.CreatedAt.ToUnixTimeMilliseconds(), ProcessAlive = s.State == "RUNNING" }));
                         await Reply(MessageType.SessionCatalogResponse, response, envelope.Seq).ConfigureAwait(false);
+                    }
+                    else if (envelope.MessageType == MessageType.SessionCleanupRequest)
+                    {
+                        var request = SessionCleanupRequestPayload.Parser.ParseFrom(plain);
+                        if (!ValidId(request.RequestId)) return;
+                        var response = await owner.CleanupTerminalSessionsAsync(account, device, host, sender, request, token).ConfigureAwait(false);
+                        var deleted = response.Results.Where(r => r.Status is "DELETED" or "NOT_FOUND").Select(r => GuidOf(r.SessionId)).ToHashSet();
+                        foreach (var entry in subscribers.Where(p => deleted.Contains(p.Key.Item2)).ToArray())
+                        { entry.Value.Dispose(); subscribers.Remove(entry.Key); }
+                        await Reply(MessageType.SessionCleanupResponse, response, envelope.Seq).ConfigureAwait(false);
                     }
                     return;
                 }
@@ -276,6 +319,8 @@ public sealed partial class RelayConnectionService
                 await gate.WaitAsync(token).ConfigureAwait(false);
                 try
                 {
+                    foreach (var retired in subscribers.Where(p => !host.Sessions.Any(s => s.Id == p.Key.Item2)).ToArray())
+                    { retired.Value.Dispose(); subscribers.Remove(retired.Key); }
                     foreach (var sub in subscribers.Values)
                     {
                         if (sub.History is { } pending && pending.Created < DateTimeOffset.UtcNow.AddSeconds(-30)) sub.ClearHistory();

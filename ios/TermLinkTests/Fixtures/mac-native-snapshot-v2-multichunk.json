@@ -1,0 +1,50 @@
+{
+  "format": "termlink.public-native-snapshot-interop-v2",
+  "public_fixture_only": true,
+  "producer": "actual macOS native core + production C# SnapshotCrypto.SealTerminalCoreSnapshot",
+  "pairwise_key": "ef77924bb0e3f252f44931dc0b7739a9ca7ed90ae79e2eb62d33654b7e226fbd",
+  "pc_device_id": "00112233-4455-4677-8899-aabbccddeeff",
+  "mobile_device_id": "10213243-5465-4687-98a9-bacbdcedfe0f",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "key_epoch": 7,
+  "request_id": "22222222-2222-4333-8444-555555555555",
+  "object_id": "33333333-2222-4333-8444-555555555555",
+  "snapshot_sequence": 162,
+  "next_source_sequence": 163,
+  "columns": 80,
+  "rows": 24,
+  "initial_transcript_before_line_id": 1,
+  "observed_local_input_epoch": 0,
+  "compression": 1,
+  "key_id": "terminal-core-snapshot-v2:102132435465468798a9bacbdcedfe0f:00000007",
+  "nonce": "18191a1b1c1d1e1f20212223",
+  "key": "096a42da71431269864a1428732f20b5738fc3ef44d8dd43f130a9c40e8aed95",
+  "associated_data": "5445524d4c494e4b2d5445524d494e414c2d434f52452d534e415053484f542d4f424a4543542d563200000000021111111122224333844455555555555500112233445546778899aabbccddeeff102132435465468798a9bacbdcedfe0f000000000000000700437465726d696e616c2d636f72652d736e617073686f742d76323a31303231333234333534363534363837393861396261636264636564666530663a303030303030303700000000000000a20000005000000018001f5445524d4c494e4b5f5445524d494e414c5f434f52455f534e415053484f54000000020000000100000000000d6cf80000000000000001000000000000000018191a1b1c1d1e1f20212223",
+  "checkpoint_sha256": "55c0e93826e10d2005f2fbef497f40eacca34224ef6089e0bd58699165b21bb6",
+  "sealed_object_sha256": "5f6d0e7773cc3af37238ed5a62c0bb0562f040da58a9b17fb65c0a144d799ad2",
+  "plaintext_marker": "TERMLINK_PUBLIC_SNAPSHOT_20261111",
+  "chunks": [
+    {
+      "index": 0,
+      "envelope_sequence": 162
+    },
+    {
+      "index": 1,
+      "envelope_sequence": 162
+    }
+  ],
+  "replay": [
+    {
+      "sequence": 163,
+      "message_type": 20,
+      "payload_hex": "0a225055424c49435f534e415053484f545f5245504c41595f4f4b20e4b8ade696870d0a",
+      "raw_output_hex": "5055424c49435f534e415053484f545f5245504c41595f4f4b20e4b8ade696870d0a"
+    }
+  ],
+  "replay_next_source_sequence": 164,
+  "replay_checkpoint_sha256": "bbd9b54d7acad9a499d53f27814cabc1b1cf8324bf6e9330b3bf6273484037df",
+  "source_fixture_sha256": "6d8d5b3103e421eaa295ad917850dfed1af7c404a20ff96dfd60b2d96360840d",
+  "resource_prefix": "mac-native-snapshot-v2-multichunk",
+  "checkpoint_bytes": 879864,
+  "sealed_object_bytes": 880076
+}

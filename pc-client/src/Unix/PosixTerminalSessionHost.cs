@@ -12,6 +12,10 @@ public sealed class PosixTerminalSessionHost : ITerminalSessionHost, IAsyncDispo
     private readonly ConcurrentDictionary<Guid, Session> sessions = new();
     private readonly SemaphoreSlim disposeGate = new(1, 1);
     private int disposed;
+    private readonly Func<string, (string Executable, IReadOnlyList<string> Arguments)> resolveCommand;
+
+    public PosixTerminalSessionHost(Func<string, (string Executable, IReadOnlyList<string> Arguments)>? resolveCommand = null) =>
+        this.resolveCommand = resolveCommand ?? PosixTerminalCommandDiscovery.Resolve;
 
     public ValueTask<TerminalLaunchResult> LaunchAsync(
         TerminalLaunchRequest request,
@@ -26,7 +30,7 @@ public sealed class PosixTerminalSessionHost : ITerminalSessionHost, IAsyncDispo
             throw new InvalidDataException("An absolute terminal working directory is required.");
         var workingDirectory = Path.GetFullPath(request.WorkingDirectory);
         if (!Directory.Exists(workingDirectory)) throw new DirectoryNotFoundException(workingDirectory);
-        var command = PosixTerminalCommandDiscovery.Resolve(request.CommandId);
+        var command = resolveCommand(request.CommandId);
         using var arguments = NativeStringVector.Create([command.Executable, .. command.Arguments]);
         using var environment = NativeStringVector.Create(BuildEnvironment(request.Environment));
         var result = PosixPtyNative.Spawn(

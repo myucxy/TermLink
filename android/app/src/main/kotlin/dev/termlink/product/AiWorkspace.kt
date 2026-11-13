@@ -52,7 +52,8 @@ internal data class AiAgentConfiguration(
     val hasPermissionControl: Boolean get() = permissionSwitch && permissionModes.isNotEmpty()
 }
 internal data class AiAgentOption(val id: String, val name: String, val version: String, val status: String, val strategy: String = "native",
-    val configuration: AiAgentConfiguration = AiAgentConfiguration(), val nativeHistory: Boolean = false) {
+    val configuration: AiAgentConfiguration = AiAgentConfiguration(), val nativeHistory: Boolean = false,
+    val runtimeAuthentication: JSONObject = JSONObject()) {
     val supported: Boolean get() = status == "available" && strategy == "native"
 }
 internal data class AiMessage(val id: String, val role: String, val text: String,
@@ -130,6 +131,9 @@ internal class AiWorkspace(
     context: Context? = null,
 ) {
     val catalogs = mutableStateMapOf<UUID, AiCatalog>()
+    // Device challenges are intentionally volatile, never persisted with drafts or history.
+    val runtimeAuthentications = mutableStateMapOf<Pair<UUID,String>, JSONObject>()
+    private val runtimeAuthenticationReads = mutableMapOf<Pair<UUID,String>, Long>()
     val conversations = mutableStateMapOf<String, AiConversation>()
     val downloads = context?.let { AiDownloads(it, repository, scope, preferences, seal, unseal,
         currentSession = { pcId, hostId, sessionId -> conversations[sessionId]?.takeIf {
@@ -265,6 +269,7 @@ internal class AiWorkspace(
         return repository.aiRequest(pcId, body)
     }
     private var retired = false
+    val isRetired: Boolean get() = retired
     private var draftJob: kotlinx.coroutines.Job? = null
     init {
         if (uncertain) error = "发现尚未确认的请求，请重试查询电脑回执。"
@@ -611,7 +616,7 @@ internal class AiWorkspace(
         if (!clearPending) saveDrafts()
         draftJob?.cancel(); draftJob = null
         stopBackgroundWatch()
-        retired = true; catalogs.clear(); conversations.clear(); drafts.clear(); unavailable.clear(); pending.clear(); busyPcs.clear(); cliDirectories.clear()
+        retired = true; runtimeAuthentications.clear(); runtimeAuthenticationReads.clear(); catalogs.clear(); conversations.clear(); drafts.clear(); unavailable.clear(); pending.clear(); busyPcs.clear(); cliDirectories.clear()
         questionDrafts.clear()
         queued.clear(); fileReferences.clear(); attachments.values.flatten().forEach { it.job?.cancel(); if (clearPending) it.file?.delete() }; attachments.clear()
         if (clearPending) preferences.edit().apply { remove("pending"); remove("drafts"); preferences.all.keys.filter { it.startsWith("web:") }.forEach(::remove) }.commit()
@@ -691,6 +696,22 @@ internal class AiWorkspace(
         return checkNotNull(conversations[id])
     }
 
+    suspend fun runtimeAuthentication(pcId: UUID, agentId: String): JSONObject {
+        val catalog = checkNotNull(catalogs[pcId])
+        check(!retired && !isBusy(pcId) && catalog.agents.any { it.id == agentId && it.supported && it.runtimeAuthentication.opt("canCheck") == true })
+        val version = version(pcId)
+        val key = pcId to agentId
+        val reading = (runtimeAuthenticationReads[key] ?: 0) + 1
+        runtimeAuthenticationReads[key] = reading
+        val result = JSONObject(nativeRequest(pcId, JSONObject().put("action", "authentication").put("hostId", catalog.hostId).put("agentId", agentId).toString()))
+        check(!retired && !isBusy(pcId) && version == version(pcId) && runtimeAuthenticationReads[key] == reading &&
+            catalogs[pcId]?.hostId == catalog.hostId && result.optString("hostId") == catalog.hostId)
+        check(result.optString("error").isEmpty()) { "暂时无法查询独立模型授权，请检查电脑运行环境。" }
+        val auth = result.getJSONObject("authentication")
+        check(auth.optString("agentId") == agentId)
+        runtimeAuthentications[pcId to agentId] = auth
+        return auth
+    }
     fun mutate(pcId: UUID, action: String, session: AiConversation? = null, extra: JSONObject = JSONObject()): Deferred<Boolean>? {
         if (isBlocked(pcId) || retired) return null
         val catalog = catalogs[pcId] ?: return null
@@ -727,6 +748,11 @@ internal class AiWorkspace(
                 val result = JSONObject(nativeRequest(pcId, body))
                 if (retired) return@async false
                 val request = JSONObject(body)
+                if (request.optString("action") in setOf("authentication.start", "authentication.cancel") && result.optString("error").isEmpty()) {
+                    check(result.getString("hostId") == request.getString("hostId") && catalogs[pcId]?.hostId == request.getString("hostId"))
+                    val authentication = result.getJSONObject("authentication")
+                    check(authentication.opt("agentId") == request.getString("agentId"))
+                }
                 val createdDirectory = if (result.optString("error").isEmpty() && request.optString("action") == "create-cli-workspace") {
                     check(result.getString("hostId") == request.getString("hostId") &&
                         result.getString("operationId") == request.getString("operationId"))
@@ -786,10 +812,15 @@ internal class AiWorkspace(
     }
 
     private fun accept(pcId: UUID, result: JSONObject) {
+        result.optJSONObject("authentication")?.let { auth ->
+            if (result.optString("error").isEmpty() && result.optString("hostId") == catalogs[pcId]?.hostId &&
+                catalogs[pcId]?.agents?.any { it.id == auth.opt("agentId") && it.supported } == true)
+                runtimeAuthentications[pcId to auth.getString("agentId")] = auth
+        }
         val code = result.optString("error")
         if (code.isNotEmpty()) {
             error = aiErrorLabel(code)
-            if (code == "HOST_CHANGED") { catalogs.remove(pcId); conversations.entries.removeAll { it.value.pcId == pcId } }
+            if (code == "HOST_CHANGED") { runtimeAuthentications.keys.filter { it.first == pcId }.forEach(runtimeAuthentications::remove); catalogs.remove(pcId); conversations.entries.removeAll { it.value.pcId == pcId } }
         } else error = ""
         result.optJSONArray("agents")?.let { agents ->
             val sessions = result.getJSONArray("sessions").objects().map { parseConversation(pcId, it) }
@@ -802,12 +833,14 @@ internal class AiWorkspace(
             val next = AiCatalog(result.getString("hostId"), agents.objects().map {
                 val id = it.getString("id")
                 AiAgentOption(id, it.getString("name"), it.optString("version"), it.getString("status"), if (it.has("strategy")) it.optString("strategy") else "native",
-                    parseAgentConfiguration(it.optJSONObject("configuration"), id, globalModelListing, legacyModes[id].orEmpty()), it.optBoolean("nativeHistory"))
+                    parseAgentConfiguration(it.optJSONObject("configuration"), id, globalModelListing, legacyModes[id].orEmpty()), it.optBoolean("nativeHistory"),
+                    it.optJSONObject("runtimeAuthentication") ?: JSONObject())
             }, sessions, result.optString("defaultDirectory"), result.optString("directoryMode", "custom"), result.optBoolean("directoryBrowsing"), globalModelListing,
                 legacyModes, result.optString("cliWorkspaceRoot"), result.optBoolean("cliWorkspaceCreation"))
             require(next.agents.size <= 16 && sessions.size <= 64)
             if (catalogs[pcId]?.hostId != next.hostId) {
                 cliDirectories.remove(pcId)
+                runtimeAuthentications.keys.filter { it.first == pcId }.forEach(runtimeAuthentications::remove)
                 conversations.entries.removeAll { it.value.pcId == pcId }
                 opened.filter { it.pcId == pcId }.forEach { entry -> attachments[entry.sessionId]?.forEach { upload ->
                     if (upload.host != next.hostId) { upload.job?.cancel(); upload.status = "failed"; upload.error = "电脑已重启，请移除附件后重新选择。" }

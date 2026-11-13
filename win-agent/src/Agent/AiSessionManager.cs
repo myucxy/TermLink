@@ -11,7 +11,7 @@ using TermLink.UpdateCore;
 namespace TermLink.Agent;
 
 // Separate from ConPTY: no AI operation can become terminal input, ACK, or resize.
-internal sealed class AiSessionManager : IDisposable
+internal sealed partial class AiSessionManager : IDisposable
 {
     internal static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { MaxDepth = 32 };
     internal readonly string HostId = Guid.NewGuid().ToString("D");
@@ -94,12 +94,16 @@ internal sealed class AiSessionManager : IDisposable
                     }
                 }
                 return Encode(new { hostId = HostId, agents = agents.Select(a => new { a.Id, a.Name, a.Path, a.RuntimePath, a.Version, a.Protocol, a.Status, a.Strategy,
-                    nativeHistory = AiAgentSession.SupportsNativeHistory(a), configuration = AiAgentSession.ConfigurationFor(a) }).ToArray(), defaultDirectory = workspaceRoot, directoryMode = "per_session", directoryBrowsing = true, modelListing = true,
+                    runtimeAuthentication = AuthenticationDescriptor(a), nativeHistory = AiAgentSession.SupportsNativeHistory(a), configuration = AiAgentSession.ConfigurationFor(a) }).ToArray(), defaultDirectory = workspaceRoot, directoryMode = "per_session", directoryBrowsing = true, modelListing = true,
                     cliWorkspaceCreation = createCliWorkspace != null || OperatingSystem.IsWindows(),
                     cliWorkspaceRoot = workspaceRoot,
                     configurationModes = agents.Where(a => a.Strategy == "native").ToDictionary(a => a.Id, a => AiAgentSession.Modes(a.Protocol)),
                     sessions = sessions.Values.Select(s => s.Snapshot(caller, false)).ToArray() });
             }
+        }
+        if (request.Action == "authentication") {
+            if (request.HostId != HostId) return Error("HOST_CHANGED");
+            return await RuntimeAuthenticationAsync(caller, request, authorized).WaitAsync(token).ConfigureAwait(false);
         }
         if (request.Action == "native-history") {
             lock (sync) { if (disposed || request.HostId != HostId) return Error("HOST_CHANGED"); }
@@ -283,6 +287,8 @@ internal sealed class AiSessionManager : IDisposable
         }
         AiAgentSession session = null;
         try {
+            if (request.Action is "authentication.start" or "authentication.cancel")
+                return await RuntimeAuthenticationAsync(caller, request, authorized).ConfigureAwait(false);
             if (request.Action == "create-cli-workspace") {
                 if (createCliWorkspace == null && !OperatingSystem.IsWindows()) return Error("CLI_WORKSPACE_UNAVAILABLE");
                 // Portable factories choose a private direct child, never a caller-supplied create path.
@@ -426,6 +432,8 @@ internal sealed class AiSessionManager : IDisposable
             lifetime.Cancel();
             foreach (var session in sessions.Values) session.Dispose();
             sessions.Clear(); operations.Clear(); nativeHistory.Clear();
+            foreach (var flow in runtimeAuthentications.Values) flow.Dispose();
+            runtimeAuthentications.Clear();
         }
     }
 }

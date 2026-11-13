@@ -188,6 +188,7 @@ public sealed record AiAgentCapability(string Id, string Name, string Path, stri
         "AI_PROBE_OUTPUT_LIMIT" => "检测输出超出安全上限，探测进程已停止。",
         "AI_PROTOCOL_UNSUPPORTED" => "CLI 可启动，但当前版本未提供所需结构化接口。",
         "AI_PROBE_FAILED" or "AI_EXECUTABLE_INVALID" => "CLI 检测失败，请检查安装路径与运行环境。",
+        "AI_PROBE_SKIPPED" => "为避免打开桌面程序，未自动执行此入口；ZCode 需使用独立 Node 运行时。",
         _ => "",
     };
     public bool HasDetectionIssue => DetectionSummary.Length > 0;
@@ -202,7 +203,7 @@ public sealed record AiAgentCapability(string Id, string Name, string Path, stri
     {
         "verified" => "当前会话已验证认证",
         "required" => "需要在对应 Agent 中登录或配置授权",
-        "isolated_required" => "TermLink 独立 Codex 运行时需单独配置授权；不会复用已有 Codex 登录",
+        "isolated_required" => "TermLink 独立 Agent 运行时需单独配置授权；不会复用已有登录",
         _ => "模型授权待确认 · 检测不会读取第三方凭据",
     };
     public string RemoteSummary => RemoteExecutionAvailable
@@ -215,6 +216,7 @@ public sealed record AiAgentCapability(string Id, string Name, string Path, stri
         "desktop_only" => "已安装桌面应用 · 未检测到公共 CLI",
         "runtime_missing" => "已找到 CLI · 缺少所需运行时",
         "runtime_blocked" => "已找到 CLI · 系统阻止启动",
+        "probe_failed" when DetectionCode == "AI_PROBE_SKIPPED" => "已发现入口路径 · 未自动执行",
         _ => "CLI 检测未通过 · 可重新检测或查看官方说明",
     }) : InstallationDetail;
     private string InstallationDetail => Strategy == "desktop_remote" ? "旧版网页接入已停用 · 请升级电脑端" : $"{Version} · " + (Status switch {

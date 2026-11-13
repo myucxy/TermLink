@@ -31,6 +31,7 @@
         "dependencies": {
           "System.Security.Cryptography.ProtectedData": "[8.0.0, )",
           "TermLink.Agent.Connection": "[0.3.16, )",
+          "TermLink.Agent.Files": "[0.3.16, )",
           "TermLink.Platform.Unix": "[0.3.16, )"
         }
       },

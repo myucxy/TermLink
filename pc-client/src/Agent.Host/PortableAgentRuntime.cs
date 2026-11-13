@@ -79,7 +79,7 @@ public sealed class PortableAgentRuntime : ILocalAgentCommandHandler, IAsyncDisp
                 if (storageKey.Length != 32) throw new CryptographicException("TERMINAL_STATE_KEY_INVALID");
                 var stateRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Application Support",
                     TermLink.Platform.MacOS.MacPlatformOptions.IsDevelopmentBuild ? "TermLink DEV" : "TermLink", "terminals");
-                terminalFactory = scope => new PortableTerminalHost(platform.TerminalHost, commands, Path.Combine(stateRoot, scope), storageKey);
+                terminalFactory = scope => new PortableTerminalHost(platform.TerminalHost, platform.TerminalCommands.DiscoverAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult(), Path.Combine(stateRoot, scope), storageKey);
             }
             catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or IOException or TypeInitializationException)
             { /* Fail closed: AI/account remains available, terminal capability is absent. */ }
@@ -142,13 +142,24 @@ public sealed class PortableAgentRuntime : ILocalAgentCommandHandler, IAsyncDisp
                     await stateGate.WaitAsync(cancellationToken).ConfigureAwait(false);
                     try { commands = detected; }
                     finally { stateGate.Release(); }
-                    return LocalAgentCommandResult.Ok(CapabilityReportFactory.Create(CreateStatus(), agents, remoteSessions: connection.SupportsTerminal, commandEditing: false));
+                    return LocalAgentCommandResult.Ok(CapabilityReportFactory.Create(CreateStatus(), agents, remoteSessions: connection.SupportsTerminal, commandEditing: platform.Descriptor.Platform == PcPlatform.MacOS, aiFileAccessAvailable: PortableAiCatalog.FileAccessAvailable));
                 }
                 case LocalAgentCommand.CancelAccountAuthorization:
                     await connection.CancelPendingAuthorizationAsync(cancellationToken).ConfigureAwait(false);
                     break;
                 case LocalAgentCommand.SaveTerminalCommands:
-                    return LocalAgentCommandResult.Reject("PORTABLE_COMMAND_EDITING_UNAVAILABLE");
+                {
+                    if (platform is not TermLink.Platform.MacOS.MacPlatformServices mac)
+                        return LocalAgentCommandResult.Reject("PORTABLE_COMMAND_EDITING_UNAVAILABLE");
+                    await mac.TerminalCommandStore.SaveAsync(Deserialize<TerminalCommandsPayload>(payload).Commands, cancellationToken).ConfigureAwait(false);
+                    var configured = await platform.TerminalCommands.DiscoverAsync(cancellationToken).ConfigureAwait(false);
+                    await stateGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try { commands = configured; }
+                    finally { stateGate.Release(); }
+                    await connection.UpdateTerminalCommandsAsync(configured, cancellationToken).ConfigureAwait(false);
+                    Interlocked.Increment(ref revision);
+                    return LocalAgentCommandResult.Ok();
+                }
                 case LocalAgentCommand.StartTerminal:
                 {
                     var start = Deserialize<StartTerminalPayload>(payload);
@@ -200,37 +211,12 @@ public sealed class PortableAgentRuntime : ILocalAgentCommandHandler, IAsyncDisp
 
     private async Task<IReadOnlyList<AiAgentCapability>> DetectAiAgentsAsync(CancellationToken token)
     {
-        var agents = (await new PosixAiAgentDiscovery().DiscoverAsync(token).ConfigureAwait(false)).ToList();
-        if (OperatingSystem.IsMacOS())
-        {
-            var codexIndex = agents.FindIndex(a => a.Id == "codex");
-            if (codexIndex >= 0 && agents[codexIndex].ProtocolStatus == "available")
-            {
-                var local = agents[codexIndex];
-                try
-                {
-                    var launch = PosixCliLaunchDescriptor.Resolve(local.Path);
-                    if (launch.NativeAgentCompatible)
-                        agents[codexIndex] = local with { Status = "available", Strategy = "native",
-                            RemoteExecutionAvailable = connection.SupportsAi, AuthenticationStatus = "isolated_required" };
-                }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException) { }
-            }
-            var zcode = await ZcodeDesktopRuntime.DetectMacAsync(token).ConfigureAwait(false);
-            // A missing desktop app does not erase a separately installed
-            // public CLI. Keep that result detection-only; it is not the Host
-            // runtime used by this build's existing native ZCode integration.
-            if (zcode.Status == "missing" && agents.Any(a => a.Id == "zcode" && a.Status != "missing")) return agents;
-            agents.RemoveAll(a => a.Id == "zcode");
-            agents.Add(new AiAgentCapability(zcode.Id, zcode.Name, zcode.Path, zcode.Version, zcode.Status, "native")
-            {
-                Protocol = zcode.Protocol,
-                ProtocolStatus = zcode.Status == "available" ? "available" : zcode.Status == "incompatible" ? "incompatible" : "not_checked",
-                AuthenticationStatus = "not_checked",
-                RemoteExecutionAvailable = connection.SupportsAi && zcode.Status == "available",
-            });
-        }
-        return agents;
+        if (!OperatingSystem.IsMacOS()) return await new PosixAiAgentDiscovery().DiscoverAsync(token).ConfigureAwait(false);
+        // Diagnostics use a separate unauthenticated runtime; discovering never
+        // loads an account secret just to find a configuration directory.
+        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Application Support",
+            TermLink.Platform.MacOS.MacPlatformOptions.IsDevelopmentBuild ? "TermLink DEV" : "TermLink", "ai-detection");
+        return (await new PortableAiCatalog(root).DiscoverAsync(token).ConfigureAwait(false)).Capabilities(connection.SupportsAi);
     }
 
     private AgentStatusSnapshot CreateStatus()

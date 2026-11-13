@@ -55,7 +55,7 @@ internal static class AiCapabilityProjection
         internal Command[] Commands { get; init; } = Array.Empty<Command>();
         internal bool Truncated { get; init; }
     }
-    private sealed record ReadResult(bool Supported, JsonElement Value);
+    private sealed record ReadResult(bool Supported, JsonElement Value, bool RequiresAuthentication = false);
     private const string Unreported = "not-reported";
     private const string InventoryUnknown = "当前协议未报告此清单；不代表代理不能使用已配置的技能或工具。";
     private static readonly Regex PrivateText = new(
@@ -195,6 +195,11 @@ internal static class AiCapabilityProjection
     private static async Task<ReadResult> ReadOptionalAsync(Func<string, object, Task<JsonElement>> read, string method, object parameters)
     {
         try { return new(true, await read(method, parameters).ConfigureAwait(false)); }
+        catch (AiOperationException error) when (method == "account/rateLimits/read" && error.Code == "AGENT_AUTH_REQUIRED") {
+            // Account authorization is optional inventory state; keep working
+            // Skills/MCP lists visible without pretending limits are unsupported.
+            return new(true, default, true);
+        }
         catch (AiOperationException error) when (error.Code is "AGENT_METHOD_NOT_FOUND" or "AGENT_INVALID_PARAMS") {
             return new(false, default);
         }
@@ -263,6 +268,7 @@ internal static class AiCapabilityProjection
     private static void ProjectLimits(ReadResult read, List<Feature> features)
     {
         if (!read.Supported) { features.Add(Unavailable("rateLimits", "用量限额")); return; }
+        if (read.RequiresAuthentication) { features.Add(new("rateLimits", "用量限额", "requires_auth", "需要登录")); return; }
         var limits = P(read.Value, "rateLimits");
         if (limits.ValueKind != JsonValueKind.Object) limits = P(P(read.Value, "rateLimitsByLimitId"), "codex");
         var summaries = new List<string>();

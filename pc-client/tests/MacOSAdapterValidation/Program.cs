@@ -19,6 +19,7 @@ var options = new MacLaunchdOptions(
 await MacDesktopValidation.RunAsync();
 await MacAuthorizationValidation.RunAsync();
 await MacUpdateValidation.RunAsync();
+await MacProcessExitValidation.RunAsync();
 var plist = MacLaunchdAutostartManager.BuildPlist(options);
 var document = XDocument.Parse(plist, LoadOptions.PreserveWhitespace);
 Require(document.Root?.Name.LocalName == "plist", "The launchd plist is invalid XML.");

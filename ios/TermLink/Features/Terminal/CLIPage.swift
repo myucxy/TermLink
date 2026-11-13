@@ -4,11 +4,32 @@ import SwiftUI
 struct CLIPage:View {
     @EnvironmentObject var product:ProductStore
     @AppStorage("terminal-font-size") private var fontSize=14.0
+    private var tabs: [CLISessionTabItem] {
+        product.orderedTerminals.map { terminal in
+            .init(id: terminal.session.id,
+                  computerName: product.pcs.first(where: { $0.id == terminal.session.pcID })?.name,
+                  title: terminal.session.title, shell: terminal.session.shell)
+        }
+    }
     var body:some View{GeometryReader{geometry in
         if geometry.size.width>=850{HStack(spacing:0){list.frame(width:280);Divider();detail}}
-        else{VStack(spacing:0){ScrollView(.horizontal){HStack{ForEach(Array(product.terminals.values),id:\.session.id){t in HStack{Button(t.session.title.isEmpty ? t.session.shell:t.session.title){product.selectedCLI=t.session.id};Button{product.closeView(t.session.id)}label:{Image(systemName:"xmark").font(.caption)}}.padding(9).background(product.selectedCLI==t.session.id ? Color.accentColor.opacity(0.2):Color.clear,in:RoundedRectangle(cornerRadius:8))}}.padding(.horizontal,8)};detail}}
+        else{VStack(spacing:0){
+            CLISessionTabStrip(items:tabs,selected:product.selectedCLI,
+                onSelect:{product.selectCLI($0)},onClose:{product.closeView($0)})
+            detail
+        }}
     }.navigationTitle("CLI").navigationBarTitleDisplayMode(.inline)}
-    private var list:some View{List(Array(product.terminals.values),id:\.session.id){t in Button{product.selectedCLI=t.session.id}label:{VStack(alignment:.leading){Text(t.session.title.isEmpty ? t.session.shell:t.session.title);Text(t.status).font(.caption).foregroundStyle(.secondary)}}.contextMenu{Button("关闭视图"){product.closeView(t.session.id)}}}}
+    private var list:some View{List(product.orderedTerminals,id:\.session.id){terminal in
+        Button{product.selectCLI(terminal.session.id)}label:{
+            VStack(alignment:.leading){
+                Text(tabs.first(where:{$0.id==terminal.session.id})?.label ?? "电脑 · 终端").lineLimit(1).truncationMode(.middle)
+                Text(terminal.status).font(.caption).foregroundStyle(.secondary)
+            }.frame(maxWidth:.infinity,alignment:.leading).padding(.vertical,4)
+        }
+        .listRowBackground(product.selectedCLI==terminal.session.id ? Color.accentColor.opacity(0.15):Color.clear)
+        .accessibilityAddTraits(product.selectedCLI==terminal.session.id ? .isSelected:[])
+        .contextMenu{Button("关闭视图"){product.closeView(terminal.session.id)}}
+    }}
     @ViewBuilder private var detail:some View{if let id=product.selectedCLI,let t=product.terminals[id]{TerminalDetailView(controller:t,fontSize:fontSize)}else{ContentUnavailableView("打开 CLI 会话",systemImage:"terminal",description:Text("从设备页面选择电脑上的会话。"))}}
 }
 struct TerminalDetailView:View {
@@ -54,6 +75,7 @@ struct TerminalDetailView:View {
             Button("结束电脑上的会话",role:.destructive){confirmEnd=true}
         }label:{HStack(spacing:4){Text(controller.status).font(.caption);Image(systemName:"cloud.fill")}.foregroundStyle(.secondary)}}.padding(.horizontal,8).frame(minHeight:34)
         if let resizeFeedback{Text(resizeFeedback).font(.caption2).foregroundStyle(.secondary).frame(maxWidth:.infinity,alignment:.leading).padding(.horizontal,8)}
+        if let notice=controller.controlNotice{Text(notice).font(.caption).foregroundStyle(.secondary).padding(.horizontal,8).padding(.vertical,4)}
         if let error=controller.error{Text(error).font(.caption).foregroundStyle(.orange).padding(8)}
         if controller.frozen {
             HStack {

@@ -62,7 +62,7 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
         this.aiHostFactory = aiHostFactory;
         this.terminalHostFactory = terminalHostFactory;
         this.fileHostFactory = fileHostFactory;
-        this.terminalCommands = terminalCommands ?? [];
+        this.terminalCommands = LaunchableCommands(terminalCommands ?? []);
         snapshot = new RelayConnectionSnapshot(identity, AgentConnectionState.NotConfigured, false, "", "", origin, false, null, []);
     }
 
@@ -305,6 +305,7 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
 
     private async Task UpsertAsync(Account current, DeviceIdentity device, CancellationToken token)
     {
+        var commands = Volatile.Read(ref terminalCommands);
         var body = JsonSerializer.SerializeToUtf8Bytes(new
         {
             name = current.PcName, agent_version = localIdentity.AgentVersion, key_epoch = current.Identity.KeyEpoch,
@@ -312,7 +313,7 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
             architecture = localIdentity.Architecture == PcArchitecture.Arm64 ? "arm64" : "x64",
             platform_version = localIdentity.PlatformVersion, machine_id = current.Identity.MachineId,
             capabilities = Capabilities, session_heartbeat_capable = false, remote_agent_update_capable = false,
-            supported_shells = terminalCommands.Select(c => c.Id).ToArray(), terminal_commands = terminalCommands.Select(c => new { id = c.Id, display_name = c.DisplayName, shell_type = c.Id, source = "detected" }).ToArray(),
+            supported_shells = commands.Where(c => c.Detected).Select(c => c.Id).Distinct().ToArray(), terminal_commands = commands.Select(c => new { id = c.Id, display_name = c.DisplayName, shell_type = c.Detected ? c.Id : "custom", source = c.Detected ? "detected" : "manual" }).ToArray(),
         });
         using var response = await SendAsync(current, device, HttpMethod.Put, "/v1/pcs/" + current.Identity.PcId.ToString("D"), body, true, token).ConfigureAwait(false);
         RelayHttp.RequireSuccess(response);
@@ -449,7 +450,7 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
         using var handshake = CancellationTokenSource.CreateLinkedTokenSource(token);
         handshake.CancelAfter(TimeSpan.FromSeconds(20));
         await socket.ConnectAsync(uri, handshake.Token).ConfigureAwait(false);
-        var expectedCapabilities = TransportCapabilities.Concat(aiHost is null ? [] : new[] { "ai_agent_v1" }).Concat(terminalHost is null ? [] : TerminalTransportCapabilities).ToArray();
+        var expectedCapabilities = TransportCapabilities.Concat(aiHost is null ? [] : new[] { "ai_agent_v1" }).Concat(terminalHost is null ? [] : TerminalTransportCapabilities).Concat(terminalHost?.SupportsCleanup == true ? new[] { "host_session_cleanup_v1" } : []).ToArray();
         await SendControlAsync(socket, new { role = "pc", protocol_versions = new[] { 1 }, capabilities = expectedCapabilities }, handshake.Token).ConfigureAwait(false);
         using var welcome = await ReceiveControlAsync(socket, handshake.Token).ConfigureAwait(false);
         var root = welcome.RootElement;
@@ -487,6 +488,9 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
                 throw new RelayOperationException("SERVER_DEVICE_LIST_INVALID");
             Publish(AgentConnectionState.Connected, devices: entries);
             await UpsertAsync(current, device, token).ConfigureAwait(false);
+            try { await RetrySessionDeletionsAsync(current, device, token).ConfigureAwait(false); }
+            catch (Exception error) when (!token.IsCancellationRequested && error is HttpRequestException or IOException or RelayOperationException or OperationCanceledException)
+            { /* Keep the control connection alive while a mirror retry is pending. */ }
             await Task.Delay(TimeSpan.FromSeconds(Math.Min(15, heartbeat)), token).ConfigureAwait(false);
             if (current.ExpiresAt <= DateTimeOffset.UtcNow.AddSeconds(30))
             {

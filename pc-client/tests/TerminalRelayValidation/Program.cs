@@ -19,6 +19,8 @@ using TermLink.Agent.Terminal;
 using TermLink.TerminalCore;
 if (!OperatingSystem.IsMacOS()) throw new PlatformNotSupportedException("Actual Mac validation required");
 PortableTerminalHost.LoadNative(args[0]);
+await TerminalCleanupValidation.RunAsync();
+await ValidateCleanupTransportAsync();
 await ValidateLocalAuthorityAsync();
 await ValidateChunkBoundariesAsync();
 await using var pty = new PosixTerminalSessionHost();
@@ -48,6 +50,67 @@ Console.WriteLine("PASS actual macOS PTY + native core + signed HTTP + encrypted
 async Task Until(Func<bool> condition) {
     var end = DateTimeOffset.UtcNow.AddSeconds(20);
     while (!condition()) { if (server.Failure is { } e) throw e; if (DateTimeOffset.UtcNow > end) throw new TimeoutException($"state={service.Snapshot.State} error={service.Snapshot.ErrorCode} snapshots={server.Snapshots} accepted={server.InputsAccepted} rejected={server.InputsRejected} output={server.Outputs} resize={server.Resizes}"); await Task.Delay(40); }
+}
+static async Task ValidateCleanupTransportAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "termlink-cleanup-relay-" + Guid.NewGuid().ToString("N"));
+    var key = RandomNumberGenerator.GetBytes(32);
+    try
+    {
+        await using var pty = new PosixTerminalSessionHost();
+        var commands = await new PosixTerminalCommandDiscovery().DiscoverAsync(CancellationToken.None);
+        await using var server = new RelayFixture();
+        PortableTerminalHost? host = null;
+        await using var service = await RelayConnectionService.CreateAsync(new MemorySecrets(),
+            new PcAgentIdentity(Guid.NewGuid(), "Cleanup Mac", PcPlatform.MacOS, PcArchitecture.Arm64, "validation", "0.3.16.146"), CancellationToken.None,
+            authorization: new FixtureAuthorization(server), terminalHostFactory: _ => host = new PortableTerminalHost(pty, commands, directory, key), terminalCommands: commands);
+        await service.ConfigureServerAsync(server.Origin, CancellationToken.None);
+        await service.AuthorizeAsync("Cleanup fixture", CancellationToken.None);
+        await service.SetRemoteAccessAsync(true, CancellationToken.None);
+        await Ready(() => service.Snapshot.State == AgentConnectionState.Connected && server.CleanupHello && server.CleanupMetadata && host is not null);
+        Check(service.Capabilities.Contains("host_session_cleanup_v1"), "Persistent Host did not advertise cleanup");
+        var active = await service.StartTerminalAsync("sh", Path.GetTempPath(), CancellationToken.None);
+        var unknown = Guid.NewGuid();
+        var live = await server.CleanupAsync(active, unknown);
+        Check(live.ErrorCode.Length == 0 && Status(live, active) == "SKIPPED_ACTIVE" && Status(live, unknown) == "NOT_FOUND" && host!.Sessions.Any(s => s.Id == active && s.State == "RUNNING"), "Cleanup altered active PTY or unknown result");
+        await service.StopTerminalAsync(active, CancellationToken.None);
+        server.MobilePermission = "CONTROL";
+        var denied = await server.CleanupAsync(active);
+        Check(denied.ErrorCode == "MANAGE_NOT_GRANTED" && denied.Results.Count == 0 && host!.Sessions.Any(s => s.Id == active), "CONTROL removed ended history");
+        server.MobilePermission = "MANAGE";
+        var duplicate = await server.CleanupAsync(active, active);
+        Check(duplicate.ErrorCode == "SESSION_CLEANUP_INVALID" && duplicate.Results.Count == 0 && host!.Sessions.Any(s => s.Id == active), "Duplicate cleanup IDs changed history");
+        var malformed = await server.RawCleanupAsync(new[] { ByteString.CopyFrom(new byte[15]) });
+        Check(malformed.ErrorCode == "SESSION_CLEANUP_INVALID" && malformed.Results.Count == 0, "Malformed cleanup ID admitted");
+        server.FailDeletionMirror = true;
+        var deferred = await server.CleanupAsync(active);
+        Check(Status(deferred, active) == "DELETED" && deferred.ErrorCode == "MIRROR_SYNC_PENDING" && !host!.Sessions.Any(s => s.Id == active) && host.DeletedSessions.Contains(active), "Mirror failure lost durable deletion result");
+        Check(server.DeletionAttempts.Any(ids => ids.SequenceEqual(new[] { active })), "Signed mirror batch did not match deleted IDs");
+        server.FailDeletionMirror = false;
+        var retry = await server.CleanupAsync(active);
+        Check(retry.ErrorCode.Length == 0 && Status(retry, active) == "DELETED" && server.MirroredSessions.ContainsKey(active), "Retry did not complete mirror idempotently");
+        var second = await service.StartTerminalAsync("sh", Path.GetTempPath(), CancellationToken.None);
+        await service.StopTerminalAsync(second, CancellationToken.None);
+        server.FailDeletionMirror = true;
+        var pending = await server.CleanupAsync(second);
+        Check(pending.ErrorCode == "MIRROR_SYNC_PENDING" && Status(pending, second) == "DELETED", "Second mirror outage did not remain retryable");
+        var priorHost = host; var connections = server.Connections;
+        server.FailDeletionMirror = false;
+        await service.RetryAsync(CancellationToken.None);
+        await Ready(() => service.Snapshot.State == AgentConnectionState.Connected && server.Connections > connections && server.MirroredSessions.ContainsKey(second));
+        Check(ReferenceEquals(priorHost, host) && host!.Sessions.Count == 0 && host.DeletedSessions.Contains(second), "Reconnect resurrected deleted history or replaced its owner");
+        Check(server.InvalidProofs == 0 && server.CleanupReplies == 7, "Cleanup bypassed signed proof or encrypted replies");
+        await service.SignOutAsync(CancellationToken.None);
+        Console.WriteLine("PASS cleanup Relay: persistent capability/hello, encrypted PC route and exact receipts, active protection, MANAGE fence, malformed/duplicate rejection, durable deletion, signed mirror outage/retry and reconnect reconciliation");
+        async Task Ready(Func<bool> condition)
+        {
+            var until = DateTimeOffset.UtcNow.AddSeconds(15);
+            while (!condition()) { if (server.Failure is { } failure) throw failure; if (DateTimeOffset.UtcNow > until) throw new TimeoutException("Cleanup fixture did not settle: " + service.Snapshot.ErrorCode); await Task.Delay(20); }
+        }
+    }
+    finally { CryptographicOperations.ZeroMemory(key); if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
+    static void Check(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+    static string Status(SessionCleanupResponsePayload response, Guid id) => response.Results.Single(r => new Guid(Convert.ToHexString(r.SessionId.Span)) == id).Status;
 }
 static async Task ValidateLocalAuthorityAsync()
 {
@@ -184,7 +247,19 @@ file sealed class RelayFixture : IAsyncDisposable
     private int attachRound;
     private readonly List<object> vectors = new();
     public void WriteVectors(string path) => File.WriteAllText(path, JsonSerializer.Serialize(vectors, new JsonSerializerOptions { WriteIndented = true }));
-    private ulong requestSeq;
+    private long requestSeq;
+    private readonly SemaphoreSlim socketSend = new(1, 1);
+    private readonly ConcurrentDictionary<Guid, TaskCompletionSource<SessionCleanupResponsePayload>> cleanupRequests = new();
+    private WebSocket? currentSocket;
+    private Guid currentDevice;
+    private Device? currentPeer;
+    public string MobilePermission = "MANAGE";
+    public bool FailDeletionMirror;
+    public bool CleanupHello, CleanupMetadata;
+    public int CleanupReplies;
+    public readonly ConcurrentBag<Guid[]> DeletionAttempts = new();
+    public readonly ConcurrentDictionary<Guid, bool> MirroredSessions = new();
+
     private InputEventPayload? originalInput;
     private readonly MemoryStream historyBytes = new();
     private NativeTerminal? replica;
@@ -274,9 +349,19 @@ file sealed class RelayFixture : IAsyncDisposable
             if (path == "/v1/devices")
             { await Json(context, new { items = new[] { new { id = Guid.NewGuid(), name = "iPhone", type = "ANDROID", trust_state = "TRUSTED", online = true } } }); return; }
             if (path.EndsWith("/grants", StringComparison.Ordinal) && path.StartsWith("/v1/pcs/", StringComparison.Ordinal)) {
-                var items = RevokeMobile ? Array.Empty<object>() : new object[] { new { device_id = MobileId, device_type = "IOS", permission = "MANAGE",
+                var items = RevokeMobile ? Array.Empty<object>() : new object[] { new { device_id = MobileId, device_type = "IOS", permission = MobilePermission,
                     exchange_public_key = Convert.ToBase64String(mobile.Exchange.PublicKey), signing_public_key = Convert.ToBase64String(mobile.SigningPublicKey) } };
                 await Json(context, new { key_epoch = 1, items }); return;
+            }
+            if (path == "/v1/pcs/" + metadataPCId.ToString("D") + "/session-deletions" && context.Request.HttpMethod == "POST")
+            {
+                using var batch = JsonDocument.Parse(bytes);
+                var ids = batch.RootElement.GetProperty("session_ids").EnumerateArray().Select(x => x.GetGuid()).ToArray();
+                if (ids.Length is < 1 or > 64 || ids.Any(id => id == Guid.Empty) || ids.Distinct().Count() != ids.Length || string.IsNullOrWhiteSpace(context.Request.Headers["Idempotency-Key"])) throw new Exception("Invalid mirror batch or missing mutation key");
+                DeletionAttempts.Add(ids);
+                if (FailDeletionMirror) { await Json(context, new { code = "fixture-mirror-unavailable" }, 503); return; }
+                foreach (var id in ids) MirroredSessions[id] = true;
+                context.Response.StatusCode = 204; context.Response.Close(); return;
             }
             if (path.StartsWith("/v1/sessions/", StringComparison.Ordinal)) {
                 if (path.EndsWith("/lease", StringComparison.Ordinal)) {
@@ -292,6 +377,7 @@ file sealed class RelayFixture : IAsyncDisposable
                 using var metadata = JsonDocument.Parse(bytes);
                 var value = metadata.RootElement;
                 AiMetadata = value.GetProperty("capabilities").EnumerateArray().Any(v => v.GetString() == "ai_agent_v1");
+                CleanupMetadata = value.GetProperty("capabilities").EnumerateArray().Any(v => v.GetString() == "host_session_cleanup_v1");
                 EmptyProductCapabilities = value.GetProperty("platform").GetString() == "macos" &&
                     value.GetProperty("architecture").GetString() == "arm64" && value.GetProperty("capabilities").GetArrayLength() == 0 &&
                     value.GetProperty("supported_shells").GetArrayLength() == 0 && !value.GetProperty("remote_agent_update_capable").GetBoolean();
@@ -305,8 +391,10 @@ file sealed class RelayFixture : IAsyncDisposable
                 using var hello = await Receive(socket);
                 if (hello.RootElement.GetProperty("role").GetString() != "pc") throw new InvalidOperationException("Wrong role.");
                 var capabilities = hello.RootElement.GetProperty("capabilities").EnumerateArray().Select(v => v.GetString()).ToArray();
+                CleanupHello = capabilities.Contains("host_session_cleanup_v1");
+                currentSocket = socket; currentDevice = deviceId; currentPeer = device;
                 Interlocked.Increment(ref connections);
-                await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new
+                await SendFrameAsync(socket, JsonSerializer.SerializeToUtf8Bytes(new
                 { type = "welcome", protocol_version = InvalidWelcome ? 9 : 1, connection_id = Guid.NewGuid().ToString("D"), heartbeat_seconds = 1, capabilities }), WebSocketMessageType.Text, true, shutdown.Token);
                 if (DropNext) { DropNext = false; await socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, "fixture reconnect", shutdown.Token); return; }
                 var sentAi = false; var subscribed = false;
@@ -332,7 +420,7 @@ file sealed class RelayFixture : IAsyncDisposable
                     }
                     using var ping = JsonDocument.Parse(data.AsMemory(0, used));
                     Interlocked.Increment(ref pings);
-                    await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { type = "pong", probe_id = ping.RootElement.GetProperty("probe_id").GetString() }), WebSocketMessageType.Text, true, shutdown.Token);
+                    await SendFrameAsync(socket, JsonSerializer.SerializeToUtf8Bytes(new { type = "pong", probe_id = ping.RootElement.GetProperty("probe_id").GetString() }), WebSocketMessageType.Text, true, shutdown.Token);
                     if (TerminalId != Guid.Empty && !subscribed) {
                         subscribed = true; attachRound++;
                         var subscribe = new SubscribePayload { RequestId = Id(Guid.NewGuid()), SubscriberExchangePublicKey = ByteString.CopyFrom(mobile.Exchange.PublicKey) };
@@ -353,10 +441,10 @@ file sealed class RelayFixture : IAsyncDisposable
                         var payload = new AiAgentRequestPayload { RequestId = ByteString.CopyFrom(Convert.FromHexString(Guid.NewGuid().ToString("N"))), Json = "{\"action\":\"catalog\"}" }.ToByteArray();
                         request.Ciphertext = ByteString.CopyFrom(SessionCrypto.Encrypt(key, request.Nonce.ToByteArray(), SessionCrypto.AssociatedData(request), payload));
                         var corrupt = request.Clone(); var bad = corrupt.Ciphertext.ToByteArray(); bad[^1] ^= 1; corrupt.Ciphertext = ByteString.CopyFrom(bad);
-                        await socket.SendAsync(corrupt.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+                        await SendFrameAsync(socket, corrupt.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
                         var wrongRecipient = request.Clone(); wrongRecipient.RecipientDeviceId = ByteString.CopyFrom(new byte[16]);
-                        await socket.SendAsync(wrongRecipient.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
-                        await socket.SendAsync(request.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+                        await SendFrameAsync(socket, wrongRecipient.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+                        await SendFrameAsync(socket, request.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
                         CryptographicOperations.ZeroMemory(key); CryptographicOperations.ZeroMemory(pairwise);
                     }
                 }
@@ -376,20 +464,69 @@ file sealed class RelayFixture : IAsyncDisposable
         var keyId = Encoding.UTF8.GetBytes("epoch-00000001");
         var key = SessionCrypto.DeriveSessionKey(pair, TerminalId, CryptoDirection.AndroidToPc, keyId);
         var envelope = new Envelope { ProtocolVersion = 1, SessionId = Id(TerminalId), SenderDeviceId = Id(MobileId), RecipientDeviceId = Id(pc),
-            Direction = Direction.AndroidToPc, MessageType = type, Seq = ++requestSeq, KeyId = ByteString.CopyFrom(keyId), Nonce = ByteString.CopyFrom(RandomNumberGenerator.GetBytes(12)) };
+            Direction = Direction.AndroidToPc, MessageType = type, Seq = checked((ulong)Interlocked.Increment(ref requestSeq)), KeyId = ByteString.CopyFrom(keyId), Nonce = ByteString.CopyFrom(RandomNumberGenerator.GetBytes(12)) };
         envelope.Ciphertext = ByteString.CopyFrom(SessionCrypto.Encrypt(key, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), payload.ToByteArray()));
         if (type == MessageType.Subscribe) {
             var corrupt = envelope.Clone(); var tampered = corrupt.Ciphertext.ToByteArray(); tampered[^1] ^= 1; corrupt.Ciphertext = ByteString.CopyFrom(tampered);
-            await socket.SendAsync(corrupt.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+            await SendFrameAsync(socket, corrupt.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
             var wrong = envelope.Clone(); wrong.RecipientDeviceId = Id(Guid.NewGuid());
-            await socket.SendAsync(wrong.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+            await SendFrameAsync(socket, wrong.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
         }
-        await socket.SendAsync(envelope.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+        await SendFrameAsync(socket, envelope.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
         CryptographicOperations.ZeroMemory(pair); CryptographicOperations.ZeroMemory(key);
+    }
+    public Task<SessionCleanupResponsePayload> CleanupAsync(params Guid[] ids) => RawCleanupAsync(ids.Select(Id).ToArray());
+    public async Task<SessionCleanupResponsePayload> RawCleanupAsync(ByteString[] ids)
+    {
+        var requestId = Guid.NewGuid();
+        var pending = new TaskCompletionSource<SessionCleanupResponsePayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!cleanupRequests.TryAdd(requestId, pending)) throw new Exception("Duplicate fixture request");
+        try
+        {
+            var socket = currentSocket ?? throw new Exception("Fixture socket missing");
+            var peer = currentPeer ?? throw new Exception("Fixture PC peer missing");
+            var payload = new SessionCleanupRequestPayload { RequestId = Id(requestId) }; payload.SessionIds.AddRange(ids);
+            var pair = SessionCrypto.DerivePairwiseKey(mobile.Exchange, Decode(peer.Exchange), currentDevice, MobileId, 1);
+            var keyId = Encoding.UTF8.GetBytes("epoch-00000001");
+            var key = SessionCrypto.DeriveSessionKey(pair, metadataPCId, CryptoDirection.AndroidToPc, keyId);
+            try
+            {
+                var envelope = new Envelope { ProtocolVersion = 1, MessageType = MessageType.SessionCleanupRequest, SessionId = Id(metadataPCId), SenderDeviceId = Id(MobileId), RecipientDeviceId = Id(currentDevice), Direction = Direction.AndroidToPc,
+                    Seq = checked((ulong)Interlocked.Increment(ref requestSeq)), KeyId = ByteString.CopyFrom(keyId), Nonce = ByteString.CopyFrom(RandomNumberGenerator.GetBytes(12)), SentAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+                var plain = payload.ToByteArray();
+                try { envelope.Ciphertext = ByteString.CopyFrom(SessionCrypto.Encrypt(key, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), plain)); }
+                finally { CryptographicOperations.ZeroMemory(plain); }
+                await SendFrameAsync(socket, envelope.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
+            }
+            finally { CryptographicOperations.ZeroMemory(key); CryptographicOperations.ZeroMemory(pair); }
+            return await pending.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally { cleanupRequests.TryRemove(requestId, out _); }
+    }
+    private async Task SendFrameAsync(WebSocket socket, byte[] bytes, WebSocketMessageType type, bool end, CancellationToken token)
+    {
+        await socketSend.WaitAsync(token);
+        try { await socket.SendAsync(bytes, type, end, token); }
+        finally { socketSend.Release(); }
     }
     private async Task TerminalReplyAsync(WebSocket socket, Guid pc, Device peer, Envelope envelope)
     {
         try {
+            if (envelope.MessageType == MessageType.SessionCleanupResponse)
+            {
+                if (envelope.SessionId.Length != 16 || new Guid(Convert.ToHexString(envelope.SessionId.Span)) != metadataPCId || envelope.SenderDeviceId != Id(pc) || envelope.RecipientDeviceId != Id(MobileId) || envelope.Direction != Direction.PcToAndroid || envelope.ProtocolVersion != 1) throw new Exception("Cleanup response route mismatch");
+                var cleanupPair = SessionCrypto.DerivePairwiseKey(mobile.Exchange, Decode(peer.Exchange), pc, MobileId, 1);
+                var cleanupKey = SessionCrypto.DeriveSessionKey(cleanupPair, metadataPCId, CryptoDirection.PcToAndroid, envelope.KeyId.ToByteArray());
+                byte[]? cleanupPlain = null;
+                try
+                {
+                    cleanupPlain = SessionCrypto.Decrypt(cleanupKey, envelope.Nonce.ToByteArray(), SessionCrypto.AssociatedData(envelope), envelope.Ciphertext.ToByteArray());
+                    var result = SessionCleanupResponsePayload.Parser.ParseFrom(cleanupPlain);
+                    if (result.RequestId.Length != 16 || !cleanupRequests.TryGetValue(new Guid(Convert.ToHexString(result.RequestId.Span)), out var pending)) throw new Exception("Cleanup response request mismatch");
+                    Interlocked.Increment(ref CleanupReplies); pending.TrySetResult(result); return;
+                }
+                finally { if (cleanupPlain is not null) CryptographicOperations.ZeroMemory(cleanupPlain); CryptographicOperations.ZeroMemory(cleanupKey); CryptographicOperations.ZeroMemory(cleanupPair); }
+            }
             if (attachRound == 1) vectors.Add(new { type = (int)envelope.MessageType, seq = envelope.Seq, ack = envelope.Ack, sha256 = Convert.ToHexString(SHA256.HashData(envelope.ToByteArray())).ToLowerInvariant() });
             var pair = SessionCrypto.DerivePairwiseKey(mobile.Exchange, Decode(peer.Exchange), pc, MobileId, 1);
             var key = SessionCrypto.DeriveSessionKey(pair, TerminalId, CryptoDirection.PcToAndroid, envelope.KeyId.ToByteArray());

@@ -10,7 +10,7 @@ internal static class PortableCodexValidation
 {
     internal static async Task RunAsync(string root)
     {
-        Directory.CreateDirectory(root);
+        PrivateDirectory(root);
         await DiscoveryAndIsolationAsync(Path.Combine(root, "discovery"));
         await CatalogAndSessionAsync(Path.Combine(root, "session"));
         ValidateWindowsStartInfoUnchanged();
@@ -182,7 +182,7 @@ internal static class PortableCodexValidation
         private int[] Pids => Lines.Where(line => line.StartsWith("pid:", StringComparison.Ordinal)).Select(line => int.Parse(line[4..])).Distinct().ToArray();
         internal FixtureScope(string root)
         {
-            Directory.CreateDirectory(root); Workspace = Path.Combine(root, "workspace with spaces ; literal"); Directory.CreateDirectory(Workspace);
+            PrivateDirectory(root); Workspace = Path.Combine(root, "workspace with spaces ; literal"); Directory.CreateDirectory(Workspace);
             trace = Path.Combine(root, "codex-trace.txt");
             Environment.SetEnvironmentVariable(PortableCodexFixture.TraceVariable, trace);
             Mode = "valid";
@@ -202,4 +202,9 @@ internal static class PortableCodexValidation
                 catch (Exception error) when (error is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
         }
     }
+    private static void PrivateDirectory(string path) {
+        Directory.CreateDirectory(path);
+        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
 }

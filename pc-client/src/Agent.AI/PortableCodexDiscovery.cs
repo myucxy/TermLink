@@ -81,12 +81,5 @@ internal sealed class PortableCodexDiscovery
         start.ArgumentList.Add("sqlite_home=" + System.Text.Json.JsonSerializer.Serialize(sqlite));
     }
 
-    private static string PrivateDirectory(string path)
-    {
-        Directory.CreateDirectory(path);
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) throw new IOException("AI_DIRECTORY_LINK_REJECTED");
-        if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        return path;
-    }
+    private static string PrivateDirectory(string path) => PortableAiRuntimeDirectory.Ensure(path);
 }

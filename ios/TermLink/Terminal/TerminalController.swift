@@ -11,6 +11,12 @@ import Combine
     @Published private(set) var status = "状态待确认"
     @Published private(set) var error: String?
     @Published private(set) var canInput = false
+    @Published private(set) var controlNotice: String?
+    private var controlRequest: Task<Void, Error>?
+    private var automaticControl: Task<Void, Never>?
+    private var controlGeneration = UUID()
+    private var automaticControlPending = false
+    private var ended = false
     let session:TerminalSession
     private let pc:PC,relay:RelayClient,api:APIClient,identity:DeviceIdentity,state:SecureState
     private var core:TLTerminalBridge?,ack:UInt64=0,inputSequence:UInt64=0,localInputEpoch:UInt64=0
@@ -26,7 +32,9 @@ import Combine
     private var title:String{session.title.isEmpty ? session.shell:session.title}
     init(session:TerminalSession,pc:PC,relay:RelayClient,api:APIClient,identity:DeviceIdentity,state:SecureState){self.session=session;self.pc=pc;self.relay=relay;self.api=api;self.identity=identity;self.state=state}
     func present(_ error:Error) { if !(error is CancellationError) { self.error=error.localizedDescription } }
-    func open() async throws {
+    func open(automaticallyRequestControl: Bool = true) async throws {
+        automaticControlPending = automaticallyRequestControl && session.lifecycle == "RUNNING"
+        ended = session.lifecycle != "RUNNING"
         let owner=incarnation
         guard TLTerminalBridge.available else{throw ClientError.unavailable("缺少 iOS terminal-core XCFramework；终端功能未启用。")}
         core=try TLTerminalBridge(columns:UInt32(session.columns),rows:UInt32(session.rows),sequence:1)
@@ -48,7 +56,7 @@ import Combine
         status="正在确认终端协议"
         deadline=Task{[weak self] in do{try await Task.sleep(for:.seconds(15));guard let self,self.incarnation==owner,!self.attached else{return};self.invalidate("主机未及时确认终端协议，请重新打开会话。")}catch{}}
     }
-    func invalidate(_ reason:String){canInput=false;leaseUsable=false;lease=nil;attached=false;presentation.reset(core:core);historyDeadline?.cancel();bootstrap=[];snapshotID=nil;snapshotBytes=Data();renewal?.cancel();deadline?.cancel();resizeTask?.cancel();status="状态待确认";error=reason;incarnation=UUID()}
+    func invalidate(_ reason:String){cancelControlRequest();canInput=false;leaseUsable=false;lease=nil;attached=false;presentation.reset(core:core);historyDeadline?.cancel();bootstrap=[];snapshotID=nil;snapshotBytes=Data();renewal?.cancel();deadline?.cancel();resizeTask?.cancel();status="状态待确认";error=reason;incarnation=UUID()}
     func close(){guard !closed else{return};let held=lease;closed=true;invalidate("会话视图已关闭。");relay.unbindSession(session.id);core=nil
         if let held{let api=api,id=session.id;Task{_=try? await api.request("/v1/sessions/\(id)/lease/\(held)",method:"DELETE",idempotency:UUID())}}
     }
@@ -71,6 +79,7 @@ import Combine
         historyDeadline?.cancel(); historyDeadline = nil
         presentation.end(core: core)
         canInput = restoreInput && leaseUsable && attached && !closed && snapshotID == nil && lease != nil && Date() < leaseExpiry && relay.state == .connected
+        if restoreInput { startAutomaticControlIfReady() }
     }
     private func startHistoryDeadline() {
         historyDeadline?.cancel()
@@ -107,21 +116,87 @@ import Combine
         let formatter=ISO8601DateFormatter();formatter.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
         return formatter.date(from:value) ?? ISO8601DateFormatter().date(from:value)
     }
+    func requestAutomaticControl() {
+        guard !ended, !closed else { return }
+        automaticControlPending = true
+        startAutomaticControlIfReady()
+    }
+    func cancelAutomaticControl() {
+        automaticControlPending = false
+        automaticControl?.cancel(); automaticControl = nil
+        cancelControlRequest()
+    }
+    private func startAutomaticControlIfReady() {
+        guard automaticControlPending, isSynchronized, !frozen, !ended, automaticControl == nil else { return }
+        automaticControlPending = false
+        let owner = incarnation
+        automaticControl = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.incarnation == owner {
+                    self.automaticControl = nil
+                    self.startAutomaticControlIfReady()
+                }
+            }
+            do { try await self.requestControl() }
+            catch is CancellationError { }
+            catch {
+                guard self.incarnation == owner, !self.closed, !self.ended else { return }
+                self.canInput = false; self.status = "只读"
+                if let api = error as? APIError, api.status == 409, api.code == "LEASE_HELD" {
+                    self.controlNotice = "控制权仍被占用；当前保留只读画面，可稍后重试。"
+                } else if let api = error as? APIError, api.status == 403 {
+                    self.controlNotice = "当前设备没有控制权限，已保留只读画面。"
+                } else { self.controlNotice = "未能取得控制权，已保留画面；可在菜单中重试。" }
+            }
+        }
+    }
+    private func cancelControlRequest() {
+        controlGeneration = UUID()
+        controlRequest?.cancel(); controlRequest = nil
+        automaticControlPending = false
+        controlNotice = nil
+        if !leaseUsable && attached && !ended { status = "只读" }
+    }
     func requestControl() async throws {
-        guard isSynchronized,!frozen,relay.state == .connected else{throw ClientError.readOnly}
-        let owner=incarnation,result=try await api.request("/v1/sessions/\(session.id)/lease",method:"POST",body:.object([:]),idempotency:UUID())
-        guard owner==incarnation,let id=UUID(uuidString:result["lease_id"].string),result["version"].integer>0,
-              let expires=leaseDate(result["expires_at"].string),expires>Date() else{throw ClientError.readOnly}
-        lease=id;leaseVersion=UInt64(result["version"].integer);leaseExpiry=expires;leaseUsable=true;canInput = !frozen;status="控制中";activity?.record("lease-granted","获得了「\(title)」的控制权")
-        if let viewport{fit(columns:viewport.0,rows:viewport.1,cellWidth:viewport.2,cellHeight:viewport.3)}
+        guard isSynchronized, !frozen, !ended, relay.state == .connected else { throw ClientError.readOnly }
+        if leaseUsable, lease != nil, Date() < leaseExpiry { canInput = true; return }
+        if let request = controlRequest { try await request.value; return }
+        let owner = incarnation, generation = UUID(), inputEpoch = localInputEpoch
+        controlGeneration = generation
+        controlNotice = nil; status = "正在获取控制权"
+        let request = Task { [weak self] in
+            guard let self else { throw CancellationError() }
+            try await TerminalControlAcquisition.acquire(current: {
+                self.incarnation == owner && self.controlGeneration == generation && !self.closed && !self.ended &&
+                    self.isSynchronized && !self.frozen && self.relay.state == .connected && self.localInputEpoch == inputEpoch
+            }, controlling: { self.leaseUsable && self.lease != nil && Date() < self.leaseExpiry }, request: {
+                try await self.acquireLease(owner: owner, generation: generation, inputEpoch: inputEpoch)
+            }, retrying: { self.status = "等待控制权" })
+        }
+        controlRequest = request
+        defer { if controlGeneration == generation { controlRequest = nil } }
+        try await withTaskCancellationHandler(operation: { try await request.value }, onCancel: { request.cancel() })
+    }
+    private func acquireLease(owner: UUID, generation: UUID, inputEpoch: UInt64) async throws {
+        let result = try await api.request("/v1/sessions/\(session.id)/lease", method: "POST", body: .object([:]), idempotency: UUID())
+        try Task.checkCancellation()
+        guard owner == incarnation, controlGeneration == generation, localInputEpoch == inputEpoch,
+              isSynchronized, !closed, !frozen, !ended, relay.state == .connected else { throw CancellationError() }
+        let grant = try TerminalLeaseGrant.decode(result)
+        let id = grant.id
+        lease = id; leaseVersion = grant.version; leaseExpiry = grant.expires; leaseUsable = true
+        canInput = true; controlNotice = nil; status = "控制中"
+        activity?.record("lease-granted", "获得了「\(title)」的控制权")
+        if let viewport { fit(columns: viewport.0, rows: viewport.1, cellWidth: viewport.2, cellHeight: viewport.3) }
         renewal?.cancel();renewal=Task{[weak self] in
             while !Task.isCancelled {do{try await Task.sleep(for:.seconds(10));guard let self,self.incarnation==owner,self.lease==id else{return}
                 let result=try await self.api.request("/v1/sessions/\(self.session.id)/lease/\(id)/renew",method:"POST",body:.object([:]),idempotency:UUID())
                 guard self.incarnation==owner,self.lease==id,let expiry=self.leaseDate(result["expires_at"].string),expiry>Date() else{throw ClientError.readOnly};self.leaseExpiry=expiry
-            }catch{if self?.incarnation==owner{self?.canInput=false;self?.leaseUsable=false;self?.status="只读"};return}}
+            }catch{if self?.incarnation==owner,self?.lease==id{self?.canInput=false;self?.leaseUsable=false;self?.status="只读"};return}}
         }
     }
-    func releaseControl() async throws{guard let id=lease else{return};canInput=false;leaseUsable=false;lease=nil;renewal?.cancel();status="只读";_=try await api.request("/v1/sessions/\(session.id)/lease/\(id)",method:"DELETE",idempotency:UUID());activity?.record("lease-released","释放了「\(title)」的控制权")}
+    func releaseControl() async throws{cancelAutomaticControl();guard let id=lease else{return};canInput=false;leaseUsable=false;lease=nil;renewal?.cancel();status="只读";_=try await api.request("/v1/sessions/\(session.id)/lease/\(id)",method:"DELETE",idempotency:UUID());activity?.record("lease-released","释放了「\(title)」的控制权")}
     func text(_ text:String) async throws {
         guard !text.isEmpty,text.utf8.count<=65536 else{throw ClientError.limitExceeded}
         var data=Data()
@@ -191,7 +266,7 @@ import Combine
             deadline?.cancel();attached=true;status="只读";try await requestSnapshot();return
         }
         if event.type == .historyResponse {try await historyChunk(p);return}
-        if event.type == .leaseRevoked || event.type == .leaseDenied {canInput=false;leaseUsable=false;lease=nil;status="只读";localInputEpoch=max(localInputEpoch,p.uint(5));if event.type == .leaseRevoked{activity?.record("lease-revoked","「\(title)」的控制权已被释放")};return}
+        if event.type == .leaseRevoked || event.type == .leaseDenied {cancelAutomaticControl();canInput=false;leaseUsable=false;lease=nil;status="只读";localInputEpoch=max(localInputEpoch,p.uint(5));if event.type == .leaseRevoked{activity?.record("lease-revoked","「\(title)」的控制权已被释放")};return}
         if event.type == .leaseGranted {return}
         guard attached else{return}
         guard [.output,.resizeApplied,.geometry,.hostTheme,.hostResize,.gap,.upsert,.removed,.theme,.started,.ended,.interrupted,.brokerOutput,.inputAccepted,.inputRejected].contains(event.type) else{return}
@@ -213,7 +288,7 @@ import Combine
             case .hostTheme:try core?.applyData(p.bytes(1),kind:6,sequence:event.sequence,columns:0,rows:0)
             case .gap:canInput=false;try await requestSnapshot();return
             case .brokerOutput:invalidate("当前 iOS 终端未支持 Broker 图形捕获。");return
-            case .ended,.interrupted:canInput=false;leaseUsable=false;lease=nil;status="已结束";fallthrough
+            case .ended,.interrupted:ended=true;cancelAutomaticControl();canInput=false;leaseUsable=false;lease=nil;status="已结束";fallthrough
             case .upsert,.removed,.theme,.started,.hostResize:try core?.applyData(Data(),kind:3,sequence:event.sequence,columns:0,rows:0)
             default:return
             }
@@ -229,7 +304,10 @@ import Combine
         if relay.capabilities.contains("flow_control_v1"){var flow=ProtoMessage();flow.set(1,ack);flow.set(2,UInt64(32));flow.set(3,UInt64(3*1024*1024));flow.set(6,UInt64(1));_=try await relay.send(route:session.id,type:.flow,payload:flow,acknowledgement:ack)}
     }
     private func requestSnapshot() async throws {
-        leaseUsable=false
+        let resumeControl = automaticControlPending || controlRequest != nil || leaseUsable
+        cancelControlRequest()
+        automaticControlPending = resumeControl && !ended
+        canInput = false; leaseUsable=false
         endHistory(restoreInput:false)
         let id=UUID();snapshotID=id;snapshotObject=nil;snapshotBytes=Data();snapshotIndex=0;bootstrap=[]
         var p=ProtoMessage();p.set(1,id.bytes);p.set(2,UInt64(1));p.add(8,Data("terminal_state_2_21_v2".utf8));_=try await relay.send(route:session.id,type:.historyRequest,payload:p)
@@ -262,6 +340,7 @@ import Combine
         try state.save(PersistedTerminalSnapshot(version:1,ack:container.uint(7),localInputEpoch:container.uint(17),snapshot:plain),name:PersistedTerminalSnapshot.storageName(session.id))
         presentation.updateLive(rendered);ack=container.uint(7);localInputEpoch=container.uint(17);snapshotID=nil;snapshotBytes=Data();deadline?.cancel();try await acknowledge();activity?.record("snapshot-restored","「\(title)」历史缺口已恢复，终端画面已重建")
         let waiting=bootstrap;bootstrap=[];for event in waiting{try await receive(event)}
+        startAutomaticControlIfReady()
     }
 }
 

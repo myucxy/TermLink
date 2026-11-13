@@ -233,7 +233,8 @@ public sealed partial class RelayConnectionService
                     var shell = operation.GetProperty("terminal_command_id").GetString() ?? "";
                     createdTerminal = await terminalHost.StartAsync(shell, path, id, cancellation).ConfigureAwait(false);
                     await PublishTerminalSessionsAsync(await CurrentFileAccountAsync(owner, cancellation).ConfigureAwait(false), device, cancellation).ConfigureAwait(false);
-                    result = new { session_id = createdTerminal, terminal_command_id = shell, shell_type = shell, cwd = path };
+                    result = new { session_id = createdTerminal, terminal_command_id = shell, shell_type = terminalHost.Sessions.FirstOrDefault(s => s.Id == createdTerminal)?.Shell ??
+                        (terminalHost.Commands.FirstOrDefault(c => c.Id == shell)?.Detected == true ? shell : "custom"), cwd = path };
                     break;
                 default: throw new RelayFileException("OPERATION_UNSUPPORTED");
             }

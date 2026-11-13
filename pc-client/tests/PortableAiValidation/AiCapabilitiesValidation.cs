@@ -168,6 +168,15 @@ internal static class AiCapabilitiesValidation
                 throw new InvalidOperationException("Unexpected failure was converted into unsupported: " + code);
             } catch (AiOperationException error) when (error.Code == code) { }
         }
+        Require(AiToolPresentation.ErrorCode(Json(new { code = -32600, message = "Authentication required: fixture private details" })) == "AGENT_AUTH_REQUIRED", "Codex signed-out state became a protocol failure");
+        Require(AiToolPresentation.ErrorCode(Json(new { code = -32600, message = "Invalid request" })) == "AGENT_PROTOCOL_INCOMPATIBLE", "Invalid JSON-RPC was treated as authentication");
+        Require(AiToolPresentation.ErrorCode(Json(new { code = -32600, message = "Native request failed: Authentication required. Fixture-only suffix" })) == "AGENT_AUTH_REQUIRED", "Wrapped signed-out error lost its authentication classification");
+        var signedOut = await AiCapabilityProjection.ReadCodexAsync("/fixture", (method, _) => method == "account/rateLimits/read"
+            ? Task.FromException<JsonElement>(new AiOperationException("AGENT_AUTH_REQUIRED"))
+            : Task.FromResult(Json(new { data = Array.Empty<object>() })));
+        var partial = AiCapabilityProjection.Catalog("codex", "codex", default, new(), codex: signedOut);
+        Expect(partial, "skills", "available"); Expect(partial, "mcp", "available"); Expect(partial, "rateLimits", "requires_auth");
+        Require(!JsonSerializer.Serialize(partial).Contains("fixture private details"), "Upstream authentication detail escaped projection");
         using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         try {
             await AiCapabilityProjection.ReadCodexAsync("/fixture", (_, _) => Task.FromCanceled<JsonElement>(cancellation.Token));

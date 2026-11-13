@@ -46,6 +46,12 @@ internal static class PortableCodexFixture
             if (!initialized) throw new InvalidOperationException("A Codex method preceded initialized");
             switch (method)
             {
+                case "account/read":
+                    Reply(new { account = File.Exists(Path.Combine(Path.GetDirectoryName(trace)!, "authenticated")) ? (object)new { type = "chatgpt", email = "never-export@example.invalid", accessToken = "must-never-leave-runtime" } : null, requiresOpenaiAuth = true }); break;
+                case "account/login/start":
+                    Reply(new { type = "chatgptDeviceCode", loginId = "11111111-2222-4333-8444-555555555555", userCode = "ABCD-1234",
+                        verificationUrl = mode == "auth-invalid" ? "https://untrusted.invalid/login" : "https://auth.openai.com/codex/device" }); break;
+                case "account/login/cancel": Reply(new { status = "canceled" }); break;
                 case "model/list": Reply(new { data = new[] { new { id = "fixture-model", model = "fixture-model", displayName = "Fixture", isDefault = true,
                     defaultReasoningEffort = "medium", supportedReasoningEfforts = new[] { new { reasoningEffort = "medium", description = "fixture" } } } }, nextCursor = (string?)null }); break;
                 case "configRequirements/read": Reply(new { requirements = new { allowedApprovalPolicies = new[] { "on-request" },

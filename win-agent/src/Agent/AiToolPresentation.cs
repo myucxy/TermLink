@@ -140,6 +140,9 @@ internal static class AiToolPresentation
     {
         var code = P(failure, "code");
         if (code.ValueKind == JsonValueKind.Number && code.TryGetInt32(out var number)) {
+            // Codex uses InvalidRequest for its documented signed-out rate-limit
+            // endpoint. Preserve authentication separately from malformed JSON-RPC.
+            if (number == -32600 && S(failure, "message").Contains("Authentication required", StringComparison.OrdinalIgnoreCase)) return "AGENT_AUTH_REQUIRED";
             if (number == -32601) return "AGENT_METHOD_NOT_FOUND";
             if (number == -32602) return "AGENT_INVALID_PARAMS";
             if (number is -32700 or -32600) return "AGENT_PROTOCOL_INCOMPATIBLE";

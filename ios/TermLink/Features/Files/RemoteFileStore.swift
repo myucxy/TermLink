@@ -17,10 +17,11 @@ import Combine
     private var favorites:[String:[String]]=[:]
     private unowned let product:ProductStore
     private var epoch=UUID()
+    lazy var cliCreation = CLICreationStore(product: product)
     init(product:ProductStore){self.product=product}
     func restore(){do{downloads=try product.privateState.load("downloads",as:[DownloadRecord].self) ?? [];favorites=try product.privateState.load("directory-favorites",as:[String:[String]].self) ?? [:];for i in downloads.indices where !["COMPLETED","CANCELLED"].contains(downloads[i].status){downloads[i].status="RESUMING"}}catch{product.report(error)}}
     private func save(){do{try product.privateState.save(downloads,name:"downloads");try product.privateState.save(favorites,name:"directory-favorites")}catch{product.report(error)}}
-    func reset(){epoch=UUID();jobs.values.forEach{$0.cancel()};jobs=[:];entries=[];downloads=[];pcID=nil;path="";query="";busy=false;error=nil;favorites=[:]}
+    func reset(){epoch=UUID();cliCreation.reset();jobs.values.forEach{$0.cancel()};jobs=[:];entries=[];downloads=[];pcID=nil;path="";query="";busy=false;error=nil;favorites=[:]}
     func pause(){jobs.values.forEach{$0.cancel()}}
     var currentFavorites:[String]{guard let pcID else{return []};return favorites[pcID.uuidString] ?? []}
     func toggleFavorite(){guard let pcID,!path.isEmpty else{return};var a=currentFavorites;if a.contains(path){a.removeAll{$0==path}}else{a.insert(path,at:0)};favorites[pcID.uuidString]=Array(a.prefix(128));save()}
@@ -37,7 +38,7 @@ import Combine
         }catch{if owner==epoch{self.error=error.localizedDescription}}
     }
     func operation(pc:UUID,kind:String,path:String,extra:[String:JSONValue]=[:]) async throws -> JSONValue {
-        guard let api=product.api,path.utf8.count<=4096,!path.contains("\0"),query.utf8.count<=512 else{throw ClientError.limitExceeded}
+        guard let api=product.api,path.utf8.count<=4096,!path.contains("\0"),extra["query", default: .string("")].string.utf8.count<=512 else{throw ClientError.limitExceeded}
         guard let target=product.pcs.first(where:{$0.id==pc}),
               kind == "OPEN_TERMINAL" ? target.canCreateTerminal:target.canBrowseFiles else{throw ClientError.readOnly}
         let owner=epoch
@@ -62,12 +63,31 @@ import Combine
         }
         throw ClientError.unavailable("文件操作结果待确认。")
     }
+    /// Directory selection owns its own presentation state; querying here must
+    /// not change Files-page navigation, search, favorites, or active downloads.
+    func cliDirectoryPage(pc: UUID, path: String, offset: Int64 = 0, query: String = "") async throws -> CLIDirectoryPage {
+        guard let target=product.pcs.first(where:{$0.id==pc}),target.canBrowseFiles,offset>=0,
+              query.utf8.count<=512,query.count<=128,!query.contains("\0") else{throw ClientError.readOnly}
+        try CLIPath.validate(path,platform:target.platform,allowRoots:true)
+        let value=try await operation(pc:pc,kind:"LIST",path:path,extra:["offset":.number(Double(offset)),"query":.string(query)])
+        guard value["operation"].string=="LIST",value["path"].string==path,
+              UUID(uuidString:value["pc_id"].string)==pc,
+              UUID(uuidString:value["requester_device_id"].string)==product.identity?.id else{throw ClientError.protocolViolation("CLI directory operation")}
+        return try CLIDirectoryPage.decode(value,platform:target.platform,offset:offset)
+    }
     func openShell(pc:UUID,path:String,command:String) async throws {
-        guard !path.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,
-              product.pcs.first(where:{$0.id==pc})?.commands.contains(where:{$0["id"].string==command}) == true else{throw ClientError.readOnly}
-        let owner=epoch,result=try await operation(pc:pc,kind:"OPEN_TERMINAL",path:path,extra:["terminal_command_id":.string(command)])
-        guard owner==epoch,let id=UUID(uuidString:result["result"]["session_id"].string) else{throw ClientError.invalidResponse("created session")}
-        await product.refreshCatalogs();guard owner==epoch else{throw CancellationError()};if let s=product.sessions.first(where:{$0.pcID==pc && $0.id==id}){await product.open(s)}
+        let owner=epoch
+        guard let id=try await cliCreation.create(pc:pc,path:path,commandID:command) else {
+            if cliCreation.request?.complete == true { throw ClientError.unavailable(cliCreation.statusText + (cliCreation.request?.failure ?? "")) }
+            throw ClientError.unavailable("创建结果尚未确认，原请求已保存。请在此电脑的“新建 CLI”中查询原回执。")
+        }
+        guard owner==epoch else{throw CancellationError()}
+        await openCreatedShell(pc:pc,session:id)
+    }
+    func openCreatedShell(pc: UUID, session: UUID) async {
+        let owner=epoch
+        await product.refreshCatalogs();guard owner==epoch else{return}
+        if let item=product.sessions.first(where:{$0.pcID==pc && $0.id==session}){await product.open(item)}
     }
     func download(_ entry:RemoteEntry,pc:PC) async throws {
         guard pc.canBrowseFiles else{throw ClientError.readOnly}

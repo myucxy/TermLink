@@ -15,6 +15,7 @@ try
 {
     await ValidateCommandsAsync();
     Console.WriteLine("PASS commands");
+    await TermLink.Platform.Unix.Validation.PosixTerminalCommandsValidation.RunAsync(testRoot);
     await TermLink.Platform.Unix.Validation.PosixAiAgentDiscoveryValidation.RunAsync();
     await ValidateFilesAsync(testRoot);
     Console.WriteLine("PASS files");
