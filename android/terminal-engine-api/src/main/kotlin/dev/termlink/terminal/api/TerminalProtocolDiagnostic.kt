@@ -8,8 +8,8 @@ class TerminalProtocolDiagnostic private constructor(
     val sequence: String,
 ) {
     companion object {
-        fun forHostExit(exitCode: Int?, text: String?): TerminalProtocolDiagnostic? =
-            if (exitCode == 125) parse(text) else null
+        fun forHostExit(exitCode: Int?, text: String?, lifecycle: String? = null): TerminalProtocolDiagnostic? =
+            if (exitCode == 125 || exitCode == null && lifecycle == "INTERRUPTED") parse(text) else null
 
         fun parse(text: String?): TerminalProtocolDiagnostic? {
             if (text?.startsWith("TL-DIAG/3\n") == true) return parseExpanded(text)

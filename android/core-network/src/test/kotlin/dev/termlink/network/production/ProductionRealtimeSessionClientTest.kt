@@ -1657,7 +1657,14 @@ class ProductionRealtimeSessionClientTest {
     }
 
     @Test
-    fun authenticatesHelloDecryptsOutputAndResumesAcrossHistoricalInputResult(): Unit = runBlocking {
+    fun authenticatesHelloDecryptsOutputAndResumesAcrossHistoricalInputResult() =
+        authenticatedHostFailureAfterReconnect("ENDED", 125)
+
+    @Test
+    fun portableInterruptedFailureIsRecipientSealedWithoutAnInventedExitCode() =
+        authenticatedHostFailureAfterReconnect("INTERRUPTED", null)
+
+    private fun authenticatedHostFailureAfterReconnect(lifecycle: String, exitCode: Int?): Unit = runBlocking {
         val androidId = UUID.fromString("10213243-5465-7687-98a9-bacbdcedfe0f")
         val pcId = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val sessionId = UUID.fromString("fedcba98-7654-3210-ffff-eeeeeeeeeeee")
@@ -1763,8 +1770,8 @@ class ProductionRealtimeSessionClientTest {
                             webSocket.close(1012, "test reconnect")
                         } else {
                             val ended = SessionUpsertPayload.newBuilder()
-                                .setLifecycle("ENDED")
-                                .setExitCode(125)
+                                .setLifecycle(lifecycle)
+                                .apply { if (exitCode != null) setExitCode(exitCode) }
                                 .setTerminalProtocolDiagnostic(hostProtocolFailure)
                                 .build()
                                 .toByteArray()
@@ -1849,7 +1856,7 @@ class ProductionRealtimeSessionClientTest {
             assertArrayEquals(byteArrayOf(7), outputs[0])
             assertArrayEquals(byteArrayOf(8), outputs[1])
             val exited = assertIs<RemoteSessionState.Exited>(client.sessionState.value)
-            assertEquals(125, exited.exitCode)
+            assertEquals(exitCode, exited.exitCode)
             assertEquals(hostProtocolFailure, exited.protocolDiagnostic?.text)
         } finally {
             client.close()

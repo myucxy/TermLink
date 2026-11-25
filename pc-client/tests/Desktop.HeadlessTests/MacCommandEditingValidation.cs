@@ -53,8 +53,21 @@ internal static class MacCommandEditingValidation
             client.SetCommands([runnable, runnable with { Id = "custom-disabled", Enabled = false },
                 runnable with { Id = "custom-missing", Executable = fixture + ".absent" }]);
             await state.RefreshAsync(true, CancellationToken.None); Dispatcher.UIThread.RunJobs();
-            Require(model.AvailableTerminalCommands.Count == 1 && model.AvailableTerminalCommands.Single().Id == runnable.Id && model.TerminalShell == runnable.Id,
-                "Mac creation list omitted a runnable manual command or included disabled/missing entries.");
+            if (OperatingSystem.IsWindows())
+            {
+                Require(model.AvailableTerminalCommands.Count == 0,
+                    "Windows headless Mac simulation advertised a POSIX command as runnable.");
+            }
+            else
+            {
+                Require(model.AvailableTerminalCommands.Count == 1 && model.AvailableTerminalCommands.Single().Id == runnable.Id && model.TerminalShell == runnable.Id,
+                    "Mac creation list omitted a runnable manual command or included disabled/missing entries.");
+            }
+            Require(model.Settings.TerminalCommands.Count == 3 &&
+                model.Settings.TerminalCommands.Any(c => c.Id == runnable.Id && c.Enabled) &&
+                model.Settings.TerminalCommands.Any(c => c.Id == "custom-disabled" && !c.Enabled) &&
+                model.Settings.TerminalCommands.Any(c => c.Id == "custom-missing"),
+                "Mac command settings lost disabled or missing entries while filtering the creation list.");
             model.RemoveTerminalCommandCommand.Execute(model.Settings.TerminalCommands.Single(c => c.Id == runnable.Id)); await Drain(model.RemoveTerminalCommandCommand);
             model.SaveTerminalCommandsCommand.Execute(null); await Drain(model.SaveTerminalCommandsCommand);
             Require(client.Saved is not null && !client.Saved.Any(c => c.Id == runnable.Id) && client.Saved.Any(c => c.Id == "custom-disabled" && !c.Enabled),

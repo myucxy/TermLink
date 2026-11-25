@@ -1714,6 +1714,7 @@ public sealed class MainWindowViewModel : ObservableObject, IAsyncDisposable
             "PC_AGENT_EXITED" => PresentationText.AgentExitedDetail,
             "PC_AGENT_EXITING" => PresentationText.AgentExitingDetail,
             "PC_AGENT_PROCESSES_STILL_RUNNING" => PresentationText.AgentProcessesStillRunningDetail,
+            "PC_AGENT_CLEANUP_INCOMPLETE" => PresentationText.AgentCleanupIncompleteDetail,
             "ACCOUNT_AUTHORIZATION_IN_PROGRESS" => PresentationText.BrowserAuthorizationInProgressDetail,
             "ACCOUNT_AUTHORIZATION_NOT_WAITING" => PresentationText.AuthorizationNotWaiting,
             "ACCOUNT_AUTHORIZATION_COMMITTING" => PresentationText.AuthorizationCommitting,

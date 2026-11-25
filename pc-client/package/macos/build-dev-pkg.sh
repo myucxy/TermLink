@@ -60,7 +60,7 @@ staged_app="$payload_root/Applications/TermLink DEV.app"
 /bin/mkdir -p "$payload_root/Applications"
 # Copy the complete signed bundle, including the private self-contained Agent
 # directory. No dependencies are flattened, pruned, or taken from an installed app.
-/usr/bin/ditto --norsrc --noextattr --noqtn "$app" "$staged_app"
+/usr/bin/ditto --noqtn "$app" "$staged_app"
 /usr/bin/codesign --verify --deep --strict "$staged_app"
 
 cat > "$work_root/components.plist" <<'PLIST'
@@ -82,6 +82,8 @@ if signature_report=$(LC_ALL=C /usr/sbin/pkgutil --check-signature "$candidate" 
   fail "local DEV installer unexpectedly has a package signature"
 fi
 [[ $signature_report == *'Status: no signature'* ]] || fail "could not confirm the local DEV installer is unsigned"
+/usr/sbin/pkgutil --expand-full "$candidate" "$work_root/expanded"
+/usr/bin/codesign --verify --deep --strict "$work_root/expanded/Payload/Applications/TermLink DEV.app"
 /bin/ln -- "$candidate" "$output"
 echo "Unsigned local DEV installer: $output"
 echo "Bundle: dev.termlink.desktop.dev; version/build preserved: $version / $build"

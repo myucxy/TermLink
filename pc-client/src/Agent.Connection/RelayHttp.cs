@@ -14,16 +14,26 @@ public static class RelayHttp
     public static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response, CancellationToken token)
     {
         if (response.Content.Headers.ContentLength is > 64 * 1024) throw new RelayOperationException("SERVER_RESPONSE_TOO_LARGE");
-        await using var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-        using var output = new MemoryStream();
-        var buffer = new byte[4096];
-        int size;
-        while ((size = await input.ReadAsync(buffer, token).ConfigureAwait(false)) > 0)
+        // ResponseHeadersRead ends HttpClient.Timeout before the body is consumed.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(TimeSpan.FromSeconds(20));
+        try
         {
-            if (output.Length + size > 64 * 1024) throw new RelayOperationException("SERVER_RESPONSE_TOO_LARGE");
-            output.Write(buffer, 0, size);
+            await using var input = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+            using var output = new MemoryStream();
+            var buffer = new byte[4096];
+            int size;
+            while ((size = await input.ReadAsync(buffer, deadline.Token).ConfigureAwait(false)) > 0)
+            {
+                if (output.Length + size > 64 * 1024) throw new RelayOperationException("SERVER_RESPONSE_TOO_LARGE");
+                output.Write(buffer, 0, size);
+            }
+            return JsonDocument.Parse(output.ToArray(), new JsonDocumentOptions { MaxDepth = 24 });
         }
-        return JsonDocument.Parse(output.ToArray(), new JsonDocumentOptions { MaxDepth = 24 });
+        catch (OperationCanceledException) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            throw new RelayOperationException("RELAY_TIMEOUT");
+        }
     }
 
     public static void RequireSuccess(HttpResponseMessage response)

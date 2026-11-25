@@ -103,8 +103,9 @@ public sealed partial class RelayConnectionService
     public bool SupportsFiles => fileHostFactory is not null;
     private async Task RetireFileHostAsync()
     {
-        var retired = fileHost; fileHost = null;
+        var retired = fileHost;
         if (retired is not null) await retired.DisposeAsync().ConfigureAwait(false);
+        if (ReferenceEquals(fileHost, retired)) fileHost = null;
     }
     private async Task RunFileOperationsAsync(FileWorkerLifetime owner)
     {

@@ -15,7 +15,14 @@ internal static class MacUsabilityValidation
         var client = new MacClient();
         await using var store = new AgentStateStore(client, TimeSpan.FromMilliseconds(250));
         var runner = new OpenRunner();
-        var operations = new MacDesktopOperations(MacPlatformOptions.CreateDefault(), runner);
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), "termlink-mac-headless-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fixtureRoot);
+        var operations = new MacDesktopOperations(new MacPlatformOptions(
+            Path.Combine(fixtureRoot, "TermLink.Agent"),
+            Path.Combine(fixtureRoot, "agent.sock"),
+            Path.Combine(fixtureRoot, "data"),
+            Path.Combine(fixtureRoot, "LaunchAgents"),
+            1), runner);
         await using var model = new MainWindowViewModel(store, client, new ImmediateUiDispatcher(),
             new PlatformDescriptor(PcPlatform.MacOS, PcArchitecture.Arm64, "macOS validation", "osx-arm64", false),
             desktopOperations: operations, updateCheckInterval: TimeSpan.FromMilliseconds(50));
@@ -89,7 +96,11 @@ internal static class MacUsabilityValidation
             Require(model.CanEnableRemoteAccess, "Mac did not recover from a transient polling failure.");
             Console.WriteLine("PASS macOS UI: native integration, detection, offline Relay enable, update/edit isolation and polling recovery");
         }
-        finally { window.Close(); }
+        finally
+        {
+            window.Close();
+            try { Directory.Delete(fixtureRoot, recursive: true); } catch { }
+        }
     }
 
     private static async Task DrainAsync(AsyncCommand command) => await UntilAsync(() => !command.IsRunning);

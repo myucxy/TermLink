@@ -22,6 +22,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
     private readonly CancellationTokenSource lifetime = new();
     private readonly Task clock;
     private int disposed;
+    private bool cleanupComplete, clockDrained;
     private readonly string? stateDirectory;
     private readonly byte[]? stateKey;
     private readonly PortableTerminalDeletionStore? deletions;
@@ -136,7 +137,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         try
         {
             if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
-            var committed = s.Checkpoint?.Sequence ?? 0;
+            var committed = s.FailedClosed ? s.View.Sequence : s.Checkpoint?.Sequence ?? 0;
             if (after > committed || (after < committed && (s.Events.Count == 0 || after + 1 < s.Events.Peek().Sequence))) return null;
             var events = s.Events.Where(e => e.Sequence > after && e.Sequence <= committed).Take(64).ToArray();
             // Intermediate UTF-8/escape/DEC2026 states cannot be checkpointed by
@@ -155,7 +156,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         try
         {
             if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
-            var committed = s.Checkpoint?.Sequence ?? 0;
+            var committed = s.FailedClosed ? s.View.Sequence : s.Checkpoint?.Sequence ?? 0;
             if (after > committed || (after < committed && (s.Events.Count == 0 || after + 1 < s.Events.Peek().Sequence))) return null;
             if (after < s.SnapshotRequiredThrough && committed >= s.SnapshotRequiredThrough) return null;
             // An incomplete UTF-8/VT token is not missing data: replay both
@@ -184,7 +185,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         {
             if (!await authority().ConfigureAwait(false)) return "LEASE_INVALID";
             if (s.Receipts.TryGetValue(key, out var receipt)) return CryptographicOperations.FixedTimeEquals(hash, receipt.Hash) ? receipt.Error : "INPUT_ID_CONFLICT";
-            if (s.View.State != "RUNNING") return "SESSION_ENDED";
+            if (s.ReaderFailure is not null || s.View.State != "RUNNING") return "SESSION_ENDED";
             var fence = sender.ToString("N") + ":" + Convert.ToHexString(input.LeaseId.Span) + ":" + input.LeaseVersion;
             if (s.InputSequences.TryGetValue(fence, out var sequence) && input.InputSeq <= sequence) return "INPUT_SEQUENCE_STALE";
             // Do not evict receipts and silently turn old retries into new writes.
@@ -218,7 +219,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         try
         {
             if (!await authority().ConfigureAwait(false)) return "LEASE_INVALID";
-            if (s.View.State != "RUNNING") return "SESSION_ENDED";
+            if (s.ReaderFailure is not null || s.View.State != "RUNNING") return "SESSION_ENDED";
             if (s.View.Columns == resize.Columns && s.View.Rows == resize.Rows) return null;
             await pty.ResizeAsync(id, (int)resize.Columns, (int)resize.Rows, token).ConfigureAwait(false);
             var seq = s.View.Sequence + 1;
@@ -238,6 +239,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         try
         {
             if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
+            if (s.FailedClosed || s.ReaderFailure is not null) throw new IOException("TERMINAL_CORE_FAILED_CLOSED");
             s.Core.ApplyAdvance(s.View.Sequence + 1, s.Core.GetPresentationInfo().LogicalTimeMicros);
             Add(s, result.Accepted ? MessageType.InputAccepted : MessageType.InputRejected, result.ToByteArray(), recipient);
         }
@@ -250,7 +252,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         try
         {
             if (s.Deleted) throw new KeyNotFoundException("TERMINAL_SESSION_NOT_FOUND");
-            if (s.Checkpoint?.Sequence != s.View.Sequence || after >= s.View.Sequence) return null;
+            if (s.ReaderFailure is not null || s.Checkpoint?.Sequence != s.View.Sequence || after >= s.View.Sequence) return null;
             s.Core.ApplyAdvance(s.View.Sequence + 1, s.Core.GetPresentationInfo().LogicalTimeMicros);
             Add(s, MessageType.Gap, new GapPayload { Start = after + 1, End = s.View.Sequence, ReasonCode = "HISTORY_GAP" }.ToByteArray(), recipient);
             return s.Events.Last();
@@ -265,9 +267,14 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         {
             if (s.Deleted) return;
             s.Cancellation.Cancel();
-            try { await s.Reader.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            await pty.StopAsync(id, token).ConfigureAwait(false);
-            s.PtyAttached = false;
+            try { await s.Reader.ConfigureAwait(false); }
+            catch (OperationCanceledException) when (s.Cancellation.IsCancellationRequested) { }
+            catch (Exception error) { s.ReaderFailure ??= error; }
+            if (s.PtyAttached)
+            {
+                await pty.StopAsync(id, token).ConfigureAwait(false);
+                s.PtyAttached = false;
+            }
             await EndAsync(s, "EXITED").ConfigureAwait(false);
         }
         finally { s.StopGate.Release(); }
@@ -299,14 +306,20 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
                             await pty.SendInputAsync(s.View.Id, effect.Payload.ToArray(), replyDeadline.Token).ConfigureAwait(false);
                         }
                 }
+                catch (NativeTerminalException error) { s.ReaderFailure ??= error; throw; }
                 finally { s.Gate.Release(); }
             }
             await EndAsync(s, "EXITED").ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-        catch (Exception)
+        catch (Exception error)
         {
-            try { await pty.StopAsync(s.View.Id, CancellationToken.None).ConfigureAwait(false); }
+            s.ReaderFailure ??= error;
+            try
+            {
+                await pty.StopAsync(s.View.Id, CancellationToken.None).ConfigureAwait(false);
+                s.PtyAttached = false;
+            }
             finally { await EndAsync(s, "INTERRUPTED").ConfigureAwait(false); }
         }
     }
@@ -317,7 +330,33 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         try
         {
             if (s.View.State != "RUNNING") return;
-            s.Core.ApplyAdvance(s.View.Sequence + 1, s.Core.GetPresentationInfo().LogicalTimeMicros);
+            var info = s.Core.GetPresentationInfo();
+            if ((info.Flags & NativeTerminalPresentationFlags.FailedClosed) != 0)
+            {
+                s.FailedClosed = true;
+                var committed = s.Checkpoint?.Sequence ?? 0;
+                // Both readers were bounded by this checkpoint before failure;
+                // no recipient has seen the uncommitted tail being neutralized.
+                var retained = s.Events.Select(item => item.Sequence > committed
+                    ? item with { Type = MessageType.SessionUpsert, Payload = Array.Empty<byte>(), RequiresSnapshot = false, Recipient = null }
+                    : item).ToArray();
+                s.Events.Clear(); s.EventBytes = 0;
+                foreach (var item in retained) { s.Events.Enqueue(item); s.EventBytes += item.Payload.Length; }
+                s.SnapshotRequiredThrough = Math.Min(s.SnapshotRequiredThrough, committed);
+                s.View = s.View with { State = "INTERRUPTED", Sequence = s.View.Sequence + 1, ActivityAt = DateTimeOffset.UtcNow };
+                var ended = new SessionUpsertPayload { ShellType = s.View.Shell, Title = s.View.Title, Lifecycle = "INTERRUPTED",
+                    Columns = (uint)s.View.Columns, Rows = (uint)s.View.Rows };
+                var diagnostic = (s.ReaderFailure as NativeTerminalException)?.Diagnostic;
+                if (diagnostic is { Length: > 0 and <= 8192 } && diagnostic.EndsWith('\n') &&
+                    (diagnostic.StartsWith("TL-DIAG/1\n", StringComparison.Ordinal) || diagnostic.StartsWith("TL-DIAG/2\n", StringComparison.Ordinal) || diagnostic.StartsWith("TL-DIAG/3\n", StringComparison.Ordinal)) &&
+                    diagnostic.All(c => c == '\n' || c is >= (char)32 and <= (char)126)) ended.TerminalProtocolDiagnostic = diagnostic;
+                var payload = ended.ToByteArray();
+                s.Events.Enqueue(new(s.View.Sequence, MessageType.SessionEnded, payload)); s.EventBytes += payload.Length;
+                while (s.Events.Count > 4096 || s.EventBytes > 8 * 1024 * 1024) s.EventBytes -= s.Events.Dequeue().Payload.Length;
+                // Keep the last committed frame; a failed core cannot advance or publish a new snapshot.
+                return;
+            }
+            s.Core.ApplyAdvance(s.View.Sequence + 1, info.LogicalTimeMicros);
             s.View = s.View with { State = state };
             Add(s, state == "EXITED" ? MessageType.SessionEnded : MessageType.SessionInterrupted, new SessionUpsertPayload {
                 ShellType = s.View.Shell, Title = s.View.Title, Lifecycle = state, Columns = (uint)s.View.Columns, Rows = (uint)s.View.Rows }.ToByteArray());
@@ -344,7 +383,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
                 {
                     if (s.View.State != "RUNNING" || s.DeferredAt is null || s.DeferredAt > DateTimeOffset.UtcNow.AddMilliseconds(-250)) continue;
                     var info = s.Core.GetPresentationInfo();
-                    if (info.SynchronizedOutputDeadlineMicros == 0) continue;
+                    if ((info.Flags & NativeTerminalPresentationFlags.FailedClosed) != 0 || info.SynchronizedOutputDeadlineMicros == 0) continue;
                     s.Core.ApplyAdvance(s.View.Sequence + 1, info.SynchronizedOutputDeadlineMicros);
                     // A native clock expiry has no raw Output equivalent. Recover
                     // via a committed checkpoint instead of fabricating PTY bytes.
@@ -362,6 +401,7 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
     private byte[] StateAad(Guid id) => Encoding.UTF8.GetBytes("TERMLINK-MAC-CLI-STATE-V1:" + stateDirectory + ":" + id.ToString("N"));
     private bool Persist(Session s)
     {
+        if (s.FailedClosed) throw new IOException("TERMINAL_CORE_FAILED_CLOSED");
         if (!s.Core.TryCaptureCheckpoint(out var checkpoint, out _))
         {
             s.DeferredAt ??= DateTimeOffset.UtcNow;
@@ -437,13 +477,32 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
         await lifecycle.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-            foreach (var s in sessions.Values) await StopAsync(s.View.Id, CancellationToken.None).ConfigureAwait(false);
-            lifetime.Cancel();
-            try { await clock.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            foreach (var s in sessions.Values) { s.Core.Dispose(); if (s.Checkpoint is { } checkpoint) CryptographicOperations.ZeroMemory(checkpoint.Bytes); }
+            if (cleanupComplete) return;
+            Volatile.Write(ref disposed, 1);
+            var failures = new List<Exception>();
+            try { lifetime.Cancel(); } catch (Exception error) { failures.Add(error); }
+            if (!clockDrained)
+            {
+                try { await clock.ConfigureAwait(false); }
+                catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+                catch (Exception error) { failures.Add(error); }
+                finally { clockDrained = clock.IsCompleted; }
+            }
+            foreach (var s in sessions.Values)
+            {
+                try
+                {
+                    await StopAsync(s.View.Id, CancellationToken.None).ConfigureAwait(false);
+                    s.Core.Dispose();
+                    if (s.Checkpoint is { } checkpoint) CryptographicOperations.ZeroMemory(checkpoint.Bytes);
+                    sessions.TryRemove(s.View.Id, out _);
+                }
+                catch (Exception error) { failures.Add(error); }
+            }
+            if (failures.Count > 0) throw new IOException("TERMINAL_CLEANUP_INCOMPLETE", new AggregateException(failures));
             deletions?.Dispose();
             if (stateKey is not null) CryptographicOperations.ZeroMemory(stateKey);
+            cleanupComplete = true;
         }
         finally { lifecycle.Release(); }
     }
@@ -456,7 +515,8 @@ public sealed partial class PortableTerminalHost : IRelayTerminalHost
             View = new(id, shell, shell, "RUNNING", 100, 30, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
         }
         public RelayTerminalSession View;
-        public bool Deleted, PtyAttached;
+        public bool Deleted, PtyAttached, FailedClosed;
+        public Exception? ReaderFailure;
         public NativeTerminal Core;
         public Guid OperationId;
         public RelayTerminalCheckpoint? Checkpoint;

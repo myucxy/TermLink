@@ -63,8 +63,9 @@ public sealed partial class RelayConnectionService
     public Task StopTerminalAsync(Guid id, CancellationToken token) => terminalHost?.StopAsync(id, token) ?? Task.CompletedTask;
     private async Task RetireTerminalHostAsync()
     {
-        var retired = terminalHost; terminalHost = null;
+        var retired = terminalHost;
         if (retired is not null) await retired.DisposeAsync().ConfigureAwait(false);
+        if (ReferenceEquals(terminalHost, retired)) terminalHost = null;
     }
     private async Task PublishTerminalSessionsAsync(Account current, DeviceIdentity device, CancellationToken token)
     {
@@ -405,6 +406,8 @@ public sealed partial class RelayConnectionService
                     if (item.Sequence != after + 1 || item.RequiresSnapshot || item.Type == MessageType.Gap)
                         return new(HostHistoryResponseStatusV1.Gap, "EVENT_RANGE_GAP", null);
                     var type = item.Type; var payload = item.Payload;
+                    if (type == MessageType.SessionEnded && SessionUpsertPayload.Parser.ParseFrom(payload) is { HasTerminalProtocolDiagnostic: true } ended)
+                    { ended.ClearTerminalProtocolDiagnostic(); payload = ended.ToByteArray(); }
                     if (item.Recipient is { } intended && intended != recipient)
                     { type = MessageType.SessionUpsert; payload = new SessionUpsertPayload().ToByteArray(); }
                     if (events.Count > 0 && bytes + payload.Length + 32 > 8 * 1024 * 1024)

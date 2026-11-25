@@ -8290,6 +8290,7 @@ internal class ProductionProductRepository(
                             dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
                                 value.exitCode.takeIf { value.hasExitCode() },
                                 value.terminalProtocolDiagnostic.takeIf { value.hasTerminalProtocolDiagnostic() },
+                                value.lifecycle,
                             ),
                         ),
                     )

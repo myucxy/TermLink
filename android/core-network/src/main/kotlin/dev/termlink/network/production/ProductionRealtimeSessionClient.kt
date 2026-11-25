@@ -3387,6 +3387,7 @@ class ProductionRealtimeSessionClient(
                                 dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
                                     payload.exitCode.takeIf { payload.hasExitCode() },
                                     payload.terminalProtocolDiagnostic.takeIf { payload.hasTerminalProtocolDiagnostic() },
+                                    payload.lifecycle,
                                 ),
                             ),
                         ),
@@ -3773,6 +3774,7 @@ class ProductionRealtimeSessionClient(
                     dev.termlink.terminal.api.TerminalProtocolDiagnostic.forHostExit(
                         payload.exitCode.takeIf { payload.hasExitCode() },
                         payload.terminalProtocolDiagnostic.takeIf { payload.hasTerminalProtocolDiagnostic() },
+                        payload.lifecycle,
                     ),
                 )
                 else -> error("unknown session lifecycle")

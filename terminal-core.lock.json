@@ -1,39 +1,39 @@
 {
   "schema_version": 2,
   "repository": "git@github.com:myucxy/terminal-core.git",
-  "revision": "1c907c51b3c6652b23a7d7216ff1bb13d3410a69",
+  "revision": "0d5b8d9fbdfc9c6cbb21588b729eefa916d9d221",
   "source_dirty": false,
   "toolchain": "1.97.1",
   "artifacts": [
     {
-      "size": 1766912,
-      "sha256": "0962fcd29389ee31450c969e845786e24648bddb5e89bca7437662d80de6750d",
+      "platform": "windows",
       "path": "native/terminal-core/windows-x64/termlink_terminal_ffi.dll",
-      "platform": "windows"
+      "size": 1766912,
+      "sha256": "1954be49fc76e4c223472b8e995c5072cdf84841ec393f4bb60f820c60b34cfe"
     },
     {
-      "size": 1981184,
-      "sha256": "a22b3bccec997f2f0f598522a6e02e1cfe4b8daf1b7e6055f61f4f5014b0b713",
+      "platform": "android",
       "path": "native/terminal-core/android/arm64-v8a/libtermlink_terminal_jni.so",
-      "platform": "android"
+      "size": 1982016,
+      "sha256": "4f9992c845451e2e3cca594aefb8ffe36cdbaaa2d3b73ff44bcd06f72d3c9c0e"
     },
     {
-      "size": 1370152,
-      "sha256": "85d931f29a562df96f46f7ceebca605fc2236473dd7e7810f9abf59c451735f3",
+      "platform": "android",
       "path": "native/terminal-core/android/armeabi-v7a/libtermlink_terminal_jni.so",
-      "platform": "android"
+      "size": 1370496,
+      "sha256": "c8532bc7a848e8e81b0c90ef428a64dc07fc3c43254d6aa6cea0fe9a6859ab6d"
     },
     {
-      "size": 2464436,
-      "sha256": "5a26a0bea95589b0c22fb96ea338ce37850fcfd4eee3bf91f7f3d567a26539d4",
+      "platform": "android",
       "path": "native/terminal-core/android/x86/libtermlink_terminal_jni.so",
-      "platform": "android"
+      "size": 2464620,
+      "sha256": "2950a1153dea6a0d0f69c2e1f05fafb8d8132507f4d00ca29b1a25170a45876d"
     },
     {
-      "size": 2194720,
-      "sha256": "af44cc9ee38ea2309163ee2420f2b7e1ad9db05ae5e835859350e518767cd4cf",
+      "platform": "android",
       "path": "native/terminal-core/android/x86_64/libtermlink_terminal_jni.so",
-      "platform": "android"
+      "size": 2194880,
+      "sha256": "340d1b67c717e152544793cf5c15e41a1006bddb31ec8d52802af56a453ee250"
     }
   ]
 }

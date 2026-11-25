@@ -7,6 +7,8 @@ if [[ $# -ne 5 ]]; then
 fi
 version=$1; build=$2; dotnet_path=$3; protoc_path=$4; output=$5
 source_revision=${TERMLINK_SOURCE_REVISION:-unknown}
+dev_signing_identity=${TERMLINK_DEV_SIGNING_IDENTITY:--}
+[[ $dev_signing_identity == - || $dev_signing_identity =~ ^[A-Fa-f0-9]{40}$ ]] || { echo "TERMLINK_DEV_SIGNING_IDENTITY must be a certificate SHA-1 fingerprint or -" >&2; exit 2; }
 [[ $source_revision == unknown || $source_revision =~ ^[a-f0-9]{7,40}$ ]] || { echo "invalid source revision" >&2; exit 2; }
 [[ $(uname -s) == Darwin ]] || { echo "macOS host required" >&2; exit 3; }
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $build =~ ^[1-9][0-9]{0,4}$ && $build -le 65535 ]] || { echo "invalid version/build" >&2; exit 2; }
@@ -58,10 +60,14 @@ cat > "$contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$contents/Info.plist"
 # Local development signature only; this is not a notarized release package.
-codesign --force --deep --sign - "$work_root/TermLink DEV.app"
-codesign --verify --deep --strict "$work_root/TermLink DEV.app"
+bash "$script_dir/sign-dev-app.sh" "$work_root/TermLink DEV.app" "$dev_signing_identity"
+# Generic managed-code signatures use extended attributes; retain them in ZIP.
+ditto -c -k --sequesterRsrc --noqtn --keepParent "$work_root/TermLink DEV.app" "$work_root/TermLink-DEV-$rid.zip"
+ditto -x -k "$work_root/TermLink-DEV-$rid.zip" "$work_root/zip-validation"
+codesign --verify --deep --strict "$work_root/zip-validation/TermLink DEV.app"
 mkdir -p "$output"
-ditto --norsrc --noextattr --noqtn "$work_root/TermLink DEV.app" "$output/TermLink DEV.app"
-ditto -c -k --norsrc --noextattr --noqtn --keepParent "$output/TermLink DEV.app" "$output/TermLink-DEV-$rid.zip"
+ditto --noqtn "$work_root/TermLink DEV.app" "$output/TermLink DEV.app"
+codesign --verify --deep --strict "$output/TermLink DEV.app"
+cp "$work_root/TermLink-DEV-$rid.zip" "$output/TermLink-DEV-$rid.zip"
 (cd -- "$output" && shasum -a 256 "TermLink-DEV-$rid.zip" > SHA256SUMS)
 echo "DEV application: $output/TermLink DEV.app"

@@ -25,6 +25,18 @@ class TerminalProtocolDiagnosticTest {
         assertNull(TerminalProtocolDiagnostic.forHostExit(125, "x".repeat(10241)))
     }
 
+    @Test fun portableInterruptedFailureRequiresExplicitLifecycleAndNoInventedExitCode() {
+        assertEquals(valid, assertNotNull(TerminalProtocolDiagnostic.forHostExit(null, valid, "INTERRUPTED")).text)
+        for (lifecycle in listOf(null, "", "ENDED", "EXITED", "RUNNING", "interrupted", " INTERRUPTED")) {
+            assertNull(TerminalProtocolDiagnostic.forHostExit(null, valid, lifecycle))
+            assertEquals(valid, assertNotNull(TerminalProtocolDiagnostic.forHostExit(125, valid, lifecycle)).text)
+        }
+        for (code in listOf(0, 17)) assertNull(TerminalProtocolDiagnostic.forHostExit(code, valid, "INTERRUPTED"))
+        for (text in listOf(null, "", "not a diagnostic", valid.replace("<ESC>", "\u001b"), "x".repeat(10241))) {
+            assertNull(TerminalProtocolDiagnostic.forHostExit(null, text, "INTERRUPTED"))
+        }
+    }
+
     @Test fun validatesV2DetectionMetadataAgainstTheExactBytes() {
         val extended = valid.replace("TL-DIAG/1", "TL-DIAG/2") +
             "detected_at=2:4\nlast_byte=68\nlast_codepoint=U+0068\ncore_revision=" + "a".repeat(40) +

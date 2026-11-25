@@ -75,13 +75,16 @@ find "$contents/MacOS" -type f -print0 | while IFS= read -r -d '' executable; do
     else
       codesign --force --timestamp --options runtime --sign "$app_identity" "$executable"
     fi
+  else
+    # Published managed assemblies and support files in MacOS are generic code.
+    codesign --force --timestamp --sign "$app_identity" "$executable"
   fi
 done
 codesign --force --timestamp --options runtime --entitlements "$script_dir/runtime-entitlements.plist" --sign "$app_identity" "$app"
 codesign --verify --deep --strict --verbose=4 "$app"
 # Notarize and staple the app itself before assessing it or enclosing it in a
 # PKG. Stapling only the outer installer leaves offline app assessment missing.
-ditto -c -k --keepParent "$app" "$work_root/TermLink-notary.zip"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$work_root/TermLink-notary.zip"
 xcrun notarytool submit "$work_root/TermLink-notary.zip" --keychain-profile "$notary_profile" --team-id "$team_id" --wait
 xcrun stapler staple "$app"
 xcrun stapler validate "$app"
@@ -89,7 +92,8 @@ spctl --assess --type execute --verbose=4 "$app"
 
 component="$work_root/TermLink-component.pkg"
 mkdir -p "$work_root/pkgroot/Applications"
-cp -R -- "$app" "$work_root/pkgroot/Applications/TermLink.app"
+ditto --noqtn "$app" "$work_root/pkgroot/Applications/TermLink.app"
+codesign --verify --deep --strict "$work_root/pkgroot/Applications/TermLink.app"
 cat > "$work_root/components.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -110,5 +114,7 @@ xcrun notarytool submit "$candidate" --keychain-profile "$notary_profile" --team
 xcrun stapler staple "$candidate"
 xcrun stapler validate "$candidate"
 spctl --assess --type install --verbose=4 "$candidate"
+pkgutil --expand-full "$candidate" "$work_root/final-payload"
+codesign --verify --deep --strict "$work_root/final-payload/TermLink-component.pkg/Payload/Applications/TermLink.app"
 ln -- "$candidate" "$output"
 shasum -a 256 "$output"

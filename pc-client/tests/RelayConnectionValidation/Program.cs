@@ -17,8 +17,13 @@ using Google.Protobuf;
 using TermLink.Protocol;
 using TermLink.Protocol.Realtime.V1;
 
+if (args.Contains("--ai-authority-only", StringComparer.Ordinal)) { await AiAuthorityValidation.RunAsync(); return; }
+
 var passed = 0;
 await Check("AI encrypted route, invalid proof, revocation and disable", ValidateAiTransportAsync);
+await Check("AI additive authority and non-additive lifetime fence", AiAuthorityValidation.RunAsync);
+if (args.Contains("--verify-installed-ai-catalog", StringComparer.Ordinal))
+    await Check("actual portable native catalog across encrypted route", ValidateNativeCatalogRouteAsync);
 await Check("origin, token and callback validation", ValidateSecurityAsync);
 await Check("browser PKCE and loopback callback", ValidateBrowserAsync);
 await Check("enrollment, signed Relay, presence and retry", ValidateConnectionAsync);
@@ -27,6 +32,7 @@ await Check("registration conflict requires matching signed identity", ValidateC
 await Check("sign-out cancels browser authorization", ValidateCancellationAsync);
 await Check("refresh rotation persists and rejects changed subject", ValidateRefreshAsync);
 await Check("bounded HTTP responses", ValidateBoundsAsync);
+await Check("whole-body HTTP deadline, cancellation and JSON limits", RelayHttpDeadlineValidation.RunAsync);
 await Check("portable Host commands expose live Relay status", ValidateHostAsync);
 await Check("revoked device cannot re-enroll or silently rotate keys", ValidateDeniedAsync);
 await Check("untrusted discovery endpoint cannot receive OAuth code", ValidateDiscoveryAsync);
@@ -63,6 +69,31 @@ static async Task ValidateAiTransportAsync()
     await service.SetRemoteAccessAsync(false, CancellationToken.None);
     Require(hosts.All(h => h.Disposed) && !service.Snapshot.RemoteAccessEnabled, "Disabling remote access left an AI owner alive.");
     await service.SignOutAsync(CancellationToken.None);
+}
+
+static async Task ValidateNativeCatalogRouteAsync()
+{
+    if (!OperatingSystem.IsMacOS()) return;
+    var root = Path.Combine(Path.GetTempPath(), "tl-native-ai-route-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        Directory.CreateDirectory(root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await using var server = new RelayFixture { EnableAi = true };
+        await using var service = await RelayConnectionService.CreateAsync(new MemorySecrets(),
+            new PcAgentIdentity(Guid.NewGuid(), "Native Mac", PcPlatform.MacOS, PcArchitecture.Arm64, "validation", "0.3.17.147"), CancellationToken.None,
+            authorization: new FixtureAuthorization(server), aiHostFactory: _ => new TermLink.Agent.AI.PortableAiHost(root));
+        await service.ConfigureServerAsync(server.Origin, CancellationToken.None);
+        await service.AuthorizeAsync("Native AI fixture", CancellationToken.None);
+        await service.SetRemoteAccessAsync(true, CancellationToken.None);
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        var response = await server.AiReply.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        using var json = JsonDocument.Parse(response);
+        Require(json.RootElement.GetProperty("agents").GetArrayLength() == 5 && !json.RootElement.TryGetProperty("error", out _), "Actual native catalog not projected through encrypted reply");
+        Console.WriteLine(JsonSerializer.Serialize(new { catalog_response_bytes = Encoding.UTF8.GetByteCount(response), catalog_response_seconds = timer.Elapsed.TotalSeconds,
+            count = json.RootElement.GetProperty("agents").GetArrayLength(), model_requests = 0 }));
+        await service.SignOutAsync(CancellationToken.None);
+    }
+    finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
 }
 
 static Task ValidateSecurityAsync()
@@ -270,7 +301,8 @@ static async Task ValidateFullExitRetryAsync()
     var platform = new FixturePlatform { TerminalHost = terminal };
     await using var runtime = await PortableAgentRuntime.CreateAsync(platform, CancellationToken.None);
     var first = await runtime.HandleAsync(LocalAgentCommand.Shutdown, null, CancellationToken.None);
-    Require(!first.Success && terminal.Attempts == 1, "Failed cleanup was reported as a successful exit.");
+    Require(!first.Success && first.Code == "PC_AGENT_CLEANUP_INCOMPLETE" && terminal.Attempts == 1,
+        "Failed cleanup was reported as a successful exit or an unrelated account error.");
     Require((await runtime.HandleAsync(LocalAgentCommand.GetStatus, null, CancellationToken.None)).Code == "PC_AGENT_EXITING",
         "Failed cleanup allowed new work.");
     var retry = await runtime.HandleAsync(LocalAgentCommand.Shutdown, null, CancellationToken.None);
@@ -403,7 +435,7 @@ static async Task ThrowsAsync<T>(Func<Task> action) where T : Exception
     throw new InvalidOperationException("Expected " + typeof(T).Name);
 }
 
-file sealed class MemorySecrets : ISecretStore
+internal sealed class MemorySecrets : ISecretStore
 {
     public ConcurrentDictionary<string, byte[]> Values { get; } = new();
     public bool IsAvailable => true;
@@ -447,7 +479,7 @@ file sealed class RetryCleanupTerminalHost : ITerminalSessionHost, IAsyncDisposa
     public ValueTask StopAsync(Guid id, CancellationToken token) => throw new NotSupportedException();
 }
 
-file sealed class FixtureAuthorization(RelayFixture server) : IRelayAuthorization
+internal sealed class FixtureAuthorization(RelayFixture server) : IRelayAuthorization
 {
     public string Subject { get; set; } = "A";
     public int ExpiresIn { get; set; } = 3600;
@@ -501,7 +533,7 @@ file sealed class RecordingAiHost : IRelayAiHost
     public void Dispose() => Disposed = true;
 }
 
-file sealed class RelayFixture : IAsyncDisposable
+internal sealed class RelayFixture : IAsyncDisposable
 {
     private readonly HttpListener listener = new();
     private readonly CancellationTokenSource shutdown = new();
@@ -513,6 +545,43 @@ file sealed class RelayFixture : IAsyncDisposable
     private int connections, pings, upserts, invalidProofs, conflicts, refreshes;
     private Guid metadataPCId;
     public bool EnableAi { get; init; }
+    public bool ManualAiRequests { get; init; }
+    public Func<Task<object>>? GrantSnapshotAsync { get; set; }
+    public int AuthorityReads => Volatile.Read(ref authorityReads);
+    private int authorityReads;
+    private WebSocket? manualSocket;
+    private readonly SemaphoreSlim manualSend = new(1, 1);
+    private readonly TaskCompletionSource manualReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly ConcurrentDictionary<ulong, (ByteString Id, byte[] Key, Guid Recipient)> manualRequests = new();
+    public ConcurrentDictionary<ulong, bool> ManualReplies { get; } = new();
+    public AiAuthorityRecipient ExistingMobile => new(MobileId, mobile, "MANAGE");
+    public async Task SendAiAsync(AiAuthorityRecipient sender, ulong sequence, string action)
+    {
+        await manualReady.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var pairwise = SessionCrypto.DerivePairwiseKey(sender.Identity.Exchange, Decode(devices[LastDeviceId].Exchange), LastDeviceId, sender.Id, 1);
+        var keyId = Encoding.UTF8.GetBytes("epoch-00000001");
+        var key = SessionCrypto.DeriveSessionKey(pairwise, metadataPCId, CryptoDirection.AndroidToPc, keyId);
+        try
+        {
+            var requestId = ByteString.CopyFrom(Convert.FromHexString(Guid.NewGuid().ToString("N")));
+            var request = new Envelope { ProtocolVersion = 1, MessageType = MessageType.AiAgentRequest, Direction = Direction.AndroidToPc,
+                SessionId = ByteString.CopyFrom(Convert.FromHexString(metadataPCId.ToString("N"))), SenderDeviceId = ByteString.CopyFrom(Convert.FromHexString(sender.Id.ToString("N"))),
+                RecipientDeviceId = ByteString.CopyFrom(Convert.FromHexString(LastDeviceId.ToString("N"))), Seq = sequence, KeyId = ByteString.CopyFrom(keyId),
+                Nonce = ByteString.CopyFrom(RandomNumberGenerator.GetBytes(12)), SentAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+            var payload = new AiAgentRequestPayload { RequestId = requestId, Json = JsonSerializer.Serialize(new { action }) }.ToByteArray();
+            request.Ciphertext = ByteString.CopyFrom(SessionCrypto.Encrypt(key, request.Nonce.ToByteArray(), SessionCrypto.AssociatedData(request), payload));
+            manualRequests[sequence] = (requestId, SessionCrypto.DeriveSessionKey(pairwise, metadataPCId, CryptoDirection.PcToAndroid, keyId), sender.Id);
+            await SendFixtureAsync(manualSocket!, request.ToByteArray(), WebSocketMessageType.Binary);
+        }
+        finally { CryptographicOperations.ZeroMemory(pairwise); CryptographicOperations.ZeroMemory(key); }
+    }
+    private async Task SendFixtureAsync(WebSocket socket, byte[] bytes, WebSocketMessageType type)
+    {
+        await manualSend.WaitAsync(shutdown.Token);
+        try { await socket.SendAsync(bytes, type, true, shutdown.Token); }
+        finally { manualSend.Release(); }
+    }
+    private ByteString? aiRequestId;
     public bool RevokeMobile { get; set; }
     public bool AiMetadata { get; private set; }
     public Guid MobileId { get; } = Guid.NewGuid();
@@ -597,6 +666,8 @@ file sealed class RelayFixture : IAsyncDisposable
             if (path == "/v1/devices")
             { await Json(context, new { items = new[] { new { id = Guid.NewGuid(), name = "iPhone", type = "ANDROID", trust_state = "TRUSTED", online = true } } }); return; }
             if (path.EndsWith("/grants", StringComparison.Ordinal) && path.StartsWith("/v1/pcs/", StringComparison.Ordinal)) {
+                Interlocked.Increment(ref authorityReads);
+                if (GrantSnapshotAsync is { } grants) { await Json(context, await grants()); return; }
                 var items = RevokeMobile ? Array.Empty<object>() : new object[] { new { device_id = MobileId, device_type = "IOS", permission = "MANAGE",
                     exchange_public_key = Convert.ToBase64String(mobile.Exchange.PublicKey), signing_public_key = Convert.ToBase64String(mobile.SigningPublicKey) } };
                 await Json(context, new { key_epoch = 1, items }); return;
@@ -624,6 +695,7 @@ file sealed class RelayFixture : IAsyncDisposable
                 await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new
                 { type = "welcome", protocol_version = InvalidWelcome ? 9 : 1, connection_id = Guid.NewGuid().ToString("D"), heartbeat_seconds = 1, capabilities }), WebSocketMessageType.Text, true, shutdown.Token);
                 if (DropNext) { DropNext = false; await socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, "fixture reconnect", shutdown.Token); return; }
+                manualSocket = socket;
                 var sentAi = false;
                 while (!shutdown.IsCancellationRequested)
                 {
@@ -633,17 +705,43 @@ file sealed class RelayFixture : IAsyncDisposable
                     if (received.MessageType == WebSocketMessageType.Binary && EnableAi) {
                         var reply = Envelope.Parser.ParseFrom(data, 0, received.Count);
                         var pc = new Guid(Convert.ToHexString(reply.SessionId.Span));
+                        if (ManualAiRequests)
+                        {
+                            if (!manualRequests.TryRemove(reply.Seq, out var pending)) throw new IOException("Unexpected authority fixture sequence");
+                            byte[]? plain = null;
+                            try
+                            {
+                                if (reply.ProtocolVersion != 1 || reply.Direction != Direction.PcToAndroid || reply.Ack != 0 ||
+                                    pc != metadataPCId || reply.SenderDeviceId != ByteString.CopyFrom(Convert.FromHexString(deviceId.ToString("N"))) ||
+                                    reply.RecipientDeviceId != ByteString.CopyFrom(Convert.FromHexString(pending.Recipient.ToString("N"))) || reply.KeyId != ByteString.CopyFromUtf8("epoch-00000001"))
+                                    throw new IOException("Authority response route mismatch");
+                                plain = SessionCrypto.Decrypt(pending.Key, reply.Nonce.ToByteArray(), SessionCrypto.AssociatedData(reply), reply.Ciphertext.ToByteArray());
+                                var payload = AiAgentResponsePayload.Parser.ParseFrom(plain);
+                                if (payload.RequestId != pending.Id) throw new IOException("Authority response request ID mismatch");
+                                ManualReplies.TryAdd(reply.Seq, true);
+                            }
+                            finally { if (plain is not null) CryptographicOperations.ZeroMemory(plain); CryptographicOperations.ZeroMemory(pending.Key); }
+                            continue;
+                        }
                         var pairwise = SessionCrypto.DerivePairwiseKey(mobile.Exchange, Decode(device.Exchange), deviceId, MobileId, 1);
                         var key = SessionCrypto.DeriveSessionKey(pairwise, pc, CryptoDirection.PcToAndroid, reply.KeyId.ToByteArray());
                         var decrypted = SessionCrypto.Decrypt(key, reply.Nonce.ToByteArray(), SessionCrypto.AssociatedData(reply), reply.Ciphertext.ToByteArray());
-                        try { AiReply.TrySetResult(AiAgentResponsePayload.Parser.ParseFrom(decrypted).Json); }
+                        try {
+                            var payload = AiAgentResponsePayload.Parser.ParseFrom(decrypted);
+                            if (reply.ProtocolVersion != 1 || reply.Direction != Direction.PcToAndroid || reply.Seq != 1 || reply.Ack != 0 ||
+                                reply.SenderDeviceId != ByteString.CopyFrom(Convert.FromHexString(deviceId.ToString("N"))) ||
+                                reply.RecipientDeviceId != ByteString.CopyFrom(Convert.FromHexString(MobileId.ToString("N"))) ||
+                                pc != metadataPCId || payload.RequestId != aiRequestId) throw new IOException("AI response identity/correlation mismatch");
+                            AiReply.TrySetResult(payload.Json);
+                        }
                         finally { CryptographicOperations.ZeroMemory(decrypted); CryptographicOperations.ZeroMemory(key); CryptographicOperations.ZeroMemory(pairwise); }
                         continue;
                     }
                     using var ping = JsonDocument.Parse(data.AsMemory(0, received.Count));
                     Interlocked.Increment(ref pings);
-                    await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { type = "pong", probe_id = ping.RootElement.GetProperty("probe_id").GetString() }), WebSocketMessageType.Text, true, shutdown.Token);
-                    if (EnableAi && !sentAi) {
+                    await SendFixtureAsync(socket, JsonSerializer.SerializeToUtf8Bytes(new { type = "pong", probe_id = ping.RootElement.GetProperty("probe_id").GetString() }), WebSocketMessageType.Text);
+                    manualReady.TrySetResult();
+                    if (EnableAi && !ManualAiRequests && !sentAi) {
                         sentAi = true;
                         var stored = devices[deviceId];
                         var pcPath = metadataPCId;
@@ -654,7 +752,8 @@ file sealed class RelayFixture : IAsyncDisposable
                             SessionId = ByteString.CopyFrom(Convert.FromHexString(pcPath.ToString("N"))), SenderDeviceId = ByteString.CopyFrom(Convert.FromHexString(MobileId.ToString("N"))),
                             RecipientDeviceId = ByteString.CopyFrom(Convert.FromHexString(deviceId.ToString("N"))), Seq = 1, KeyId = ByteString.CopyFrom(keyId),
                             Nonce = ByteString.CopyFrom(RandomNumberGenerator.GetBytes(12)), SentAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
-                        var payload = new AiAgentRequestPayload { RequestId = ByteString.CopyFrom(Convert.FromHexString(Guid.NewGuid().ToString("N"))), Json = "{\"action\":\"catalog\"}" }.ToByteArray();
+                        aiRequestId = ByteString.CopyFrom(Convert.FromHexString(Guid.NewGuid().ToString("N")));
+                        var payload = new AiAgentRequestPayload { RequestId = aiRequestId, Json = "{\"action\":\"catalog\"}" }.ToByteArray();
                         request.Ciphertext = ByteString.CopyFrom(SessionCrypto.Encrypt(key, request.Nonce.ToByteArray(), SessionCrypto.AssociatedData(request), payload));
                         var corrupt = request.Clone(); var bad = corrupt.Ciphertext.ToByteArray(); bad[^1] ^= 1; corrupt.Ciphertext = ByteString.CopyFrom(bad);
                         await socket.SendAsync(corrupt.ToByteArray(), WebSocketMessageType.Binary, true, shutdown.Token);
@@ -715,6 +814,8 @@ file sealed class RelayFixture : IAsyncDisposable
         shutdown.Cancel(); listener.Close();
         await loop;
         await Task.WhenAll(clients);
+        foreach (var pending in manualRequests.Values) CryptographicOperations.ZeroMemory(pending.Key);
+        manualRequests.Clear(); manualSend.Dispose();
         shutdown.Dispose(); mobile.Dispose();
     }
 }

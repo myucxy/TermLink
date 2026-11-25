@@ -1084,6 +1084,124 @@ class JniNativeBridgeInstrumentedTest {
     }
 
     @Test
+    fun decCursorBlinkModePreservesShapeAndSnapshotContinuationThroughJni() {
+        val shapes = listOf(
+            dev.termlink.terminal.api.TerminalRenderCursorShapeV2.BLOCK,
+            dev.termlink.terminal.api.TerminalRenderCursorShapeV2.UNDERLINE,
+            dev.termlink.terminal.api.TerminalRenderCursorShapeV2.BAR,
+        )
+        for (style in 1..6) {
+            NativeTerminalHandle.create(JniNativeBridge, TerminalSize(20, 4), 1).use { terminal ->
+                terminal.feed(1, "\u001b[$style qA".encodeToByteArray())
+                val shape = shapes[(style - 1) / 2]
+                assertEquals(shape, terminal.renderV4().renderFrame.cursor.shape)
+                assertEquals(style % 2 == 1, terminal.renderV4().renderFrame.cursor.blinking)
+                terminal.feedWithHostEffectsV2(2, "\u001b[?12l".encodeToByteArray())
+                assertEquals(shape, terminal.renderV4().renderFrame.cursor.shape)
+                assertFalse(terminal.renderV4().renderFrame.cursor.blinking)
+                NativeTerminalHandle.importCheckpoint(JniNativeBridge, terminal.exportCheckpoint().copyPayload()).use { restored ->
+                    assertEquals(terminal.renderV4().renderFrame.cursor, restored.renderV4().renderFrame.cursor)
+                    for (copy in listOf(terminal, restored)) {
+                        copy.feed(3, "B".encodeToByteArray())
+                        assertEquals(4L, copy.nextSourceSequence)
+                        assertEquals("A", firstCellText(copy.renderV4().renderFrame))
+                        copy.feedWithHostEffectsV2(4, "\u001b[?12h".encodeToByteArray())
+                        assertEquals(shape, copy.renderV4().renderFrame.cursor.shape)
+                        assertTrue(copy.renderV4().renderFrame.cursor.blinking)
+                        copy.feed(5, "C".encodeToByteArray())
+                        assertEquals(3, copy.renderV4().renderFrame.cursor.column)
+                    }
+                    assertArrayEquals(terminal.exportCheckpoint().copyPayload(), restored.exportCheckpoint().copyPayload())
+                    NativeTerminalHandle.importCheckpoint(JniNativeBridge, restored.exportCheckpoint().copyPayload()).use { blinking ->
+                        assertTrue(blinking.renderV4().renderFrame.cursor.blinking)
+                        assertEquals(shape, blinking.renderV4().renderFrame.cursor.shape)
+                        blinking.feed(6, "D".encodeToByteArray())
+                        assertEquals(7L, blinking.nextSourceSequence)
+                        assertEquals(4, blinking.renderV4().renderFrame.cursor.column)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun fragmentedDecCursorBlinkModeDoesNotHideUnknownModeDiagnosticThroughJni() {
+        for (enabled in listOf(false, true)) {
+            val sequence = "\u001b[?12${if (enabled) "h" else "l"}".encodeToByteArray()
+            for (split in 0..sequence.size) {
+                NativeTerminalHandle.create(JniNativeBridge, TerminalSize(20, 4), 1).use { terminal ->
+                    terminal.feed(1, "\u001b[6 q".encodeToByteArray())
+                    if (split == 0) terminal.advance(2, 0) else terminal.feed(2, sequence.copyOfRange(0, split))
+                    if (split == sequence.size) terminal.advance(3, 0) else terminal.feed(3, sequence.copyOfRange(split, sequence.size))
+                    terminal.feed(4, "ok".encodeToByteArray())
+                    assertEquals(5L, terminal.nextSourceSequence)
+                    assertEquals(enabled, terminal.renderV4().renderFrame.cursor.blinking)
+                    assertEquals(dev.termlink.terminal.api.TerminalRenderCursorShapeV2.BAR, terminal.renderV4().renderFrame.cursor.shape)
+                    val error = runCatching { terminal.feedWithHostEffectsV2(5, "\u001b[?9999h".encodeToByteArray()) }.exceptionOrNull() as NativeTerminalException
+                    assertEquals(NativeTerminalStatus.UNSUPPORTED, error.status)
+                    val diagnostic = requireNotNull(error.terminalProtocolDiagnostic)
+                    assertEquals("<ESC>[?9999h", diagnostic.sequence)
+                    assertTrue(diagnostic.text.contains("core_impact=failed_closed\n"))
+                    val repeated = runCatching { terminal.feed(5, "retry".encodeToByteArray()) }.exceptionOrNull() as NativeTerminalException
+                    assertEquals(diagnostic.text, repeated.terminalProtocolDiagnostic!!.text)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun mode1034StaysUtf8EscMetaAtEveryJniSplitAndSnapshot() {
+        for (enabled in listOf(false, true)) {
+            val mode = "\u001b[?1034${if (enabled) "h" else "l"}".encodeToByteArray()
+            for (split in 0..mode.size) {
+                NativeTerminalHandle.create(JniNativeBridge, TerminalSize(20, 4), 1).use { terminal ->
+                    if (split == 0) terminal.advance(1, 0) else terminal.feed(1, mode.copyOfRange(0, split))
+                    if (split == mode.size) terminal.advance(2, 0) else terminal.feed(2, mode.copyOfRange(split, mode.size))
+                    terminal.feed(3, "中文".encodeToByteArray())
+                    assertEquals("中", firstCellText(terminal.renderV4().renderFrame))
+                    assertEquals(4, terminal.renderV4().renderFrame.cursor.column)
+                    assertArrayEquals("\u001bx".encodeToByteArray(), terminal.encodeCharacter('x'.code, TerminalInputModifiers(alt = true)))
+                    assertArrayEquals("\u001bé".encodeToByteArray(), terminal.encodeCharacter('é'.code, TerminalInputModifiers(alt = true)))
+                    val reply = terminal.feedWithHostEffectsV2(4, "\u001b[?1034\$p".encodeToByteArray()).effects.single()
+                    assertArrayEquals("\u001b[?1034;4\$y".encodeToByteArray(), reply.copyPayload())
+                    NativeTerminalHandle.importCheckpoint(JniNativeBridge, terminal.exportCheckpoint().copyPayload()).use { restored ->
+                        assertEquals(terminal.renderV4().renderFrame.cursor, restored.renderV4().renderFrame.cursor)
+                        for (copy in listOf(terminal, restored)) {
+                            assertArrayEquals("\u001b中".encodeToByteArray(), copy.encodeCharacter('中'.code, TerminalInputModifiers(alt = true)))
+                            assertArrayEquals("\u001b[?1034;4\$y".encodeToByteArray(), copy.feedWithHostEffectsV2(5, "\u001b[?1034\$p".encodeToByteArray()).effects.single().copyPayload())
+                            copy.feed(6, "!".encodeToByteArray())
+                            assertEquals(7L, copy.nextSourceSequence)
+                            assertEquals(5, copy.renderV4().renderFrame.cursor.column)
+                        }
+                        assertArrayEquals(terminal.exportCheckpoint().copyPayload(), restored.exportCheckpoint().copyPayload())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun mode1034ToggleStillRejectsUnknownPrivateModeThroughJni() {
+        for (mode in listOf("\u001b[?1034h", "\u001b[?1034l")) {
+            NativeTerminalHandle.create(JniNativeBridge, TerminalSize(20, 4), 1).use { terminal ->
+                terminal.feedWithHostEffectsV2(1, mode.encodeToByteArray())
+                terminal.feed(2, "中文".encodeToByteArray())
+                NativeTerminalHandle.importCheckpoint(JniNativeBridge, terminal.exportCheckpoint().copyPayload()).use { restored ->
+                    assertArrayEquals("\u001b[?1034;4\$y".encodeToByteArray(), restored.feedWithHostEffectsV2(3, "\u001b[?1034\$p".encodeToByteArray()).effects.single().copyPayload())
+                    restored.feed(4, "still-usable".encodeToByteArray())
+                    val error = runCatching { restored.feedWithHostEffectsV2(5, "\u001b[?9999h".encodeToByteArray()) }.exceptionOrNull() as NativeTerminalException
+                    assertEquals(NativeTerminalStatus.UNSUPPORTED, error.status)
+                    val diagnostic = requireNotNull(error.terminalProtocolDiagnostic)
+                    assertEquals("<ESC>[?9999h", diagnostic.sequence)
+                    assertTrue(diagnostic.text.contains("core_impact=failed_closed\n"))
+                    val repeated = runCatching { restored.feed(5, "retry".encodeToByteArray()) }.exceptionOrNull() as NativeTerminalException
+                    assertEquals(diagnostic.text, repeated.terminalProtocolDiagnostic!!.text)
+                }
+            }
+        }
+    }
+
+    @Test
     fun unsupportedOutputExposesExactRedactedDiagnosticThroughJni() {
         NativeTerminalHandle.create(JniNativeBridge, TerminalSize(80, 24), initialNextSourceSequence = 1).use { terminal ->
             terminal.feedWithHostEffectsV2(1, "ok\u001b[?".encodeToByteArray())

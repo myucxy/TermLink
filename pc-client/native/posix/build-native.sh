@@ -13,7 +13,7 @@ case "$(uname -s)" in
       -o "$output_dir/libtermlink-pty.so"
     ;;
   Darwin)
-    cc -std=c11 -O2 -fPIC -fstack-protector-strong \
+    cc -std=c11 -O2 -fPIC -fstack-protector-strong -mmacosx-version-min=13.0 \
       -Wall -Wextra -Werror -dynamiclib \
       "$source_dir/termlink_pty.c" -o "$output_dir/libtermlink-pty.dylib"
     ;;

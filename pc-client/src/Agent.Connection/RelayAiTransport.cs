@@ -15,8 +15,8 @@ public sealed partial class RelayConnectionService
     private void RetireAiHost()
     {
         var retired = aiHost;
-        aiHost = null;
         retired?.Dispose();
+        if (ReferenceEquals(aiHost, retired)) aiHost = null;
     }
 
     private sealed record AiRecipient(Guid Id, byte[] ExchangeKey, long Epoch, string Permission);
@@ -56,7 +56,8 @@ public sealed partial class RelayConnectionService
         var jobs = new List<Task>();
         var host = aiHost!;
         var recipients = await ReadAiRecipientsAsync(current, device, cancellation).ConfigureAwait(false);
-        var authorityFingerprint = Fingerprint(recipients);
+        var authorityGate = new object();
+        var authorityActive = 1;
         string? probe = null;
         TaskCompletionSource? pong = null;
         await using var terminal = terminalHost is null ? null : new TerminalPlane(this, current, device, terminalHost, SendAsync, cancellation);
@@ -70,13 +71,7 @@ public sealed partial class RelayConnectionService
                 await SendAsync(JsonSerializer.SerializeToUtf8Bytes(new { type = "ping", probe_id = probe }), WebSocketMessageType.Text).ConfigureAwait(false);
                 await pong.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellation).ConfigureAwait(false);
                 var updated = await ReadAiRecipientsAsync(current, device, cancellation).ConfigureAwait(false);
-                if (Fingerprint(updated) != authorityFingerprint) {
-                    // Revocation, grant or epoch changes retire the whole local AI
-                    // owner, including pending tools; no accepted work keeps old authority.
-                    CancelFileWorker();
-                    RetireAiHost();
-                    throw new RelayOperationException("AI_AUTHORITY_CHANGED");
-                }
+                if (!AcceptAuthority(updated)) throw new RelayOperationException("AI_AUTHORITY_CHANGED");
                 using var response = await this.SendAsync(current, device, HttpMethod.Get, "/v1/devices", [], true, cancellation).ConfigureAwait(false);
                 RelayHttp.RequireSuccess(response);
                 using var json = await RelayHttp.ReadJsonAsync(response, cancellation).ConfigureAwait(false);
@@ -97,16 +92,40 @@ public sealed partial class RelayConnectionService
                 }
             }
         } finally {
+            Volatile.Write(ref authorityActive, 0);
             lifetime.Cancel();
             try { await terminalPump.ConfigureAwait(false); } catch (Exception) when (cancellation.IsCancellationRequested) { }
             try { await receive.ConfigureAwait(false); } catch (Exception) when (cancellation.IsCancellationRequested) { }
             try { await Task.WhenAll(jobs).ConfigureAwait(false); } catch (Exception) when (cancellation.IsCancellationRequested) { }
         }
 
+        bool AcceptAuthority(Dictionary<Guid, AiRecipient> fresh)
+        {
+            lock (authorityGate) {
+                if (authorityActive == 0) return false;
+                // New recipients cannot invalidate existing work. Any changed or
+                // removed mapping permanently fences this socket before retirement.
+                if (recipients.All(pair => fresh.TryGetValue(pair.Key, out var next) &&
+                    next.Id == pair.Value.Id && next.Epoch == pair.Value.Epoch && next.Permission == pair.Value.Permission &&
+                    CryptographicOperations.FixedTimeEquals(next.ExchangeKey, pair.Value.ExchangeKey))) {
+                    recipients = fresh;
+                    return true;
+                }
+                Volatile.Write(ref authorityActive, 0);
+            }
+            lifetime.Cancel();
+            CancelFileWorker();
+            RetireAiHost();
+            return false;
+        }
+
         async Task SendAsync(byte[] bytes, WebSocketMessageType type)
         {
             await sendGate.WaitAsync(cancellation).ConfigureAwait(false);
-            try { await socket.SendAsync(bytes, type, true, cancellation).ConfigureAwait(false); }
+            try {
+                if (Volatile.Read(ref authorityActive) == 0) throw new RelayOperationException("AI_AUTHORITY_CHANGED");
+                await socket.SendAsync(bytes, type, true, cancellation).ConfigureAwait(false);
+            }
             finally { sendGate.Release(); }
         }
 
@@ -162,7 +181,7 @@ public sealed partial class RelayConnectionService
                     GuidOf(envelope.SessionId) != current.Identity.PcId || GuidOf(envelope.RecipientDeviceId) != current.Identity.DeviceId) return;
                 var sender = GuidOf(envelope.SenderDeviceId);
                 var authorized = await ReadAiRecipientsAsync(current, device, cancellation).ConfigureAwait(false);
-                if (Fingerprint(authorized) != authorityFingerprint) { CancelFileWorker(); RetireAiHost(); lifetime.Cancel(); return; }
+                if (!AcceptAuthority(authorized)) return;
                 if (!authorized.TryGetValue(sender, out var recipient) || recipient.Permission != "MANAGE") return;
                 var keyId = Encoding.UTF8.GetBytes("epoch-" + recipient.Epoch.ToString("D8", CultureInfo.InvariantCulture));
                 if (!CryptographicOperations.FixedTimeEquals(keyId, envelope.KeyId.Span)) return;
@@ -177,11 +196,11 @@ public sealed partial class RelayConnectionService
                     if (!selected.Wait(0)) return;
                     requestSlot = selected;
                 }
-                bool StillAuthorized() => !cancellation.IsCancellationRequested && ReferenceEquals(host, aiHost) && account?.RemoteAccessEnabled == true;
+                bool StillAuthorized() => Volatile.Read(ref authorityActive) != 0 && !cancellation.IsCancellationRequested && ReferenceEquals(host, aiHost) && account?.RemoteAccessEnabled == true;
                 var response = await host!.ExecuteAsync(sender, request.Json, cancellation, StillAuthorized).ConfigureAwait(false);
                 if (!StillAuthorized()) return;
                 authorized = await ReadAiRecipientsAsync(current, device, cancellation).ConfigureAwait(false);
-                if (Fingerprint(authorized) != authorityFingerprint) { CancelFileWorker(); RetireAiHost(); lifetime.Cancel(); return; }
+                if (!AcceptAuthority(authorized)) return;
                 var payload = new AiAgentResponsePayload { RequestId = request.RequestId, Json = response }.ToByteArray();
                 if (payload.Length > 900 * 1024) return;
                 var reply = new Envelope {
@@ -208,6 +227,4 @@ public sealed partial class RelayConnectionService
     }
 
     private static Guid GuidOf(ByteString value) => new(Convert.ToHexString(value.Span));
-    private static string Fingerprint(Dictionary<Guid, AiRecipient> recipients) => string.Join("|", recipients.OrderBy(p => p.Key)
-        .Select(p => p.Key.ToString("D") + ":" + p.Value.Epoch + ":" + p.Value.Permission + ":" + Convert.ToBase64String(p.Value.ExchangeKey)));
 }

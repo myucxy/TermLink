@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "repository": "git@github.com:myucxy/terminal-core.git",
-  "revision": "f51936441dea83fa2f9459386fb6c35b90102979",
+  "revision": "0d5b8d9fbdfc9c6cbb21588b729eefa916d9d221",
   "source_dirty": false,
   "source_method": "git_archive_HEAD",
   "rust_toolchain": "1.97.1",
@@ -13,8 +13,8 @@
   "libraries": [
     {
       "path": "native/terminal-core/macos/osx-arm64/libtermlink_terminal_ffi.dylib",
-      "size": 2058688,
-      "sha256": "82a561b12bf28293cbb5b3835d531000b55ae48e5138765412f4a46fa83ea7b0",
+      "size": 2058704,
+      "sha256": "a8ceb82779a888c6af8b74fc925b81578ea46cabd2003a85b33125e99634235b",
       "platform": "macos",
       "architecture": "arm64",
       "rid": "osx-arm64",
@@ -24,6 +24,20 @@
       "minimum_os": "13.0",
       "signing": "ad_hoc_local_only",
       "smoke_executed": true
+    },
+    {
+      "path": "native/terminal-core/macos/osx-x64/libtermlink_terminal_ffi.dylib",
+      "size": 2221504,
+      "sha256": "43b3452ec937fbe46285ca79023449ef81fe128fdd3dfd3e7259f050f68b0e1a",
+      "platform": "macos",
+      "architecture": "x64",
+      "rid": "osx-x64",
+      "target": "x86_64-apple-darwin",
+      "crate_version": "0.1.0-rc.1",
+      "abi_version": 1,
+      "minimum_os": "13.0",
+      "signing": "ad_hoc_local_only",
+      "smoke_executed": false
     }
   ],
   "artifacts": [
@@ -209,13 +223,20 @@
     },
     {
       "path": "native/terminal-core/macos/osx-arm64/libtermlink_terminal_ffi.dylib",
-      "size": 2058688,
-      "sha256": "82a561b12bf28293cbb5b3835d531000b55ae48e5138765412f4a46fa83ea7b0"
+      "size": 2058704,
+      "sha256": "a8ceb82779a888c6af8b74fc925b81578ea46cabd2003a85b33125e99634235b"
+    },
+    {
+      "path": "native/terminal-core/macos/osx-x64/libtermlink_terminal_ffi.dylib",
+      "size": 2221504,
+      "sha256": "43b3452ec937fbe46285ca79023449ef81fe128fdd3dfd3e7259f050f68b0e1a"
     }
   ],
   "provenance": {
-    "export_lock_sha256": "d6b04565706ecfa44f28241fcadcc48fb04d2c9d8d846de5237b6df8a8466a89",
-    "source_archive_sha256": "f0a42a1cc32f8e7db16c2795920a20b4d26282a863a5942810ca852afa3d5a7c",
-    "build_info_sha256": "42708608ef93213189e7fd7fd1ad2cd96f7e022caebde7e3710d30d4663cc555"
+    "export_lock_sha256": "dc204533ffb4029984c47b6b47d0652f82d237c028f7653688765729f72af122",
+    "source_archive_sha256": "2353adf19aafacb52e06feaad518121f08be3e1438407a72a152a6d0a9fc0ca2",
+    "build_info_sha256": "12a439e4ac7c5bff42a3c7ef25c687e8570d18ae21f3d880121f1e5a3414507a",
+    "driver_sha256": "dc2736cb31bfd2924cfd786810470be36356be96f79a0f1e725c6668cb8445c2",
+    "import_scope": "precompiled libraries and licenses only; source headers remain in core export"
   }
 }

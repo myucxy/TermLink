@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="terminal_protocol_mirror_context">来源：安卓终端镜像。此镜像已停止应用输出；这不代表 Windows 进程或网络连接已结束。detected_at 是检测位置，不一定是首个无效参数的位置。</string>
-    <string name="terminal_protocol_host_context">来源：Windows 终端主机。Windows 端已因终端协议错误结束会话；detected_at 是检测位置，不一定是首个无效参数的位置。</string>
+    <string name="terminal_protocol_mirror_context">来源：安卓终端镜像。此镜像已停止应用输出；这不代表电脑端进程或网络连接已结束。detected_at 是检测位置，不一定是首个无效参数的位置。</string>
+    <string name="terminal_protocol_host_context">来源：电脑终端主机。电脑端已因终端协议错误停止应用输出；这不代表电脑端进程或网络连接已结束。detected_at 是检测位置，不一定是首个无效参数的位置。</string>
     <string name="ai_directory_return">返回对话</string>
     <string name="ai_directory_pc_unavailable">电脑暂不可用，请恢复连接后重试。</string>
     <string name="ai_directory_upgrade">请升级 Windows 客户端以浏览文件。</string>

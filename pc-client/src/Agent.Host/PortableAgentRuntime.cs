@@ -205,7 +205,8 @@ public sealed class PortableAgentRuntime : ILocalAgentCommandHandler, IAsyncDisp
             JsonException or CryptographicException or InvalidOperationException or KeyNotFoundException)
         {
             // Never return credential-bearing HTTP bodies or callback URLs.
-            return LocalAgentCommandResult.Reject("ACCOUNT_CONNECTION_FAILED");
+            return LocalAgentCommandResult.Reject(command == LocalAgentCommand.Shutdown
+                ? "PC_AGENT_CLEANUP_INCOMPLETE" : "ACCOUNT_CONNECTION_FAILED");
         }
     }
 

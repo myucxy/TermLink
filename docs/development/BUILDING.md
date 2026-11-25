@@ -140,6 +140,29 @@ $env:TERMLINK_LLVM_READELF = Join-Path $env:ANDROID_SDK_ROOT 'ndk/27.0.12077973/
 
 Android 的 Cargo 配置应指向实际 1.97.1 工具链；CMake 会从同目录定位 `rustc.exe`，与上面 Windows 脚本需要的 rustup 入口有所区别。SDK 平台、Build Tools、NDK 需已安装且许可证已接受；不要提交 `local.properties` 或机器凭据。
 
+macOS 构建也使用同一固定版本。2026-11-14 已实际执行完整 `:app:assembleDebug`
+（未排除任务），CMake 会按宿主选择工具后缀。为当前构建进程显式提供
+`TERMLINK_CMAKE`、`TERMLINK_NINJA`、`TERMLINK_CARGO`、`CARGO_HOME`、
+`ANDROID_SDK_ROOT` 和 NDK 的无后缀 `llvm-readelf`，不会使用 Windows 默认路径：
+
+```sh
+# 从 android/ 目录运行；dev_version/dev_build 使用已核验的本平台 DEV 基线。
+env JAVA_HOME=/absolute/jdk \
+  ANDROID_SDK_ROOT=/absolute/android-sdk \
+  TERMLINK_CMAKE=/absolute/bin/cmake \
+  TERMLINK_NINJA=/absolute/bin/ninja \
+  TERMLINK_CARGO=/absolute/rust-1.97.1/toolchain/bin/cargo \
+  CARGO_HOME=/absolute/rust-1.97.1/cargo-home \
+  CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=3 \
+  TERMLINK_LLVM_READELF=/absolute/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf \
+  bash ./gradlew :app:assembleDebug --offline --no-daemon \
+    -PtermlinkVersionName="$dev_version" -PtermlinkVersionCode="$dev_build"
+```
+
+首次离线构建前需按原锁准备 network-core 的 Cargo 缓存。构建网络模块不表示
+开启 Direct；当前 CLI/AI 验收仍为 Relay Only。宿主工具选择检查为
+`python3 scripts/test_android_direct_cmake.py`。
+
 预编译终端库覆盖四个 ABI；应用内 network-core 的 Rust 构建仍需要以下目标：`aarch64-linux-android`、`armv7-linux-androideabi`、`i686-linux-android`、`x86_64-linux-android`。缺少目标会导致网络 JNI 构建失败；仅准备模拟器 x86_64 并不足以完成默认全 ABI 构建。
 
 AI Web 资源准备好后，在仓库根目录执行：

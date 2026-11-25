@@ -433,6 +433,14 @@ public static class Program
         var originalUiCulture = CultureInfo.CurrentUICulture;
         try
         {
+            foreach (var culture in new[] { "zh-CN", "en-US" })
+            {
+                CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo(culture);
+                await viewModel.ReportFailureAsync(new AgentClientOperationException("PC_AGENT_CLEANUP_INCOMPLETE"));
+                Require(viewModel.NoticeCode == "PC_AGENT_CLEANUP_INCOMPLETE" &&
+                        viewModel.NoticeDetail == PresentationText.AgentCleanupIncompleteDetail,
+                    "Cleanup failure was shown as an unrelated account error.");
+            }
             CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("zh-CN");
             await viewModel.ReportFailureAsync(new AgentClientOperationException(
                 "PC_AGENT_EXITED",

@@ -505,6 +505,13 @@ a live VT parser.
 zero. An absent field means that an older sender did not publish the result; a
 receiver must not reinterpret that unknown value as a successful exit.
 
+A portable host whose terminal authority failed closed can send a recipient-sealed
+`SESSION_ENDED` with lifecycle `INTERRUPTED`, the existing bounded
+`terminal_protocol_diagnostic`, and no `exit_code` when the actual Shell result is
+unknown. Receivers must not invent 125 or zero for that absence. Diagnostic content
+stays out of event-history objects and generic telemetry; it is evidence of a
+terminal failure, not evidence that all host processes or network links ended.
+
 `SESSION_TERMINATE_REQUEST` is a distinct Android-to-PC MANAGE operation. Its
 encrypted payload carries a 16-byte request ID and the fixed reason
 `USER_REQUESTED`. The Relay authorizes and routes the opaque frame but cannot

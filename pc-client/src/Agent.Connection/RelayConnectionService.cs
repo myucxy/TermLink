@@ -43,6 +43,7 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
     private CancellationTokenSource? authorizationCancellation;
     private long generation;
     private int disposed;
+    private bool cleanupComplete;
     private readonly Func<string, IRelayAiHost>? aiHostFactory;
     private IRelayAiHost? aiHost;
 
@@ -348,11 +349,18 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
     {
         if (stopFiles) CancelFileWorker();
         workerCancellation?.Cancel();
-        if (worker is not null) await worker.ConfigureAwait(false);
-        workerCancellation?.Dispose();
-        workerCancellation = null;
-        worker = null;
-        if (stopFiles) await StopFileWorkerAsync().ConfigureAwait(false);
+        try { if (worker is not null) await worker.ConfigureAwait(false); }
+        finally
+        {
+            // Await has observed completion even when the worker faulted.
+            if (worker is null || worker.IsCompleted)
+            {
+                workerCancellation?.Dispose();
+                workerCancellation = null;
+                worker = null;
+            }
+            if (stopFiles) await StopFileWorkerAsync().ConfigureAwait(false);
+        }
     }
 
     private async Task RunAsync(CancellationToken token)
@@ -599,13 +607,22 @@ public sealed partial class RelayConnectionService : IAsyncDisposable
         await operations.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-            CancelAuthorization();
-            await StopWorkerAsync().ConfigureAwait(false);
-            RetireAiHost();
-            await RetireTerminalHostAsync().ConfigureAwait(false);
-            await RetireFileHostAsync().ConfigureAwait(false);
-            if (ownsHttp) http.Dispose();
+            if (cleanupComplete) return;
+            Volatile.Write(ref disposed, 1);
+            var failures = new List<Exception>();
+            try { CancelAuthorization(); } catch (Exception error) { failures.Add(error); }
+            try { await StopWorkerAsync().ConfigureAwait(false); } catch (Exception error) { failures.Add(error); }
+            // Owners cannot be retired while background work can still use them.
+            if (worker is null && fileWorker is null)
+            {
+                try { RetireAiHost(); } catch (Exception error) { failures.Add(error); }
+                try { await RetireTerminalHostAsync().ConfigureAwait(false); } catch (Exception error) { failures.Add(error); }
+                try { await RetireFileHostAsync().ConfigureAwait(false); } catch (Exception error) { failures.Add(error); }
+                try { if (ownsHttp) http.Dispose(); } catch (Exception error) { failures.Add(error); }
+            }
+            else failures.Add(new IOException("PC_AGENT_WORKERS_STILL_RUNNING"));
+            if (failures.Count > 0) throw new IOException("PC_AGENT_CLEANUP_INCOMPLETE", new AggregateException(failures));
+            cleanupComplete = true;
         }
         finally { operations.Release(); }
     }

@@ -306,6 +306,9 @@ public static class PresentationText
     public static string AgentProcessesStillRunningDetail => Pick(
         "部分 Agent 或命令行会话仍在运行，请稍后重试完全退出。",
         "Some Agent or command-line session processes are still running. Try the full exit again shortly.");
+    public static string AgentCleanupIncompleteDetail => Pick(
+        "部分后台资源尚未完成清理，请稍后重试完全退出。",
+        "Some background resources have not finished cleaning up. Try the full exit again shortly.");
     public static string RemoteAccessUpdated => Pick("远程访问设置已更新。", "Remote access was updated.");
     public static string RetryRequested => Pick("已请求立即重连。", "An immediate reconnect was requested.");
 

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using TermLink.Agent;
 using TermLink.Ai;
 
@@ -6,6 +7,12 @@ internal static class AcpValidation
 {
     private static JsonElement Snap(AiAgentSession s, Guid caller) => JsonSerializer.SerializeToElement(s.Snapshot(caller, true), AiSessionManager.Json);
     private static void Check(bool condition, string message) { if (!condition) throw new Exception("ACP: " + message); }
+    private static bool SameMessageText(string expected, string actual)
+    {
+        if (string.Equals(expected, actual, StringComparison.Ordinal)) return true;
+        try { return JsonNode.DeepEquals(JsonNode.Parse(expected), JsonNode.Parse(actual)); }
+        catch (JsonException) { return false; }
+    }
     private static async Task Wait(Func<bool> condition) {
         for (var i = 0; i < 100 && !condition(); i++) await Task.Delay(30);
         Check(condition(), "condition timed out");
@@ -51,6 +58,8 @@ internal static class AcpValidation
         Check(Snap(s, caller).GetProperty("reasoningEffort").GetString() == "minimal", "model changes effort list");
         await Reject(() => s.ApplyAsync(caller, Configure(Snap(s, caller), model: "rejected-model")), "AGENT_REQUEST_REJECTED");
         Check(Snap(s, caller).GetProperty("modelId").GetString() == "model-b", "rejected config must not apply locally");
+        await Reject(() => s.ApplyAsync(caller, Configure(Snap(s, caller), model: "invalid-params")), "AGENT_INVALID_PARAMS");
+        Check(Snap(s, caller).GetProperty("modelId").GetString() == "model-b", "invalid params config must not apply locally");
         await Send(s, caller, "stream");
         await Wait(() => Snap(s, caller).GetProperty("state").GetString() == "idle");
         var messages = Snap(s, caller).GetProperty("messages").EnumerateArray().ToArray();
@@ -111,8 +120,12 @@ internal static class AcpValidation
         await Send(restored, caller, "stream");
         await Wait(() => Snap(restored, caller).GetProperty("state").GetString() == "idle");
         Check(Snap(restored, caller).GetProperty("messages").GetArrayLength() > record.Messages.Length, "resumed conversation accepts a new turn");
-        foreach (var message in record.Messages) Check(Snap(restored, caller).GetProperty("messages").EnumerateArray().Any(m =>
-            m.GetProperty("id").GetString() == message.Id && m.GetProperty("text").GetString() == message.Text), "resumed request IDs must not overwrite archive");
+        var resumedMessages = Snap(restored, caller).GetProperty("messages").EnumerateArray().ToArray();
+        foreach (var message in record.Messages) Check(resumedMessages.Any(m =>
+            m.GetProperty("id").GetString() == message.Id &&
+            m.GetProperty("role").GetString() == message.Role &&
+            (message.Role == "tool" ? SameMessageText(m.GetProperty("text").GetString(), message.Text) :
+                string.Equals(m.GetProperty("text").GetString(), message.Text, StringComparison.Ordinal))), "resumed request IDs must not overwrite archive");
         using (var privileged = new AiAgentSession(agent, directory, caller, mode: "full-access")) {
             await privileged.StartAsync();
             Check(Snap(privileged, caller).GetProperty("permissionMode").GetString() == "full-access", "explicit create grant retained");
@@ -185,7 +198,8 @@ internal static class AcpValidation
                     Check(AiAgentSession.S(p, "sessionId") == sessionId, "configuration session");
                     Check(AiAgentSession.P(p, "value").ValueKind == JsonValueKind.String, "config option value must be a scalar string (native Grok 1.0.46)");
                     var value = AiAgentSession.S(p, "value");
-                    if (value == "rejected-model") { Emit(new { jsonrpc = "2.0", id, error = new { code = -32602, message = "unknown model" } }); break; }
+                    if (value == "rejected-model") { Emit(new { jsonrpc = "2.0", id, error = new { code = -32000, message = "unknown model" } }); break; }
+                    if (value == "invalid-params") { Emit(new { jsonrpc = "2.0", id, error = new { code = -32602, message = "invalid model parameters" } }); break; }
                     if (value == "bad-ack") { Reply(id, new { }); break; }
                     if (AiAgentSession.S(p, "configId") == "model") { model = value; effort = model == "model-a" ? "high" : "minimal"; } else effort = value;
                     Reply(id, Config()); break;

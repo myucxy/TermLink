@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="terminal_protocol_mirror_context">Source: Android terminal mirror. This mirror stopped applying output; this does not establish that the Windows process or network connection ended. detected_at identifies detection, not necessarily the first invalid parameter.</string>
-    <string name="terminal_protocol_host_context">Source: Windows terminal host. Windows ended the session after a terminal protocol failure; detected_at identifies detection, not necessarily the first invalid parameter.</string>
+    <string name="terminal_protocol_mirror_context">Source: Android terminal mirror. This mirror stopped applying output; this does not establish that the computer process or network connection ended. detected_at identifies detection, not necessarily the first invalid parameter.</string>
+    <string name="terminal_protocol_host_context">Source: computer terminal host. The host stopped applying output after a terminal protocol failure; this does not establish that the computer process or network connection ended. detected_at identifies detection, not necessarily the first invalid parameter.</string>
     <string name="ai_directory_return">Back to chat</string>
     <string name="ai_directory_pc_unavailable">The computer is unavailable. Reconnect and try again.</string>
     <string name="ai_directory_upgrade">Update the Windows client to browse files.</string>

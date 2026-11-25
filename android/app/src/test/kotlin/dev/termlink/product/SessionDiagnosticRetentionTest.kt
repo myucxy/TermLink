@@ -64,6 +64,21 @@ class SessionDiagnosticRetentionTest {
     }
 
     @Test
+    fun portableInterruptedHostEvidenceIsRetainedWithoutASyntheticShellExitCode() {
+        val id = UUID.randomUUID()
+        val diagnostic = requireNotNull(TerminalProtocolDiagnostic.forHostExit(null, hostDiagnostic.text, "INTERRUPTED"))
+        val snapshot = ProductSnapshot(
+            sessions = listOf(session(id, SessionState.INTERRUPTED, online = false)),
+            sessionOpenFailures = mapOf(id to SessionOpenFailure(
+                SessionOpenFailureCode.UNSUPPORTED_TERMINAL_CAPABILITY, protocolDiagnostic = diagnostic,
+            )),
+        )
+        assertEquals(setOf(id), retainedProtocolDiagnosticSessionIds(snapshot, listOf(id.toString())))
+        assertEquals(hostDiagnostic.text, snapshot.sessionOpenFailures.getValue(id).protocolDiagnostic?.text)
+        assertTrue(!shouldAutoReopenSession(SessionState.INTERRUPTED, hasEngine = false, hasProtocolDiagnostic = true))
+    }
+
+    @Test
     fun anEndedSessionWithoutProtocolEvidenceIsNotRetainedForAnErrorCard() {
         val sessionId = UUID.randomUUID()
         val snapshot = ProductSnapshot(
