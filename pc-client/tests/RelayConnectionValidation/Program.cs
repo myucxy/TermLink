@@ -769,7 +769,10 @@ internal sealed class RelayFixture : IAsyncDisposable
             context.Response.Close();
         }
         catch (Exception error) when (error is WebSocketException or OperationCanceledException or HttpListenerException or IOException or ObjectDisposedException)
-        { context.Response.Abort(); }
+        {
+            try { context.Response.Abort(); }
+            catch (ObjectDisposedException) when (shutdown.IsCancellationRequested) { }
+        }
     }
 
     private bool ValidateProof(HttpListenerRequest request, byte[] body, Device device)
