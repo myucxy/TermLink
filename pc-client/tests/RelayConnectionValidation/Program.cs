@@ -621,7 +621,7 @@ internal sealed class RelayFixture : IAsyncDisposable
         });
     }
 
-    public string TokenFor(string subject) => tokens.GetOrAdd(subject, key => "eyJhbGciOiJub25lIn0." + RelaySecurity.Base64Url(JsonSerializer.SerializeToUtf8Bytes(new
+    public string TokenFor(string subject) => tokens.GetOrAdd(subject, key => RelaySecurity.Base64Url("""{"alg":"none"}"""u8) + "." + RelaySecurity.Base64Url(JsonSerializer.SerializeToUtf8Bytes(new
     { iss = Issuer, azp = "desktop", sub = subject, preferred_username = "user-" + subject, name = "User " + subject,
         exp = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds() })) + ".fixture-signature");
 
