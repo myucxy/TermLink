@@ -28,7 +28,10 @@ jobs:
       - name: Check Android icons for every discovered AI Agent
         run: python scripts/check_ai_agent_icons.py --self-test
       - name: Check GitHub release trust boundaries
-        run: python scripts/test_github_release.py
+        run: |
+          python scripts/test_github_release.py
+          python scripts/test_github_server_release.py
+          bash server/release/test-tag-build.sh
       - name: Install checksum-pinned Gitleaks
         shell: bash
         run: |

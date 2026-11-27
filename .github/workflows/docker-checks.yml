@@ -56,55 +56,8 @@ jobs:
           assert labels['org.opencontainers.image.source'] == 'https://github.com/myucxy/TermLink'
           assert labels['org.opencontainers.image.licenses'] == 'GPL-3.0-only'
           PY
-          docker create --name termlink-ci-files termlink-ci:smoke
-          docker cp termlink-ci-files:/LICENSE "$RUNNER_TEMP/image-LICENSE"
-          docker cp termlink-ci-files:/NOTICE "$RUNNER_TEMP/image-NOTICE"
-          docker cp termlink-ci-files:/licenses/THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/image-third-party.txt"
-          cmp LICENSE "$RUNNER_TEMP/image-LICENSE"
-          cmp NOTICE "$RUNNER_TEMP/image-NOTICE"
-          cmp server/licenses/THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/image-third-party.txt"
       - name: Start isolated PostgreSQL and verify real readiness, OIDC and restart
-        shell: bash
-        run: |
-          set -euo pipefail
-          admin_password=$(openssl rand -hex 24)
-          signing_key=$(openssl rand -hex 32)
-          echo "::add-mask::$admin_password"
-          echo "::add-mask::$signing_key"
-          docker network create termlink-image-ci
-          # No database host port; trust is limited to this disposable CI network.
-          docker run -d --name termlink-ci-postgres --network termlink-image-ci --network-alias postgres \
-            -e POSTGRES_DB=termlink -e POSTGRES_USER=termlink -e POSTGRES_HOST_AUTH_METHOD=trust \
-            postgres:17.5-alpine3.22@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
-          for attempt in $(seq 1 60); do
-            # TCP excludes the socket-only temporary server used during first-time initialization.
-            if docker exec termlink-ci-postgres pg_isready -h 127.0.0.1 -U termlink -d termlink; then break; fi
-            sleep 1
-          done
-          docker exec termlink-ci-postgres pg_isready -h 127.0.0.1 -U termlink -d termlink
-          docker run -d --name termlink-ci-server --network termlink-image-ci -p 127.0.0.1:18080:8080 \
-            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --cap-drop ALL --security-opt no-new-privileges:true \
-            -e TERMLINK_RUNTIME_MODE=single-node -e TERMLINK_IDENTITY_PROVIDER=embedded \
-            -e TERMLINK_PUBLIC_URL=https://termlink.example.test \
-            -e 'TERMLINK_DATABASE_URL=postgres://termlink@postgres:5432/termlink?sslmode=disable' \
-            -e "TERMLINK_INITIAL_ADMIN_PASSWORD=$admin_password" -e "TERMLINK_TOKEN_SIGNING_KEY=$signing_key" \
-            -e TERMLINK_DIRECT_TRANSPORT_ENABLED=false -e TERMLINK_DIRECT_ROUTING_PERMITTED=false \
-            -e TERMLINK_LOG_FAILURE_REASON=true termlink-ci:smoke
-          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-all-errors --retry-delay 1 --max-time 5 \
-            http://127.0.0.1:18080/readyz > "$RUNNER_TEMP/readiness.json"
-          docker exec termlink-ci-server /termlink-server healthcheck
-          curl --fail --silent --show-error --max-time 10 \
-            http://127.0.0.1:18080/realms/termlink/.well-known/openid-configuration > "$RUNNER_TEMP/oidc.json"
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP'])
-          assert json.loads((root/'readiness.json').read_text())['status'] == 'ready'
-          assert json.loads((root/'oidc.json').read_text())['issuer'] == 'https://termlink.example.test/realms/termlink'
-          PY
-          docker restart termlink-ci-server
-          curl --fail --silent --show-error --retry 60 --retry-connrefused --retry-all-errors --retry-delay 1 --max-time 5 http://127.0.0.1:18080/readyz
-          docker exec termlink-ci-server /termlink-server healthcheck
+        run: bash server/release/smoke-image.sh termlink-ci:smoke
       - name: Failure diagnostics
         if: failure()
         shell: bash
@@ -115,5 +68,5 @@ jobs:
         if: always()
         shell: bash
         run: |
-          docker rm -f termlink-ci-files termlink-ci-server termlink-ci-postgres || true
+          docker rm -f termlink-ci-server termlink-ci-postgres || true
           docker network rm termlink-image-ci || true

@@ -3,15 +3,21 @@
 本文用于每次 TermLink 正式版本的现场发布、故障恢复和最终复核。构建与签名门禁仍以
 [统一发布构建](RELEASE.md)为准；本文补充执行顺序和已经验证过的运行环境陷阱。
 
-## 当前 Docker 发布入口（2026-10-04）
+## Server 标签发布与 Docker Hub 交接
 
-正式 Docker 镜像本机编译后直接 push 到 `docker.io/myucxy/termlink`，不使用 GitHub Actions 发布。
-2026-10-18 新增的 Docker CI 仅构建和验证不发布的 DEV 镜像，覆盖双架构 OCI、amd64 就绪与重启，不推进正式版本。
-旧 Docker 发布工作流已从当前树移除。GitHub 客户端 Release 使用独立的[校验发布管道](development/GITHUB_RELEASE.md)，不构建或发布 Docker。
-本机发布仍固定已提交 revision 和版本/build，保留 BuildKit provenance/SBOM，逐项检查 amd64/arm64、
-版本镜像 digest、源码标签和健康；版本镜像核验后再同步同 digest 的 latest。凭据使用现有 Docker credential helper。
-本机没有 GitHub OIDC 身份，不能声称本地镜像通过 GitHub keyless 签名；本地签名资料未就绪时先完成
-候选构建和验证，记录签名门禁未完成，不静默降级发布结论。
+维护者先按本文版本规则核对并固定 version、build 与已通过 Repository checks 的 `main` 提交。创建附注标签 `server-vX.Y.Z`，注释首段只写 `build=N`（1–65535）。以下以 PowerShell 为例，变量取本轮已核验值。
+
+```powershell
+$tag = "server-v$version"
+git tag -a $tag $revision -m "build=$build"
+git push origin "refs/tags/$tag"
+```
+
+`Server OCI release` 在独立 Linux runner 上编译一次，验证两个架构和 BuildKit 证明，从归档导入 amd64 镜像运行数据库、OIDC、就绪和重启测试。GitHub 在同名 Release 发布 OCI tar、对应源码包、`server-release.json` 和 `SHA256SUMS`；服务器签名状态为待本地签名。工作流的 **Run workflow** 可以在没有远端标签的情况下演练构建，附件留在该次 Actions 运行。客户端 `vX.Y.Z` 继续使用独立的发布管道。
+
+下载整组附件后用 `sha256sum -c SHA256SUMS` 检查文件，核对清单中的提交、版本和 OCI index digest；本机使用既有 Cosign 密钥签署归档，按第 6 节把原归档推到 Docker Hub 构建号标签并签署精确 digest。分别核验两个架构及证明，再推进版本别名和 `latest`。GitHub 工作流仅使用该仓库的 `GITHUB_TOKEN`，Docker Hub 账户与签名材料保留在发布机。
+
+若发布中断，优先对原运行使用 **Re-run failed jobs**，发布任务按原构建的 Actions 附件 ID 恢复。保留草稿及已上传的字节；同名不同哈希时，使用原制品核对，禁止覆盖附件或移动标签。
 
 ## 当前传输验收范围（2026-10-04）
 
@@ -101,8 +107,7 @@ core 仓库后续公开与本次许可变更分开执行。匹配的源码交付
    `release/Verify-LocalRelease.ps1` 验证 manifest、哈希、版本、证书连续性和 Windows RFC 3161 时间戳。
    Production MSIX 尚不支持；`Build-Release.ps1 -ServerImage` 只产生本地 OCI tar，不是 Docker Hub 发布命令。
 5. **发布并验证**：AppShip 的 Android/Windows 通过 `scripts/Publish-AppShipProduction.ps1` 顺序发布；每端必须有
-   已人工审核的签名、`published` release 和 `ready` artifact。Docker 本机编译、直接 push Hub，
-   不走 GitHub Actions，不创建 GitHub Release/GHCR 镜像。核对 amd64/arm64、OCI index digest、
+   已人工审核的签名、`published` release 和 `ready` artifact。Server 标签先发布 OCI 归档到 GitHub Release，本机验包签名后推送 Docker Hub。核对 amd64/arm64、OCI index digest、
    revision、签名及 provenance/SBOM；通过后将同一 digest 同步到 `latest`。签名未验证需明确记录和处理，
    不把本机 BuildKit attestation 当成已有 GitHub keyless 签名。失败时保留原 AppShip 状态/版本镜像 tag，恢复同一操作。
    若本轮指定 GitHub Release，改用[GitHub 管道](development/GITHUB_RELEASE.md)发布同批正式签名客户端和完整对应源码；
@@ -356,7 +361,7 @@ GET /api/v1/apps/termlink-win64/updates?platform=windows&arch=x64&channel=stable
 
 ## 6. Docker Hub 本机发布与标签核验
 
-按页首规则从已提交源码本机构建并推送 `docker.io/myucxy/termlink`，固定 amd64/arm64、
+按页首规则，从同一标签的已验证 OCI 归档推送 `docker.io/myucxy/termlink`，固定 amd64/arm64、
 版本/build 和 OCI revision，保留 BuildKit provenance 与 SBOM。使用现有 Cosign 密钥对精确
 digest 签名，并用发布公钥独立验证；[0.3.5 记录](RELEASE_0.3.5_135.md)提供已使用的公钥与证据。
 其他证明是否生成、是否签名需分别记录，不能由镜像签名推断全部证明已签名。

@@ -1,0 +1,119 @@
+name: Server OCI release
+
+on:
+  push:
+    tags: ['server-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Test package version (no release is published)'
+        required: true
+        default: '0.3.18'
+      build:
+        description: 'Test package build number'
+        required: true
+        default: '148'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.event_name == 'workflow_dispatch' || (github.event.created && !github.event.deleted && !github.event.forced)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      revision: ${{ steps.identity.outputs.revision }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve tag and source revision
+        id: identity
+        env:
+          TEST_VERSION: ${{ inputs.version }}
+          TEST_BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          rev=$(git rev-parse HEAD)
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            # Use the same tag parser for a read-only rehearsal in the runner checkout.
+            [[ "$TEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$TEST_BUILD" =~ ^[1-9][0-9]{0,4}$ ]]
+            tag="server-v$TEST_VERSION"
+            if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+              git -c user.name=CI -c user.email=ci@example.invalid tag -a "$tag" -m "build=$TEST_BUILD" "$rev"
+            fi
+            identity=$(bash server/release/tag-build.sh "$tag" "$rev")
+            grep -Fxq "build=$TEST_BUILD" <<< "$identity"
+          else
+            tag="$GITHUB_REF_NAME"
+            [[ $(git rev-parse "$GITHUB_SHA^{commit}") == "$rev" ]]
+            git merge-base --is-ancestor "$rev" origin/main
+            identity=$(bash server/release/tag-build.sh "$tag" "$rev")
+          fi
+          printf '%s\n' "$identity" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.2'
+          cache-dependency-path: server/go.sum
+      - name: Run Server tests and check dependency notices
+        run: |
+          (cd server && go test -mod=readonly ./... && go vet -mod=readonly ./...)
+          python3 scripts/update_dependency_inventory.py --verify
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the release OCI archive and corresponding source
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+          BUILD: ${{ steps.identity.outputs.build }}
+          REVISION: ${{ steps.identity.outputs.revision }}
+        run: bash server/release/package-oci.sh
+      - name: Run amd64 from the verified archive
+        run: |
+          image=termlink-ci:smoke
+          archive=("$RUNNER_TEMP"/server-release/*.oci.tar)
+          skopeo --override-os linux --override-arch amd64 copy "oci-archive:${archive[0]}" "docker-daemon:$image"
+          bash server/release/smoke-image.sh "$image"
+      - name: Show service failures
+        if: failure()
+        run: |
+          docker logs --tail 80 termlink-ci-server 2>&1 || true
+          docker logs --tail 40 termlink-ci-postgres 2>&1 || true
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-oci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/server-release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    if: github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.package.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: ${{ runner.temp }}/server-release
+          merge-multiple: true
+      - name: Publish the tested archive to the Server tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ needs.package.outputs.revision }}
+        run: |
+          python3 scripts/github_server_release.py publish --directory "$RUNNER_TEMP/server-release" --tag "$GITHUB_REF_NAME" --revision "$REVISION"

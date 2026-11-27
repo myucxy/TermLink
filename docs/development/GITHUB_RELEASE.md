@@ -5,7 +5,7 @@ GitHub Release 支持两种严格的正式制品批次：Android APK＋完整对
 构建和签名在维护者本机完成，私钥与口令不上传 Actions；GitHub 托管 Windows runner 下载草稿附件，
 核验哈希、源码、双端原生签名、版本、Windows 载荷及 RFC3161 时间戳。stage 命令等待这次
 验证成功，再使用仍在本机进程内的 GitHub 凭据发布原草稿。
-Docker 正式发布仍由本机直接推送 Docker Hub；本管道不发布 Docker、AppShip 或升级现有安装。
+Server 使用独立的 [`server-vX.Y.Z` 标签发布流程](../RELEASE_RUNBOOK.md#server-标签发布与-docker-hub-交接)，Docker Hub 签名和推送由本机执行。
 
 独立的 `Docker server image checks` 在 Server/Docker 配置的 push/PR 及手动调度时运行：
 复用现有构建和验证脚本生成 amd64/arm64 OCI，检查架构、版本、revision，再检查 amd64 镜像的
