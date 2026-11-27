@@ -135,7 +135,7 @@ function Resolve-RustToolchain {
     })
     if ($installed.Count -eq 0) {
         Write-Host "Installing Rust toolchain $toolchain."
-        & $rustup toolchain install $toolchain --profile minimal --no-self-update
+        & $rustup toolchain install $toolchain --profile minimal --no-self-update | Out-Host
         Assert-Condition ($LASTEXITCODE -eq 0) "Rust toolchain installation failed: $toolchain"
     }
     $targets = @('aarch64-linux-android', 'armv7-linux-androideabi',
@@ -146,7 +146,7 @@ function Resolve-RustToolchain {
             Where-Object { ([string]$_) -match ('^' + [regex]::Escape($name) + '\s+\(installed\)$') })
     })
     if ($missing.Count -gt 0) {
-        & $rustup target add --toolchain $toolchain @missing
+        & $rustup target add --toolchain $toolchain @missing | Out-Host
         Assert-Condition ($LASTEXITCODE -eq 0) "Rust Android target installation failed: $($missing -join ', ')"
     }
     $cargo = (& $rustup which cargo --toolchain $toolchain).Trim()

@@ -26,7 +26,7 @@ TermLink 让你在 Android 手机上使用 Windows 电脑上的 **CLI 终端、A
 
 ## 下载与开始使用
 
-- Android / Windows：[GitHub Releases](https://github.com/myucxy/TermLink/releases)（APK、Setup、完整对应源码）或 [AppShip](https://appship.kget.cc:8910)，版本及签名说明见[发布记录索引](docs/releases/README.md)。
+- Android / Windows：[GitHub Releases](https://github.com/myucxy/TermLink/releases)（APK、Setup、完整对应源码）；[AppShip](https://appship.kget.cc:8910) 保留历史版，版本及签名说明见[发布记录索引](docs/releases/README.md)。
 - 0.3.16 / 146：[Android APK](https://appship.kget.cc:8910/api/v1/artifacts/52b8b4a0-66b8-44bf-ac6a-80702cac42e7/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/bf561878-06c0-4f6f-aa80-582d24d94160/download) · [完整对应源码](https://appship.kget.cc:8910/api/v1/artifacts/a6c64e99-e0f4-4cd6-b845-c9f260fad4ff/download)；[发布记录](docs/RELEASE_0.3.16_146.md)。
 - 服务端：[Docker Hub](https://hub.docker.com/r/myucxy/termlink)，部署方式见 [Server README](server/README.md)。
 - 首次使用：[快速开始](docs/guides/QUICK_START.md)。
@@ -125,7 +125,7 @@ flowchart LR
 
 请先阅读[开发与构建](docs/development/BUILDING.md)。它说明固定工具链、AI Web 资源生成、Android 原生依赖及 DEV 版本参数，不要求贡献者复用维护者电脑的盘符路径。
 
-正式构建、签名及上传遵循[发布运行手册](docs/RELEASE_RUNBOOK.md)和[发布构建说明](docs/RELEASE.md)。客户端支持 AppShip 与 [GitHub 发布管道](docs/development/GITHUB_RELEASE.md)：本地签名，Actions 独立校验通过后由本机命令自动发布。Server 的 `server-vX.Y.Z` 标签自动构建双架构 OCI 归档并发布到 GitHub Release，由本机签名后推送 Docker Hub。
+正式构建、签名及上传遵循[发布运行手册](docs/RELEASE_RUNBOOK.md)和[发布构建说明](docs/RELEASE.md)。Android 和 Windows 的 `vX.Y.Z` 附注标签触发 [GitHub 发布管道](docs/development/GITHUB_RELEASE.md)，由 Actions 构建、签名、校验并发布。Server 的 `server-vX.Y.Z` 标签自动构建双架构 OCI 归档并发布到 GitHub Release，由本机签名后推送 Docker Hub。
 
 Docker CI 另行验证双架构镜像构建、许可入包和 amd64 容器的数据库迁移、就绪及重启恢复，不推送镜像。
 

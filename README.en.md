@@ -27,7 +27,7 @@ All final assets live in this repository. [Recording notes](docs/media/feature-d
 
 ## Download and start
 
-- Android / Windows: [GitHub Releases](https://github.com/myucxy/TermLink/releases) (APK, Setup and full corresponding source) or [AppShip](https://appship.kget.cc:8910), with [release records](docs/releases/README.md).
+- Android / Windows: [GitHub Releases](https://github.com/myucxy/TermLink/releases) (APK, Setup and full corresponding source), with older versions on [AppShip](https://appship.kget.cc:8910) and [release records](docs/releases/README.md).
 - 0.3.16 / build 146: [Android APK](https://appship.kget.cc:8910/api/v1/artifacts/52b8b4a0-66b8-44bf-ac6a-80702cac42e7/download) · [Windows Setup](https://appship.kget.cc:8910/api/v1/artifacts/bf561878-06c0-4f6f-aa80-582d24d94160/download) · [full corresponding source](https://appship.kget.cc:8910/api/v1/artifacts/a6c64e99-e0f4-4cd6-b845-c9f260fad4ff/download). [Results](docs/RELEASE_0.3.16_146.md).
 - Server: [Docker Hub](https://hub.docker.com/r/myucxy/termlink), with [deployment instructions](server/README.md).
 - [Quick start](docs/guides/QUICK_START.md) · [Build guide](docs/development/BUILDING.md).
@@ -94,7 +94,6 @@ Project names and product marks do not imply endorsement. This overview is not a
 [Contributing](CONTRIBUTING.md) · [Security reports](SECURITY.md) · [Open-source readiness](docs/development/OPEN_SOURCE_READINESS.md)
 
 GitHub checks documentation, committed-source secrets, Server/Web tests and source packaging. The separate
-[client release pipeline](docs/development/GITHUB_RELEASE.md) verifies locally signed clients before the local command publishes them;
-signing keys stay local. AppShip remains available; pushing an annotated `server-vX.Y.Z` tag builds and publishes the dual-architecture Server OCI archive on GitHub Releases. Docker Hub promotion and signing run locally.
+[client release pipeline](docs/development/GITHUB_RELEASE.md) builds and signs Android and Windows with environment secrets, verifies the packages, and publishes them on GitHub. AppShip keeps older releases available. An annotated `server-vX.Y.Z` tag builds and publishes the dual-architecture Server OCI archive on GitHub Releases. Docker Hub promotion and signing run locally.
 Separate Docker CI checks both image architectures and amd64 startup, database migrations, readiness and restart without pushing images.
 Follow the [release runbook](docs/RELEASE_RUNBOOK.md) for signatures, source identity, tests and rollback.
