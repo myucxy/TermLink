@@ -1,6 +1,6 @@
 # 统一发布构建
 
-Server 使用 `server-vX.Y.Z` 附注标签触发 GitHub Actions，发布未签名 OCI 镜像归档与对应源码。Docker Hub 的签名、推送和版本推进在本机完成。标签格式、验证与恢复见[运行手册](RELEASE_RUNBOOK.md#server-标签发布与-docker-hub-交接)。客户端使用独立的[发布管道](development/GITHUB_RELEASE.md)。
+Server 使用 `server-vX.Y.Z` 附注标签触发 GitHub Actions，发布未签名 OCI 镜像归档与对应源码。Docker Hub 的签名、推送和版本推进在本机完成。标签格式、验证与恢复见[运行手册](RELEASE_RUNBOOK.md#server-标签发布与-docker-hub-交接)。Android 和 Windows 通过 `vX.Y.Z` 附注标签签名构建并发布到 GitHub Release，见[客户端发布管道](development/GITHUB_RELEASE.md)。
 
 仓库根入口为 `scripts/Build-Release.ps1`。它只编排已有的组件构建器并把产物集中到
 `artifacts/release/<Version>-<BuildNumber>/`；本入口不会上传产物，也不会调用外部发布技能。

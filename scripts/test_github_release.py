@@ -157,6 +157,28 @@ class ReleaseChecks(unittest.TestCase):
             self.assertNotIn('TermLink-Setup-0.3.7.137-x64.exe',
                 {row['name'] for row in release.read_json(directory/'github-release.json')['files']})
 
+    def test_tag_needs_matching_workflow_signature_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            manifest = directory/'artifact-manifest.json'
+            release.write_json(manifest, dict(artifacts=[dict(type='apk'), dict(type='setup')]))
+            metadata = dict(version='0.3.19', build_number=149, source_revision='a'*40)
+            evidence = dict(verified=True, manifest_sha256='b'*64, **metadata)
+            release.write_json(directory/'ci-verification.json', evidence)
+            args = argparse.Namespace(directory=directory, tag='v0.3.19', revision='a'*40)
+            with patch.object(release, 'prepare_bundle', return_value=metadata), \
+                    patch.object(release, 'stage_bundle') as stage, patch.object(release, 'publish_bundle') as publish:
+                with self.assertRaisesRegex(ValueError, 'verification evidence'):
+                    release.publish_from_tag(args, unittest.mock.Mock())
+                stage.assert_not_called()
+                publish.assert_not_called()
+                evidence['manifest_sha256'] = release.sha256(manifest)
+                release.write_json(directory/'ci-verification.json', evidence)
+                (directory/'github-release.json').touch()
+                release.publish_from_tag(args, unittest.mock.Mock())
+                stage.assert_called_once()
+                publish.assert_called_once()
+
     def test_native_evidence_is_required_before_publish(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)

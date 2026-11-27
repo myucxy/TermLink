@@ -1,0 +1,168 @@
+name: Build clients from tag
+run-name: Client build ${{ github.ref_name }} ${{ inputs.version }} ${{ inputs.build }}
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for signing rehearsal only
+        required: true
+        default: '0.3.18'
+        type: string
+      build:
+        description: Build for signing rehearsal only
+        required: true
+        default: '148'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-client-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.event.created && !github.event.deleted && !github.event.forced)
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      build: ${{ steps.identity.outputs.build }}
+      revision: ${{ steps.identity.outputs.revision }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: identity
+        name: Resolve client version and source
+        env:
+          TEST_VERSION: ${{ inputs.version }}
+          TEST_BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse HEAD)
+          git merge-base --is-ancestor "$revision" origin/main
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version="$TEST_VERSION"
+            build="$TEST_BUILD"
+          else
+            ref="refs/tags/$GITHUB_REF_NAME"
+            [[ $(git cat-file -t "$ref") == tag && $(git rev-parse "$ref^{commit}") == "$revision" ]]
+            version="${GITHUB_REF_NAME#v}"
+            annotation=$(git for-each-ref --format='%(contents:subject)' "$ref")
+            [[ "$annotation" == build=* ]]
+            build="${annotation#build=}"
+          fi
+          part='(0|[1-9][0-9]{0,4})'
+          [[ "$version" =~ ^${part}\.${part}\.${part}$ && "$build" =~ ^[1-9][0-9]{0,4}$ ]]
+          ((build <= 65535))
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            [[ $(printf '%s\n' 0.3.18 "$version" | sort -V | tail -n1) == "$version" && "$version" != 0.3.18 ]]
+            ((build > 148))
+          fi
+          printf 'version=%s\nbuild=%s\nrevision=%s\n' "$version" "$build" "$revision" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: identity
+    runs-on: windows-2025
+    timeout-minutes: 70
+    environment: github-client-signing
+    env:
+      CLIENT_VERSION: ${{ needs.identity.outputs.version }}
+      CLIENT_BUILD: ${{ needs.identity.outputs.build }}
+      CLIENT_REVISION: ${{ needs.identity.outputs.revision }}
+    outputs:
+      artifact_id: ${{ steps.assets.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.identity.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-dotnet@baa11fbfe1d6520db94683bd5c7a3818018e4309 # v5.1.0
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/termlink-dotnet
+        with:
+          dotnet-version: '8.0.303'
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Retrieve previously published core source by SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'previous-client-source.zip'
+          $source = Get-Content -Raw release/github-client-core-source.json | ConvertFrom-Json
+          $lock = Get-Content -Raw terminal-core.lock.json | ConvertFrom-Json
+          if ($source.schema_version -ne 1 -or $source.core_revision -cne $lock.revision -or $lock.source_dirty) {
+            throw 'The pinned core source does not match the clean native lock revision.'
+          }
+          $sha = $source.archive_sha256
+          Invoke-WebRequest -Uri $source.archive_url -OutFile $archive -TimeoutSec 300 -MaximumRetryCount 2
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $sha) {
+            throw 'Pinned corresponding source download digest mismatch.'
+          }
+          "CORE_SOURCE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+          "CORE_SOURCE_SHA256=$sha" >> $env:GITHUB_ENV
+      - name: Prepare Windows and Android build tools
+        shell: pwsh
+        run: ./scripts/build-github-clients.ps1 -Version $env:CLIENT_VERSION -BuildNumber $env:CLIENT_BUILD -PrepareOnly
+      - name: Build and validate signed APK and Setup
+        shell: pwsh
+        env:
+          GH_CLIENT_ANDROID_KEYSTORE_B64: ${{ secrets.GH_CLIENT_ANDROID_KEYSTORE_B64 }}
+          GH_CLIENT_ANDROID_PASSWORD: ${{ secrets.GH_CLIENT_ANDROID_PASSWORD }}
+          GH_CLIENT_WINDOWS_PFX_B64: ${{ secrets.GH_CLIENT_WINDOWS_PFX_B64 }}
+          GH_CLIENT_WINDOWS_PASSWORD: ${{ secrets.GH_CLIENT_WINDOWS_PASSWORD }}
+        run: ./scripts/build-github-clients.ps1 -Version $env:CLIENT_VERSION -BuildNumber $env:CLIENT_BUILD
+      - name: Generate matching corresponding source and verify the complete batch
+        shell: pwsh
+        run: |
+          $dir = "artifacts/release/$env:CLIENT_VERSION-$env:CLIENT_BUILD"
+          $source = "$dir/TermLink-$env:CLIENT_VERSION-$env:CLIENT_BUILD-source.zip"
+          ./scripts/New-CorrespondingSourceArchive.ps1 -ApplicationRepository . `
+            -Version $env:CLIENT_VERSION -BuildNumber $env:CLIENT_BUILD -ApplicationRevision $env:CLIENT_REVISION `
+            -ArtifactManifestPath "$dir/artifact-manifest.json" -OutputPath $source `
+            -CoreSourceArchivePath $env:CORE_SOURCE_ARCHIVE -CoreSourceArchiveSha256 $env:CORE_SOURCE_SHA256
+          python scripts/github_release.py verify-bundle --directory $dir
+          if ($LASTEXITCODE -ne 0) { throw 'Client release bundle verification failed.' }
+      - name: Preserve the exact verified bytes for publication retry
+        if: github.event_name == 'push'
+        id: assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: client-release-assets
+          path: artifacts/release/${{ env.CLIENT_VERSION }}-${{ env.CLIENT_BUILD }}/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.event_name == 'push'
+    concurrency:
+      group: github-client-stable-publication
+      cancel-in-progress: false
+    needs: [identity, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.identity.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          path: artifacts/github-client-assets
+      - name: Publish the signed client release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLIENT_REVISION: ${{ needs.identity.outputs.revision }}
+        run: python3 scripts/github_release.py publish-tag --directory artifacts/github-client-assets --tag "$GITHUB_REF_NAME" --revision "$CLIENT_REVISION"

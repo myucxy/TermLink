@@ -1,11 +1,21 @@
 # GitHub 客户端发布管道
 
-GitHub Release 支持两种严格的正式制品批次：Android APK＋完整对应源码，或 Android APK＋Windows x64 Setup＋完整对应源码。
-`artifact-manifest.json` 必须明确列出一个 APK，可选一个 Setup；未知、重复或缺失 APK 的批次会在本地和 CI 拒绝。
-构建和签名在维护者本机完成，私钥与口令不上传 Actions；GitHub 托管 Windows runner 下载草稿附件，
-核验哈希、源码、双端原生签名、版本、Windows 载荷及 RFC3161 时间戳。stage 命令等待这次
-验证成功，再使用仍在本机进程内的 GitHub 凭据发布原草稿。
-Server 使用独立的 [`server-vX.Y.Z` 标签发布流程](../RELEASE_RUNBOOK.md#server-标签发布与-docker-hub-交接)，Docker Hub 签名和推送由本机执行。
+客户端正式发布由附注标签 `vX.Y.Z` 触发。GitHub Actions 在同一源码提交上构建和签名 Android APK、Windows x64 Setup，
+校验固定签名指纹、Windows RFC3161 时间戳及载荷、Android 签名、双端原生依赖和可下载的完整对应源码。
+`Build clients from tag` 通过后，独立发布任务将核验过的同一批字节上传到 GitHub Release。
+Server 继续使用 [`server-vX.Y.Z` 标签流程](../RELEASE_RUNBOOK.md#server-标签发布与-docker-hub-交接)。
+
+1. 查询实际的 GitHub Releases 及迁移前 AppShip 的最终版本，分配严格递增的 version/build。等待目标 `main` 提交的 `Repository checks` 全部通过。
+2. 先在 `main` 上手动运行 `Build clients from tag` 检查两端签名及源码交付。演练使用最后已核验的正式 version/build，只有日志随运行保留。
+3. 经正式发布确认后，对目标提交创建 `git tag -a vX.Y.Z -m "build=N" <commit>`，随后单独推送该标签。一次失败重试使用同一标签和构建编号。
+4. 核验 Release 中的 APK、Setup、对应源码 ZIP、sidecar、`artifact-manifest.json`、`github-release.json` 和 `SHA256SUMS`。
+
+签名材料保存在 `github-client-signing` 环境 Secrets，允许 `main` 演练及受规则集限制的 `v*` 标签。
+签名步骤专用的密钥随托管 runner 作业清理，发布 job 只读取核验后的产物，并使用当次 GitHub 令牌。
+迁移期固定上一版已公开对应源码 ZIP 的 SHA-256，复用其中与当前原生库锁一致的 core 源码和 Rust 依赖；core revision 改变时需先更新该输入。
+发布 job 中断时选择 **Re-run failed jobs**，复用保留的签名产物；已上传的同名附件必须匹配原字节。
+macOS 正式包需要 Developer ID Application、Developer ID Installer 和 Apple 公证凭据，以及 Apple Silicon/Intel 各自的签名验证。
+已安装客户端的旧版更新功能仍读取历史渠道，GitHub 版本自动发现需由更新源适配接通。
 
 独立的 `Docker server image checks` 在 Server/Docker 配置的 push/PR 及手动调度时运行：
 复用现有构建和验证脚本生成 amd64/arm64 OCI，检查架构、版本、revision，再检查 amd64 镜像的
@@ -13,7 +23,7 @@ Server 使用独立的 [`server-vX.Y.Z` 标签发布流程](../RELEASE_RUNBOOK.m
 容器内 healthcheck、内嵌 OIDC discovery 和容器重启恢复。arm64 只核验构建及 ELF，不宣称已运行。
 只使用一次性数据库和本地镜像，不登录 Docker Hub、不推送镜像、不触碰正式签名或生产数据。
 
-## 每轮执行
+## 本机已签名批次的恢复流程
 
 1. 按[运行手册](../RELEASE_RUNBOOK.md#dev-与正式发布版本规则)查询 AppShip、Docker Hub、GitHub
    实际版本，固定严格递增的 version/build。本轮后续重试复用同一组值。

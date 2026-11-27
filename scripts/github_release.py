@@ -1,4 +1,4 @@
-"""Stage locally signed clients; let GitHub Actions verify and publish the same bytes."""
+"""Verify and publish signed clients and their corresponding source on GitHub."""
 import argparse
 import hashlib
 import json
@@ -194,8 +194,7 @@ class GitHub:
         require(obj['type'] == 'commit' and obj['sha'] == revision, 'Release tag points at a different source commit')
 
 
-def stage(args, api):
-    directory = args.directory.resolve()
+def prepare_bundle(directory):
     manifest = read_json(directory/'artifact-manifest.json')
     version, build, revision = manifest['version'], manifest['build_number'], manifest['source_revision']
     require(not git('status', '--porcelain'), 'Commit source and documentation before staging a release')
@@ -211,19 +210,34 @@ def stage(args, api):
                            for name in sorted(expected_names(version, build, artifact_types))])
     write_json(directory/'github-release.json', metadata)
     validate_bundle(directory, revision)
+    return metadata
+
+
+def stage_bundle(directory, api, metadata, notes, allow_published=False):
+    version, build, revision = metadata['version'], metadata['build_number'], metadata['source_revision']
+    artifact_types = metadata['artifact_types']
     api.require_checks(revision)
     tag = 'v'+version
     api.require_tag(tag, revision)
     releases = api.request('/releases?per_page=100')
+    if allow_published:
+        for row in releases:
+            previous = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', row['tag_name'])
+            if not previous or row['tag_name'] == tag or row['draft'] or row['prerelease']:
+                continue
+            previous_build = re.search(r'\(build (\d+)\)$', row.get('name') or '')
+            require(tuple(map(int, version.split('.'))) > tuple(map(int, previous.groups())) and
+                    (not previous_build or build > int(previous_build[1])),
+                    'Client publication would move the stable version or build backwards')
     existing = [row for row in releases if row['tag_name'] == tag]
     require(len(existing) <= 1, 'Ambiguous release identity')
     if existing:
         release = existing[0]
-        require(release['draft'] and release['target_commitish'] == revision, 'Only the same unpublished draft can be resumed')
-        require(release['body'] == args.notes.read_text(encoding='utf-8'), 'Release notes differ from existing draft')
+        require((release['draft'] or allow_published) and release['target_commitish'] == revision, 'Release already exists for a different publication')
+        require(release['body'] == notes, 'Release notes differ from existing release')
     else:
         release = api.request('/releases', 'POST', dict(tag_name=tag, target_commitish=revision,
-            name=f'TermLink {version} (build {build})', body=args.notes.read_text(encoding='utf-8'), draft=True, prerelease=False))
+            name=f'TermLink {version} (build {build})', body=notes, draft=True, prerelease=False))
     assets = {row['name']: row for row in api.request(f'/releases/{release["id"]}/assets?per_page=100')}
     upload_names = expected_names(version, build, artifact_types) | {'github-release.json'}
     require(set(assets) <= upload_names, 'Unexpected existing draft attachments; preserve draft and inspect manually')
@@ -232,6 +246,7 @@ def stage(args, api):
         if name in assets:
             require(assets[name]['size'] == path.stat().st_size and assets[name].get('digest') == 'sha256:'+sha256(path), 'Existing draft asset differs; refusing replacement')
             continue
+        require(release['draft'], 'Published release attachments cannot be repaired by uploading files')
         # Stream the binary body instead of duplicating large Setup files in memory.
         upload_url = release['upload_url'].split('{', 1)[0]+'?'+urlencode({'name': name})
         require(upload_url.startswith('https://uploads.github.com/repos/'), 'Unexpected upload API host')
@@ -243,7 +258,15 @@ def stage(args, api):
                 uploaded = json.load(response)
         require(uploaded.get('digest') == 'sha256:'+sha256(path), 'Uploaded asset digest mismatch')
         print('Uploaded '+name, flush=True)
-    inputs = dict(release_id=str(release['id']), revision=revision, metadata_sha256=sha256(directory/'github-release.json'))
+    return release['id']
+
+
+def stage(args, api):
+    directory = args.directory.resolve()
+    metadata = prepare_bundle(directory)
+    release_id = stage_bundle(directory, api, metadata, args.notes.read_text(encoding='utf-8'))
+    revision = metadata['source_revision']
+    inputs = dict(release_id=str(release_id), revision=revision, metadata_sha256=sha256(directory/'github-release.json'))
     write_json(directory/'github-dispatch.json', inputs)
     previous_runs = {run['id'] for run in api.request('/actions/workflows/github-release.yml/runs?event=workflow_dispatch&per_page=20')['workflow_runs']}
     api.request('/actions/workflows/github-release.yml/dispatches', 'POST', dict(ref='main', inputs=inputs))
@@ -252,10 +275,10 @@ def stage(args, api):
     while time.monotonic() < deadline:
         runs = api.request('/actions/workflows/github-release.yml/runs?event=workflow_dispatch&per_page=20')['workflow_runs']
         matches = [run for run in runs if run['id'] not in previous_runs and
-                   run['display_title'] == f'Verify release {release["id"]} {inputs["metadata_sha256"]}']
+                   run['display_title'] == f'Verify release {release_id} {inputs["metadata_sha256"]}']
         if matches and matches[0]['status'] == 'completed':
             require(matches[0]['conclusion'] == 'success', 'GitHub verification failed; preserve the draft and retry after fixing the pipeline')
-            args.release_id, args.revision = release['id'], revision
+            args.release_id, args.revision = release_id, revision
             args.metadata_sha256, args.verification_run = inputs['metadata_sha256'], matches[0]['id']
             args.verify_only = False
             publish(args, api)
@@ -303,42 +326,72 @@ def publish(args, api):
             run['path'] == '.github/workflows/github-release.yml' and run['event'] == 'workflow_dispatch' and
             run['head_branch'] == 'main' and
             run['display_title'] == f'Verify release {args.release_id} {args.metadata_sha256}', 'Verification run does not approve this exact release metadata')
-    api.require_checks(args.revision)
-    api.require_tag('v'+metadata['version'], args.revision)
-    release = api.request(f'/releases/{args.release_id}')
-    require(release['tag_name'] == 'v'+metadata['version'] and release['target_commitish'] == args.revision, 'Release identity changed')
-    remote = api.request(f'/releases/{args.release_id}/assets?per_page=100')
-    records = metadata['files']+[dict(name='github-release.json', sha256=args.metadata_sha256)]
+    publish_bundle(api, metadata, args.revision, args.release_id, args.metadata_sha256)
+
+
+def publish_bundle(api, metadata, revision, release_id, metadata_sha256):
+    api.require_checks(revision)
+    api.require_tag('v'+metadata['version'], revision)
+    release = api.request(f'/releases/{release_id}')
+    require(release['tag_name'] == 'v'+metadata['version'] and release['target_commitish'] == revision, 'Release identity changed')
+    remote = api.request(f'/releases/{release_id}/assets?per_page=100')
+    records = metadata['files']+[dict(name='github-release.json', sha256=metadata_sha256)]
     require(len(remote) == len(records), 'Remote attachments changed during verification')
     for row in records:
         matches = [asset for asset in remote if asset['name'] == row['name']]
         require(len(matches) == 1 and matches[0]['state'] == 'uploaded' and matches[0].get('digest') == 'sha256:'+row['sha256'], 'Remote asset changed during verification')
     if release['draft']:
-        release = api.request(f'/releases/{args.release_id}', 'PATCH', dict(draft=False, make_latest='true',
-            tag_name='v'+metadata['version'], target_commitish=args.revision))
+        release = api.request(f'/releases/{release_id}', 'PATCH', dict(draft=False, make_latest='true',
+            tag_name='v'+metadata['version'], target_commitish=revision))
     require(not release['draft'] and not release['prerelease'] and release['tag_name'] == 'v'+metadata['version'] and
-            release['target_commitish'] == args.revision, 'Release was not published at the expected tag and source')
+            release['target_commitish'] == revision, 'Release was not published at the expected tag and source')
     print(json.dumps(dict(published=True, url=release['html_url'], version=metadata['version'], build_number=metadata['build_number'])))
+
+
+def publish_from_tag(args, api):
+    directory = args.directory.resolve()
+    metadata = prepare_bundle(directory)
+    require(f"v{metadata['version']}" == args.tag and metadata['source_revision'] == args.revision,
+            'Signed batch does not match the release tag')
+    require(artifact_types_from_manifest(read_json(directory/'artifact-manifest.json')) == {'apk', 'setup'},
+            'A client tag must deliver both Android and Windows')
+    evidence = read_json(directory/'ci-verification.json')
+    require(evidence['verified'] is True and evidence['source_revision'] == args.revision and
+            evidence['version'] == metadata['version'] and evidence['build_number'] == metadata['build_number'] and
+            evidence['manifest_sha256'] == sha256(directory/'artifact-manifest.json'),
+            'Signed batch verification evidence is missing or does not match')
+    notes = (f"Android APK and Windows x64 Setup for TermLink {metadata['version']} "
+             f"(build {metadata['build_number']}).\n\n"
+             "The release includes matching GPL-3.0-only corresponding source and SHA-256 checksums.\n")
+    release_id = stage_bundle(directory, api, metadata, notes, allow_published=True)
+    publish_bundle(api, metadata, args.revision, release_id, sha256(directory/'github-release.json'))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=['stage', 'receive', 'publish'])
+    parser.add_argument('phase', choices=['stage', 'receive', 'publish', 'publish-tag', 'verify-bundle'])
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', 'myucxy/TermLink'))
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--notes', type=Path)
     parser.add_argument('--release-id', type=int)
     parser.add_argument('--revision')
+    parser.add_argument('--tag')
     parser.add_argument('--metadata-sha256')
     parser.add_argument('--verify-only', action='store_true')
     parser.add_argument('--verification-run', type=int)
     args = parser.parse_args()
+    if args.phase == 'verify-bundle':
+        metadata = prepare_bundle(args.directory.resolve())
+        print(json.dumps(dict(verified=True, version=metadata['version'], build_number=metadata['build_number'])))
+        return
     if args.phase == 'stage':
         require(args.notes and args.notes.is_file(), 'Release notes file is required')
+    elif args.phase == 'publish-tag':
+        require(args.tag and args.revision and re.fullmatch('[0-9a-f]{40}', args.revision), 'Invalid client tag identity')
     else:
         require(args.release_id and args.release_id > 0 and args.revision and re.fullmatch('[0-9a-f]{40}', args.revision) and
                 args.metadata_sha256 and re.fullmatch('[0-9a-f]{64}', args.metadata_sha256), 'Invalid dispatch identity')
-    {'stage': stage, 'receive': receive, 'publish': publish}[args.phase](args, GitHub(args.repository))
+    {'stage': stage, 'receive': receive, 'publish': publish, 'publish-tag': publish_from_tag}[args.phase](args, GitHub(args.repository))
 
 
 if __name__ == '__main__':

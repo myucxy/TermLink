@@ -234,6 +234,30 @@ $global:LASTEXITCODE=0
     } finally { $vendorZip.Dispose() }
     Write-Host 'PASS vendored source and relative Cargo config preserve static CRT'
 
+    $sourceModeArgs=@{}
+    foreach($key in $vendorArgs.Keys){$sourceModeArgs[$key]=$vendorArgs[$key]}
+    $null = $sourceModeArgs.Remove('CoreRepository')
+    $null = $sourceModeArgs.Remove('IncludeCoreVendor')
+    $sourceModeArgs.CoreSourceArchivePath=$vendorArgs.OutputPath
+    $sourceModeArgs.CoreSourceArchiveSha256=Get-Sha256 $vendorArgs.OutputPath
+    $sourceModeArgs.OutputPath=Join-Path $root 'source-archive-core-input.zip'
+    & $script:NewScript @sourceModeArgs | Out-Null
+    $sourceModeZip=[IO.Compression.ZipFile]::OpenRead($sourceModeArgs.OutputPath)
+    try {
+        $reader=[IO.StreamReader]::new($sourceModeZip.GetEntry('SOURCE-MANIFEST.json').Open())
+        try{$sourceModeManifest=$reader.ReadToEnd()|ConvertFrom-Json}finally{$reader.Dispose()}
+        Assert-Condition ($sourceModeManifest.core_revision -ceq $fixture.CoreRevision -and
+            $sourceModeManifest.core_source_archive.sha256 -ceq $sourceModeArgs.CoreSourceArchiveSha256 -and
+            $sourceModeManifest.core_dependencies_vendored) `
+            'Source-archive core input did not preserve revision, digest, or vendored provenance.'
+    } finally { $sourceModeZip.Dispose() }
+    Write-Host 'PASS previously published corresponding-source archive can supply exact core files'
+    $badSourceModeArgs=@{}
+    foreach($key in $sourceModeArgs.Keys){$badSourceModeArgs[$key]=$sourceModeArgs[$key]}
+    $badSourceModeArgs.CoreSourceArchiveSha256='0'*64
+    $badSourceModeArgs.OutputPath=Join-Path $root 'source-archive-bad-digest.zip'
+    Invoke-ArchiveExpectFailure -Arguments $badSourceModeArgs -Name 'core source archive digest mismatch'
+
     $extract = Join-Path $root 'rebuild'
     Expand-Archive -LiteralPath $archive -DestinationPath $extract
     foreach ($repoName in @('termlink', 'terminal-core')) {

@@ -3,8 +3,12 @@ param(
     [Parameter(Mandatory)]
     [string]$ApplicationRepository,
 
-    [Parameter(Mandatory)]
     [string]$CoreRepository,
+
+    [string]$CoreSourceArchivePath,
+
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$CoreSourceArchiveSha256,
 
     [Parameter(Mandatory)]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
@@ -271,6 +275,88 @@ function Get-Sha256File {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Read-CoreSourceArchive {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedSha256,
+        [Parameter(Mandatory)][string]$ExpectedCoreRevision
+    )
+
+    Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "Core source archive not found: $Path"
+    $actualSha256 = Get-Sha256File -Path $Path
+    Assert-Condition ($actualSha256 -ceq $ExpectedSha256.ToLowerInvariant()) `
+        "Core source archive SHA-256 mismatch: expected $($ExpectedSha256.ToLowerInvariant()), got $actualSha256"
+
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $manifestEntry = $zip.GetEntry('SOURCE-MANIFEST.json')
+        Assert-Condition ($null -ne $manifestEntry) 'Core source archive is missing SOURCE-MANIFEST.json.'
+        $reader = [IO.StreamReader]::new($manifestEntry.Open(), [Text.UTF8Encoding]::new($false))
+        try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json }
+        finally { $reader.Dispose() }
+        Assert-Condition ([int]$manifest.schema_version -eq 1) 'Unsupported corresponding source manifest schema.'
+        Assert-Condition ([string]$manifest.core_revision -ceq $ExpectedCoreRevision) `
+            "Core source archive revision does not match terminal-core.lock.json: $($manifest.core_revision)"
+        Assert-Condition ([bool]$manifest.core_dependencies_vendored) `
+            'The pinned core source archive must include locked dependency sources.'
+
+        $coreRecords = @($manifest.files | Where-Object { [string]$_.repository -ceq 'terminal-core' })
+        Assert-Condition ($coreRecords.Count -gt 0) 'Core source archive contains no terminal-core files.'
+        $archiveCoreNames = @($zip.Entries | Where-Object {
+            $_.FullName.StartsWith('terminal-core/', [StringComparison]::Ordinal)
+        } | ForEach-Object FullName)
+        Assert-Condition ($archiveCoreNames.Count -eq $coreRecords.Count -and
+            (@($archiveCoreNames | Select-Object -Unique).Count -eq $archiveCoreNames.Count)) `
+            'Core source archive contains undeclared or duplicate terminal-core entries.'
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $entries = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($record in $coreRecords) {
+            $archiveName = [string]$record.path
+            Assert-Condition ($archiveName.StartsWith('terminal-core/', [StringComparison]::Ordinal) -and
+                $archiveName -notmatch '\\' -and $archiveName -notmatch '(^|/)\.\.?(/|$)') `
+                "Unsafe terminal-core path in source archive: $archiveName"
+            Assert-Condition ($seen.Add($archiveName)) "Duplicate terminal-core path in source archive: $archiveName"
+            Assert-Condition ([string]$record.mode -in @('100644', '100755', '120000')) `
+                "Unsupported terminal-core mode in source archive: $archiveName"
+            Assert-Condition ([int64]$record.size -ge 0 -and [string]$record.sha256 -match '^[0-9a-fA-F]{64}$') `
+                "Invalid terminal-core file metadata in source archive: $archiveName"
+            $entry = $zip.GetEntry($archiveName)
+            Assert-Condition ($null -ne $entry) "Source archive is missing $archiveName"
+            $memory = [IO.MemoryStream]::new()
+            $entryStream = $entry.Open()
+            try { $entryStream.CopyTo($memory); $bytes = $memory.ToArray() }
+            finally { $entryStream.Dispose(); $memory.Dispose() }
+            Assert-Condition ($bytes.Length -eq [int64]$record.size -and
+                (Get-Sha256Bytes -Bytes $bytes) -ceq ([string]$record.sha256).ToLowerInvariant()) `
+                "Source archive bytes do not match its manifest: $archiveName"
+            Test-PrivateBytes -Path $archiveName -Bytes $bytes
+            $relative = $archiveName.Substring('terminal-core/'.Length)
+            $entries.Add([pscustomobject]@{
+                Entry = [pscustomobject]@{
+                    Path = $relative
+                    Mode = [Convert]::ToInt32([string]$record.mode, 8)
+                    ModeText = [string]$record.mode
+                    Blob = if ([string]$record.git_blob -match '^[0-9a-fA-F]{40}$') { [string]$record.git_blob } else { $null }
+                    Generated = if ($record.PSObject.Properties['generated']) { [string]$record.generated } else { $null }
+                }
+                Bytes = $bytes
+            })
+        }
+        Assert-Condition ($seen.Count -eq $coreRecords.Count) 'Core source archive manifest contains duplicate paths.'
+        foreach ($archiveName in $archiveCoreNames) {
+            Assert-Condition $seen.Contains($archiveName) "Core source archive entry is absent from its manifest: $archiveName"
+        }
+        return [pscustomobject]@{
+            Entries = $entries.ToArray()
+            Sha256 = $actualSha256
+            Archive = (Split-Path -Leaf $Path)
+            CoreRevision = [string]$manifest.core_revision
+            CoreDependenciesVendored = [bool]$manifest.core_dependencies_vendored
+        }
+    }
+    finally { $zip.Dispose() }
+}
+
 function Add-ZipBytes {
     param(
         [Parameter(Mandatory)][IO.Compression.ZipArchive]$Archive,
@@ -434,23 +520,57 @@ function Assert-ArchiveContents {
 }
 
 $application = Resolve-FullPath -Path $ApplicationRepository
-$core = Resolve-FullPath -Path $CoreRepository
 $output = Resolve-FullPath -Path $OutputPath
-Assert-Condition ($application -ine $core) 'ApplicationRepository and CoreRepository must be separate Git checkouts.'
 Assert-Condition (Test-Path -LiteralPath $application -PathType Container) "Application repository not found: $application"
-Assert-Condition (Test-Path -LiteralPath $core -PathType Container) "Core repository not found: $core"
 Assert-CleanRepository -Repository $application -Name 'Application'
-Assert-CleanRepository -Repository $core -Name 'Core'
 $applicationRevision = if ($ApplicationRevision) { Get-GitRevision -Repository $application -Revision $ApplicationRevision } else { Get-GitRevision -Repository $application }
-$coreRevision = if ($CoreRevision) { Get-GitRevision -Repository $core -Revision $CoreRevision } else { Get-GitRevision -Repository $core }
 $applicationEntries = @(Get-GitTree -Repository $application -Revision $applicationRevision)
-$coreEntries = @(Get-GitTree -Repository $core -Revision $coreRevision)
 $applicationTree = @{}
 foreach ($entry in $applicationEntries) { $applicationTree[$entry.Path] = $entry }
-$coreTree = @{}
-foreach ($entry in $coreEntries) { $coreTree[$entry.Path] = $entry }
 Assert-Condition $applicationTree.ContainsKey('LICENSE') 'Application Git tree must track LICENSE.'
 Assert-Condition $applicationTree.ContainsKey('NOTICE') 'Application Git tree must track NOTICE.'
+
+$hasCoreRepository = -not [string]::IsNullOrWhiteSpace($CoreRepository)
+$hasCoreSourceArchive = -not [string]::IsNullOrWhiteSpace($CoreSourceArchivePath)
+Assert-Condition ($hasCoreRepository -xor $hasCoreSourceArchive) `
+    'Specify exactly one of CoreRepository or CoreSourceArchivePath.'
+if ($hasCoreSourceArchive) {
+    Assert-Condition (-not $IncludeCoreVendor) `
+        'CoreSourceArchivePath already contains the pinned vendored dependencies; omit IncludeCoreVendor.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($CoreSourceArchiveSha256)) `
+        'CoreSourceArchiveSha256 is required with CoreSourceArchivePath.'
+}
+else {
+    Assert-Condition ([string]::IsNullOrWhiteSpace($CoreSourceArchiveSha256)) `
+        'CoreSourceArchiveSha256 is only valid with CoreSourceArchivePath.'
+}
+
+$core = $null
+$coreEntries = @()
+$coreSource = $null
+if ($hasCoreRepository) {
+    $core = Resolve-FullPath -Path $CoreRepository
+    Assert-Condition ($application -ine $core) 'ApplicationRepository and CoreRepository must be separate Git checkouts.'
+    Assert-Condition (Test-Path -LiteralPath $core -PathType Container) "Core repository not found: $core"
+    Assert-CleanRepository -Repository $core -Name 'Core'
+    $coreRevision = if ($CoreRevision) { Get-GitRevision -Repository $core -Revision $CoreRevision } else { Get-GitRevision -Repository $core }
+    $coreEntries = @(Get-GitTree -Repository $core -Revision $coreRevision)
+}
+else {
+    Assert-Condition $applicationTree.ContainsKey('terminal-core.lock.json') `
+        'Application Git tree must track terminal-core.lock.json.'
+    $nativeLockBytes = Invoke-GitBytes -Repository $application -Arguments @('cat-file','blob',$applicationTree['terminal-core.lock.json'].Blob)
+    $lockedCoreRevision = ([Text.Encoding]::UTF8.GetString($nativeLockBytes) | ConvertFrom-Json).revision.ToLowerInvariant()
+    $coreRevision = if ($CoreRevision) { $CoreRevision.ToLowerInvariant() } else { $lockedCoreRevision }
+    Assert-Condition ($coreRevision -ceq $lockedCoreRevision) `
+        'CoreRevision must match terminal-core.lock.json when using CoreSourceArchivePath.'
+    $coreSource = Read-CoreSourceArchive -Path (Resolve-FullPath -Path $CoreSourceArchivePath) `
+        -ExpectedSha256 $CoreSourceArchiveSha256.ToLowerInvariant() -ExpectedCoreRevision $coreRevision
+    $coreEntries = @($coreSource.Entries | ForEach-Object { $_.Entry })
+}
+
+$coreTree = @{}
+foreach ($entry in $coreEntries) { $coreTree[$entry.Path] = $entry }
 Assert-Condition $coreTree.ContainsKey('LICENSE') 'Core Git tree must track LICENSE.'
 Assert-Condition $coreTree.ContainsKey('NOTICE') 'Core Git tree must track NOTICE.'
 Assert-Condition (@($coreEntries | Where-Object { $_.Path -like 'scripts/*' -and $_.Path -match '(?i)(build|compile|export|package)' }).Count -gt 0) `
@@ -487,10 +607,22 @@ try {
     $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $false)
     $manifestFiles = New-Object 'System.Collections.Generic.List[object]'
     $seenNames = @{}
-    foreach ($repoSpec in @(
-            [pscustomobject]@{ Name = 'termlink'; Root = $application; Entries = $applicationEntries },
-            [pscustomobject]@{ Name = 'terminal-core'; Root = $core; Entries = $coreEntries })) {
-        foreach ($blob in Get-GitBlobBytes -Repository $repoSpec.Root -Entries $repoSpec.Entries) {
+    $repoSpecs = @(
+        [pscustomobject]@{ Name = 'termlink'; Root = $application; Entries = $applicationEntries; Source = 'git' })
+    if ($coreSource) {
+        $repoSpecs += [pscustomobject]@{ Name = 'terminal-core'; Root = $null; Entries = $coreSource.Entries; Source = 'archive' }
+    }
+    else {
+        $repoSpecs += [pscustomobject]@{ Name = 'terminal-core'; Root = $core; Entries = $coreEntries; Source = 'git' }
+    }
+    foreach ($repoSpec in $repoSpecs) {
+        $blobItems = if ($repoSpec.Source -ceq 'archive') {
+            @($repoSpec.Entries)
+        }
+        else {
+            @(Get-GitBlobBytes -Repository $repoSpec.Root -Entries $repoSpec.Entries)
+        }
+        foreach ($blob in $blobItems) {
             $entry = $blob.Entry
             Test-PrivateBytes -Path "$($repoSpec.Name)/$($entry.Path)" -Bytes $blob.Bytes
             if (Test-PrivatePath -Path $entry.Path) { throw "Tracked private credential path found: $($repoSpec.Name)/$($entry.Path)" }
@@ -506,7 +638,7 @@ try {
             Assert-Condition (-not $seenNames.ContainsKey($archiveName)) "Duplicate archive path: $archiveName"
             $seenNames[$archiveName] = $true
             Add-ZipBytes -Archive $archive -Name $archiveName -Bytes $blob.Bytes -Mode $entry.Mode
-            $manifestFiles.Add([ordered]@{
+            $manifestRecord = [ordered]@{
                 path = $archiveName
                 repository = $repoSpec.Name
                 source_path = $entry.Path
@@ -514,7 +646,11 @@ try {
                 mode = $entry.ModeText
                 size = [int64]$blob.Bytes.Length
                 sha256 = Get-Sha256Bytes -Bytes $blob.Bytes
-            })
+            }
+            if ($entry.PSObject.Properties['Generated'] -and -not [string]::IsNullOrWhiteSpace([string]$entry.Generated)) {
+                $manifestRecord.generated = [string]$entry.Generated
+            }
+            $manifestFiles.Add($manifestRecord)
         }
     }
     if ($vendorStage) {
@@ -548,6 +684,13 @@ try {
     $artifactLines = @($artifactManifest.Artifacts | ForEach-Object {
         "- $($_.path) ($($_.size) bytes, SHA-256 $($_.sha256))"
     }) -join "`n"
+    $coreSourceDescription = if ($coreSource) {
+        "- terminal-core source input: previously published corresponding-source archive $($coreSource.Archive) (SHA-256 $($coreSource.Sha256))"
+    }
+    else {
+        '- terminal-core source input: the selected clean Git revision'
+    }
+    $coreDependenciesVendored = [bool]($coreSource -or $IncludeCoreVendor)
     $readme = @"
 # TermLink Corresponding Source
 
@@ -559,6 +702,7 @@ This archive accompanies TermLink version $Version, build $BuildNumber.
 - release artifact manifest SHA-256: $($artifactManifest.Sha256)
 - layout: termlink/ and terminal-core/ are the two sibling source trees
 - terminal-core.lock.json records the five native libraries and their hashes
+$coreSourceDescription
 
 This corresponding-source tool handles a client release batch only. The
 manifest must contain at least one Windows Setup or Android APK/AAB artifact
@@ -576,7 +720,7 @@ build scripts, lock files, LICENSE and NOTICE. Git metadata, credentials,
 private keys, ignored build output and user files are deliberately excluded.
 Build dependencies are resolved using the pinned files and instructions in
 termlink/docs/RELEASE_RUNBOOK.md and the repository build documentation.
-Core Rust dependencies vendored: $([bool]$IncludeCoreVendor). When enabled, the
+Core Rust dependencies vendored: $coreDependenciesVendored. When enabled, the
 core .cargo/config.toml retains its original settings and adds relative vendor
 source replacement, allowing offline rebuilds without a populated Cargo cache.
 
@@ -641,7 +785,10 @@ SOURCE-MANIFEST.json, which avoids a circular archive hash.
         application_revision = $applicationRevision
         core_revision = $coreRevision
         core_lock_revision = $nativeInfo.Lock.revision
-        core_dependencies_vendored = [bool]$IncludeCoreVendor
+        core_dependencies_vendored = $coreDependenciesVendored
+        core_source_archive = if ($coreSource) {
+            [ordered]@{ archive = $coreSource.Archive; sha256 = $coreSource.Sha256; core_revision = $coreSource.CoreRevision }
+        } else { $null }
         native_artifacts = [array]$nativeInfo.Native
         release_artifact_manifest = [ordered]@{
             path = Split-Path -Leaf $artifactManifest.Path
@@ -670,6 +817,7 @@ SOURCE-MANIFEST.json, which avoids a circular archive hash.
         application_revision = $applicationRevision
         core_revision = $coreRevision
         artifact_manifest_sha256 = $artifactManifest.Sha256
+        core_source_archive_sha256 = if ($coreSource) { $coreSource.Sha256 } else { $null }
         artifacts = $artifactManifest.Artifacts
         generated_utc = [DateTime]::UtcNow.ToString('O')
     }
