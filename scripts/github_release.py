@@ -194,6 +194,25 @@ class GitHub:
         require(obj['type'] == 'commit' and obj['sha'] == revision, 'Release tag points at a different source commit')
 
 
+def fetch_core_source(args, api):
+    lock = read_json(ROOT/'terminal-core.lock.json')
+    source = read_json(ROOT/'release/github-client-core-source.json')
+    require(source['schema_version'] == 1 and not lock['source_dirty'] and
+            source['core_revision'] == lock['revision'], 'Core source input does not match the clean native lock')
+    asset_id = source['github_asset_id']
+    expected_digest = 'sha256:'+source['archive_sha256']
+    require(type(asset_id) is int and asset_id > 0, 'Invalid core source input asset identity')
+    asset = api.request(f'/releases/assets/{asset_id}')
+    require(asset['id'] == asset_id and asset['state'] == 'uploaded' and asset.get('digest') == expected_digest and
+            asset['name'] == f"TermLink-{source['archive_version']}-{source['archive_build']}-core-source-input.zip",
+            'Core source input metadata differs from the pinned archive')
+    args.directory.mkdir(parents=True, exist_ok=True)
+    target = args.directory/'core-source.zip'
+    api.download(asset_id, target)
+    require('sha256:'+sha256(target) == expected_digest, 'Core source input download digest mismatch')
+    print(json.dumps(dict(core_revision=lock['revision'], sha256=source['archive_sha256'])))
+
+
 def prepare_bundle(directory):
     manifest = read_json(directory/'artifact-manifest.json')
     version, build, revision = manifest['version'], manifest['build_number'], manifest['source_revision']
@@ -369,7 +388,7 @@ def publish_from_tag(args, api):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=['stage', 'receive', 'publish', 'publish-tag', 'verify-bundle'])
+    parser.add_argument('phase', choices=['stage', 'receive', 'publish', 'publish-tag', 'verify-bundle', 'fetch-core-source'])
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', 'myucxy/TermLink'))
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--notes', type=Path)
@@ -383,6 +402,9 @@ def main():
     if args.phase == 'verify-bundle':
         metadata = prepare_bundle(args.directory.resolve())
         print(json.dumps(dict(verified=True, version=metadata['version'], build_number=metadata['build_number'])))
+        return
+    if args.phase == 'fetch-core-source':
+        fetch_core_source(args, GitHub(args.repository))
         return
     if args.phase == 'stage':
         require(args.notes and args.notes.is_file(), 'Release notes file is required')

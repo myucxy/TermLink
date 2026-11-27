@@ -50,6 +50,14 @@ function Find-SdkManager {
 
 function Get-CMakeAndNinja {
     param([Parameter(Mandatory)][string]$SdkRoot)
+    $configuredCMake = [Environment]::GetEnvironmentVariable('TERMLINK_CMAKE', 'Process')
+    $configuredNinja = [Environment]::GetEnvironmentVariable('TERMLINK_NINJA', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($configuredCMake) -and
+        -not [string]::IsNullOrWhiteSpace($configuredNinja) -and
+        (Test-Path -LiteralPath $configuredCMake -PathType Leaf) -and
+        (Test-Path -LiteralPath $configuredNinja -PathType Leaf)) {
+        return [pscustomobject]@{ CMake = [IO.Path]::GetFullPath($configuredCMake); Ninja = [IO.Path]::GetFullPath($configuredNinja) }
+    }
     $tools = @(Get-ChildItem -LiteralPath (Join-Path $SdkRoot 'cmake') -Directory `
         -ErrorAction SilentlyContinue | ForEach-Object {
             $cmake = Join-Path $_.FullName 'bin\cmake.exe'
@@ -84,6 +92,12 @@ function Ensure-AndroidPackages {
     if (-not (Test-Path -LiteralPath (Join-Path $SdkRoot 'ndk\27.0.12077973') -PathType Container)) {
         $needs.Add('ndk;27.0.12077973')
     }
+    $configuredPair = [Environment]::GetEnvironmentVariable('TERMLINK_CMAKE', 'Process'),
+        [Environment]::GetEnvironmentVariable('TERMLINK_NINJA', 'Process')
+    $configuredTools = -not [string]::IsNullOrWhiteSpace([string]$configuredPair[0]) -and
+        -not [string]::IsNullOrWhiteSpace([string]$configuredPair[1]) -and
+        (Test-Path -LiteralPath $configuredPair[0] -PathType Leaf) -and
+        (Test-Path -LiteralPath $configuredPair[1] -PathType Leaf)
     $cmakePair = @(Get-ChildItem -LiteralPath (Join-Path $SdkRoot 'cmake') -Directory `
         -ErrorAction SilentlyContinue | Where-Object {
             (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\cmake.exe') -PathType Leaf) -and
@@ -91,7 +105,7 @@ function Ensure-AndroidPackages {
         })
     $cmakeOnPath = Get-Command cmake.exe -CommandType Application -ErrorAction SilentlyContinue
     $ninjaOnPath = Get-Command ninja.exe -CommandType Application -ErrorAction SilentlyContinue
-    if ($cmakePair.Count -eq 0 -and ($null -eq $cmakeOnPath -or $null -eq $ninjaOnPath)) {
+    if (-not $configuredTools -and $cmakePair.Count -eq 0 -and ($null -eq $cmakeOnPath -or $null -eq $ninjaOnPath)) {
         $needs.Add('cmake;3.22.1')
     }
     if ($needs.Count -eq 0) { return }
@@ -201,8 +215,10 @@ $androidStoreB64 = Get-RequiredSecret -Name 'GH_CLIENT_ANDROID_KEYSTORE_B64'
 $androidStorePasswordText = Get-RequiredSecret -Name 'GH_CLIENT_ANDROID_PASSWORD'
 $windowsPfxB64 = Get-RequiredSecret -Name 'GH_CLIENT_WINDOWS_PFX_B64'
 $windowsPfxPasswordText = Get-RequiredSecret -Name 'GH_CLIENT_WINDOWS_PASSWORD'
-$androidAlias = [Environment]::GetEnvironmentVariable('GH_CLIENT_ANDROID_KEY_ALIAS', 'Process')
-if ([string]::IsNullOrWhiteSpace($androidAlias)) { $androidAlias = 'nuanya-release' }
+$androidAlias = 'nuanya-release'
+foreach ($name in 'GH_CLIENT_ANDROID_KEYSTORE_B64', 'GH_CLIENT_ANDROID_PASSWORD', 'GH_CLIENT_WINDOWS_PFX_B64', 'GH_CLIENT_WINDOWS_PASSWORD') {
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
 
 $secretRoot = Join-Path ([IO.Path]::GetTempPath()) ('termlink-client-signing-' + [guid]::NewGuid().ToString('N'))
 $androidStorePath = Join-Path $secretRoot 'android-release.jks'
@@ -243,7 +259,8 @@ try {
     }
     finally { $certificate.Dispose() }
     if (@(Get-ChildItem -LiteralPath "Cert:\CurrentUser\Root\$rootThumbprint" -ErrorAction SilentlyContinue).Count -eq 0) {
-        Import-Certificate -FilePath $windowsCertPath -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+        & certutil.exe -user -addstore -f Root $windowsCertPath *> $null
+        Assert-Condition ($LASTEXITCODE -eq 0) 'Pinned Windows signer trust setup failed.'
         $rootImported = $true
     }
 

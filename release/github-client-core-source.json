@@ -3,7 +3,9 @@
   "core_revision": "0d5b8d9fbdfc9c6cbb21588b729eefa916d9d221",
   "archive_version": "0.3.18",
   "archive_build": 148,
-  "archive_url": "https://appship.kget.cc:8910/api/v1/artifacts/78d40718-ab72-413d-aca3-9a83a8fa13b2/download",
-  "archive_sha256": "456d37b9c93ca258e30986765a93814c64e0dce49276fb359ed55bdbe1ffe6b5",
-  "purpose": "Pinned corresponding-source archive used to supply the exact terminal-core revision when the public core repository does not expose that Git object."
+  "purpose": "Draft asset containing the complete terminal-core subtree and its manifest records from the already published corresponding source.",
+  "github_asset_id": 800009138,
+  "published_archive_sha256": "456d37b9c93ca258e30986765a93814c64e0dce49276fb359ed55bdbe1ffe6b5",
+  "published_archive_url": "https://appship.kget.cc:8910/api/v1/artifacts/78d40718-ab72-413d-aca3-9a83a8fa13b2/download",
+  "archive_sha256": "56aae871b4e088ccf3158ca0aa13fac403fe7b8c551992d6579ba9396f938ea4"
 }

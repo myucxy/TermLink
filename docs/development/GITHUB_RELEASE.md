@@ -12,7 +12,7 @@ Server 继续使用 [`server-vX.Y.Z` 标签流程](../RELEASE_RUNBOOK.md#server-
 
 签名材料保存在 `github-client-signing` 环境 Secrets，允许 `main` 演练及受规则集限制的 `v*` 标签。
 签名步骤专用的密钥随托管 runner 作业清理，发布 job 只读取核验后的产物，并使用当次 GitHub 令牌。
-迁移期固定上一版已公开对应源码 ZIP 的 SHA-256，复用其中与当前原生库锁一致的 core 源码和 Rust 依赖；core revision 改变时需先更新该输入。
+迁移期从 GitHub 草稿资产读取上一版已公开对应源码中的完整 core 子树，固定资产 ID 和 SHA-256，复用与当前原生库锁一致的 core 源码和 Rust 依赖；core revision 改变时需先更新该输入。
 发布 job 中断时选择 **Re-run failed jobs**，复用保留的签名产物；已上传的同名附件必须匹配原字节。
 macOS 正式包需要 Developer ID Application、Developer ID Installer 和 Apple 公证凭据，以及 Apple Silicon/Intel 各自的签名验证。
 已安装客户端的旧版更新功能仍读取历史渠道，GitHub 版本自动发现需由更新源适配接通。
