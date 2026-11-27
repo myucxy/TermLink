@@ -258,8 +258,9 @@ try {
             $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
     }
     finally { $certificate.Dispose() }
-    if (@(Get-ChildItem -LiteralPath "Cert:\CurrentUser\Root\$rootThumbprint" -ErrorAction SilentlyContinue).Count -eq 0) {
-        & certutil.exe -user -addstore -f Root $windowsCertPath *> $null
+    Write-Host 'Installing pinned public Windows signing certificate on the disposable runner.'
+    if (@(Get-ChildItem -LiteralPath "Cert:\LocalMachine\Root\$rootThumbprint" -ErrorAction SilentlyContinue).Count -eq 0) {
+        & certutil.exe -addstore -f Root $windowsCertPath *> $null
         Assert-Condition ($LASTEXITCODE -eq 0) 'Pinned Windows signer trust setup failed.'
         $rootImported = $true
     }
@@ -285,6 +286,7 @@ try {
         AndroidKeystorePassword = $androidPassword; AndroidKeyAlias = $androidAlias
         ExpectedAndroidSignerSha256 = [string]$policy.android_signer_sha256
     }
+    Write-Host 'Building and signing the Windows Setup and Android APK.'
     & (Join-Path $repositoryRoot 'scripts\Build-Release.ps1') @build | Out-Host
     Assert-Condition ($LASTEXITCODE -eq 0) 'Production Android/Windows build failed.'
 
@@ -315,7 +317,7 @@ finally {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
     }
     if ($rootImported -and $rootThumbprint) {
-        Remove-Item -LiteralPath "Cert:\CurrentUser\Root\$rootThumbprint" -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "Cert:\LocalMachine\Root\$rootThumbprint" -Force -ErrorAction SilentlyContinue
     }
     if ($androidPassword) { $androidPassword.Dispose() }
     if ($windowsPassword) { $windowsPassword.Dispose() }
