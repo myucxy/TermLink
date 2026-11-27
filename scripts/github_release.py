@@ -34,7 +34,7 @@ def read_json(path):
 
 
 def write_json(path, value):
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n', encoding='utf-8', newline='\n')
 
 
 def git(*arguments):
@@ -221,7 +221,7 @@ def prepare_bundle(directory):
     artifact_types = artifact_types_from_manifest(manifest)
     names = expected_names(version, build, artifact_types)-{'SHA256SUMS'}
     checksum_text = ''.join(f'{sha256(directory/name)}  {name}\n' for name in sorted(names))
-    (directory/'SHA256SUMS').write_text(checksum_text, encoding='utf-8')
+    (directory/'SHA256SUMS').write_text(checksum_text, encoding='utf-8', newline='\n')
     metadata = dict(schema_version=1, version=version, build_number=build, source_revision=revision,
                     core_revision=manifest['core_revision'], artifact_types=sorted(artifact_types),
                     signers=read_json(ROOT/'release/github-release-policy.json'),
@@ -369,7 +369,7 @@ def publish_bundle(api, metadata, revision, release_id, metadata_sha256):
 
 def publish_from_tag(args, api):
     directory = args.directory.resolve()
-    metadata = prepare_bundle(directory)
+    metadata = validate_bundle(directory, args.revision)
     require(f"v{metadata['version']}" == args.tag and metadata['source_revision'] == args.revision,
             'Signed batch does not match the release tag')
     require(artifact_types_from_manifest(read_json(directory/'artifact-manifest.json')) == {'apk', 'setup'},

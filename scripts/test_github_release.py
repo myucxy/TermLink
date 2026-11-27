@@ -166,7 +166,7 @@ class ReleaseChecks(unittest.TestCase):
             evidence = dict(verified=True, manifest_sha256='b'*64, **metadata)
             release.write_json(directory/'ci-verification.json', evidence)
             args = argparse.Namespace(directory=directory, tag='v0.3.19', revision='a'*40)
-            with patch.object(release, 'prepare_bundle', return_value=metadata), \
+            with patch.object(release, 'validate_bundle', return_value=metadata), \
                     patch.object(release, 'stage_bundle') as stage, patch.object(release, 'publish_bundle') as publish:
                 with self.assertRaisesRegex(ValueError, 'verification evidence'):
                     release.publish_from_tag(args, unittest.mock.Mock())
