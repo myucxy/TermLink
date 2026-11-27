@@ -152,7 +152,10 @@ function Resolve-RustToolchain {
     $cargo = (& $rustup which cargo --toolchain $toolchain).Trim()
     Assert-Condition (Test-Path -LiteralPath $cargo -PathType Leaf) `
         "Pinned Rust cargo was not resolved: $cargo"
-    return [pscustomobject]@{ Cargo = $cargo }
+    $rustc = (& $rustup which rustc --toolchain $toolchain).Trim()
+    Assert-Condition ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $rustc -PathType Leaf)) `
+        'Pinned rustc was not resolved.'
+    return [pscustomobject]@{ Cargo = $cargo; Rustc = $rustc }
 }
 
 function Get-RequiredSecret {
@@ -231,7 +234,7 @@ $rootImported = $false
 $savedEnvironment = @{}
 $environmentNames = @(
     'ANDROID_SDK_ROOT', 'ANDROID_HOME', 'TERMLINK_CMAKE', 'TERMLINK_NINJA',
-    'TERMLINK_CARGO', 'TERMLINK_LLVM_READELF', 'TERMLINK_RELEASE_STORE_FILE',
+    'TERMLINK_CARGO', 'TERMLINK_LLVM_READELF', 'RUSTC', 'RUSTUP_TOOLCHAIN', 'TermLinkDirectDataPlaneEnabled', 'TERMLINK_RELEASE_STORE_FILE',
     'TERMLINK_RELEASE_STORE_PASSWORD', 'TERMLINK_RELEASE_KEY_ALIAS',
     'TERMLINK_RELEASE_KEY_PASSWORD')
 foreach ($name in $environmentNames) {
@@ -270,6 +273,9 @@ try {
     [Environment]::SetEnvironmentVariable('TERMLINK_CMAKE', $cmake.CMake, 'Process')
     [Environment]::SetEnvironmentVariable('TERMLINK_NINJA', $cmake.Ninja, 'Process')
     [Environment]::SetEnvironmentVariable('TERMLINK_CARGO', $rust.Cargo, 'Process')
+    [Environment]::SetEnvironmentVariable('RUSTC', $rust.Rustc, 'Process')
+    [Environment]::SetEnvironmentVariable('RUSTUP_TOOLCHAIN', '1.97.1-x86_64-pc-windows-msvc', 'Process')
+    [Environment]::SetEnvironmentVariable('TermLinkDirectDataPlaneEnabled', 'false', 'Process')
     [Environment]::SetEnvironmentVariable('TERMLINK_LLVM_READELF', $readelf, 'Process')
 
     $outputDirectory = Join-Path $repositoryRoot "artifacts\release\$Version-$BuildNumber"
