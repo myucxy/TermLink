@@ -39,6 +39,7 @@ type Offer struct {
 	Version           string
 	Build             int64
 	ReleaseNotes      string
+	PublishedAt       time.Time
 	DownloadURL       string
 	ArtifactFilename  string
 	SizeBytes         int64

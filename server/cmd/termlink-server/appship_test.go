@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"github.com/termlink/termlink/server/internal/agentupdate"
+	"github.com/termlink/termlink/server/internal/webportal"
+)
 
 func TestAppShipSourcesUseStartupPolicy(t *testing.T) {
 	// An obsolete URL override cannot redirect either production reader.
@@ -38,5 +44,47 @@ func TestAppShipMacPublisherIsIndependentAndFailsClosed(t *testing.T) {
 		if catalog, source, err := newAppShipSources(); err == nil || catalog != nil || source != nil {
 			t.Fatal("invalid Mac publisher partly initialized")
 		}
+	}
+}
+
+type githubPortalCatalog func(context.Context, string, string, int64) (agentupdate.Offer, error)
+
+func (f githubPortalCatalog) LatestStable(ctx context.Context, platform, arch string, build int64) (agentupdate.Offer, error) {
+	return f(ctx, platform, arch, build)
+}
+
+type legacyPortalCatalog func(context.Context, webportal.PublicReleaseTarget) (webportal.PublicRelease, error)
+
+func (f legacyPortalCatalog) Latest(ctx context.Context, target webportal.PublicReleaseTarget) (webportal.PublicRelease, error) {
+	return f(ctx, target)
+}
+
+func TestPublicDownloadsUseGitHubForVerifiedNewerClient(t *testing.T) {
+	const githubURL = "https://github.com/myucxy/TermLink/releases/download/v0.3.19/TermLink-Android-0.3.19-149.apk"
+	target := webportal.PublicReleaseTarget{Application: "termlink-android", Platform: "android", Architecture: "universal", FileKind: "apk"}
+	signer := agentupdate.DefaultGitHubAndroidSignerSHA256
+	var fallbacks int
+	source := githubPublicReleases{
+		github: githubPortalCatalog(func(_ context.Context, platform, arch string, build int64) (agentupdate.Offer, error) {
+			if platform != "android" || arch != "universal" || build != 148 {
+				t.Fatalf("unexpected GitHub target %s/%s build %d", platform, arch, build)
+			}
+			return agentupdate.Offer{Available: true, Version: "0.3.19", Build: 149, DownloadURL: githubURL, SignerFingerprint: &signer}, nil
+		}),
+		legacy: legacyPortalCatalog(func(_ context.Context, _ webportal.PublicReleaseTarget) (webportal.PublicRelease, error) {
+			fallbacks++
+			return webportal.PublicRelease{Version: "0.3.18", Build: 148}, nil
+		}),
+	}
+	got, err := source.Latest(context.Background(), target)
+	if err != nil || got.DownloadURL != githubURL || got.Build != 149 || fallbacks != 0 {
+		t.Fatalf("GitHub download: %+v, %v", got, err)
+	}
+	source.github = githubPortalCatalog(func(context.Context, string, string, int64) (agentupdate.Offer, error) {
+		return agentupdate.Offer{}, agentupdate.ErrUnavailable
+	})
+	got, err = source.Latest(context.Background(), target)
+	if err != nil || got.Build != 148 || fallbacks != 1 {
+		t.Fatalf("legacy download: %+v, %v", got, err)
 	}
 }
