@@ -422,7 +422,8 @@ def receive(args, api):
     require(sha256(directory/'github-release.json') == args.metadata_sha256, 'Release metadata digest mismatch')
     metadata = read_json(directory/'github-release.json')
     metadata_types = frozenset(metadata.get('artifact_types', ('apk', 'setup')))
-    metadata_macos = bool(metadata.get('macos', False))
+    metadata_macos = metadata.get('macos', False)
+    require(type(metadata_macos) is bool, 'Invalid macOS release flag')
     if 'artifact_types' not in metadata:
         metadata_types = frozenset({'apk'} | ({'setup'} if f'TermLink-Setup-{metadata["version"]}.{metadata["build_number"]}-x64.exe' in indexed else set()))
     expected_remote = expected_names(metadata['version'], metadata['build_number'], metadata_types) | {'github-release.json'}

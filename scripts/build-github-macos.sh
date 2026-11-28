@@ -7,9 +7,19 @@ umask 077
 work=$(mktemp -d "$RUNNER_TEMP/termlink-signing.XXXXXX")
 keychain="$work/signing.keychain-db"
 certificate="$work/signer.cer"
+previous_keychains=()
+while IFS= read -r line; do
+  line=${line#*\"}
+  line=${line%\"*}
+  if [[ -n $line ]]; then previous_keychains+=("$line"); fi
+done < <(/usr/bin/security list-keychains -d user)
 cleanup() {
+  /usr/bin/security list-keychains -d user -s "${previous_keychains[@]}" >/dev/null 2>&1 || true
+  if [[ -f $certificate ]]; then
+    sudo /usr/bin/security remove-trusted-cert -d "$certificate" >/dev/null 2>&1 || true
+  fi
   /usr/bin/security delete-keychain "$keychain" >/dev/null 2>&1 || true
-  rm -f -- "$work/signer.p12" "$certificate" "$work/codesign0"
+  rm -f -- "$work/signer.p12" "$certificate" "$work/signing-probe"
   rmdir -- "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -25,6 +35,7 @@ unset GH_MACOS_SIGNING_P12_B64
 /usr/bin/security create-keychain -p "$keypass" "$keychain"
 /usr/bin/security set-keychain-settings -lut 2700 "$keychain"
 /usr/bin/security unlock-keychain -p "$keypass" "$keychain"
+/usr/bin/security list-keychains -d user -s "$keychain" "${previous_keychains[@]}"
 /usr/bin/security import "$work/signer.p12" -k "$keychain" -f pkcs12 -P "$GH_MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
 unset GH_MACOS_SIGNING_P12_PASSWORD
 rm -f -- "$work/signer.p12"
@@ -33,6 +44,11 @@ rm -f -- "$work/signer.p12"
 printf '%s  %s\n' "$sha256" "$certificate" | shasum -a 256 --check
 # The dedicated ephemeral runner trusts only the pinned certificate for signing.
 sudo /usr/bin/security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$certificate"
+# Check the same host session can actually sign before investing in a full build.
+printf '%s\n' 'int main(void) { return 0; }' | clang -x c - -o "$work/signing-probe"
+/usr/bin/codesign --force --timestamp=none --keychain "$keychain" --sign "$pin" "$work/signing-probe"
+/usr/bin/codesign --verify --strict -R "certificate leaf = H\"$pin\"" "$work/signing-probe"
+rm -f -- "$work/signing-probe"
 
 out="$RUNNER_TEMP/macos-release"
 mkdir -p "$out"
