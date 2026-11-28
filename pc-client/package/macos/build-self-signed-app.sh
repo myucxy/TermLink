@@ -109,19 +109,30 @@ cat > "$contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-sign_macho() {
-  local item=$1
-  if [[ $item == "$contents/MacOS/TermLink" || $item == "$contents/MacOS/agent/TermLink.Agent" ]]; then
-    codesign --force --timestamp=none --options runtime --entitlements "$script_dir/runtime-entitlements.plist" "${keychain_args[@]}" "${identity_args[@]}" "$item"
-  else
-    codesign --force --timestamp=none "${keychain_args[@]}" "${identity_args[@]}" "$item"
+# .NET resolves adjacent runtime files. Keep that layout via relative links while
+# sealing managed assemblies and data as resources, without generic code xattrs.
+while IFS= read -r -d '' item; do
+  relative=${item#"$contents/MacOS/"}
+  if [[ $relative == TermLink ]]; then
+    continue
   fi
-}
-while IFS= read -r -d '' executable; do
-  if file -b "$executable" | grep -q 'Mach-O'; then
-    sign_macho "$executable"
+  if file -b "$item" | grep -q 'Mach-O'; then
+    args=()
+    if [[ $relative == agent/TermLink.Agent ]]; then
+      args=(--options runtime --entitlements "$script_dir/runtime-entitlements.plist" --identifier dev.termlink.desktop.agent)
+    fi
+    codesign --force --timestamp=none "${args[@]}" "${keychain_args[@]}" "${identity_args[@]}" "$item"
   else
-    codesign --force --timestamp=none "${keychain_args[@]}" "${identity_args[@]}" "$executable"
+    resource="$contents/Resources/dotnet/$relative"
+    mkdir -p -- "$(dirname -- "$resource")"
+    up=..
+    parent=$(dirname -- "$relative")
+    while [[ $parent != . ]]; do
+      up="../$up"
+      parent=$(dirname -- "$parent")
+    done
+    mv -- "$item" "$resource"
+    ln -s -- "$up/Resources/dotnet/$relative" "$item"
   fi
 done < <(find "$contents/MacOS" -type f -print0)
 codesign --force --timestamp=none --options runtime --entitlements "$script_dir/runtime-entitlements.plist" "${keychain_args[@]}" "${identity_args[@]}" --requirements "=designated => $bundle_requirement" "$app"
@@ -133,5 +144,16 @@ roundtrip="$work_root/zip-validation/TermLink.app"
 codesign --verify --deep --strict -R "=$bundle_requirement" "$roundtrip"
 [[ $(lipo -archs "$roundtrip/Contents/MacOS/TermLink") == "$(uname -m)" ]]
 [[ $(lipo -archs "$roundtrip/Contents/MacOS/agent/TermLink.Agent") == "$(uname -m)" ]]
+if "$roundtrip/Contents/MacOS/agent/TermLink.Agent" > "$work_root/agent-smoke.log" 2>&1; then
+  echo 'The Agent entry point accepted a command without its required arguments.' >&2
+  exit 4
+else
+  agent_status=$?
+fi
+if [[ $agent_status != 2 ]] || ! grep -Fq 'requires --agent' "$work_root/agent-smoke.log"; then
+  cat "$work_root/agent-smoke.log" >&2
+  echo "The signed Agent process did not start correctly (exit $agent_status)." >&2
+  exit 4
+fi
 ln -- "$work_root/TermLink-$rid.zip" "$output"
 shasum -a 256 "$output"

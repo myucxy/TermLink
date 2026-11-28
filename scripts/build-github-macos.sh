@@ -15,9 +15,6 @@ while IFS= read -r line; do
 done < <(/usr/bin/security list-keychains -d user)
 cleanup() {
   /usr/bin/security list-keychains -d user -s "${previous_keychains[@]}" >/dev/null 2>&1 || true
-  if [[ -f $certificate ]]; then
-    sudo /usr/bin/security remove-trusted-cert -d "$certificate" >/dev/null 2>&1 || true
-  fi
   /usr/bin/security delete-keychain "$keychain" >/dev/null 2>&1 || true
   rm -f -- "$work/signer.p12" "$certificate" "$work/signing-probe"
   rmdir -- "$work" 2>/dev/null || true
