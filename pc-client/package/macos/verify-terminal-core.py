@@ -3,7 +3,7 @@
 import argparse, hashlib, json, re, shutil, subprocess
 from pathlib import Path, PurePosixPath
 
-def verify(root, rid):
+def verify(root, rid, same_host_smoke_sha256=None):
     root = root.resolve(strict=True)
     lock = json.loads((root / "terminal-core.macos.lock.json").read_text())
     if lock.get("schema") != 2 or lock.get("platform") != "macos" or lock.get("source_dirty") is not False or not re.fullmatch(r"[0-9a-f]{40}", lock.get("revision", "")):
@@ -11,7 +11,8 @@ def verify(root, rid):
     if lock.get("rust_toolchain") != "1.97.1" or lock.get("abi_version") != 1 or lock.get("source_method") != "git_archive_HEAD" or lock.get("minimum_os") != "13.0":
         raise ValueError("unapproved native contract")
     libraries = [x for x in lock["libraries"] if x["rid"] == rid]
-    if len(libraries) != 1 or libraries[0].get("smoke_executed") is not True:
+    if len(libraries) != 1 or (libraries[0].get("smoke_executed") is not True and
+                               same_host_smoke_sha256 != libraries[0]["sha256"]):
         raise ValueError("native architecture unavailable or not smoke tested")
     library = libraries[0]
     architecture = {"osx-arm64": "arm64", "osx-x64": "x86_64"}[rid]
@@ -43,7 +44,8 @@ def verify(root, rid):
 
 if __name__ == "__main__":
     parser=argparse.ArgumentParser();parser.add_argument("root",type=Path);parser.add_argument("rid",choices=["osx-arm64","osx-x64"]);parser.add_argument("--stage",type=Path)
-    args=parser.parse_args(); library=verify(args.root,args.rid)
+    parser.add_argument("--same-host-smoke-sha256", help="Digest emitted by the release runner after both runtime smoke tests")
+    args=parser.parse_args(); library=verify(args.root,args.rid,args.same_host_smoke_sha256)
     if args.stage:
         target=args.stage;target.mkdir(parents=True,exist_ok=True)
         shutil.copy2(args.root/library["path"], target/"libtermlink_terminal_ffi.dylib")

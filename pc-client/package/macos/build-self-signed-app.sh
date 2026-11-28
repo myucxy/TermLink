@@ -77,7 +77,11 @@ mkdir -p "$contents/MacOS" "$contents/Resources"
   -p:TermLinkDevelopmentBuild=false -p:TermLinkMacUpdatesEnabled=false \
   -o "$contents/MacOS/agent" "${protocol_args[@]}"
 
-python3 "$script_dir/verify-terminal-core.py" "$repo_root" "$rid" --stage "$contents/MacOS/agent"
+smoke_args=()
+if [[ -n ${TERMLINK_MACOS_NATIVE_SMOKE_SHA256:-} ]]; then
+  smoke_args+=(--same-host-smoke-sha256 "$TERMLINK_MACOS_NATIVE_SMOKE_SHA256")
+fi
+python3 "$script_dir/verify-terminal-core.py" "$repo_root" "$rid" --stage "$contents/MacOS/agent" "${smoke_args[@]}"
 cp "$repo_root/terminal-core.macos.lock.json" "$contents/Resources/"
 cp -R "$repo_root/native/terminal-core/macos/licenses" "$contents/Resources/terminal-core-licenses"
 bash "$repo_root/pc-client/native/posix/build-native.sh" "$contents/MacOS"

@@ -73,6 +73,8 @@ build = int(os.environ['CLIENT_BUILD'])
 rid = os.environ['CLIENT_RID']
 assert revision == subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 assert lock['source_dirty'] is False
+(library,) = [x for x in lock['libraries'] if x['rid'] == rid]
+assert os.environ.get('TERMLINK_MACOS_NATIVE_SMOKE_SHA256') == library['sha256']
 with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP']) as temp:
     subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), temp], check=True)
     app = Path(temp)/'TermLink.app'
