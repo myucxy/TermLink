@@ -52,7 +52,7 @@ fi
 certificate_sha1=$(printf '%s' "$certificate_sha1" | tr '[:lower:]' '[:upper:]')
 identity_args+=(--sign "$certificate_sha1")
 bundle_requirement='identifier "dev.termlink.desktop" and certificate leaf = H"'"$certificate_sha1"'"'
-identity_lines=$(security find-identity -v -p codesigning "${identity_query[@]}" 2>/dev/null || true)
+identity_lines=$(security find-identity -v -p codesigning ${identity_query[@]+"${identity_query[@]}"} 2>/dev/null || true)
 printf '%s\n' "$identity_lines" | awk '{print toupper($2)}' | grep -Fx -- "$certificate_sha1" >/dev/null || {
   echo "the pinned self-signing identity is unavailable in the selected keychain" >&2
   exit 4
@@ -70,18 +70,18 @@ mkdir -p "$contents/MacOS" "$contents/Resources"
   -c Release -f net8.0 -r "$rid" --self-contained true -p:RestoreLockedMode=true \
   -p:EnableWindowsTargeting=true -p:Version="$version" -p:AssemblyVersion="$version.$build" -p:FileVersion="$version.$build" \
   -p:TermLinkDevelopmentBuild=false -p:TermLinkMacUpdatesEnabled=false \
-  -o "$contents/MacOS" "${protocol_args[@]}"
+  -o "$contents/MacOS" ${protocol_args[@]+"${protocol_args[@]}"}
 "$dotnet_path" publish "$repo_root/pc-client/src/Agent.Host/TermLink.Agent.Host.csproj" \
   -c Release -r "$rid" --self-contained true -p:RestoreLockedMode=true \
   -p:Version="$version" -p:AssemblyVersion="$version.$build" -p:FileVersion="$version.$build" \
   -p:TermLinkDevelopmentBuild=false -p:TermLinkMacUpdatesEnabled=false \
-  -o "$contents/MacOS/agent" "${protocol_args[@]}"
+  -o "$contents/MacOS/agent" ${protocol_args[@]+"${protocol_args[@]}"}
 
 smoke_args=()
 if [[ -n ${TERMLINK_MACOS_NATIVE_SMOKE_SHA256:-} ]]; then
   smoke_args+=(--same-host-smoke-sha256 "$TERMLINK_MACOS_NATIVE_SMOKE_SHA256")
 fi
-python3 "$script_dir/verify-terminal-core.py" "$repo_root" "$rid" --stage "$contents/MacOS/agent" "${smoke_args[@]}"
+python3 "$script_dir/verify-terminal-core.py" "$repo_root" "$rid" --stage "$contents/MacOS/agent" ${smoke_args[@]+"${smoke_args[@]}"}
 cp "$repo_root/terminal-core.macos.lock.json" "$contents/Resources/"
 cp -R "$repo_root/native/terminal-core/macos/licenses" "$contents/Resources/terminal-core-licenses"
 bash "$repo_root/pc-client/native/posix/build-native.sh" "$contents/MacOS"
@@ -121,7 +121,7 @@ while IFS= read -r -d '' item; do
     if [[ $relative == agent/TermLink.Agent ]]; then
       args=(--options runtime --entitlements "$script_dir/runtime-entitlements.plist" --identifier dev.termlink.desktop.agent)
     fi
-    codesign --force --timestamp=none "${args[@]}" "${keychain_args[@]}" "${identity_args[@]}" "$item"
+    codesign --force --timestamp=none ${args[@]+"${args[@]}"} ${keychain_args[@]+"${keychain_args[@]}"} "${identity_args[@]}" "$item"
   else
     resource="$contents/Resources/dotnet/$relative"
     mkdir -p -- "$(dirname -- "$resource")"
@@ -135,7 +135,7 @@ while IFS= read -r -d '' item; do
     ln -s -- "$up/Resources/dotnet/$relative" "$item"
   fi
 done < <(find "$contents/MacOS" -type f -print0)
-codesign --force --timestamp=none --options runtime --entitlements "$script_dir/runtime-entitlements.plist" "${keychain_args[@]}" "${identity_args[@]}" --requirements "=designated => $bundle_requirement" "$app"
+codesign --force --timestamp=none --options runtime --entitlements "$script_dir/runtime-entitlements.plist" ${keychain_args[@]+"${keychain_args[@]}"} "${identity_args[@]}" --requirements "=designated => $bundle_requirement" "$app"
 codesign --verify --deep --strict --verbose=4 -R "=$bundle_requirement" "$app"
 
 ditto -c -k --sequesterRsrc --noqtn --keepParent "$app" "$work_root/TermLink-$rid.zip"

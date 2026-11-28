@@ -14,7 +14,7 @@ while IFS= read -r line; do
   if [[ -n $line ]]; then previous_keychains+=("$line"); fi
 done < <(/usr/bin/security list-keychains -d user)
 cleanup() {
-  /usr/bin/security list-keychains -d user -s "${previous_keychains[@]}" >/dev/null 2>&1 || true
+  /usr/bin/security list-keychains -d user -s ${previous_keychains[@]+"${previous_keychains[@]}"} >/dev/null 2>&1 || true
   /usr/bin/security delete-keychain "$keychain" >/dev/null 2>&1 || true
   rm -f -- "$work/signer.p12" "$certificate" "$work/signing-probe"
   rmdir -- "$work" 2>/dev/null || true
@@ -32,7 +32,7 @@ unset GH_MACOS_SIGNING_P12_B64
 /usr/bin/security create-keychain -p "$keypass" "$keychain"
 /usr/bin/security set-keychain-settings -lut 2700 "$keychain"
 /usr/bin/security unlock-keychain -p "$keypass" "$keychain"
-/usr/bin/security list-keychains -d user -s "$keychain" "${previous_keychains[@]}"
+/usr/bin/security list-keychains -d user -s "$keychain" ${previous_keychains[@]+"${previous_keychains[@]}"}
 /usr/bin/security import "$work/signer.p12" -k "$keychain" -f pkcs12 -P "$GH_MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
 unset GH_MACOS_SIGNING_P12_PASSWORD
 rm -f -- "$work/signer.p12"
@@ -50,7 +50,8 @@ rm -f -- "$work/signing-probe"
 out="$RUNNER_TEMP/macos-release"
 mkdir -p "$out"
 zip="$out/TermLink-macOS-$CLIENT_VERSION-$CLIENT_BUILD-$CLIENT_RID.zip"
-bash pc-client/package/macos/build-self-signed-app.sh "$CLIENT_VERSION" "$CLIENT_BUILD" "$CLIENT_RID" "$DOTNET_ROOT/dotnet" "$pin" "$keychain" "$zip"
+bash pc-client/package/macos/build-self-signed-app.sh "$CLIENT_VERSION" "$CLIENT_BUILD" "$CLIENT_RID" "$DOTNET_ROOT/dotnet" "$pin" "$keychain" "$zip" || exit "$?"
+[[ -s $zip ]]
 
 python3 - "$zip" "$policy" "$out/macos-$CLIENT_RID-verification.json" <<'PY'
 import hashlib
