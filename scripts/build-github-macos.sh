@@ -47,7 +47,7 @@ sudo /usr/bin/security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/
 # Check the same host session can actually sign before investing in a full build.
 printf '%s\n' 'int main(void) { return 0; }' | clang -x c - -o "$work/signing-probe"
 /usr/bin/codesign --force --timestamp=none --keychain "$keychain" --sign "$pin" "$work/signing-probe"
-/usr/bin/codesign --verify --strict -R "certificate leaf = H\"$pin\"" "$work/signing-probe"
+/usr/bin/codesign --verify --strict -R "=certificate leaf = H\"$pin\"" "$work/signing-probe"
 rm -f -- "$work/signing-probe"
 
 out="$RUNNER_TEMP/macos-release"

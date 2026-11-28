@@ -124,13 +124,13 @@ while IFS= read -r -d '' executable; do
     codesign --force --timestamp=none "${keychain_args[@]}" "${identity_args[@]}" "$executable"
   fi
 done < <(find "$contents/MacOS" -type f -print0)
-codesign --force --timestamp=none --options runtime --entitlements "$script_dir/runtime-entitlements.plist" "${keychain_args[@]}" "${identity_args[@]}" --requirements "designated => $bundle_requirement" "$app"
-codesign --verify --deep --strict --verbose=4 -R "$bundle_requirement" "$app"
+codesign --force --timestamp=none --options runtime --entitlements "$script_dir/runtime-entitlements.plist" "${keychain_args[@]}" "${identity_args[@]}" --requirements "=designated => $bundle_requirement" "$app"
+codesign --verify --deep --strict --verbose=4 -R "=$bundle_requirement" "$app"
 
 ditto -c -k --sequesterRsrc --noqtn --keepParent "$app" "$work_root/TermLink-$rid.zip"
 ditto -x -k "$work_root/TermLink-$rid.zip" "$work_root/zip-validation"
 roundtrip="$work_root/zip-validation/TermLink.app"
-codesign --verify --deep --strict -R "$bundle_requirement" "$roundtrip"
+codesign --verify --deep --strict -R "=$bundle_requirement" "$roundtrip"
 [[ $(lipo -archs "$roundtrip/Contents/MacOS/TermLink") == "$(uname -m)" ]]
 [[ $(lipo -archs "$roundtrip/Contents/MacOS/agent/TermLink.Agent") == "$(uname -m)" ]]
 ln -- "$work_root/TermLink-$rid.zip" "$output"

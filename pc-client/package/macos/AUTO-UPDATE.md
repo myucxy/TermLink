@@ -12,7 +12,7 @@ GitHub Releases 提供 Apple Silicon (`osx-arm64`) 和 Intel (`osx-x64`) 两种 
 
 ```bash
 codesign --verify --deep --strict \
-  -R 'identifier "dev.termlink.desktop" and certificate leaf = H"<signer_sha1>"' \
+  -R '=identifier "dev.termlink.desktop" and certificate leaf = H"<signer_sha1>"' \
   /Applications/TermLink.app
 ```
 
