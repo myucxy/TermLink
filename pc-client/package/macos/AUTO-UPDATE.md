@@ -2,6 +2,22 @@
 
 2026-10-26：客户端已经实现 macOS PKG 更新流程。当前本机产物是 DEV 包，未发布正式 Mac 更新渠道；正式签名、公证、授权安装及重启仍需真实验收。
 
+## 自有签名应用
+
+GitHub Releases 提供 Apple Silicon (`osx-arm64`) 和 Intel (`osx-x64`) 两种 `TermLink.app` ZIP。先核对发布页 `SHA256SUMS`，再解压，将应用移到 `/Applications`。覆盖安装前从托盘选择“完全退出 TermLink”。
+
+应用使用 TermLink 自有证书签名。首次启动若 macOS 提示开发者无法验证，核对可信来源后，在“系统设置 → 隐私与安全性”里点“仍要打开”。设备策略可能禁止此操作。更新时从 GitHub 下载新版本并手动覆盖应用。
+
+签名验证及 SHA-1 证书固定要求如下，指纹见 `release/github-macos-signing-policy.json`：
+
+```bash
+codesign --verify --deep --strict \
+  -R 'identifier "dev.termlink.desktop" and certificate leaf = H"<signer_sha1>"' \
+  /Applications/TermLink.app
+```
+
+以下 PKG 自动更新流程适用于 Apple Developer ID 签名和公证构建。
+
 ## 首次安装和 DEV 包
 
 DEV `.app` 可直接运行，也可使用 [DEV PKG 脚本](DEV-PKG.md)生成安装包，手动安装至 `/Applications/TermLink DEV.app`。沿用原始图标及独立 DEV 数据、Keychain 和 IPC。手动覆盖前，应从托盘选择“完全退出 TermLink”，确保 Agent 和受管任务结束。

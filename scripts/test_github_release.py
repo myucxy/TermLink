@@ -119,6 +119,71 @@ class ReleaseChecks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.expected_names('0.3.7', 137, artifact_types)
 
+    def test_macos_asset_names_are_fixed_to_both_rids_and_evidence(self):
+        self.assertEqual(release.macos_asset_names('0.3.19', 149), {
+            'TermLink-macOS-0.3.19-149-osx-arm64.zip',
+            'TermLink-macOS-0.3.19-149-osx-x64.zip',
+            'macos-osx-arm64-verification.json',
+            'macos-osx-x64-verification.json',
+        })
+
+    def test_macos_evidence_binds_self_signed_zip_and_rejects_changed_digest(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            filename = 'TermLink-macOS-0.3.19-149-osx-arm64.zip'
+            artifact = directory/filename
+            artifact.write_bytes(b'self-signed macOS fixture')
+            evidence = {
+                'schema_version': 1, 'verified': True, 'notarized': False,
+                'source_revision': 'a'*40, 'core_revision': 'b'*40,
+                'version': '0.3.19', 'build_number': 149, 'rid': 'osx-arm64',
+                'filename': filename, 'size': artifact.stat().st_size,
+                'sha256': release.sha256(artifact), 'signer_sha1': 'c'*40,
+            }
+            release.write_json(directory/'macos-osx-arm64-verification.json', evidence)
+            release.validate_macos_evidence(directory, '0.3.19', 149, 'a'*40, 'b'*40, 'c'*40, 'osx-arm64')
+            evidence['sha256'] = '0'*64
+            release.write_json(directory/'macos-osx-arm64-verification.json', evidence)
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                release.validate_macos_evidence(directory, '0.3.19', 149, 'a'*40, 'b'*40, 'c'*40, 'osx-arm64')
+
+    def test_macos_policy_requires_schema_and_valid_fingerprints(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            policy = root/'release/github-macos-signing-policy.json'
+            policy.parent.mkdir()
+            release.write_json(policy, {'schema_version': 1, 'signer_sha1': 'c'*40,
+                                        'signer_sha256': 'd'*64, 'bundle_id': 'dev.termlink.desktop'})
+            with patch.object(release, 'ROOT', root), patch.object(release, 'git', return_value=policy.read_text()):
+                loaded, signer = release.read_macos_policy('a'*40)
+            self.assertEqual(signer, 'c'*40)
+            self.assertEqual(loaded['bundle_id'], 'dev.termlink.desktop')
+
+    def test_publish_tag_with_macos_requires_and_records_self_signed_assets(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            manifest = directory/'artifact-manifest.json'
+            release.write_json(manifest, {'artifacts': [
+                {'type': 'apk'}, {'type': 'setup'},
+            ]})
+            release.write_json(directory/'ci-verification.json', {
+                'verified': True, 'source_revision': 'a'*40,
+                'version': '0.3.19', 'build_number': 149,
+                'manifest_sha256': release.sha256(manifest),
+            })
+            release.write_json(directory/'github-release.json', {'fixture': True})
+            args = argparse.Namespace(directory=directory, tag='v0.3.19', revision='a'*40,
+                                      with_macos=True)
+            metadata = {'version': '0.3.19', 'build_number': 149, 'source_revision': 'a'*40,
+                        'macos': True}
+            with patch.object(release, 'validate_bundle', return_value=metadata), \
+                    patch.object(release, 'stage_bundle', return_value=12) as stage, \
+                    patch.object(release, 'publish_bundle') as publish:
+                release.publish_from_tag(args, unittest.mock.Mock())
+            stage.assert_called_once()
+            self.assertIn('Self-signed macOS', stage.call_args.args[3])
+            publish.assert_called_once()
+
     def test_android_only_stage_resumes_exact_asset_set_without_windows_setup(self):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)

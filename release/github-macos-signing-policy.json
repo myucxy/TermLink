@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "signer_sha1": "61f328ff9b12224607aac227cf76c115abe924be",
+  "signer_sha256": "c472d20f36cc7968066e00a6a21f6d2170d47f5e46da3e8664121eb10494e81a",
+  "bundle_id": "dev.termlink.desktop"
+}

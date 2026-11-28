@@ -1,20 +1,20 @@
 # GitHub 客户端发布管道
 
-客户端正式发布由附注标签 `vX.Y.Z` 触发。GitHub Actions 在同一源码提交上构建和签名 Android APK、Windows x64 Setup，
+客户端正式发布由附注标签 `vX.Y.Z` 触发。GitHub Actions 在同一源码提交上构建和签名 Android APK、Windows x64 Setup、Apple Silicon 和 Intel 的 macOS ZIP，
 校验固定签名指纹、Windows RFC3161 时间戳及载荷、Android 签名、双端原生依赖和可下载的完整对应源码。
 `Build clients from tag` 通过后，独立发布任务将核验过的同一批字节上传到 GitHub Release。
 Server 继续使用 [`server-vX.Y.Z` 标签流程](../RELEASE_RUNBOOK.md#server-标签发布与-docker-hub-交接)。
 
 1. 查询实际的 GitHub Releases 及迁移前 AppShip 的最终版本，分配严格递增的 version/build。等待目标 `main` 提交的 `Repository checks` 全部通过。
-2. 先在 `main` 上手动运行 `Build clients from tag` 检查两端签名及源码交付。演练使用最后已核验的正式 version/build，只有日志随运行保留。
+2. 先在 `main` 上手动运行 `Build clients from tag` 验证签名。`all` 验证整个批次的构建，`macos` 只验证两种 Mac 架构。演练沿用已核验的 version/build，保留日志。
 3. 经正式发布确认后，对目标提交创建 `git tag -a vX.Y.Z -m "build=N" <commit>`，随后单独推送该标签。一次失败重试使用同一标签和构建编号。
-4. 核验 Release 中的 APK、Setup、对应源码 ZIP、sidecar、`artifact-manifest.json`、`github-release.json` 和 `SHA256SUMS`。
+4. 核验 Release 中的 APK、Setup、两个 macOS 应用 ZIP、对应源码 ZIP、sidecar、`artifact-manifest.json`、`github-release.json` 和 `SHA256SUMS`。
 
 签名材料保存在 `github-client-signing` 环境 Secrets，允许 `main` 演练及受规则集限制的 `v*` 标签。
 签名步骤专用的密钥随托管 runner 作业清理，发布 job 只读取核验后的产物，并使用当次 GitHub 令牌。
 迁移期从 GitHub 草稿资产读取上一版已公开对应源码中的完整 core 子树，固定资产 ID 和 SHA-256，复用与当前原生库锁一致的 core 源码和 Rust 依赖；core revision 改变时需先更新该输入。
 发布 job 中断时选择 **Re-run failed jobs**，复用保留的签名产物；已上传的同名附件必须匹配原字节。
-macOS 正式包需要 Developer ID Application、Developer ID Installer 和 Apple 公证凭据，以及 Apple Silicon/Intel 各自的签名验证。
+macOS 使用项目自有证书，签名只在独立的 `github-macos-signing` 环境使用。两种架构都必须通过验证，签名指纹固定在 `release/github-macos-signing-policy.json`。安装见[自签名应用](../../pc-client/package/macos/AUTO-UPDATE.md#自有签名应用)。
 已安装客户端的旧版更新功能仍读取历史渠道，GitHub 版本自动发现需由更新源适配接通。
 
 独立的 `Docker server image checks` 在 Server/Docker 配置的 push/PR 及手动调度时运行：

@@ -34,7 +34,7 @@
 
 ## Release policy
 
-- 附注标签 `vX.Y.Z`（注释 `build=N`）触发 GitHub Actions 构建、签名并发布 Android APK、Windows x64 Setup 和对应源码。发标签前先通过 `main` 上的无发布演练及同提交的仓库检查。签名环境、恢复流程和 macOS 前提见 `docs/development/GITHUB_RELEASE.md`。新客户端版本停止上传 AppShip。
+- 附注标签 `vX.Y.Z`（注释 `build=N`）触发 GitHub Actions 构建、签名并发布 Android APK、Windows x64 Setup、Apple Silicon/Intel 自签名 ZIP 和对应源码。发标签前先通过 `main` 上的无发布演练及同提交的仓库检查。签名环境、恢复流程和 macOS 前提见 `docs/development/GITHUB_RELEASE.md`。新客户端版本停止上传 AppShip。
 - Server 标签 `server-vX.Y.Z` 触发 GitHub Actions 构建、测试并发布未签名的双架构 OCI 归档及对应源码到同名 GitHub Release。正式签名与 Docker Hub 推送由本机按归档 digest 执行，核验后再更新 `latest`。客户端标签及普通 CI 不触发此流程。
 
 - 版本规则（2026-10-03 起）：下一轮新正式发布从 `0.3.0` 开始，后续未另行指定时自动递增 patch（`0.3.1`、`0.3.2`……）。不得回退或覆盖已发布版本；现场若已有 `0.3.0` 或更高版本，应从实际已发布版本继续递增。

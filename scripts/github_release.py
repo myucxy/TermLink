@@ -67,7 +67,65 @@ def expected_names(version, build, artifact_types=None):
     return names
 
 
-def validate_bundle(directory, revision, digest=None):
+def macos_asset_names(version, build):
+    require(isinstance(version, str) and re.fullmatch(r'\d+\.\d+\.\d+', version), 'Invalid release version')
+    require(type(build) is int and 1 <= build <= 65535, 'Invalid release build')
+    return {
+        f'TermLink-macOS-{version}-{build}-osx-arm64.zip',
+        f'TermLink-macOS-{version}-{build}-osx-x64.zip',
+        'macos-osx-arm64-verification.json',
+        'macos-osx-x64-verification.json',
+    }
+
+
+def read_macos_policy(revision):
+    try:
+        policy = json.loads(git('show', revision+':release/github-macos-signing-policy.json'))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        raise ValueError('GitHub macOS signing policy is missing from the release commit') from None
+    require(policy.get('schema_version') == 1, 'Unsupported GitHub macOS signing policy schema')
+    signer = str(policy.get('signer_sha1', '')).replace(':', '').replace('-', '').lower()
+    require(re.fullmatch(r'[0-9a-f]{40}', signer), 'GitHub macOS signing policy has an invalid signer_sha1')
+    if policy.get('signer_sha256'):
+        signer_sha256 = str(policy['signer_sha256']).replace(':', '').replace('-', '').lower()
+        require(re.fullmatch(r'[0-9a-f]{64}', signer_sha256),
+                'GitHub macOS signing policy has an invalid signer_sha256')
+    if policy.get('bundle_id'):
+        require(isinstance(policy['bundle_id'], str) and
+                re.fullmatch(r'[A-Za-z0-9.-]+', policy['bundle_id']),
+                'GitHub macOS signing policy has an invalid bundle_id')
+    return policy, signer
+
+
+def validate_macos_evidence(directory, version, build, revision, mac_lock_revision, signer, rid, policy=None):
+    filename = f'TermLink-macOS-{version}-{build}-{rid}.zip'
+    evidence_path = directory/f'macos-{rid}-verification.json'
+    evidence = read_json(evidence_path)
+    require(evidence.get('schema_version') == 1 and evidence.get('verified') is True,
+            f'Invalid macOS verification evidence: {evidence_path.name}')
+    require(evidence.get('notarized') is False, 'Self-signed macOS evidence must declare notarized=false')
+    require(evidence.get('source_revision') == revision and evidence.get('core_revision') == mac_lock_revision and
+            evidence.get('version') == version and evidence.get('build_number') == build and
+            evidence.get('rid') == rid and evidence.get('filename') == filename and
+            str(evidence.get('signer_sha1', '')).replace(':', '').replace('-', '').lower() == signer,
+            f'MacOS verification evidence identity mismatch: {evidence_path.name}')
+    artifact = directory/filename
+    actual_size = artifact.stat().st_size
+    actual_sha = sha256(artifact)
+    require(type(evidence.get('size')) is int and evidence.get('size') == actual_size and
+            str(evidence.get('sha256', '')).lower() == actual_sha,
+            f'MacOS verification evidence hash mismatch: {filename}')
+    if policy and policy.get('signer_sha256'):
+        signer_sha256 = str(policy['signer_sha256']).replace(':', '').replace('-', '').lower()
+        require(re.fullmatch(r'[0-9a-f]{64}', signer_sha256) and
+                str(evidence.get('signer_sha256', '')).replace(':', '').replace('-', '').lower() == signer_sha256,
+                f'MacOS SHA-256 signer mismatch: {evidence_path.name}')
+    if policy and policy.get('bundle_id'):
+        require(evidence.get('bundle_id') == policy['bundle_id'],
+                f'MacOS bundle identifier mismatch: {evidence_path.name}')
+
+
+def validate_bundle(directory, revision, digest=None, with_macos=False):
     require(re.fullmatch('[0-9a-f]{40}', revision), 'Expected a full source commit')
     metadata_path = directory/'github-release.json'
     if digest:
@@ -78,10 +136,17 @@ def validate_bundle(directory, revision, digest=None):
     require(type(build) is int and 1 <= build <= 65535, 'Invalid release build')
     require(metadata['source_revision'] == revision == git('rev-parse', '--verify', revision+'^{commit}'), 'Release source commit is unavailable')
     require(metadata['signers'] == json.loads(git('show', revision+':release/github-release-policy.json')), 'Unexpected signing identities')
+    if 'macos' in metadata:
+        require(type(metadata['macos']) is bool, 'Invalid macOS release flag')
+        require(metadata['macos'] == with_macos, 'MacOS release flag differs from validation mode')
+    else:
+        require(not with_macos, 'MacOS assets require macos=true release metadata')
     records = metadata['files']
     manifest = read_json(directory/'artifact-manifest.json')
     artifact_types = artifact_types_from_manifest(manifest)
     expected = expected_names(version, build, artifact_types)
+    if with_macos:
+        expected |= macos_asset_names(version, build)
     require(len(records) == len(expected), 'Unexpected release file count')
     require({row['name'] for row in records} == expected, 'Unexpected release filenames')
     for row in records:
@@ -92,6 +157,26 @@ def validate_bundle(directory, revision, digest=None):
             manifest['build_number'] == build and manifest['source_revision'] == revision, 'Client manifest identity mismatch')
     lock = json.loads(git('show', revision+':terminal-core.lock.json'))
     require(not lock['source_dirty'] and manifest['core_revision'] == metadata['core_revision'] == lock['revision'], 'Core revision mismatch')
+    mac_lock_revision = None
+    mac_signer = None
+    if with_macos:
+        mac_lock = json.loads(git('show', revision+':terminal-core.macos.lock.json'))
+        mac_lock_revision = str(mac_lock.get('revision', ''))
+        require(re.fullmatch(r'[0-9a-f]{40}', mac_lock_revision) and not mac_lock.get('source_dirty', False),
+                'Invalid macOS native lock')
+        mac_policy, mac_signer = read_macos_policy(revision)
+        require(str(metadata.get('macos_signer_sha1', '')).replace(':', '').replace('-', '').lower() == mac_signer,
+                'MacOS signer policy differs from release metadata')
+        if mac_policy.get('signer_sha256'):
+            mac_signer_sha256 = str(mac_policy['signer_sha256']).replace(':', '').replace('-', '').lower()
+            require(re.fullmatch(r'[0-9a-f]{64}', mac_signer_sha256) and
+                    str(metadata.get('macos_signer_sha256', '')).replace(':', '').replace('-', '').lower() == mac_signer_sha256,
+                    'MacOS SHA-256 signer policy differs from release metadata')
+        else:
+            mac_signer_sha256 = None
+        if mac_policy.get('bundle_id'):
+            require(metadata.get('macos_bundle_id') == mac_policy['bundle_id'],
+                    'MacOS bundle identifier policy differs from release metadata')
     if 'artifact_types' in metadata:
         require(frozenset(metadata['artifact_types']) == artifact_types, 'Release metadata artifact types differ from manifest')
     for row in manifest['artifacts']:
@@ -105,6 +190,7 @@ def validate_bundle(directory, revision, digest=None):
     source = directory/f'TermLink-{version}-{build}-source.zip'
     sidecar = read_json(source.with_name(source.name+'.sha256.json'))
     require(sidecar['archive'] == source.name and sidecar['sha256'] == sha256(source), 'Corresponding-source digest mismatch')
+    source_manifest_core_revision = None
     with zipfile.ZipFile(source) as archive:
         names = archive.namelist()
         require(len(names) == len(set(names)), 'Duplicate corresponding-source entries')
@@ -112,6 +198,7 @@ def validate_bundle(directory, revision, digest=None):
             require(not name.startswith('/') and '\\' not in name and ':' not in name and
                     all(part not in ('', '.', '..') for part in name.split('/')), 'Unsafe source archive entry')
         source_manifest = json.loads(archive.read('SOURCE-MANIFEST.json'))
+        source_manifest_core_revision = source_manifest.get('core_revision')
         require(source_manifest['application_revision'] == revision and source_manifest['core_revision'] == lock['revision'] and
                 source_manifest['version'] == version and source_manifest['build_number'] == build and
                 source_manifest['core_dependencies_vendored'] is True, 'Corresponding-source provenance mismatch')
@@ -137,6 +224,11 @@ def validate_bundle(directory, revision, digest=None):
                 require(blob == tree[row['path']], f'Application source is not from the selected commit: {row["path"]}')
         for row in lock['artifacts']:
             require(hashlib.sha256(archive.read('termlink/'+row['path'])).hexdigest() == row['sha256'], 'Archived native library differs from lock')
+    if with_macos:
+        require(source_manifest_core_revision == mac_lock_revision,
+                'Corresponding source core revision differs from terminal-core.macos.lock.json')
+        for rid in ('osx-arm64', 'osx-x64'):
+            validate_macos_evidence(directory, version, build, revision, mac_lock_revision, mac_signer, rid, mac_policy)
     return metadata
 
 
@@ -213,22 +305,33 @@ def fetch_core_source(args, api):
     print(json.dumps(dict(core_revision=lock['revision'], sha256=source['archive_sha256'])))
 
 
-def prepare_bundle(directory):
+def prepare_bundle(directory, with_macos=False):
     manifest = read_json(directory/'artifact-manifest.json')
     version, build, revision = manifest['version'], manifest['build_number'], manifest['source_revision']
     require(not git('status', '--porcelain'), 'Commit source and documentation before staging a release')
     require(revision == git('rev-parse', 'HEAD'), 'Stage the clients from their exact build source checkout')
     artifact_types = artifact_types_from_manifest(manifest)
-    names = expected_names(version, build, artifact_types)-{'SHA256SUMS'}
+    names = expected_names(version, build, artifact_types)
+    if with_macos:
+        names |= macos_asset_names(version, build)
+    names -= {'SHA256SUMS'}
     checksum_text = ''.join(f'{sha256(directory/name)}  {name}\n' for name in sorted(names))
     (directory/'SHA256SUMS').write_text(checksum_text, encoding='utf-8', newline='\n')
     metadata = dict(schema_version=1, version=version, build_number=build, source_revision=revision,
                     core_revision=manifest['core_revision'], artifact_types=sorted(artifact_types),
                     signers=read_json(ROOT/'release/github-release-policy.json'),
+                    macos=bool(with_macos),
                     files=[dict(name=name, size=(directory/name).stat().st_size, sha256=sha256(directory/name))
-                           for name in sorted(expected_names(version, build, artifact_types))])
+                           for name in sorted(names)])
+    if with_macos:
+        policy, signer = read_macos_policy(revision)
+        metadata['macos_signer_sha1'] = signer
+        if policy.get('signer_sha256'):
+            metadata['macos_signer_sha256'] = str(policy['signer_sha256']).replace(':', '').replace('-', '').lower()
+        if policy.get('bundle_id'):
+            metadata['macos_bundle_id'] = policy['bundle_id']
     write_json(directory/'github-release.json', metadata)
-    validate_bundle(directory, revision)
+    validate_bundle(directory, revision, with_macos=with_macos)
     return metadata
 
 
@@ -259,6 +362,8 @@ def stage_bundle(directory, api, metadata, notes, allow_published=False):
             name=f'TermLink {version} (build {build})', body=notes, draft=True, prerelease=False))
     assets = {row['name']: row for row in api.request(f'/releases/{release["id"]}/assets?per_page=100')}
     upload_names = expected_names(version, build, artifact_types) | {'github-release.json'}
+    if metadata.get('macos'):
+        upload_names |= macos_asset_names(version, build)
     require(set(assets) <= upload_names, 'Unexpected existing draft attachments; preserve draft and inspect manually')
     for name in sorted(upload_names):
         path = directory/name
@@ -282,7 +387,7 @@ def stage_bundle(directory, api, metadata, notes, allow_published=False):
 
 def stage(args, api):
     directory = args.directory.resolve()
-    metadata = prepare_bundle(directory)
+    metadata = prepare_bundle(directory, with_macos=getattr(args, 'with_macos', False))
     release_id = stage_bundle(directory, api, metadata, args.notes.read_text(encoding='utf-8'))
     revision = metadata['source_revision']
     inputs = dict(release_id=str(release_id), revision=revision, metadata_sha256=sha256(directory/'github-release.json'))
@@ -317,21 +422,26 @@ def receive(args, api):
     require(sha256(directory/'github-release.json') == args.metadata_sha256, 'Release metadata digest mismatch')
     metadata = read_json(directory/'github-release.json')
     metadata_types = frozenset(metadata.get('artifact_types', ('apk', 'setup')))
+    metadata_macos = bool(metadata.get('macos', False))
     if 'artifact_types' not in metadata:
         metadata_types = frozenset({'apk'} | ({'setup'} if f'TermLink-Setup-{metadata["version"]}.{metadata["build_number"]}-x64.exe' in indexed else set()))
-    require(set(indexed) == expected_names(metadata['version'], metadata['build_number'], metadata_types) | {'github-release.json'}, 'Unexpected remote attachments')
+    expected_remote = expected_names(metadata['version'], metadata['build_number'], metadata_types) | {'github-release.json'}
+    if metadata_macos:
+        expected_remote |= macos_asset_names(metadata['version'], metadata['build_number'])
+    require(set(indexed) == expected_remote, 'Unexpected remote attachments')
     require(release['tag_name'] == 'v'+metadata['version'] and release['target_commitish'] == args.revision, 'Draft source identity mismatch')
     api.require_tag(release['tag_name'], args.revision)
     for name, asset in indexed.items():
         require(asset['state'] == 'uploaded', 'Incomplete release asset')
         if name != 'github-release.json':
             api.download(asset['id'], directory/name)
-    validate_bundle(directory, args.revision, args.metadata_sha256)
+    validate_bundle(directory, args.revision, args.metadata_sha256, with_macos=metadata_macos)
     print(json.dumps(dict(verified=True, version=metadata['version'], build_number=metadata['build_number'])))
 
 
 def publish(args, api):
-    metadata = validate_bundle(args.directory.resolve(), args.revision, args.metadata_sha256)
+    metadata = validate_bundle(args.directory.resolve(), args.revision, args.metadata_sha256,
+                                with_macos=getattr(args, 'with_macos', False))
     if args.verify_only:
         evidence = read_json(args.directory/'ci-verification.json')
         require(evidence['verified'] is True and evidence['source_revision'] == args.revision and
@@ -369,7 +479,7 @@ def publish_bundle(api, metadata, revision, release_id, metadata_sha256):
 
 def publish_from_tag(args, api):
     directory = args.directory.resolve()
-    metadata = validate_bundle(directory, args.revision)
+    metadata = validate_bundle(directory, args.revision, with_macos=getattr(args, 'with_macos', False))
     require(f"v{metadata['version']}" == args.tag and metadata['source_revision'] == args.revision,
             'Signed batch does not match the release tag')
     require(artifact_types_from_manifest(read_json(directory/'artifact-manifest.json')) == {'apk', 'setup'},
@@ -379,9 +489,13 @@ def publish_from_tag(args, api):
             evidence['version'] == metadata['version'] and evidence['build_number'] == metadata['build_number'] and
             evidence['manifest_sha256'] == sha256(directory/'artifact-manifest.json'),
             'Signed batch verification evidence is missing or does not match')
+    if getattr(args, 'with_macos', False):
+        require(metadata.get('macos') is True, 'MacOS assets were requested but release metadata is not macOS-enabled')
     notes = (f"Android APK and Windows x64 Setup for TermLink {metadata['version']} "
              f"(build {metadata['build_number']}).\n\n"
              "The release includes matching GPL-3.0-only corresponding source and SHA-256 checksums.\n")
+    if getattr(args, 'with_macos', False):
+        notes += 'Self-signed macOS arm64 and Intel ZIPs are included; notarization is not provided.\n'
     release_id = stage_bundle(directory, api, metadata, notes, allow_published=True)
     publish_bundle(api, metadata, args.revision, release_id, sha256(directory/'github-release.json'))
 
@@ -398,9 +512,11 @@ def main():
     parser.add_argument('--metadata-sha256')
     parser.add_argument('--verify-only', action='store_true')
     parser.add_argument('--verification-run', type=int)
+    parser.add_argument('--with-macos', action='store_true',
+                        help='Require and publish the two self-signed macOS ZIPs and verification evidence')
     args = parser.parse_args()
     if args.phase == 'verify-bundle':
-        metadata = prepare_bundle(args.directory.resolve())
+        metadata = prepare_bundle(args.directory.resolve(), with_macos=args.with_macos)
         print(json.dumps(dict(verified=True, version=metadata['version'], build_number=metadata['build_number'])))
         return
     if args.phase == 'fetch-core-source':
