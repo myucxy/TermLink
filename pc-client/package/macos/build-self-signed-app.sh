@@ -116,21 +116,23 @@ while IFS= read -r -d '' item; do
   if [[ $relative == TermLink ]]; then
     continue
   fi
+  resource="$contents/Resources/dotnet/$relative"
+  mkdir -p -- "$(dirname -- "$resource")"
+  up=..
+  parent=$(dirname -- "$relative")
+  while [[ $parent != . ]]; do
+    up="../$up"
+    parent=$(dirname -- "$parent")
+  done
   if file -b "$item" | grep -q 'Mach-O'; then
     args=()
     if [[ $relative == agent/TermLink.Agent ]]; then
       args=(--options runtime --entitlements "$script_dir/runtime-entitlements.plist" --identifier dev.termlink.desktop.agent)
     fi
     codesign --force --timestamp=none ${args[@]+"${args[@]}"} ${keychain_args[@]+"${keychain_args[@]}"} "${identity_args[@]}" "$item"
+    # The .NET host can resolve a linked runtimeconfig to its real directory.
+    ln -s -- "../$up/MacOS/$relative" "$resource"
   else
-    resource="$contents/Resources/dotnet/$relative"
-    mkdir -p -- "$(dirname -- "$resource")"
-    up=..
-    parent=$(dirname -- "$relative")
-    while [[ $parent != . ]]; do
-      up="../$up"
-      parent=$(dirname -- "$parent")
-    done
     mv -- "$item" "$resource"
     ln -s -- "$up/Resources/dotnet/$relative" "$item"
   fi
@@ -144,7 +146,7 @@ roundtrip="$work_root/zip-validation/TermLink.app"
 codesign --verify --deep --strict -R "=$bundle_requirement" "$roundtrip"
 [[ $(lipo -archs "$roundtrip/Contents/MacOS/TermLink") == "$(uname -m)" ]]
 [[ $(lipo -archs "$roundtrip/Contents/MacOS/agent/TermLink.Agent") == "$(uname -m)" ]]
-if "$roundtrip/Contents/MacOS/agent/TermLink.Agent" > "$work_root/agent-smoke.log" 2>&1; then
+if env -u DOTNET_ROOT -u DOTNET_ROOT_X64 -u DOTNET_ROOT_ARM64 "$roundtrip/Contents/MacOS/agent/TermLink.Agent" > "$work_root/agent-smoke.log" 2>&1; then
   echo 'The Agent entry point accepted a command without its required arguments.' >&2
   exit 4
 else
